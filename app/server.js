@@ -1,0 +1,96 @@
+import express from 'express';
+import fs from 'fs/promises';
+import path from 'path';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const app = express();
+const execFileAsync = promisify(execFile);
+const registryPath = '/opt/project-workbench/projects.json';
+const workspaceRoot = '/opt/project-workbench/workspaces';
+const nginxPath = '/etc/nginx/sites-available/project-workbench';
+const managedProjects = ['AmrikPublic','HarmaniPublic','IPSpeaker_ESP32','ProVisionIPortal','ProVisionIPublic','SunEstateHomesCA'];
+
+app.use(express.json({ limit: '100mb' }));
+app.use(express.urlencoded({ extended: true, limit: '100mb' }));
+
+async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
+async function saveProjects(projects){ await fs.writeFile(registryPath, JSON.stringify(projects, null, 2)+'\n'); }
+function esc(s){ return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function slug(s){ return String(s ?? '').replace(/[^A-Za-z0-9._-]/g,'_').slice(0,120) || 'clipboard-file'; }
+function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
+function workspacePath(name){ return path.join(workspaceRoot, name); }
+async function projectByName(name){ return (await loadProjects()).find(p => p.name === name); }
+function nextPort(projects){ const used = new Set(projects.map(p => Number(p.port))); let port = 7681; while(used.has(port)) port++; return port; }
+async function sh(cmd,args,opts={}){ return execFileAsync(cmd,args,{timeout:120000,...opts}); }
+async function getClaudeVersion(){ try { const { stdout } = await sh('claude',['--version'],{timeout:5000}); return stdout.trim() || 'unknown'; } catch { return 'unavailable'; } }
+async function getClaudeUpdateStamp(){ try { const stat = await fs.stat('/var/log/claude-code-update.log'); return stat.mtime.toISOString().replace('T',' ').replace(/\.\d+Z$/,' UTC'); } catch { return 'never'; } }
+
+function nginxConfig(projects){
+ const locations = projects.map(p => `    location /pty/${p.name}/ {\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="/terminal-preload.js"></script></head>';\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
+ return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\nserver {\n    listen 80 default_server;\n    server_name _;\n    auth_basic "Project Workbench";\n    auth_basic_user_file /etc/nginx/.htpasswd;\n    location / { proxy_pass http://127.0.0.1:3000; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; }\n${locations}}\n`;
+}
+async function applyRouting(projects){
+ await fs.writeFile(nginxPath, nginxConfig(projects));
+ await sh('nginx',['-t']);
+ await sh('systemctl',['reload','nginx']);
+ await sh('systemctl',['daemon-reload']);
+}
+async function cloneWorkspace(p){
+ await fs.mkdir(workspaceRoot,{recursive:true});
+ try { await fs.access(path.join(p.path,'.git')); return; } catch {}
+ try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
+ await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+}
+async function startProject(p){ await sh('systemctl',['enable','--now',`project-terminal@${p.name}.service`]); }
+async function stopProject(name){ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{}); }
+async function removeWorkspace(p){ const full = path.resolve(p.path); const root = path.resolve(workspaceRoot); if(!full.startsWith(root + path.sep)) throw new Error('Refusing to delete outside workspace root'); await fs.rm(full,{recursive:true,force:true}); }
+
+const homeCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#0f172a;color:#e5e7eb}a{color:#93c5fd}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:1rem}article{background:#111827;border:1px solid #374151;border-radius:12px;padding:1rem}.button{display:inline-block;background:#2563eb;color:white;padding:.6rem .85rem;border-radius:8px;text-decoration:none;margin:.15rem}.button.secondary{background:#374151}.button.danger{background:#991b1b}.muted{color:#9ca3af;font-size:.9rem}code{color:#bfdbfe;word-break:break-all}.repo{color:#93c5fd;text-decoration:none;font-size:.9rem}.repo:hover{text-decoration:underline}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:1.5rem;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid #1f2937}.hero h1{margin:0;font-size:2rem;line-height:1.1}.subtitle{margin:.45rem 0 0;color:#cbd5e1}.hero-actions{display:flex;flex-direction:column;align-items:flex-end;gap:.55rem;min-width:260px}.meta-row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}.badge{display:inline-flex;align-items:center;gap:.35rem;background:#111827;border:1px solid #334155;border-radius:999px;padding:.35rem .65rem;color:#cbd5e1;font-size:.9rem}.subtle{color:#94a3b8;font-size:.8rem}.top{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}input{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.55rem;width:100%;box-sizing:border-box}label{display:block;margin:.5rem 0}.row{display:grid;grid-template-columns:1fr 1.5fr .5fr auto;gap:.5rem;align-items:end}@media(max-width:800px){.row{grid-template-columns:1fr}.hero{flex-direction:column}.hero-actions{align-items:flex-start}.meta-row{justify-content:flex-start}}`;
+
+app.get('/', async (_req,res)=>{
+ const projects = await loadProjects(); const claudeVersion = await getClaudeVersion(); const updateStamp = await getClaudeUpdateStamp();
+ const rows = projects.map(p=>`<article><h2>${esc(p.name)}</h2><p><code>${esc(p.path)}</code></p><p><a class="button" href="/term/${encodeURIComponent(p.name)}/">Open Claude terminal</a></p><p><a class="repo" href="${esc(p.repo)}" target="_blank" rel="noopener">Github Repo</a></p></article>`).join('\n');
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Workbench</title><style>${homeCss}</style></head><body><header class="hero"><div><h1>Project Workbench</h1><p class="subtitle">Protected project terminals with Claude Code CLI</p></div><div class="hero-actions"><div class="meta-row"><span class="badge">Claude Code: <b>${esc(claudeVersion)}</b></span></div><div class="subtle">Last update check: ${esc(updateStamp)}</div><a class="button secondary" href="/manage">Manage Projects</a></div></header><div class="grid">${rows || '<p>No projects configured.</p>'}</div></body></html>`);
+});
+
+app.get('/manage', async (req,res)=>{
+ const projects = await loadProjects(); const msg = req.query.msg ? `<p class="badge">${esc(req.query.msg)}</p>` : '';
+ const rows = projects.map(p=>`<article><form method="post" action="/manage/update/${encodeURIComponent(p.name)}"><div class="row"><label>Name<input name="name" value="${esc(p.name)}" required></label><label>Repo<input name="repo" value="${esc(p.repo)}" required></label><label>Port<input name="port" type="number" value="${esc(p.port)}" required></label><button class="button" type="submit">Update</button></div><p class="muted"><code>${esc(p.path)}</code></p></form><form method="post" action="/manage/delete/${encodeURIComponent(p.name)}" onsubmit="return confirm('Delete ${esc(p.name)} and remove its local workspace?')"><label class="muted"><input type="checkbox" name="confirm" value="yes" required style="width:auto"> Delete local workspace content too</label><button class="button danger" type="submit">Delete project</button></form></article>`).join('\n');
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manage Projects</title><style>${homeCss}</style></head><body><div class="top"><h1>Manage Projects</h1><a class="button secondary" href="/">Dashboard</a></div>${msg}<article><h2>Add project</h2><form method="post" action="/manage/add"><div class="row"><label>Name<input name="name" placeholder="RepoName" required pattern="[A-Za-z0-9._-]+"></label><label>Repo URL<input name="repo" placeholder="https://github.com/JD2005L/RepoName.git" required></label><label>Port<input name="port" type="number" placeholder="auto"></label><button class="button" type="submit">Add + clone</button></div></form></article><div class="grid">${rows}</div></body></html>`);
+});
+
+app.post('/manage/add', async (req,res,next)=>{ try {
+ const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); if(!validName(name)) throw new Error('Invalid project name');
+ const projects = await loadProjects(); if(projects.some(p=>p.name===name)) throw new Error('Project already exists');
+ const port = Number(req.body.port || nextPort(projects)); if(!port || projects.some(p=>Number(p.port)===port)) throw new Error('Invalid or duplicate port');
+ const p = { name, repo, path: workspacePath(name), port }; projects.push(p); await saveProjects(projects); await cloneWorkspace(p); await applyRouting(projects); await startProject(p);
+ res.redirect('/manage?msg='+encodeURIComponent(`Added ${name}`));
+ } catch(e){ next(e); }});
+
+app.post('/manage/update/:oldName', async (req,res,next)=>{ try {
+ const oldName = req.params.oldName; const newName = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); const port = Number(req.body.port);
+ if(!validName(newName)) throw new Error('Invalid project name'); const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project not found');
+ if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('New name already exists'); if(!port || projects.some(x=>x.name!==oldName && Number(x.port)===port)) throw new Error('Invalid or duplicate port');
+ await stopProject(oldName); const oldPath = p.path; p.name = newName; p.repo = repo; p.port = port; p.path = workspacePath(newName);
+ if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
+ await saveProjects(projects); await applyRouting(projects); await startProject(p); res.redirect('/manage?msg='+encodeURIComponent(`Updated ${newName}`));
+ } catch(e){ next(e); }});
+
+app.post('/manage/delete/:name', async (req,res,next)=>{ try {
+ if(req.body.confirm !== 'yes') throw new Error('Delete confirmation required'); const name = req.params.name; const projects = await loadProjects(); const idx = projects.findIndex(p=>p.name===name); if(idx<0) throw new Error('Project not found'); const [p] = projects.splice(idx,1);
+ await stopProject(name); await removeWorkspace(p); await saveProjects(projects); await applyRouting(projects); res.redirect('/manage?msg='+encodeURIComponent(`Deleted ${name} and removed local workspace`));
+ } catch(e){ next(e); }});
+
+app.get('/term/:project/', async (req,res)=>{
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); const projectJson = JSON.stringify(p.name);
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} terminal</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#1f1f1f;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}body{display:flex;flex-direction:column}iframe{border:0;width:100%;flex:1 1 auto;min-height:0;display:block;background:#1f1f1f}#imgBtn{flex:0 0 34px;width:100%;height:34px;background:linear-gradient(180deg,rgba(15,23,42,.96),rgba(15,23,42,.82));color:#dbeafe;border:0;border-bottom:1px solid #334155;font:13px system-ui;cursor:pointer;box-shadow:0 2px 10px #0008;display:flex;align-items:center;justify-content:center;gap:8px;letter-spacing:.01em}#imgBtn:hover{background:#1e293b;color:#fff}#imgBtn::before{content:'⬇'}body.shade-open #imgBtn::before{content:'⬆'}#tray{flex:0 0 auto;max-height:0;overflow:hidden;background:rgba(15,23,42,.98);color:#e5e7eb;border-bottom:0 solid #334155;box-shadow:0 6px 18px #0008;transition:max-height .18s ease,padding .18s ease,border-width .18s ease;padding:0 18px;box-sizing:border-box;display:grid;grid-template-columns:1fr;gap:10px;align-items:stretch}body.shade-open #tray{max-height:260px;border-bottom-width:1px;padding:14px 18px 16px}#drop{border:2px dashed #64748b;border-radius:14px;padding:30px 18px;text-align:center;background:#111827;outline:none;cursor:pointer;min-height:130px;display:flex;flex-direction:column;justify-content:center;width:100%;box-sizing:border-box}#status{white-space:pre-wrap;color:#94a3b8;font-size:13px;line-height:1.35}button,label{font:inherit}.close{display:none}code{color:#bfdbfe}img{max-width:100%;max-height:170px;border-radius:8px;margin-top:0;border:1px solid #334155}</style></head><body><button id="imgBtn" title="Open file shade">Files / paste or drop into project</button><div id="tray"><div id="drop" tabindex="0"><div>Paste/drop/select files here</div><div style="color:#94a3b8;margin-top:6px">PDF, txt, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status">Saved files go to <code>${esc(p.path)}/_inbox</code>. The path will be inserted into the terminal.</div><div id="preview"></div><button class="close" id="close">Close</button></div><iframe id="term" src="/pty/${encodeURIComponent(p.name)}/"></iframe><script>const project=${projectJson};const tray=document.getElementById('tray'),drop=document.getElementById('drop'),file=document.getElementById('file'),status=document.getElementById('status'),preview=document.getElementById('preview'),frame=document.getElementById('term');function setStatus(t,bad=false){status.textContent=t;status.style.color=bad?'#fca5a5':'#bbf7d0'}function openTray(msg){document.body.classList.add('shade-open');setTimeout(()=>drop.focus(),50);if(msg)setStatus(msg)}function closeTray(){document.body.classList.remove('shade-open');frame.contentWindow?.focus()}function toggleTray(){document.body.classList.contains('shade-open')?closeTray():openTray()}document.getElementById('imgBtn').onclick=toggleTray;document.getElementById('close').onclick=closeTray;function insertPath(path){try{if(frame.contentWindow.__pwSendToTerminal?.(path))return true}catch{}try{const ta=frame.contentDocument.querySelector('textarea.xterm-helper-textarea')||frame.contentDocument.querySelector('textarea');if(!ta)return false;ta.focus();const dt=new DataTransfer();dt.setData('text/plain',path);ta.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));return true}catch{return false}}async function upload(blob,name='clipboard-file'){if(!blob)return setStatus('No file received.',true);setStatus('Saving file...');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const res=await fetch('/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name,mime:blob.type||'application/octet-stream',data})});const out=await res.json().catch(()=>null);if(!res.ok||!out?.ok)throw new Error(out?.error||'Upload failed');const ok=insertPath(out.path);try{await navigator.clipboard.writeText(out.path)}catch{}if((blob.type||'').startsWith('image/'))preview.innerHTML='<img src="'+out.url+'">';else preview.innerHTML='<div style="padding:10px;border:1px solid #334155;border-radius:8px;color:#cbd5e1">Saved: '+(name||'file')+'</div>';setStatus('Saved and '+(ok?'inserted':'copied')+':\\n'+out.path)}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name).catch(e=>setStatus(e.message||String(e),true));drop.addEventListener('dragover',e=>{e.preventDefault();drop.style.borderColor='#60a5fa'});drop.addEventListener('dragleave',()=>drop.style.borderColor='#64748b');drop.addEventListener('drop',e=>{e.preventDefault();drop.style.borderColor='#64748b';upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))});tray.addEventListener('paste',e=>{const item=[...e.clipboardData.items].find(i=>i.kind==='file');if(!item){setStatus('No file found in this paste. Try drop/select instead.',true);return}e.preventDefault();const f=item.getAsFile();upload(f,f?.name||'clipboard-file').catch(err=>setStatus(err.message||String(err),true))},true);window.addEventListener('message',e=>{if(e.data?.type==='pw-open-image-tray')openTray(e.data.message||'Paste the file here.')});</script></body></html>`);
+});
+
+app.post('/api/upload/:project', async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); return res.json({ok:true,path:full,url:`/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
+app.get('/file/:project/:file', async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
+app.get('/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
+app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
+app.get('/healthz', (_req,res)=>res.json({ok:true}));
+app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
+app.listen(3000,'127.0.0.1',()=>console.log('dashboard listening on 127.0.0.1:3000'));

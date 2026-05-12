@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+LOG=/var/log/claude-code-update.log
+{
+  echo "===== $(date -Is) Claude Code update start ====="
+  echo "Before: $(claude --version 2>/dev/null || echo missing)"
+  npm install -g @anthropic-ai/claude-code
+  echo "After:  $(claude --version 2>/dev/null || echo missing)"
+  systemctl restart project-workbench.service || true
+  echo "===== $(date -Is) Claude Code update complete ====="
+} >> "$LOG" 2>&1

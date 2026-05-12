@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+name="$1"
+json=/opt/project-workbench/projects.json
+path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path' "$json")
+port=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .port' "$json")
+repo=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .repo' "$json")
+[[ -n "$path" && "$path" != null && -n "$port" && "$port" != null ]] || { echo "Unknown project: $name" >&2; exit 1; }
+mkdir -p "$path"
+real_path=$(readlink -f "$path")
+cd "$real_path"
+if [[ ! -d .git && -n "$repo" && "$repo" != null ]]; then
+  echo "Workspace not cloned yet. Run: git clone $repo ."
+fi
+session="pw_${name//[^A-Za-z0-9_]/_}"
+# Create the project tmux session once. Future browser sessions reattach to the same shell/process state.
+if ! tmux has-session -t "$session" 2>/dev/null; then
+  tmux new-session -d -s "$session" -c "$real_path" "bash --noprofile --norc"
+  tmux send-keys -t "$session" "printf 'Project workspace: %s\\nClaude: %s\\nPersistent console: tmux session %s\\nTip: run claude from here after auth is completed.\\n\\n' '$real_path' '\$(command -v claude || echo missing)' '$session'" C-m
+fi
+exec /usr/bin/ttyd \
+  --interface 127.0.0.1 \
+  --port "$port" \
+  --base-path "/pty/$name" \
+  --writable \
+  --check-origin \
+  tmux attach-session -t "$session"

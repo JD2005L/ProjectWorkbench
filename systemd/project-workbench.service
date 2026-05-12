@@ -1,0 +1,14 @@
+[Unit]
+Description=Project Workbench dashboard
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+WorkingDirectory=/opt/project-workbench/app
+ExecStart=/usr/bin/node /opt/project-workbench/app/server.js
+Restart=on-failure
+RestartSec=3
+User=root
+Environment=NODE_ENV=production
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+[
+  {
+    "name": "AmrikPublic",
+    "repo": "https://github.com/JD2005L/AmrikPublic.git",
+    "path": "/opt/project-workbench/workspaces/AmrikPublic",
+    "port": 7681
+  },
+  {
+    "name": "HarmaniPublic",
+    "repo": "https://github.com/JD2005L/HarmaniPublic.git",
+    "path": "/opt/project-workbench/workspaces/HarmaniPublic",
+    "port": 7682
+  },
+  {
+    "name": "IPSpeaker_ESP32",
+    "repo": "https://github.com/JD2005L/IPSpeaker_ESP32.git",
+    "path": "/opt/project-workbench/workspaces/IPSpeaker_ESP32",
+    "port": 7683
+  },
+  {
+    "name": "ProVisionIPortal",
+    "repo": "https://github.com/JD2005L/ProVisionIPortal.git",
+    "path": "/opt/project-workbench/workspaces/ProVisionIPortal",
+    "port": 7684
+  },
+  {
+    "name": "ProVisionIPublic",
+    "repo": "https://github.com/JD2005L/ProVisionIPublic.git",
+    "path": "/opt/project-workbench/workspaces/ProVisionIPublic",
+    "port": 7685
+  },
+  {
+    "name": "SunEstateHomesCA",
+    "repo": "https://github.com/JD2005L/SunEstateHomesCA.git",
+    "path": "/opt/project-workbench/workspaces/SunEstateHomesCA",
+    "port": 7686
+  }
+]
