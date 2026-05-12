@@ -15,7 +15,7 @@ fi
 session="pw_${name//[^A-Za-z0-9_]/_}"
 # Create the project tmux session once. Future browser sessions reattach to the same shell/process state.
 if ! tmux has-session -t "$session" 2>/dev/null; then
-  tmux new-session -d -s "$session" -c "$real_path" "bash --noprofile --norc"
+  tmux -u new-session -d -s "$session" -c "$real_path" "env LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor bash --noprofile --norc"
   tmux send-keys -t "$session" "printf 'Project workspace: %s\\nClaude: %s\\nPersistent console: tmux session %s\\nTip: run claude from here after auth is completed.\\n\\n' '$real_path' '\$(command -v claude || echo missing)' '$session'" C-m
 fi
 exec /usr/bin/ttyd \
@@ -23,5 +23,10 @@ exec /usr/bin/ttyd \
   --port "$port" \
   --base-path "/pty/$name" \
   --writable \
+  --terminal-type xterm-256color \
+  --client-option fontFamily=monospace \
+  --client-option fontSize=14 \
+  --client-option lineHeight=1 \
+  --client-option letterSpacing=0 \
   --check-origin \
-  tmux attach-session -t "$session"
+  tmux -u attach-session -t "$session"
