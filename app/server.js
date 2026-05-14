@@ -95,8 +95,8 @@ app.get('/terminal-preload.js', async (_req,res)=>{ res.type('application/javasc
 app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
 app.get('/api/term/:project/windows', async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const { stdout } = await tmux(['list-windows','-t',tmuxSession(p.name),'-F','#{window_index}\t#{window_name}\t#{window_active}']);
- const windows = stdout.split('\n').filter(Boolean).map(line=>{ const parts = line.split('\t'); const index = Number(parts[0]); const active = parts[parts.length-1]==='1'; const name = parts.slice(1,-1).join('\t'); return { index, name, active }; });
+ const { stdout } = await tmux(['list-windows','-t',tmuxSession(p.name),'-F','#{window_index}|~|#{window_name}|~|#{window_active}']);
+ const windows = stdout.split('\n').map(l=>l.trim()).filter(Boolean).map(line=>{ const parts = line.split('|~|'); if(parts.length<3) return null; const index = Number(parts[0]); if(!Number.isInteger(index)) return null; const active = parts[parts.length-1].trim()==='1'; const name = parts.slice(1,-1).join('|~|'); return { index, name, active }; }).filter(Boolean);
  res.json({ok:true,windows});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
