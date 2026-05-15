@@ -7,13 +7,20 @@ LOG=/var/log/claude-code-update.log
   npm install -g @anthropic-ai/claude-code@latest
 
   # Keep npm-managed /bin/claude and /usr/bin/claude symlinks untouched.
-  # Put a stable local wrapper earlier in PATH; do not force bypass mode.
+  # Put a stable local wrapper earlier in PATH; PW intentionally runs Claude Code with blanket permissions.
   rm -f /usr/local/bin/claude
   cat > /usr/local/bin/claude <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
-exec "$REAL" "$@"
+for arg in "$@"; do
+  case "$arg" in
+    --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
+      exec "$REAL" "$@"
+      ;;
+  esac
+done
+exec "$REAL" --dangerously-skip-permissions "$@"
 BASH
   chmod +x /usr/local/bin/claude
 

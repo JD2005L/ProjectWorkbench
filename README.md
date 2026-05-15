@@ -101,7 +101,7 @@ npm install -g @anthropic-ai/claude-code
 /usr/local/sbin/update-claude-code
 ```
 
-The update script also recreates `/usr/local/bin/claude` as a wrapper that runs Claude Code with `--permission-mode bypassPermissions` unless a permission-mode flag is explicitly supplied. This is intentional for this trusted internal workbench.
+The update script also recreates `/usr/local/bin/claude` as a wrapper that runs Claude Code with `--dangerously-skip-permissions` unless a permission-mode/bypass flag is explicitly supplied. This is intentional for this trusted internal workbench so PW does not ask for command-by-command approvals.
 
 Authenticate Claude once as the `admin` user, then verify credentials persist under `/home/admin/.claude/`:
 
