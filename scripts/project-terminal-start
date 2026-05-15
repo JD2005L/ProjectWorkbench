@@ -8,15 +8,47 @@ repo=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .repo' "$json")
 [[ -n "$path" && "$path" != null && -n "$port" && "$port" != null ]] || { echo "Unknown project: $name" >&2; exit 1; }
 mkdir -p "$path"
 real_path=$(readlink -f "$path")
+chown -R admin:admin "$real_path" 2>/dev/null || true
 cd "$real_path"
-if [[ ! -d .git && -n "$repo" && "$repo" != null ]]; then
+if [[ -d .git ]]; then
+  git config --global --add safe.directory "$real_path" 2>/dev/null || true
+elif [[ -n "$repo" && "$repo" != null ]]; then
   echo "Workspace not cloned yet. Run: git clone $repo ."
 fi
+claude_path=$(command -v claude || true)
+[[ -n "$claude_path" ]] || claude_path="missing"
+# ProjectWorkbench terminals are created only for managed local workspaces.
+# Pre-mark them trusted so CRUD-created projects open Claude Code immediately.
+python3 - "$real_path" <<'PY' 2>/dev/null || true
+import json, os, sys, time
+path=sys.argv[1]
+conf=os.path.expanduser('~/.claude.json')
+try:
+    with open(conf) as f: data=json.load(f)
+except Exception:
+    data={}
+projects=data.setdefault('projects', {})
+entry=projects.setdefault(path, {})
+entry.setdefault('allowedTools', [])
+entry.setdefault('mcpContextUris', [])
+entry.setdefault('mcpServers', {})
+entry.setdefault('enabledMcpjsonServers', [])
+entry.setdefault('disabledMcpjsonServers', [])
+entry['hasTrustDialogAccepted']=True
+entry.setdefault('projectOnboardingSeenCount', 0)
+entry.setdefault('hasClaudeMdExternalIncludesApproved', False)
+entry.setdefault('hasClaudeMdExternalIncludesWarningShown', False)
+entry.setdefault('hasCompletedProjectOnboarding', True)
+entry.setdefault('lastGracefulShutdown', True)
+tmp=conf+'.tmp'
+with open(tmp,'w') as f: json.dump(data,f,indent=2)
+os.replace(tmp, conf)
+PY
 session="pw_${name//[^A-Za-z0-9_]/_}"
 # Create the project tmux session once. Future browser sessions reattach to the same shell/process state.
 if ! tmux has-session -t "$session" 2>/dev/null; then
-  tmux -u new-session -d -s "$session" -c "$real_path" "env LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor bash --noprofile --norc"
-  tmux send-keys -t "$session" "printf 'Project workspace: %s\\nClaude: %s\\nPersistent console: tmux session %s\\nTip: run claude from here after auth is completed.\\n\\n' '$real_path' '\$(command -v claude || echo missing)' '$session'" C-m
+  tmux -u new-session -d -s "$session" -c "$real_path" "env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc"
+  tmux send-keys -t "$session" "printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' '$real_path' '$claude_path' '$session'" C-m
 fi
 exec /usr/bin/ttyd \
   --interface 127.0.0.1 \

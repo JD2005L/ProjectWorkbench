@@ -3,25 +3,21 @@ set -euo pipefail
 LOG=/var/log/claude-code-update.log
 {
   echo "===== $(date -Is) Claude Code update start ====="
-  echo "Before: $(claude --version 2>/dev/null || echo missing)"
-  npm install -g @anthropic-ai/claude-code
-  
-  cat > /usr/local/bin/claude <<BASH
+  echo "Before: $(/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe --version 2>/dev/null || echo missing)"
+  npm install -g @anthropic-ai/claude-code@latest
+
+  # Keep npm-managed /bin/claude and /usr/bin/claude symlinks untouched.
+  # Put a stable local wrapper earlier in PATH; do not force bypass mode.
+  rm -f /usr/local/bin/claude
+  cat > /usr/local/bin/claude <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
-for arg in "$@"; do
-  case "$arg" in
-    --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
-      exec "$REAL" "$@"
-      ;;
-  esac
-done
-exec "$REAL" --permission-mode bypassPermissions "$@"
+exec "$REAL" "$@"
 BASH
   chmod +x /usr/local/bin/claude
 
-  echo "After:  $(claude --version 2>/dev/null || echo missing)"
+  echo "After:  $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
   systemctl restart project-workbench.service || true
   echo "===== $(date -Is) Claude Code update complete ====="
 } >> "$LOG" 2>&1

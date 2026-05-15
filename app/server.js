@@ -44,15 +44,48 @@ async function applyRouting(projects){
 }
 async function cloneWorkspace(p){
  await fs.mkdir(workspaceRoot,{recursive:true});
- try { await fs.access(path.join(p.path,'.git')); return; } catch {}
+ try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R','admin:admin',p.path]).catch(()=>{}); return; } catch {}
  try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
  await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+ await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
+ await sh('sudo',['-u','admin','git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
 }
-async function startProject(p){ await sh('systemctl',['enable','--now',`project-terminal@${p.name}.service`]); }
+async function trustClaudeProject(p){
+ const script = `import json, os, sys
+path=sys.argv[1]
+conf=os.path.expanduser('~/.claude.json')
+try:
+    data=json.load(open(conf))
+except Exception:
+    data={}
+projects=data.setdefault('projects', {})
+entry=projects.setdefault(path, {})
+entry.setdefault('allowedTools', [])
+entry.setdefault('mcpContextUris', [])
+entry.setdefault('mcpServers', {})
+entry.setdefault('enabledMcpjsonServers', [])
+entry.setdefault('disabledMcpjsonServers', [])
+entry['hasTrustDialogAccepted']=True
+entry.setdefault('projectOnboardingSeenCount', 0)
+entry.setdefault('hasClaudeMdExternalIncludesApproved', False)
+entry.setdefault('hasClaudeMdExternalIncludesWarningShown', False)
+entry.setdefault('hasCompletedProjectOnboarding', True)
+entry.setdefault('lastGracefulShutdown', True)
+tmp=conf+'.tmp'
+json.dump(data, open(tmp,'w'), indent=2)
+os.replace(tmp, conf)
+`;
+ await sh('sudo',['-u','admin','python3','-c',script,p.path]).catch(()=>{});
+}
+async function startProject(p){
+ await trustClaudeProject(p);
+ await sh('systemctl',['enable',`project-terminal@${p.name}.service`]);
+ await sh('systemctl',['restart',`project-terminal@${p.name}.service`]);
+}
 async function stopProject(name){ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{}); }
 async function removeWorkspace(p){ const full = path.resolve(p.path); const root = path.resolve(workspaceRoot); if(!full.startsWith(root + path.sep)) throw new Error('Refusing to delete outside workspace root'); await fs.rm(full,{recursive:true,force:true}); }
 
-const homeCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#0f172a;color:#e5e7eb}a{color:#93c5fd}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:1rem}article{background:#111827;border:1px solid #374151;border-radius:12px;padding:1rem;transition:border-color .2s,box-shadow .2s}article.pending{border-color:#3b82f6;box-shadow:0 0 0 1px rgba(59,130,246,.35),0 8px 28px -12px rgba(59,130,246,.55)}.button{display:inline-block;background:#2563eb;color:white;padding:.6rem .85rem;border-radius:8px;text-decoration:none;margin:.15rem;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.muted{color:#9ca3af;font-size:.9rem}code{color:#bfdbfe;word-break:break-all}.repo{color:#93c5fd;text-decoration:none;font-size:.9rem}.repo:hover{text-decoration:underline}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:1.5rem;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid #1f2937}.hero h1{margin:0;font-size:2rem;line-height:1.1}.subtitle{margin:.45rem 0 0;color:#cbd5e1}.hero-actions{display:flex;flex-direction:column;align-items:flex-end;gap:.55rem;min-width:260px}.meta-row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}.badge{display:inline-flex;align-items:center;gap:.35rem;background:#111827;border:1px solid #334155;border-radius:999px;padding:.35rem .65rem;color:#cbd5e1;font-size:.9rem}.subtle{color:#94a3b8;font-size:.8rem}.top{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}input{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.55rem;width:100%;box-sizing:border-box;min-width:0}label{display:block;margin:.5rem 0}.row{display:grid;grid-template-columns:1fr 1.5fr .5fr auto;gap:.5rem;align-items:end}.grid article .row{display:grid;grid-template-columns:3fr 1fr;gap:.5rem;align-items:end}.grid article .row label:nth-of-type(1){grid-column:1;grid-row:1}.grid article .row label:nth-of-type(3){grid-column:2;grid-row:1}.grid article .row label:nth-of-type(2){grid-column:1/-1;grid-row:2}.grid article .row .button{grid-column:1/-1;grid-row:3;justify-self:start;margin-top:.35rem}.grid article h2{margin:0 0 .5rem;font-size:1.15rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}.pending-dot{display:none;width:.6em;height:.6em;border-radius:50%;background:#3b82f6;box-shadow:0 0 0 .18em rgba(59,130,246,.25);animation:pwPulse 1.6s ease-in-out infinite}article.pending .pending-dot{display:inline-block}.pending-label{display:none;color:#93c5fd;font-size:.78rem;font-weight:500;letter-spacing:.02em}article.pending .pending-label{display:inline}@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}@media(max-width:800px){.row{grid-template-columns:1fr}.hero{flex-direction:column}.hero-actions{align-items:flex-start}.meta-row{justify-content:flex-start}}`;
+const homeCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:2rem;background:#0f172a;color:#e5e7eb}a{color:#93c5fd}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(380px,1fr));gap:1rem}.manage-grid{margin-top:1.25rem}article{background:#111827;border:1px solid #374151;border-radius:12px;padding:1rem;transition:border-color .2s,box-shadow .2s}article.pending{border-color:#3b82f6;box-shadow:0 0 0 1px rgba(59,130,246,.35),0 8px 28px -12px rgba(59,130,246,.55)}.button{display:inline-block;background:#2563eb;color:white;padding:.6rem .85rem;border-radius:8px;text-decoration:none;margin:.15rem;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.muted{color:#9ca3af;font-size:.9rem}code{color:#bfdbfe;word-break:break-all}.repo{color:#93c5fd;text-decoration:none;font-size:.9rem}.repo:hover{text-decoration:underline}.hero{display:flex;justify-content:space-between;align-items:flex-start;gap:1.5rem;margin-bottom:1.5rem;padding-bottom:1rem;border-bottom:1px solid #1f2937}.hero h1{margin:0;font-size:2rem;line-height:1.1}.subtitle{margin:.45rem 0 0;color:#cbd5e1}.hero-actions{display:flex;flex-direction:column;align-items:flex-end;gap:.55rem;min-width:260px}.meta-row{display:flex;gap:.5rem;align-items:center;flex-wrap:wrap;justify-content:flex-end}.badge{display:inline-flex;align-items:center;gap:.35rem;background:#111827;border:1px solid #334155;border-radius:999px;padding:.35rem .65rem;color:#cbd5e1;font-size:.9rem}.subtle{color:#94a3b8;font-size:.8rem}.top{display:flex;align-items:center;gap:1rem;flex-wrap:wrap}input{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.55rem;width:100%;box-sizing:border-box;min-width:0}label{display:block;margin:.5rem 0}.row{display:grid;grid-template-columns:1fr 1.5fr .5fr auto;gap:.5rem;align-items:end}.grid article .row{display:grid;grid-template-columns:3fr 1fr;gap:.5rem;align-items:end}.grid article .row label:nth-of-type(1){grid-column:1;grid-row:1}.grid article .row label:nth-of-type(3){grid-column:2;grid-row:1}.grid article .row label:nth-of-type(2){grid-column:1/-1;grid-row:2}.grid article .row .button{grid-column:1/-1;grid-row:3;justify-self:start;margin-top:.35rem}.grid article h2{margin:0 0 .5rem;font-size:1.15rem;display:flex;align-items:center;gap:.5rem;flex-wrap:wrap}.pending-dot{display:none;width:.6em;height:.6em;border-radius:50%;background:#3b82f6;box-shadow:0 0 0 .18em rgba(59,130,246,.25);animation:pwPulse 1.6s ease-in-out infinite}article.pending .pending-dot{display:inline-block}.pending-label{display:none;color:#93c5fd;font-size:.78rem;font-weight:500;letter-spacing:.02em}article.pending .pending-label{display:inline}@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}@media(max-width:800px){.row{grid-template-columns:1fr}.hero{flex-direction:column}.hero-actions{align-items:flex-start}.meta-row{justify-content:flex-start}}`;
 
 app.get('/', async (_req,res)=>{
  const projects = await loadProjects(); const claudeVersion = await getClaudeVersion(); const updateStamp = await getClaudeUpdateStamp();
@@ -63,14 +96,14 @@ app.get('/', async (_req,res)=>{
 app.get('/manage', async (req,res)=>{
  const projects = await loadProjects(); const msg = req.query.msg ? `<p class="badge">${esc(req.query.msg)}</p>` : '';
  const rows = projects.map(p=>`<article><form method="post" action="/manage/update/${encodeURIComponent(p.name)}"><div class="row"><label>Name<input name="name" value="${esc(p.name)}" required></label><label>Repo<input name="repo" value="${esc(p.repo)}" required></label><label>Port<input name="port" type="number" value="${esc(p.port)}" required></label><button class="button" type="submit">Update</button></div><p class="muted"><code>${esc(p.path)}</code></p></form><form method="post" action="/manage/delete/${encodeURIComponent(p.name)}" onsubmit="return confirm('Delete ${esc(p.name)} and remove its local workspace?')"><label class="muted"><input type="checkbox" name="confirm" value="yes" required style="width:auto"> Delete local workspace content too</label><button class="button danger" type="submit">Delete project</button></form></article>`).join('\n');
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manage Projects</title><style>${homeCss}</style></head><body><div class="top"><h1>Manage Projects</h1><a class="button secondary" href="/">Dashboard</a></div>${msg}<article><h2>Add project</h2><form method="post" action="/manage/add"><div class="row"><label>Name<input name="name" placeholder="RepoName" required pattern="[A-Za-z0-9._-]+"></label><label>Repo URL<input name="repo" placeholder="https://github.com/JD2005L/RepoName.git" required></label><label>Port<input name="port" type="number" placeholder="auto"></label><button class="button" type="submit">Add + clone</button></div></form></article><div class="grid">${rows}</div></body></html>`);
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manage Projects</title><style>${homeCss}</style></head><body><div class="top"><h1>Manage Projects</h1><a class="button secondary" href="/">Dashboard</a></div>${msg}<article><h2>Add project</h2><form method="post" action="/manage/add"><div class="row"><label>Name<input name="name" placeholder="RepoName" required pattern="[A-Za-z0-9._-]+"></label><label>Repo URL<input name="repo" placeholder="https://github.com/JD2005L/RepoName.git" required></label><label>Port<input name="port" type="number" placeholder="auto"></label><button class="button" type="submit">Add + clone</button></div></form></article><div class="grid manage-grid">${rows}</div></body></html>`);
 });
 
 app.post('/manage/add', async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); if(!validName(name)) throw new Error('Invalid project name');
  const projects = await loadProjects(); if(projects.some(p=>p.name===name)) throw new Error('Project already exists');
  const port = Number(req.body.port || nextPort(projects)); if(!port || projects.some(p=>Number(p.port)===port)) throw new Error('Invalid or duplicate port');
- const p = { name, repo, path: workspacePath(name), port }; projects.push(p); await saveProjects(projects); await cloneWorkspace(p); await applyRouting(projects); await startProject(p);
+ const p = { name, repo, path: workspacePath(name), port }; await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
  res.redirect('/manage?msg='+encodeURIComponent(`Added ${name}`));
  } catch(e){ next(e); }});
 
@@ -135,40 +168,6 @@ app.delete('/api/inbox/:project', async (req,res)=>{ try {
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 app.get('/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
 app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
-app.get('/api/term/:project/windows', async (req,res)=>{ try {
- const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const { stdout } = await tmux(['list-windows','-t',tmuxSession(p.name),'-F','#{window_index}|~|#{window_name}|~|#{window_active}']);
- const windows = stdout.split('\n').map(l=>l.trim()).filter(Boolean).map(line=>{ const parts = line.split('|~|'); if(parts.length<3) return null; const index = Number(parts[0]); if(!Number.isInteger(index)) return null; const active = parts[parts.length-1].trim()==='1'; const name = parts.slice(1,-1).join('|~|'); return { index, name, active }; }).filter(Boolean);
- res.json({ok:true,windows});
-} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-
-app.post('/api/term/:project/windows', async (req,res)=>{ try {
- const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const name = String(req.body?.name || '').trim().slice(0,60);
- const args = ['new-window','-t',tmuxSession(p.name),'-c',p.path]; if(name) args.push('-n',name);
- args.push('env','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','bash','--noprofile','--norc');
- await tmux(args); res.json({ok:true});
-} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-
-app.post('/api/term/:project/windows/:index/select', async (req,res)=>{ try {
- const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const idx = Number(req.params.index); if(!Number.isInteger(idx) || idx<0) return res.status(400).json({ok:false,error:'Invalid window index'});
- await tmux(['select-window','-t',`${tmuxSession(p.name)}:${idx}`]); res.json({ok:true});
-} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-
-app.post('/api/term/:project/windows/:index/rename', async (req,res)=>{ try {
- const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const idx = Number(req.params.index); if(!Number.isInteger(idx) || idx<0) return res.status(400).json({ok:false,error:'Invalid window index'});
- const name = String(req.body?.name || '').trim().slice(0,60); if(!name) return res.status(400).json({ok:false,error:'Name required'});
- await tmux(['rename-window','-t',`${tmuxSession(p.name)}:${idx}`,name]); res.json({ok:true});
-} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-
-app.delete('/api/term/:project/windows/:index', async (req,res)=>{ try {
- const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const idx = Number(req.params.index); if(!Number.isInteger(idx) || idx<0) return res.status(400).json({ok:false,error:'Invalid window index'});
- await tmux(['kill-window','-t',`${tmuxSession(p.name)}:${idx}`]); res.json({ok:true});
-} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-
 app.get('/healthz', (_req,res)=>res.json({ok:true}));
 app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
 app.listen(3000,'127.0.0.1',()=>console.log('dashboard listening on 127.0.0.1:3000'));
