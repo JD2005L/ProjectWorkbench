@@ -21,6 +21,8 @@ The production instance currently runs as CT2115 (`project-workbench`) on PVI2 a
 - Workspaces: `/opt/project-workbench/workspaces`
 - Terminal launcher: `/usr/local/bin/project-terminal-start`
 - Claude updater: `/usr/local/sbin/update-claude-code`
+- Shared PW memory: `/opt/project-workbench/memory`
+- PW MCP isolation config: `/etc/project-workbench/empty-mcp.json`
 - nginx site: `/etc/nginx/sites-available/project-workbench`
 - Basic Auth file: `/etc/nginx/.htpasswd` *(not committed)*
 - Claude/Git user home: `/home/admin`
@@ -53,8 +55,9 @@ Terminals and git workspaces run as `admin`; the dashboard runs as root so it ca
 ```bash
 adduser --disabled-password --gecos '' admin
 usermod -aG sudo admin
-mkdir -p /opt/project-workbench/workspaces
-chown -R admin:admin /opt/project-workbench/workspaces
+mkdir -p /opt/project-workbench/workspaces /opt/project-workbench/memory /etc/project-workbench
+chown -R admin:admin /opt/project-workbench/workspaces /opt/project-workbench/memory
+chmod 700 /opt/project-workbench/memory
 ```
 
 Configure any SSH/Git credentials for `admin` separately. Do not commit tokens, deploy keys, `.git-credentials`, or Claude credentials.
@@ -70,6 +73,36 @@ npm install --omit=dev
 cp config/projects.example.json /opt/project-workbench/projects.json
 chown root:root /opt/project-workbench/projects.json
 chmod 0644 /opt/project-workbench/projects.json
+
+cp config/empty-mcp.json /etc/project-workbench/empty-mcp.json
+cp config/shared-memory/CLAUDE.md config/shared-memory/TOOLS.md config/shared-memory/DECISIONS.md /opt/project-workbench/memory/
+cp config/shared-memory/CREDENTIALS.md.example /opt/project-workbench/memory/CREDENTIALS.md
+chown -R admin:admin /opt/project-workbench/memory
+chmod 700 /opt/project-workbench/memory
+chmod 640 /opt/project-workbench/memory/CLAUDE.md /opt/project-workbench/memory/TOOLS.md /opt/project-workbench/memory/DECISIONS.md
+chmod 600 /opt/project-workbench/memory/CREDENTIALS.md
+install -d -o admin -g admin -m 755 /home/admin/.claude
+cat > /home/admin/.claude/CLAUDE.md <<'EOF'
+# ProjectWorkbench User Memory
+
+This Claude Code account is the PVI2 ProjectWorkbench instance.
+
+Before doing durable work, read `/opt/project-workbench/memory/CLAUDE.md`.
+Use `/opt/project-workbench/memory/` as shared permanent memory across all PW projects/workspaces.
+Do not use account-level MCP memory from this instance; PW is intentionally isolated from external MCP memory servers.
+EOF
+chown admin:admin /home/admin/.claude/CLAUDE.md
+chmod 640 /home/admin/.claude/CLAUDE.md
+cat > /opt/project-workbench/workspaces/CLAUDE.md <<'EOF'
+# ProjectWorkbench Workspace Root
+
+All PW project terminals share local memory at `/opt/project-workbench/memory/`.
+Read `/opt/project-workbench/memory/CLAUDE.md` before durable work and update it when new reusable tools, credentials, or cross-project decisions are learned.
+
+Do not use external/account MCP memory from this PVI2 instance.
+EOF
+chown admin:admin /opt/project-workbench/workspaces/CLAUDE.md
+chmod 640 /opt/project-workbench/workspaces/CLAUDE.md
 ```
 
 Edit `/opt/project-workbench/projects.json` with the projects that should appear on the landing page. Each project needs:
@@ -101,7 +134,13 @@ npm install -g @anthropic-ai/claude-code
 /usr/local/sbin/update-claude-code
 ```
 
-The update script also recreates `/usr/local/bin/claude` as a wrapper that runs Claude Code with `--dangerously-skip-permissions` unless a permission-mode/bypass flag is explicitly supplied. This is intentional for this trusted internal workbench so PW does not ask for command-by-command approvals.
+The update script also recreates `/usr/local/bin/claude` as a wrapper that:
+
+- runs Claude Code with `--dangerously-skip-permissions` unless a permission-mode/bypass flag is explicitly supplied;
+- grants every workspace access to `/opt/project-workbench/memory` via `--add-dir`; and
+- blocks inherited/account-level MCP servers by default via `/etc/project-workbench/empty-mcp.json` + `--strict-mcp-config`, unless a session explicitly supplies its own MCP config.
+
+This is intentional for this trusted internal workbench so PW does not ask for command-by-command approvals and does not try to use MCP servers that are valid for the account but unreachable from PVI2.
 
 Authenticate Claude once as the `admin` user, then verify credentials persist under `/home/admin/.claude/`:
 

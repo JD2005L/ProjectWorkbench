@@ -7,20 +7,45 @@ LOG=/var/log/claude-code-update.log
   npm install -g @anthropic-ai/claude-code@latest
 
   # Keep npm-managed /bin/claude and /usr/bin/claude symlinks untouched.
-  # Put a stable local wrapper earlier in PATH; PW intentionally runs Claude Code with blanket permissions.
+  # Put a stable local wrapper earlier in PATH; PW intentionally runs Claude Code with blanket permissions,
+  # local shared memory access, and no account-level MCP unless explicitly requested.
   rm -f /usr/local/bin/claude
   cat > /usr/local/bin/claude <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+SHARED_MEMORY=/opt/project-workbench/memory
+PW_MCP_CONFIG=/etc/project-workbench/empty-mcp.json
+
+args=()
+has_permission=0
+has_add_dir=0
+has_mcp_config=0
 for arg in "$@"; do
   case "$arg" in
     --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
-      exec "$REAL" "$@"
+      has_permission=1
+      ;;
+    --add-dir|--add-dir=*)
+      has_add_dir=1
+      ;;
+    --mcp-config|--mcp-config=*|--strict-mcp-config)
+      has_mcp_config=1
       ;;
   esac
 done
-exec "$REAL" --dangerously-skip-permissions "$@"
+
+if [[ "$has_permission" -eq 0 ]]; then
+  args+=(--dangerously-skip-permissions)
+fi
+if [[ "$has_add_dir" -eq 0 && -d "$SHARED_MEMORY" ]]; then
+  args+=(--add-dir "$SHARED_MEMORY")
+fi
+if [[ "$has_mcp_config" -eq 0 && -f "$PW_MCP_CONFIG" ]]; then
+  args+=(--mcp-config "$PW_MCP_CONFIG" --strict-mcp-config)
+fi
+
+exec "$REAL" "${args[@]}" "$@"
 BASH
   chmod +x /usr/local/bin/claude
 
