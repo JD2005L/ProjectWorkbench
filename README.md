@@ -75,6 +75,7 @@ chown root:root /opt/project-workbench/projects.json
 chmod 0644 /opt/project-workbench/projects.json
 
 cp config/empty-mcp.json /etc/project-workbench/empty-mcp.json
+cp config/claude-wrapper.env.example /etc/project-workbench/claude-wrapper.env
 cp config/shared-memory/CLAUDE.md config/shared-memory/TOOLS.md config/shared-memory/DECISIONS.md /opt/project-workbench/memory/
 cp config/shared-memory/CREDENTIALS.md.example /opt/project-workbench/memory/CREDENTIALS.md
 chown -R admin:admin /opt/project-workbench/memory
@@ -85,11 +86,11 @@ install -d -o admin -g admin -m 755 /home/admin/.claude
 cat > /home/admin/.claude/CLAUDE.md <<'EOF'
 # ProjectWorkbench User Memory
 
-This Claude Code account is the PVI2 ProjectWorkbench instance.
+This Claude Code account is a ProjectWorkbench instance.
 
 Before doing durable work, read `/opt/project-workbench/memory/CLAUDE.md`.
 Use `/opt/project-workbench/memory/` as shared permanent memory across all PW projects/workspaces.
-Do not use account-level MCP memory from this instance; PW is intentionally isolated from external MCP memory servers.
+Follow this instance's MCP policy from `/etc/project-workbench/claude-wrapper.env`.
 EOF
 chown admin:admin /home/admin/.claude/CLAUDE.md
 chmod 640 /home/admin/.claude/CLAUDE.md
@@ -99,7 +100,7 @@ cat > /opt/project-workbench/workspaces/CLAUDE.md <<'EOF'
 All PW project terminals share local memory at `/opt/project-workbench/memory/`.
 Read `/opt/project-workbench/memory/CLAUDE.md` before durable work and update it when new reusable tools, credentials, or cross-project decisions are learned.
 
-Do not use external/account MCP memory from this PVI2 instance.
+Follow this instance's MCP policy from `/etc/project-workbench/claude-wrapper.env`.
 EOF
 chown admin:admin /opt/project-workbench/workspaces/CLAUDE.md
 chmod 640 /opt/project-workbench/workspaces/CLAUDE.md
@@ -137,10 +138,16 @@ npm install -g @anthropic-ai/claude-code
 The update script also recreates `/usr/local/bin/claude` as a wrapper that:
 
 - runs Claude Code with `--dangerously-skip-permissions` unless a permission-mode/bypass flag is explicitly supplied;
-- grants every workspace access to `/opt/project-workbench/memory` via `--add-dir`; and
-- blocks inherited/account-level MCP servers by default via `/etc/project-workbench/empty-mcp.json` + `--strict-mcp-config`, unless a session explicitly supplies its own MCP config.
+- grants every workspace access to `PW_SHARED_MEMORY` via `--add-dir`; and
+- applies the instance-local MCP policy in `/etc/project-workbench/claude-wrapper.env`.
 
-This is intentional for this trusted internal workbench so PW does not ask for command-by-command approvals and does not try to use MCP servers that are valid for the account but unreachable from PVI2.
+MCP policy is deployment-specific:
+
+- `PW_MCP_MODE=inherit` — default template behavior; do not add MCP flags, so the instance can use account/project MCP normally. Use this for PVE when its MCP server is purposeful/reachable.
+- `PW_MCP_MODE=isolated` — force an empty strict MCP config, useful for PVI2 where account-level MCP points at an unreachable server.
+- `PW_MCP_MODE=custom` — force a specific per-instance MCP config from `PW_MCP_CONFIG`.
+
+This keeps the repo aligned across deployments while letting each instance choose whether to inherit, isolate, or customize MCP.
 
 Authenticate Claude once as the `admin` user, then verify credentials persist under `/home/admin/.claude/`:
 

@@ -7,15 +7,22 @@ LOG=/var/log/claude-code-update.log
   npm install -g @anthropic-ai/claude-code@latest
 
   # Keep npm-managed /bin/claude and /usr/bin/claude symlinks untouched.
-  # Put a stable local wrapper earlier in PATH; PW intentionally runs Claude Code with blanket permissions,
-  # local shared memory access, and no account-level MCP unless explicitly requested.
+  # Put a stable local wrapper earlier in PATH. Blanket permissions and shared memory are common
+  # to PW instances; MCP behavior is instance-local via /etc/project-workbench/claude-wrapper.env.
   rm -f /usr/local/bin/claude
   cat > /usr/local/bin/claude <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
 REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
-SHARED_MEMORY=/opt/project-workbench/memory
+CONFIG=/etc/project-workbench/claude-wrapper.env
+
+PW_SHARED_MEMORY=/opt/project-workbench/memory
+PW_MCP_MODE=inherit
 PW_MCP_CONFIG=/etc/project-workbench/empty-mcp.json
+if [[ -f "$CONFIG" ]]; then
+  # shellcheck source=/etc/project-workbench/claude-wrapper.env
+  source "$CONFIG"
+fi
 
 args=()
 has_permission=0
@@ -38,11 +45,31 @@ done
 if [[ "$has_permission" -eq 0 ]]; then
   args+=(--dangerously-skip-permissions)
 fi
-if [[ "$has_add_dir" -eq 0 && -d "$SHARED_MEMORY" ]]; then
-  args+=(--add-dir "$SHARED_MEMORY")
+if [[ "$has_add_dir" -eq 0 && -n "${PW_SHARED_MEMORY:-}" && -d "$PW_SHARED_MEMORY" ]]; then
+  args+=(--add-dir "$PW_SHARED_MEMORY")
 fi
-if [[ "$has_mcp_config" -eq 0 && -f "$PW_MCP_CONFIG" ]]; then
-  args+=(--mcp-config "$PW_MCP_CONFIG" --strict-mcp-config)
+if [[ "$has_mcp_config" -eq 0 ]]; then
+  case "${PW_MCP_MODE:-inherit}" in
+    inherit)
+      ;;
+    isolated)
+      if [[ -f "$PW_MCP_CONFIG" ]]; then
+        args+=(--mcp-config "$PW_MCP_CONFIG" --strict-mcp-config)
+      fi
+      ;;
+    custom)
+      if [[ -f "$PW_MCP_CONFIG" ]]; then
+        args+=(--mcp-config "$PW_MCP_CONFIG" --strict-mcp-config)
+      else
+        echo "PW_MCP_MODE=custom but PW_MCP_CONFIG not found: $PW_MCP_CONFIG" >&2
+        exit 1
+      fi
+      ;;
+    *)
+      echo "Invalid PW_MCP_MODE: $PW_MCP_MODE (expected inherit, isolated, or custom)" >&2
+      exit 1
+      ;;
+  esac
 fi
 
 exec "$REAL" "${args[@]}" "$@"
