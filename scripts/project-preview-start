@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+set -euo pipefail
+name="$1"
+json=/opt/project-workbench/projects.json
+path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path' "$json")
+cmd=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .preview.cmd // empty' "$json")
+port=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .preview.port // empty' "$json")
+[[ -n "$path" && "$path" != null ]] || { echo "Unknown project: $name" >&2; exit 1; }
+[[ -n "$cmd"  ]] || { echo "No preview.cmd configured for $name"  >&2; exit 1; }
+[[ -n "$port" ]] || { echo "No preview.port configured for $name" >&2; exit 1; }
+real_path=$(readlink -f "$path")
+cd "$real_path"
+# Workbench-managed substitution vars (these always win)
+export PORT="$port"
+export BASEPATH="/preview/$name"
+# Sensible cross-framework defaults; preview.env can override anything below.
+export ASPNETCORE_URLS="http://127.0.0.1:${PORT}"
+export DOTNET_USE_POLLING_FILE_WATCHER=1
+# Per-project env overrides from preview.env (object in projects.json).
+# PORT and BASEPATH are reserved and not overridable here (also enforced in server.js).
+while IFS= read -r kvline; do
+ [[ -z "$kvline" ]] && continue
+ export "$kvline"
+done < <(jq -r --arg n "$name" '.[] | select(.name==$n) | .preview.env // {} | to_entries[] | select(.key|test("^[A-Za-z_][A-Za-z0-9_]*$")) | select(.key!="PORT" and .key!="BASEPATH") | "\(.key)=\(.value)"' "$json")
+echo "[project-preview-start] name=$name path=$real_path port=$port basepath=$BASEPATH env=$(env | grep -E '^(ASPNETCORE_|DOTNET_)' | sort | paste -sd' ' -)"
+echo "[project-preview-start] cmd: $cmd"
+exec bash -c "$cmd"
