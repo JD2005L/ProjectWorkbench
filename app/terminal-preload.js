@@ -63,6 +63,44 @@
   // tmux emits OSC 52 on copy-pipe-and-cancel (set-clipboard on), but the
   // xterm.js bundled with ttyd 1.7.x has no OSC 52 handler. Sniff it from
   // the inbound ttyd stream and write the decoded text to the OS clipboard.
+  function copyExecFallback(text) {
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = text;
+      ta.setAttribute('readonly', '');
+      ta.style.cssText = 'position:fixed;top:0;left:0;width:1px;height:1px;opacity:0;pointer-events:none;border:0;padding:0;margin:0';
+      document.body.appendChild(ta);
+      const prev = document.activeElement;
+      ta.select(); ta.setSelectionRange(0, ta.value.length);
+      let ok = false;
+      try { ok = document.execCommand('copy'); } catch {}
+      ta.remove();
+      try { prev && prev.focus && prev.focus(); } catch {}
+      return ok;
+    } catch { return false; }
+  }
+  let toastEl = null, toastTimer = null;
+  function flashToast(text) {
+    if (!toastEl) {
+      toastEl = document.createElement('div');
+      toastEl.style.cssText = 'position:fixed;right:12px;bottom:12px;z-index:9999;background:#0f172a;color:#bbf7d0;border:1px solid #166534;border-radius:8px;padding:6px 10px;font:12px system-ui,-apple-system,Segoe UI,sans-serif;box-shadow:0 6px 22px rgba(0,0,0,.55);opacity:0;transition:opacity .12s ease;pointer-events:none;max-width:60vw;white-space:nowrap;overflow:hidden;text-overflow:ellipsis';
+      document.body.appendChild(toastEl);
+    }
+    toastEl.textContent = text;
+    toastEl.style.opacity = '1';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { toastEl.style.opacity = '0'; }, 900);
+  }
+  function writeClipboard(text) {
+    if (!text) return;
+    const preview = (text.length > 48 ? text.slice(0, 48) + '…' : text).replace(/\s+/g, ' ');
+    const after = (ok) => { if (ok) flashToast('Copied: ' + preview); };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(() => after(true), () => after(copyExecFallback(text)));
+    } else {
+      after(copyExecFallback(text));
+    }
+  }
   const oscDecoder = new TextDecoder();
   const oscRe = /\x1b\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\x07|\x1b\\)/g;
   function handleClipboardOSC(text) {
@@ -72,7 +110,7 @@
     while ((m = oscRe.exec(text)) !== null) {
       try {
         const data = atob(m[1]);
-        if (data) navigator.clipboard.writeText(data).catch(() => {});
+        if (data) writeClipboard(data);
       } catch {}
     }
   }
