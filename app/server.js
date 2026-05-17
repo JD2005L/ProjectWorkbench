@@ -32,8 +32,10 @@ function slug(s){ return String(s ?? '').replace(/[^A-Za-z0-9._-]/g,'_').slice(0
 function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
 function workspacePath(name){ return path.join(workspaceRoot, name); }
 async function projectByName(name){ return (await loadProjects()).find(p => p.name === name); }
-function nextPort(projects){ const used = new Set(projects.map(p => Number(p.port))); let port = 7681; while(used.has(port)) port++; return port; }
-function nextPreviewPort(projects){ const used = new Set(projects.map(p => Number(p?.preview?.port)).filter(n=>Number.isFinite(n)&&n>0)); let port = 7790; while(used.has(port)) port++; return port; }
+function allUsedPorts(projects){ const out = new Set(); for(const p of projects){ const a = Number(p?.port); if(Number.isFinite(a)) out.add(a); const b = Number(p?.preview?.port); if(Number.isFinite(b) && b > 0) out.add(b); } return out; }
+function nextPort(projects){ const used = allUsedPorts(projects); let port = 7681; while(used.has(port)) port++; return port; }
+function nextPreviewPort(projects){ const used = allUsedPorts(projects); let port = 7790; while(used.has(port)) port++; return port; }
+function validPort(n){ return Number.isInteger(n) && n >= 1024 && n <= 65535; }
 function hasPreview(p){ return !!(p && p.preview && typeof p.preview.cmd === 'string' && p.preview.cmd.trim() && Number(p.preview.port) > 0); }
 function previewUnit(name){ return `project-preview@${name}.service`; }
 async function sh(cmd,args,opts={}){ return execFileAsync(cmd,args,{timeout:120000,...opts}); }
@@ -243,10 +245,16 @@ app.get('/manage', async (req,res)=>{
 });
 
 app.post('/manage/add', async (req,res,next)=>{ try {
- const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); if(!validName(name)) throw new Error('Invalid project name');
- const projects = await loadProjects(); if(projects.some(p=>p.name===name)) throw new Error('Project already exists');
- const port = Number(req.body.port || nextPort(projects)); if(!port || projects.some(p=>Number(p.port)===port)) throw new Error('Invalid or duplicate port');
- const p = { name, repo, path: workspacePath(name), port }; await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
+ const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
+ if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
+ if(!repo) throw new Error('Repository URL is required');
+ const projects = await loadProjects();
+ if(projects.some(p=>p.name===name)) throw new Error('A project named "'+name+'" already exists');
+ const port = Number(req.body.port) || nextPort(projects);
+ if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
+ if(allUsedPorts(projects).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
+ const p = { name, repo, path: workspacePath(name), port };
+ await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
  res.redirect('/manage?msg='+encodeURIComponent(`Added ${name}`));
  } catch(e){ next(e); }});
 
@@ -255,14 +263,19 @@ app.post('/manage/update/:oldName', async (req,res,next)=>{ try {
  const previewCmd = String(req.body.previewCmd || '').trim();
  const previewPortRaw = String(req.body.previewPort || '').trim();
  const previewEnvRaw = String(req.body.previewEnv || '');
- if(!validName(newName)) throw new Error('Invalid project name'); const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project not found');
- if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('New name already exists'); if(!port || projects.some(x=>x.name!==oldName && Number(x.port)===port)) throw new Error('Invalid or duplicate port');
+ if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
+ if(!repo) throw new Error('Repository URL is required');
+ const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project "'+oldName+'" not found');
+ if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('A project named "'+newName+'" already exists');
+ if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
+ const others = projects.filter(x=>x.name!==oldName);
+ if(allUsedPorts(others).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
  let previewBlock = null;
  if(previewCmd){
-  const others = projects.filter(x=>x.name!==oldName);
   let previewPort = Number(previewPortRaw) || Number(p.preview?.port) || nextPreviewPort(others);
-  if(others.some(x=>Number(x.preview?.port)===previewPort)) throw new Error(`Preview port ${previewPort} is already in use`);
-  if(previewPort === port || others.some(x=>Number(x.port)===previewPort)) throw new Error(`Preview port ${previewPort} clashes with a terminal port`);
+  if(!validPort(previewPort)) throw new Error('Preview port must be between 1024 and 65535');
+  if(previewPort === port) throw new Error('Preview port cannot match this project\'s terminal port');
+  if(allUsedPorts(others).has(previewPort)) throw new Error('Preview port '+previewPort+' is already in use by another project');
   const env = {};
   for(const raw of previewEnvRaw.split(/\r?\n/)){
    const line = raw.replace(/^\s+|\s+$/g,'');
