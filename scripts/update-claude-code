@@ -1,11 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 LOG=/var/log/claude-code-update.log
-{
-  echo "===== $(date -Is) Claude Code update start ====="
-  echo "Before: $(/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe --version 2>/dev/null || echo missing)"
-  npm install -g @anthropic-ai/claude-code@latest
+WORKBENCH_JSON=/etc/project-workbench/workbench.json
 
+cli_pkg() {
+  case "$1" in
+    claude)  echo "@anthropic-ai/claude-code" ;;
+    codex)   echo "@openai/codex" ;;
+    copilot) echo "@github/copilot" ;;
+    *)       echo "" ;;
+  esac
+}
+
+install_claude_wrapper() {
   # Keep npm-managed /bin/claude and /usr/bin/claude symlinks untouched.
   # Put a stable local wrapper earlier in PATH. Blanket permissions and shared memory are common
   # to PW instances; MCP behavior is instance-local via /etc/project-workbench/claude-wrapper.env.
@@ -19,6 +26,7 @@ CONFIG=/etc/project-workbench/claude-wrapper.env
 PW_SHARED_MEMORY=/opt/project-workbench/memory
 PW_MCP_MODE=inherit
 PW_MCP_CONFIG=/etc/project-workbench/empty-mcp.json
+PW_PERMISSION_MODE=skip
 if [[ -f "$CONFIG" ]]; then
   # shellcheck source=/etc/project-workbench/claude-wrapper.env
   source "$CONFIG"
@@ -42,7 +50,7 @@ for arg in "$@"; do
   esac
 done
 
-if [[ "$has_permission" -eq 0 ]]; then
+if [[ "$has_permission" -eq 0 && "${PW_PERMISSION_MODE:-skip}" == "skip" ]]; then
   args+=(--dangerously-skip-permissions)
 fi
 if [[ "$has_add_dir" -eq 0 && -n "${PW_SHARED_MEMORY:-}" && -d "$PW_SHARED_MEMORY" ]]; then
@@ -75,8 +83,49 @@ fi
 exec "$REAL" "${args[@]}" "$@"
 BASH
   chmod +x /usr/local/bin/claude
+}
 
-  echo "After:  $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
+update_one() {
+  local cli="$1"
+  local pkg
+  pkg="$(cli_pkg "$cli")"
+  if [[ -z "$pkg" ]]; then
+    echo "Unknown CLI: $cli" >&2
+    return 1
+  fi
+  echo "----- $(date -Is) updating $cli ($pkg) -----"
+  if [[ "$cli" == "claude" ]]; then
+    echo "Before: $(/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe --version 2>/dev/null || echo missing)"
+  else
+    echo "Before: $(command -v "$cli" >/dev/null && "$cli" --version 2>/dev/null || echo missing)"
+  fi
+  npm install -g "$pkg@latest"
+  if [[ "$cli" == "claude" ]]; then
+    install_claude_wrapper
+    echo "After:  $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
+  else
+    echo "After:  $(command -v "$cli" >/dev/null && "$cli" --version 2>/dev/null || echo missing)"
+  fi
+}
+
+read_update_clis() {
+  if [[ -f "$WORKBENCH_JSON" ]] && command -v jq >/dev/null; then
+    jq -r '(.updateClis // ["claude"]) | .[]' "$WORKBENCH_JSON"
+  else
+    echo claude
+  fi
+}
+
+{
+  echo "===== $(date -Is) PW CLI update start ====="
+  mapfile -t CLIS < <(read_update_clis)
+  if [[ ${#CLIS[@]} -eq 0 ]]; then
+    echo "No CLIs configured in $WORKBENCH_JSON; defaulting to claude"
+    CLIS=(claude)
+  fi
+  for cli in "${CLIS[@]}"; do
+    update_one "$cli" || echo "Failed to update $cli"
+  done
   systemctl restart project-workbench.service || true
-  echo "===== $(date -Is) Claude Code update complete ====="
+  echo "===== $(date -Is) PW CLI update complete ====="
 } >> "$LOG" 2>&1

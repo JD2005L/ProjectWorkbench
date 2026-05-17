@@ -1,0 +1,6 @@
+{
+  "permissionMode": "skip",
+  "mcpMode": "isolated",
+  "enabledClis": ["claude"],
+  "updateClis": ["claude"]
+}

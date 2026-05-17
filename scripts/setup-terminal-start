@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# Persistent setup/auth terminal for the Project Workbench Setup Wizard.
+# Reuses the same ttyd + tmux pattern as project-terminal-start, but is not
+# tied to any project — it lives at HOME=/home/admin so any CLI auth tokens
+# (Claude, Codex, Copilot, gh) land in the admin user's profile and apply
+# globally to every project terminal.
+
+PORT=7680
+SESSION=pw_setup
+HOME_DIR=/home/admin
+
+if ! tmux has-session -t "$SESSION" 2>/dev/null; then
+  tmux -u new-session -d -s "$SESSION" -c "$HOME_DIR" \
+    "env HOME=$HOME_DIR LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc"
+  tmux send-keys -t "$SESSION" "printf 'Project Workbench setup terminal.\nUse this shell to sign in to CLIs (claude /login, codex login, gh auth login, copilot, etc.). Tokens land in /home/admin and apply to every project.\n\n'" C-m
+fi
+
+exec /usr/bin/ttyd \
+  --interface 127.0.0.1 \
+  --port "$PORT" \
+  --base-path "/pty/_setup" \
+  --writable \
+  --terminal-type xterm-256color \
+  --client-option fontFamily=monospace \
+  --client-option fontSize=14 \
+  --client-option lineHeight=1 \
+  --client-option letterSpacing=0 \
+  --check-origin \
+  tmux -u attach-session -t "$SESSION"
