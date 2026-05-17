@@ -58,6 +58,40 @@
     }
   }, true);
 
+  // tmux mouse-on makes tmux own drag-selection, so xterm.js never sees a
+  // selection and ttyd's built-in onSelectionChange auto-copy never fires.
+  // tmux emits OSC 52 on copy-pipe-and-cancel (set-clipboard on), but the
+  // xterm.js bundled with ttyd 1.7.x has no OSC 52 handler. Sniff it from
+  // the inbound ttyd stream and write the decoded text to the OS clipboard.
+  const oscDecoder = new TextDecoder();
+  const oscRe = /\x1b\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\x07|\x1b\\)/g;
+  function handleClipboardOSC(text) {
+    if (!text || text.indexOf('\x1b]52;') === -1) return;
+    oscRe.lastIndex = 0;
+    let m;
+    while ((m = oscRe.exec(text)) !== null) {
+      try {
+        const data = atob(m[1]);
+        if (data) navigator.clipboard.writeText(data).catch(() => {});
+      } catch {}
+    }
+  }
+  function sniffFrame(d) {
+    try {
+      if (typeof d === 'string') {
+        if (d.charCodeAt(0) === 0x30) handleClipboardOSC(d.slice(1));
+      } else if (d instanceof ArrayBuffer) {
+        const v = new Uint8Array(d);
+        if (v.length && v[0] === 0x30) handleClipboardOSC(oscDecoder.decode(v.subarray(1)));
+      } else if (typeof Blob !== 'undefined' && d instanceof Blob) {
+        d.arrayBuffer().then(buf => {
+          const v = new Uint8Array(buf);
+          if (v.length && v[0] === 0x30) handleClipboardOSC(oscDecoder.decode(v.subarray(1)));
+        }).catch(() => {});
+      }
+    } catch {}
+  }
+
   const NativeWebSocket = window.WebSocket;
   window.WebSocket = function(...args) {
     const ws = new NativeWebSocket(...args);
@@ -81,6 +115,7 @@
       } catch {}
       return nativeSend(data);
     };
+    ws.addEventListener('message', (ev) => sniffFrame(ev.data));
     ws.addEventListener('close', () => { if (activeSend === nativeSend) activeSend = null; });
     return ws;
   };
