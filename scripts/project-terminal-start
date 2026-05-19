@@ -45,10 +45,21 @@ with open(tmp,'w') as f: json.dump(data,f,indent=2)
 os.replace(tmp, conf)
 PY
 session="pw_${name//[^A-Za-z0-9_]/_}"
+tab_env='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
 # Create the project tmux session once. Future browser sessions reattach to the same shell/process state.
 if ! tmux has-session -t "$session" 2>/dev/null; then
-  tmux -u new-session -d -s "$session" -c "$real_path" "env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc"
+  tmux -u new-session -d -s "$session" -c "$real_path" "$tab_env"
   tmux send-keys -t "$session" "printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' '$real_path' '$claude_path' '$session'" C-m
+  # Auto-spawn tab templates flagged autoStart. The cmd is typed into the
+  # new window via send-keys so the shell stays alive after it exits.
+  while IFS=$'\t' read -r tab_name tab_cmd; do
+    [[ -z "$tab_name" ]] && continue
+    tmux new-window -t "$session" -c "$real_path" -n "$tab_name" "$tab_env" || continue
+    if [[ -n "$tab_cmd" ]]; then
+      tmux send-keys -t "$session:$tab_name" "$tab_cmd" C-m
+    fi
+  done < <(jq -r --arg n "$name" '.[] | select(.name==$n) | .tabs // [] | .[] | select(.autoStart==true) | "\(.name)\t\(.cmd // "")"' "$json")
+  tmux select-window -t "$session:0" 2>/dev/null || true
 fi
 exec /usr/bin/ttyd \
   --interface 127.0.0.1 \
