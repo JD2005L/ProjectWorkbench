@@ -71,5 +71,6 @@ exec /usr/bin/ttyd \
   --client-option fontSize=14 \
   --client-option lineHeight=1 \
   --client-option letterSpacing=0 \
+  --client-option disableLeaveAlert=true \
   --check-origin \
-  tmux -u attach-session -t "$session"
+  tmux -u new-session -A -s "$session" -c "$real_path" "$tab_env"

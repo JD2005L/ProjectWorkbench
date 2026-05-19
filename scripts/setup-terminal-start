@@ -9,10 +9,10 @@ set -euo pipefail
 PORT=7680
 SESSION=pw_setup
 HOME_DIR=/home/admin
+tab_env="env HOME=$HOME_DIR LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc"
 
 if ! tmux has-session -t "$SESSION" 2>/dev/null; then
-  tmux -u new-session -d -s "$SESSION" -c "$HOME_DIR" \
-    "env HOME=$HOME_DIR LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc"
+  tmux -u new-session -d -s "$SESSION" -c "$HOME_DIR" "$tab_env"
   tmux send-keys -t "$SESSION" "printf 'Project Workbench setup terminal.\nUse this shell to sign in to CLIs (claude /login, codex login, gh auth login, copilot, etc.). Tokens land in /home/admin and apply to every project.\n\n'" C-m
 fi
 
@@ -26,5 +26,6 @@ exec /usr/bin/ttyd \
   --client-option fontSize=14 \
   --client-option lineHeight=1 \
   --client-option letterSpacing=0 \
+  --client-option disableLeaveAlert=true \
   --check-origin \
-  tmux -u attach-session -t "$SESSION"
+  tmux -u new-session -A -s "$SESSION" -c "$HOME_DIR" "$tab_env"
