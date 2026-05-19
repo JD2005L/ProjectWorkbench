@@ -2,6 +2,19 @@
   if (window.__projectWorkbenchPreloadInstalled) return;
   window.__projectWorkbenchPreloadInstalled = true;
 
+  // ttyd's bundled JS registers a beforeunload handler that calls
+  // preventDefault() whenever its websocket is open, which makes the
+  // browser nag with "Leave site?" any time the user clicks the project
+  // terminal's Back link. tmux holds the session for them, so the prompt
+  // adds nothing — block the registration before ttyd's app code runs.
+  try {
+    const _add = window.addEventListener;
+    window.addEventListener = function(type, ...rest){ if (type === 'beforeunload') return; return _add.call(window, type, ...rest); };
+    const _docAdd = document.addEventListener;
+    document.addEventListener = function(type, ...rest){ if (type === 'beforeunload') return; return _docAdd.call(document, type, ...rest); };
+    Object.defineProperty(window, 'onbeforeunload', { configurable: true, set(){}, get(){ return null; } });
+  } catch {}
+
   const project = decodeURIComponent((location.pathname.match(/^\/pty\/([^/]+)/) || [])[1] || '');
   if (!project) return;
 
