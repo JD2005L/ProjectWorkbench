@@ -26,7 +26,7 @@ CONFIG=/etc/project-workbench/claude-wrapper.env
 PW_SHARED_MEMORY=/opt/project-workbench/memory
 PW_MCP_MODE=inherit
 PW_MCP_CONFIG=/etc/project-workbench/empty-mcp.json
-PW_PERMISSION_MODE=skip
+PW_PERMISSION_MODE=prompt
 if [[ -f "$CONFIG" ]]; then
   # shellcheck source=/etc/project-workbench/claude-wrapper.env
   source "$CONFIG"
@@ -50,7 +50,7 @@ for arg in "$@"; do
   esac
 done
 
-if [[ "$has_permission" -eq 0 && "${PW_PERMISSION_MODE:-skip}" == "skip" ]]; then
+if [[ "$has_permission" -eq 0 && "${PW_PERMISSION_MODE:-prompt}" == "skip" ]]; then
   args+=(--dangerously-skip-permissions)
 fi
 if [[ "$has_add_dir" -eq 0 && -n "${PW_SHARED_MEMORY:-}" && -d "$PW_SHARED_MEMORY" ]]; then

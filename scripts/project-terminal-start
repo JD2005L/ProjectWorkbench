@@ -2,10 +2,12 @@
 set -euo pipefail
 name="$1"
 json=/opt/project-workbench/projects.json
-path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path' "$json")
-port=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .port' "$json")
-repo=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .repo' "$json")
-[[ -n "$path" && "$path" != null && -n "$port" && "$port" != null ]] || { echo "Unknown project: $name" >&2; exit 1; }
+[[ -f "$json" ]] || { echo "[project-terminal-start] $json not found" >&2; exit 1; }
+path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path // empty' "$json")
+port=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .port // empty' "$json")
+repo=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .repo // empty' "$json")
+[[ -n "$path" ]] || { echo "[project-terminal-start] no .path in projects.json for '$name'" >&2; exit 1; }
+[[ -n "$port" ]] || { echo "[project-terminal-start] no .port in projects.json for '$name'" >&2; exit 1; }
 mkdir -p "$path"
 real_path=$(readlink -f "$path")
 chown -R admin:admin "$real_path" 2>/dev/null || true

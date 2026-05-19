@@ -2,12 +2,13 @@
 set -euo pipefail
 name="$1"
 json=/opt/project-workbench/projects.json
-path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path' "$json")
+[[ -f "$json" ]] || { echo "[project-preview-start] $json not found" >&2; exit 1; }
+path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path // empty' "$json")
 cmd=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .preview.cmd // empty' "$json")
 port=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .preview.port // empty' "$json")
-[[ -n "$path" && "$path" != null ]] || { echo "Unknown project: $name" >&2; exit 1; }
-[[ -n "$cmd"  ]] || { echo "No preview.cmd configured for $name"  >&2; exit 1; }
-[[ -n "$port" ]] || { echo "No preview.port configured for $name" >&2; exit 1; }
+[[ -n "$path" ]] || { echo "[project-preview-start] no .path in projects.json for '$name' (deleted?)" >&2; exit 1; }
+[[ -n "$cmd"  ]] || { echo "[project-preview-start] no .preview.cmd configured for '$name'"  >&2; exit 1; }
+[[ -n "$port" ]] || { echo "[project-preview-start] no .preview.port configured for '$name'" >&2; exit 1; }
 real_path=$(readlink -f "$path")
 cd "$real_path"
 # Workbench-managed substitution vars (these always win)
