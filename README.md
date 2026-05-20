@@ -119,6 +119,68 @@ A nightly `systemd` timer keeps Claude Code (and any other enabled CLIs) on thei
 
 ---
 
+## Users & permissions (Phase 1)
+
+Phase 1 adds app-level users with hashed passwords, cookie sessions, and per-project grants on top of the existing nginx Basic Auth gate. Basic Auth (or Cloudflare Access / a VPN) should stay in front of the dashboard as the outer perimeter until later phases lock the box down further.
+
+### Roles
+
+| Role | Sees | Can open `/term/<n>/` | Can upload / start preview | Can do project CRUD / Setup Wizard |
+|---|---|---|---|---|
+| `admin` | all projects | yes | yes | yes |
+| `developer` | only granted projects | yes | yes | no |
+| `content_editor` | only granted projects | **no** (Phase 2 PVIKPBot workflow) | no | no |
+| `viewer` | only granted projects | no | no (read-only status) | no |
+
+`admin` ignores grants and sees everything. The other roles respect `--projects '*'` or an explicit list.
+
+### CLI: `pw-user` (root-only)
+
+`pw-user` lives at `/usr/local/sbin/pw-user` and writes `/etc/project-workbench/users.json` (mode 0600).
+
+```bash
+sudo pw-user add james --role admin --projects '*'           # prompts for password (hidden)
+sudo pw-user add alice --role developer --projects 'AmrikPublic,HarmaniPublic'
+sudo pw-user add carol --role content_editor --projects 'AmrikPublic'
+sudo pw-user list
+sudo pw-user passwd alice
+sudo pw-user grant alice ProVisionIPortal
+sudo pw-user revoke alice AmrikPublic
+sudo pw-user role alice viewer
+sudo pw-user delete alice
+```
+
+Password input is read from a TTY with echo disabled. To pipe a password (CI / scripts), pass `--password '...'` to `add`.
+
+### Enforcement switch (`PW_AUTH_ENFORCE`)
+
+The dashboard ships with auth in **soft mode** by default — anonymous requests are treated as an implicit admin so existing browser sessions don't break the moment the code lands. To require login:
+
+1. Create at least one admin via `sudo pw-user add ... --role admin`.
+2. Browse to `http://<workbench>/login` and confirm the cookie flow works.
+3. Edit `/etc/systemd/system/project-workbench.service.d/auth.conf` and change `PW_AUTH_ENFORCE=false` to `true`.
+4. `sudo systemctl daemon-reload && sudo systemctl restart project-workbench.service`.
+5. If anything breaks, flip back to `false` and restart.
+
+When enforce is on, nginx's `auth_request` on every `/pty/<n>/` and `/preview/<n>/` block makes the dashboard re-check the cookie + project grant on each terminal/preview page load.
+
+### Audit log
+
+Sensitive events (login ok/fail, logout, terminal open, upload, project CRUD, setup state change) are appended as JSON-lines to `/var/log/project-workbench/audit.log`. Tail it: `sudo tail -F /var/log/project-workbench/audit.log`.
+
+### Public-exposure guidance
+
+Phase 1 is **safe to ship behind an outer gate** (Basic Auth, Cloudflare Access, VPN, etc.). Phase 2 will tighten the runtime further so the dashboard can survive direct public exposure:
+
+- Per-user / per-action rate limiting on `/api/auth/login`.
+- WebAuthn / 2FA enrollment.
+- A real PVIKPBot supervised-workflow page that `content_editor` users land on instead of `/term/`.
+- Read-only project dashboards for `viewer`.
+- User management inside the dashboard UI (Phase 1 is CLI-only).
+- Tighter file permissions on `/var/log/project-workbench/audit.log`.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Most likely cause | Fix |

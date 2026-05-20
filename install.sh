@@ -82,6 +82,7 @@ install -d -m 0755 "$PW_INSTALL_DIR" "$APP_DIR" "$CONF_DIR"
 install -d -o "$PW_USER" -g "$PW_USER" -m 0755 "$WORKSPACES_DIR"
 install -d -o "$PW_USER" -g "$PW_USER" -m 0700 "$MEMORY_DIR"
 install -d -m 0755 /var/lib/project-workbench /var/lib/project-workbench/pending
+install -d -m 0750 /var/log/project-workbench
 
 if [ -d "$SRC_DIR/.git" ]; then
   log "Updating source tree…"
@@ -141,6 +142,7 @@ install -m 0755 "$SRC_DIR/scripts/project-terminal-start" /usr/local/bin/project
 install -m 0755 "$SRC_DIR/scripts/project-preview-start"  /usr/local/bin/project-preview-start
 install -m 0755 "$SRC_DIR/scripts/setup-terminal-start"   /usr/local/bin/setup-terminal-start
 install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update-claude-code
+install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
 
 if [ -f "$SRC_DIR/config/tmux.conf" ]; then
   install -o "$PW_USER" -g "$PW_USER" -m 0644 "$SRC_DIR/config/tmux.conf" "/home/$PW_USER/.tmux.conf"
@@ -153,6 +155,10 @@ install -m 0644 "$SRC_DIR/systemd/project-setup-terminal.service" /etc/systemd/s
 install -m 0644 "$SRC_DIR/systemd/project-preview@.service"       /etc/systemd/system/project-preview@.service
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.service"     /etc/systemd/system/claude-code-update.service
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.timer"       /etc/systemd/system/claude-code-update.timer
+# Drop-in for app-level auth enforcement (Phase 1: defaults to OFF for safe
+# rollout — flip PW_AUTH_ENFORCE=true after creating an admin via `pw-user`).
+install -d -m 0755 /etc/systemd/system/project-workbench.service.d
+install -m 0644 "$SRC_DIR/systemd/project-workbench.service.d/auth.conf" /etc/systemd/system/project-workbench.service.d/auth.conf
 systemctl daemon-reload
 
 if ! command -v claude >/dev/null 2>&1; then

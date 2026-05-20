@@ -1,6 +1,7 @@
 import express from 'express';
 import fs from 'fs/promises';
 import path from 'path';
+import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 
@@ -47,6 +48,10 @@ app.use((req, res, next) => {
  res.status(403).type('text/plain').send('CSRF check failed: Origin/Referer must match Host on mutating requests.\nIf scripting the API, set Origin to your workbench host.');
 });
 
+// attachUser must run on every request so route handlers can read req.user.
+// It does not block — enforcement is done per-route via requireAuth/requireAdmin/etc.
+app.use(attachUser);
+
 async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
 async function saveProjects(projects){ await fs.writeFile(registryPath, JSON.stringify(projects, null, 2)+'\n'); }
 // Serialize every projects.json read-modify-write transaction. Concurrent POSTs
@@ -58,6 +63,202 @@ async function withProjectsLock(fn){
  let release;
  projectsLock = new Promise(r => { release = r; });
  try { await prev; return await fn(); } finally { release(); }
+}
+
+// ============================================================================
+// Auth (Phase 1): users.json + cookie sessions + per-project grants.
+// PW_AUTH_ENFORCE controls whether unauthenticated requests are blocked. When
+// false (the safe default for code-only rollouts), the dashboard treats anon
+// requests as an implicit admin so existing terminals/Claude sessions keep
+// working until an operator creates a real admin via `pw-user add` and flips
+// the env var. Throughout Phase 1, nginx Basic Auth remains the outer gate.
+// ============================================================================
+const usersPath = '/etc/project-workbench/users.json';
+const sessionsPath = '/var/lib/project-workbench/sessions.json';
+const auditLogPath = '/var/log/project-workbench/audit.log';
+const AUTH_ENFORCE = String(process.env.PW_AUTH_ENFORCE || '').toLowerCase() === 'true';
+const SESSION_COOKIE = 'pw_session';
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const ROLES = ['admin','developer','content_editor','viewer'];
+const TERMINAL_ROLES = new Set(['admin','developer']);
+const scryptAsync = promisify(crypto.scrypt);
+
+async function hashPassword(plain){
+ const salt = crypto.randomBytes(16);
+ const hash = await scryptAsync(String(plain), salt, 64, { N:16384, r:8, p:1 });
+ return `scrypt$${salt.toString('base64')}$${Buffer.from(hash).toString('base64')}`;
+}
+async function verifyPassword(plain, stored){
+ try {
+  const [scheme, saltB64, hashB64] = String(stored||'').split('$');
+  if(scheme !== 'scrypt' || !saltB64 || !hashB64) return false;
+  const salt = Buffer.from(saltB64, 'base64');
+  const expected = Buffer.from(hashB64, 'base64');
+  const actual = await scryptAsync(String(plain), salt, expected.length, { N:16384, r:8, p:1 });
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, Buffer.from(actual));
+ } catch { return false; }
+}
+
+async function loadUsers(){
+ try { const raw = await fs.readFile(usersPath,'utf8'); const data = JSON.parse(raw); return Array.isArray(data?.users) ? data.users : []; }
+ catch(e){ if(e.code === 'ENOENT') return []; throw e; }
+}
+async function saveUsers(users){
+ await fs.mkdir(path.dirname(usersPath),{recursive:true});
+ await fs.writeFile(usersPath, JSON.stringify({ users }, null, 2)+'\n');
+ await fs.chmod(usersPath, 0o600).catch(()=>{});
+}
+
+let sessionsCache = null;
+let sessionsLock = Promise.resolve();
+async function withSessionsLock(fn){
+ const prev = sessionsLock;
+ let release;
+ sessionsLock = new Promise(r => { release = r; });
+ try { await prev; return await fn(); } finally { release(); }
+}
+async function loadSessions(){
+ if(sessionsCache) return sessionsCache;
+ try { const raw = await fs.readFile(sessionsPath,'utf8'); const data = JSON.parse(raw); sessionsCache = Array.isArray(data?.sessions) ? data.sessions : []; }
+ catch { sessionsCache = []; }
+ return sessionsCache;
+}
+async function saveSessions(){
+ if(!sessionsCache) return;
+ await fs.mkdir(path.dirname(sessionsPath),{recursive:true});
+ await fs.writeFile(sessionsPath, JSON.stringify({ sessions: sessionsCache }, null, 2)+'\n');
+ await fs.chmod(sessionsPath, 0o600).catch(()=>{});
+}
+async function createSession(userId){
+ return withSessionsLock(async () => {
+  const sessions = await loadSessions();
+  const id = crypto.randomBytes(32).toString('base64url');
+  const now = new Date();
+  sessions.push({ id, userId, createdAt: now.toISOString(), expiresAt: new Date(now.getTime()+SESSION_TTL_MS).toISOString() });
+  await saveSessions();
+  return id;
+ });
+}
+async function revokeSession(id){
+ return withSessionsLock(async () => {
+  const sessions = await loadSessions();
+  const i = sessions.findIndex(s => s.id === id);
+  if(i >= 0){ sessions.splice(i,1); await saveSessions(); }
+ });
+}
+async function lookupSession(id){
+ if(!id) return null;
+ const sessions = await loadSessions();
+ const s = sessions.find(x => x.id === id);
+ if(!s) return null;
+ if(new Date(s.expiresAt) < new Date()){ await revokeSession(id); return null; }
+ return s;
+}
+async function purgeExpiredSessions(){
+ return withSessionsLock(async () => {
+  const sessions = await loadSessions();
+  const now = new Date();
+  const kept = sessions.filter(s => new Date(s.expiresAt) >= now);
+  if(kept.length !== sessions.length){ sessionsCache = kept; await saveSessions(); }
+ });
+}
+
+function userHasProjectAccess(user, projectName){
+ if(!user) return false;
+ if(user.role === 'admin') return true;
+ if(user.projects === '*') return true;
+ return Array.isArray(user.projects) && user.projects.includes(projectName);
+}
+function filterProjectsForUser(projects, user){
+ if(!user || user.role === 'admin' || user.projects === '*') return projects;
+ const allowed = new Set(Array.isArray(user.projects) ? user.projects : []);
+ return projects.filter(p => allowed.has(p.name));
+}
+
+// Cookie helpers (cookie-parser kept out of the dep tree to avoid native build).
+function getCookie(req, name){
+ const raw = req.headers.cookie || '';
+ for(const c of raw.split(/;\s*/)){
+  const i = c.indexOf('=');
+  if(i > 0 && c.slice(0,i) === name){ try { return decodeURIComponent(c.slice(i+1)); } catch { return c.slice(i+1); } }
+ }
+ return null;
+}
+function isHttps(req){ return req.protocol === 'https' || req.get('x-forwarded-proto') === 'https'; }
+function setSessionCookie(req, res, value, maxAgeSec){
+ const parts = [`${SESSION_COOKIE}=${encodeURIComponent(value)}`,'Path=/','HttpOnly','SameSite=Lax'];
+ if(typeof maxAgeSec === 'number') parts.push(`Max-Age=${Math.floor(maxAgeSec)}`);
+ if(isHttps(req)) parts.push('Secure');
+ res.append('Set-Cookie', parts.join('; '));
+}
+function clearSessionCookie(req, res){ setSessionCookie(req, res, '', 0); }
+
+// Implicit admin used when PW_AUTH_ENFORCE=false and no session cookie present.
+// This is the soft-mode back-compat path; flipping enforce=true makes anon
+// requests get a 401 / login redirect.
+const IMPLICIT_ADMIN = Object.freeze({ id:'anon-admin', username:'(anonymous)', role:'admin', projects:'*', implicit:true });
+
+async function attachUser(req, res, next){
+ try {
+  const sid = getCookie(req, SESSION_COOKIE);
+  if(sid){
+   const sess = await lookupSession(sid);
+   if(sess){
+    const users = await loadUsers();
+    const u = users.find(x => x.id === sess.userId);
+    if(u){ req.user = u; req.sessionId = sid; return next(); }
+   }
+  }
+  req.user = AUTH_ENFORCE ? null : IMPLICIT_ADMIN;
+  return next();
+ } catch(e){ next(e); }
+}
+
+function wantsJson(req){
+ return req.path.startsWith('/api/') || (req.get('accept') || '').includes('json');
+}
+function requireAuth(req, res, next){
+ if(req.user) return next();
+ if(wantsJson(req)) return res.status(401).json({ ok:false, error:'Authentication required' });
+ return res.redirect('/login?next=' + encodeURIComponent(req.originalUrl || req.url));
+}
+function requireAdmin(req, res, next){
+ if(!req.user) return requireAuth(req, res, next);
+ if(req.user.role === 'admin') return next();
+ if(wantsJson(req)) return res.status(403).json({ ok:false, error:'Admin role required' });
+ return res.status(403).type('html').send(`<h1>403 — Admin access required</h1><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) cannot access this page.</p><p><a href="/">Back to dashboard</a></p>`);
+}
+function requireProjectAccess(req, res, next){
+ const projectName = req.params.project || req.params.name || req.params.oldName;
+ if(!projectName){ if(wantsJson(req)) return res.status(400).json({ok:false,error:'No project in route'}); return res.status(400).send('No project in route'); }
+ if(!req.user) return requireAuth(req, res, next);
+ if(userHasProjectAccess(req.user, projectName)) return next();
+ if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
+ return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="/">Back to dashboard</a></p>`);
+}
+function requireTerminalAccess(req, res, next){
+ if(!req.user) return requireAuth(req, res, next);
+ if(!TERMINAL_ROLES.has(req.user.role)){
+  if(wantsJson(req)) return res.status(403).json({ ok:false, error:'Terminal/Claude access requires admin or developer role' });
+  const hint = req.user.role === 'content_editor' ? ' The PVIKPBot supervised workflow is planned for Phase 2.' : '';
+  return res.status(403).type('html').send(`<h1>403 — Terminal access denied</h1><p>Your role (<b>${esc(req.user.role)}</b>) cannot open project terminals.${hint}</p><p><a href="/">Back to dashboard</a></p>`);
+ }
+ return requireProjectAccess(req, res, next);
+}
+
+async function audit(event, detail = {}, req = null){
+ try {
+  const entry = {
+   ts: new Date().toISOString(),
+   event,
+   user: req?.user?.username ?? null,
+   role: req?.user?.role ?? null,
+   ip: req ? (req.get('x-forwarded-for')?.split(',')[0]?.trim() || req.ip || '') : '',
+   ...detail,
+  };
+  await fs.mkdir(path.dirname(auditLogPath),{recursive:true});
+  await fs.appendFile(auditLogPath, JSON.stringify(entry)+'\n');
+ } catch { /* never fail a request for audit */ }
 }
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function slug(s){ return String(s ?? '').replace(/[^A-Za-z0-9._-]/g,'_').slice(0,120) || 'clipboard-file'; }
@@ -203,19 +404,27 @@ async function ensureSetupTerminal(){
 
 function nginxConfig(projects){
  const previewProjects = projects.filter(hasPreview);
- const setupRoute = `    location /pty/_setup/ {\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
+ // Internal endpoint that nginx auth_request calls. Forwards Cookie to the
+ // dashboard so it can decide based on the session. `auth_basic off` because
+ // the server-level basic_auth would otherwise also gate this subrequest.
+ const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        auth_basic off;\n        proxy_pass http://127.0.0.1:3000/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n    }\n`;
+ // Setup terminal is admin-only — the wizard signs in CLIs whose tokens land
+ // in /home/admin and apply to every project.
+ const setupRoute = `    location /pty/_setup/ {\n        auth_request /pw-auth-check?admin=1;\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
  // Accept-Encoding is cleared so ttyd serves uncompressed HTML — otherwise
  // sub_filter can't match '</head>' inside a gzipped body and the preload
  // script tag is silently dropped, breaking mouse-drag-copy (OSC 52 sniffer).
- const locations = projects.map(p => `    location /pty/${p.name}/ {\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
- const previewRoutes = previewProjects.map(p => `    location /preview/${p.name}/ {\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ /preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
+ // auth_request gates each terminal/preview block per-project; in soft mode
+ // (PW_AUTH_ENFORCE=false) the dashboard returns 200 for anonymous callers.
+ const locations = projects.map(p => `    location /pty/${p.name}/ {\n        auth_request /pw-auth-check?project=${p.name};\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
+ const previewRoutes = previewProjects.map(p => `    location /preview/${p.name}/ {\n        auth_request /pw-auth-check?project=${p.name};\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ /preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
  const refererMaps = previewProjects.length ? `map $http_referer $pw_preview_name {\n    default "";\n    "~^https?://[^/]+/preview/(?<pname>[^/]+)/" "$pname";\n}\nmap $pw_preview_name $pw_preview_port {\n    default 0;\n${previewProjects.map(p => `    "${p.name}" ${p.preview.port};`).join('\n')}\n}\n` : '';
  const knownDashboardPaths = '^/(api|pty|term|file|manage|preview|terminal-preload|terminal-paste|healthz|favicon|robots)(/|$|\\.|\\?)';
  const previewFallbackLocation = previewProjects.length ? `    location @pw_preview_fallback {\n        proxy_pass http://127.0.0.1:$pw_preview_port$request_uri;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/$pw_preview_name;\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/)(.*)$ /preview/$pw_preview_name/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n    }\n` : '';
  const rootLocation = previewProjects.length
   ? `    location / {\n        set $pw_route dashboard;\n        if ($pw_preview_port) { set $pw_route preview; }\n        if ($request_uri ~ "${knownDashboardPaths}") { set $pw_route dashboard; }\n        if ($pw_route = preview) { return 418; }\n        error_page 418 = @pw_preview_fallback;\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n`
   : `    location / { proxy_pass http://127.0.0.1:3000; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; }\n`;
- return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    auth_basic "Project Workbench";\n    auth_basic_user_file /etc/nginx/.htpasswd;\n    client_max_body_size 100m;\n${rootLocation}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
+ return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    auth_basic "Project Workbench";\n    auth_basic_user_file /etc/nginx/.htpasswd;\n    client_max_body_size 100m;\n${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
 }
 async function applyRouting(projects){
  const newConfig = nginxConfig(projects);
@@ -298,19 +507,40 @@ const previewScript = `<script>(function(){const backdrop=document.getElementByI
 
 const reorderScript = `<script>(function(){const btn=document.getElementById('editOrderBtn');const grid=document.querySelector('.order-grid');if(!btn||!grid)return;let editing=false;let dragSrc=null;function setEditing(on){editing=on;document.body.classList.toggle('editing-order',on);btn.classList.toggle('active',on);btn.textContent=on?'✓':'✎';grid.querySelectorAll('article[data-name]').forEach(a=>{a.draggable=on})}btn.onclick=()=>setEditing(!editing);grid.addEventListener('dragstart',e=>{if(!editing)return;const a=e.target.closest('article[data-name]');if(!a){e.preventDefault();return}dragSrc=a;a.classList.add('dragging');e.dataTransfer.effectAllowed='move';try{e.dataTransfer.setData('text/plain',a.dataset.name)}catch{}});grid.addEventListener('dragover',e=>{if(!editing||!dragSrc)return;const target=e.target.closest('article[data-name]');if(!target||target===dragSrc)return;e.preventDefault();const rect=target.getBoundingClientRect();const after=(e.clientY-rect.top)>rect.height/2;if(after)target.parentNode.insertBefore(dragSrc,target.nextSibling);else target.parentNode.insertBefore(dragSrc,target)});grid.addEventListener('dragend',async()=>{if(!editing)return;if(dragSrc)dragSrc.classList.remove('dragging');dragSrc=null;const order=[...grid.querySelectorAll('article[data-name]')].map(c=>c.dataset.name);try{await fetch('/api/projects/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})})}catch{}})})();</script>`;
 
-app.get('/', async (_req,res)=>{
- const projects = await loadProjects(); const claudeVersion = await getClaudeVersion(); const updateStamp = await getClaudeUpdateStamp();
+app.get('/', requireAuth, async (req,res)=>{
+ const allProjects = await loadProjects();
+ const projects = filterProjectsForUser(allProjects, req.user);
+ const claudeVersion = await getClaudeVersion(); const updateStamp = await getClaudeUpdateStamp();
+ const isAdmin = req.user.role === 'admin';
+ const canOpenTerminal = TERMINAL_ROLES.has(req.user.role);
  const rows = projects.map(p=>{
   const previewBtn = hasPreview(p)
    ? `<button class="button secondary" type="button" data-preview="${esc(p.name)}">Preview</button>`
    : `<button class="button secondary" type="button" data-preview="${esc(p.name)}" title="Preview command not yet configured — click to set up">Preview…</button>`;
-  return `<article data-name="${esc(p.name)}" data-project="${esc(p.name)}"><h2>${esc(p.name)} <span class="pending-dot" aria-hidden="true"></span><span class="pending-label">ready</span></h2><p><code>${esc(p.path)}</code></p><p><a class="button" href="/term/${encodeURIComponent(p.name)}/">Open Claude terminal</a> ${previewBtn}</p><p><a class="repo" href="${esc(p.repo)}" target="_blank" rel="noopener">Github Repo</a></p></article>`;
+  const termBtn = canOpenTerminal
+   ? `<a class="button" href="/term/${encodeURIComponent(p.name)}/">Open Claude terminal</a>`
+   : `<span class="button" style="opacity:.55;cursor:not-allowed" title="Your role cannot open raw terminals">Terminal — restricted</span>`;
+  return `<article data-name="${esc(p.name)}" data-project="${esc(p.name)}"><h2>${esc(p.name)} <span class="pending-dot" aria-hidden="true"></span><span class="pending-label">ready</span></h2><p><code>${esc(p.path)}</code></p><p>${termBtn} ${previewBtn}</p><p><a class="repo" href="${esc(p.repo)}" target="_blank" rel="noopener">Github Repo</a></p></article>`;
  }).join('\n');
+ // Empty-state only shown to admins (non-admins with no grants get a clearer message).
+ const noGrantsState = `<div class="empty-state"><h2>No projects assigned</h2><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) has no project grants yet. Ask an admin to grant access.</p></div>`;
  const emptyState = `<div class="empty-state"><h2>Welcome to Project Workbench</h2><p>LAN-internal browser terminals backed by Claude Code (or your CLI of choice). Two steps to get started:</p><div class="step"><span class="num">1</span><div class="meta"><b>Sign in your AI CLI</b><span>Authenticate Claude Code (or Codex / Copilot) once in the shared setup terminal.</span></div><button id="emptyWizardBtn" class="button" type="button">Open Setup Wizard</button></div><div class="step"><span class="num">2</span><div class="meta"><b>Add your first project</b><span>Clone a repo into a workspace and get a browser terminal + live preview.</span></div><a class="button" href="/manage">Manage Projects</a></div></div>`;
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Workbench</title><style>${homeCss}${wizardCss}${previewCss}</style></head><body><header class="hero"><div><h1>Project Workbench</h1><p class="subtitle">Protected project terminals with Claude Code CLI</p></div><div class="hero-actions"><div class="meta-row"><span class="badge">Claude Code: <b>${esc(claudeVersion)}</b></span></div><div class="subtle">Last update check: ${esc(updateStamp)}</div><div class="action-row"><button id="editOrderBtn" class="button secondary pencilBtn iconBtn" type="button" title="Drag cards to reorder" aria-label="Edit order">✎</button><button id="setupBtn" class="button secondary" type="button">Setup Wizard</button><a class="button secondary" href="/manage">Manage Projects</a></div></div></header>${rows ? `<div class="grid order-grid">${rows}</div>` : emptyState}${wizardModalHtml}${previewModalHtml}<script>async function pwRefreshStatus(){try{const r=await fetch('/api/projects/status',{cache:'no-store'});const out=await r.json();if(!out?.ok)return;const map=Object.create(null);for(const p of out.projects)map[p.name]=p;document.querySelectorAll('article[data-project]').forEach(a=>{const s=map[a.dataset.project];a.classList.toggle('pending',!!(s&&s.pending))})}catch{}}pwRefreshStatus();setInterval(()=>{if(!document.hidden)pwRefreshStatus()},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwRefreshStatus()});document.getElementById('emptyWizardBtn')?.addEventListener('click',()=>document.getElementById('setupBtn')?.click());</script>${reorderScript}${wizardScript}${previewScript}</body></html>`);
+ const bodyContent = rows
+  ? `<div class="grid order-grid">${rows}</div>`
+  : (isAdmin ? emptyState : (allProjects.length === 0 ? emptyState : noGrantsState));
+ const userChip = req.user.implicit
+  ? `<span class="subtle" title="PW_AUTH_ENFORCE is OFF; all requests treated as admin">anonymous (enforce off)</span>`
+  : `<span class="badge" title="Role: ${esc(req.user.role)}"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span> <button id="logoutBtn" class="button secondary" type="button" style="padding:.35rem .7rem;font-size:.82rem">Sign out</button>`;
+ const adminButtons = isAdmin
+  ? `<button id="editOrderBtn" class="button secondary pencilBtn iconBtn" type="button" title="Drag cards to reorder" aria-label="Edit order">✎</button><button id="setupBtn" class="button secondary" type="button">Setup Wizard</button><a class="button secondary" href="/manage">Manage Projects</a>`
+  : '';
+ const adminModals = isAdmin ? `${wizardModalHtml}` : '';
+ const adminScripts = isAdmin ? `${reorderScript}${wizardScript}` : '';
+ const logoutScript = req.user.implicit ? '' : `<script>document.getElementById('logoutBtn')?.addEventListener('click',async()=>{try{await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='/login'});</script>`;
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Workbench</title><style>${homeCss}${wizardCss}${previewCss}</style></head><body><header class="hero"><div><h1>Project Workbench</h1><p class="subtitle">Protected project terminals with Claude Code CLI</p></div><div class="hero-actions"><div class="meta-row">${userChip}<span class="badge">Claude Code: <b>${esc(claudeVersion)}</b></span></div><div class="subtle">Last update check: ${esc(updateStamp)}</div><div class="action-row">${adminButtons}</div></div></header>${bodyContent}${adminModals}${previewModalHtml}<script>async function pwRefreshStatus(){try{const r=await fetch('/api/projects/status',{cache:'no-store'});const out=await r.json();if(!out?.ok)return;const map=Object.create(null);for(const p of out.projects)map[p.name]=p;document.querySelectorAll('article[data-project]').forEach(a=>{const s=map[a.dataset.project];a.classList.toggle('pending',!!(s&&s.pending))})}catch{}}pwRefreshStatus();setInterval(()=>{if(!document.hidden)pwRefreshStatus()},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwRefreshStatus()});document.getElementById('emptyWizardBtn')?.addEventListener('click',()=>document.getElementById('setupBtn')?.click());</script>${adminScripts}${previewScript}${logoutScript}</body></html>`);
 });
 
-app.get('/manage', async (req,res)=>{
+app.get('/manage', requireAdmin, async (req,res)=>{
  const projects = await loadProjects(); const msg = req.query.msg ? `<p class="badge">${esc(req.query.msg)}</p>` : '';
  const placeholder = 'e.g. dotnet watch --project Foo/Foo.csproj --non-interactive --no-hot-reload run --no-launch-profile    |    npm run dev -- --host 127.0.0.1 --port ${PORT}';
  const envPlaceholder = '# one KEY=VALUE per line; lines starting with # ignored\n# ASPNETCORE_ENVIRONMENT=Development\n# DATABASE_URL=postgres://localhost/foo';
@@ -328,7 +558,7 @@ app.get('/manage', async (req,res)=>{
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manage Projects</title><style>${homeCss}</style></head><body><div class="top"><h1>Manage Projects</h1><a class="button secondary" href="/">Dashboard</a></div>${msg}${emptyHint}<article><h2>Add project</h2><form method="post" action="/manage/add"><div class="row"><label>Name<input name="name" placeholder="RepoName" required pattern="[A-Za-z0-9._-]+"></label><label>Repo URL<input name="repo" placeholder="https://github.com/owner/RepoName.git" required></label><label>Port<input name="port" type="number" placeholder="auto"></label><button class="button" type="submit">Add + clone</button></div><p class="muted">Configure preview and tab templates after the project is added.</p></form></article><div class="grid manage-grid">${rows}</div>${tabsScript}</body></html>`);
 });
 
-app.post('/manage/add', async (req,res,next)=>{ try {
+app.post('/manage/add', requireAdmin, async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
  if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!repo) throw new Error('Repository URL is required');
@@ -341,10 +571,11 @@ app.post('/manage/add', async (req,res,next)=>{ try {
   const p = { name, repo, path: workspacePath(name), port };
   await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
  });
+ await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
  res.redirect('/manage?msg='+encodeURIComponent(`Added ${name}`));
  } catch(e){ next(e); }});
 
-app.post('/manage/update/:oldName', async (req,res,next)=>{ try {
+app.post('/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
  const oldName = req.params.oldName; const newName = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); const port = Number(req.body.port);
  const previewCmd = String(req.body.previewCmd || '').trim();
  const previewPortRaw = String(req.body.previewPort || '').trim();
@@ -398,30 +629,34 @@ app.post('/manage/update/:oldName', async (req,res,next)=>{ try {
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
  await saveProjects(projects); await applyRouting(projects); await startProject(p);
- }); res.redirect('/manage?msg='+encodeURIComponent(`Updated ${newName}`));
+ });
+ await audit('project_update', { oldName, newName, port }, req);
+ res.redirect('/manage?msg='+encodeURIComponent(`Updated ${newName}`));
  } catch(e){ next(e); }});
 
-app.post('/manage/delete/:name', async (req,res,next)=>{ try {
+app.post('/manage/delete/:name', requireAdmin, async (req,res,next)=>{ try {
  if(req.body.confirm !== 'yes') throw new Error('Delete confirmation required'); const name = req.params.name;
  await withProjectsLock(async () => {
   const projects = await loadProjects(); const idx = projects.findIndex(p=>p.name===name); if(idx<0) throw new Error('Project not found'); const [p] = projects.splice(idx,1);
   await stopProject(name); await removeWorkspace(p); await saveProjects(projects); await applyRouting(projects);
  });
+ await audit('project_delete', { project: name }, req);
  res.redirect('/manage?msg='+encodeURIComponent(`Deleted ${name} and removed local workspace`));
  } catch(e){ next(e); }});
 
-app.get('/api/projects/status', async (_req,res)=>{ try {
- const projects = await loadProjects();
+app.get('/api/projects/status', requireAuth, async (req,res)=>{ try {
+ const all = await loadProjects();
+ const projects = filterProjectsForUser(all, req.user);
  const out = await Promise.all(projects.map(async p => ({ name: p.name, ...(await readPending(p)) })));
  res.json({ ok:true, projects: out });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/projects/:name/clear-pending', async (req,res)=>{ try {
+app.post('/api/projects/:name/clear-pending', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.name); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  await clearPending(p); res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/projects/reorder', async (req,res)=>{ try {
+app.post('/api/projects/reorder', requireAdmin, async (req,res)=>{ try {
  const order = req.body?.order;
  if(!Array.isArray(order)) return res.status(400).json({ok:false,error:'order must be an array of names'});
  await withProjectsLock(async () => {
@@ -435,25 +670,25 @@ app.post('/api/projects/reorder', async (req,res)=>{ try {
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/term/:project/windows', async (req,res)=>{ try {
+app.get('/api/term/:project/windows', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  const windows = await listTmuxWindows(p.name);
  res.json({ok:true,windows});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/term/:project/windows', async (req,res)=>{ try {
+app.post('/api/term/:project/windows', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  await newTmuxWindow(p, req.body?.name || 'new task', req.body?.cmd || '');
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/term/:project/windows/:index/select', async (req,res)=>{ try {
+app.post('/api/term/:project/windows/:index/select', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  await tmux(['select-window','-t',`${tmuxSession(p.name)}:${Number(req.params.index)}`]);
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/term/:project/windows/:index/rename', async (req,res)=>{ try {
+app.post('/api/term/:project/windows/:index/rename', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  const name = String(req.body?.name || '').replace(/[\r\n\t]/g,' ').trim().slice(0,80);
  if(!name) return res.status(400).json({ok:false,error:'Window name required'});
@@ -461,7 +696,7 @@ app.post('/api/term/:project/windows/:index/rename', async (req,res)=>{ try {
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.delete('/api/term/:project/windows/:index', async (req,res)=>{ try {
+app.delete('/api/term/:project/windows/:index', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  const windows = await listTmuxWindows(p.name);
  if(windows.length <= 1) return res.status(400).json({ok:false,error:'Cannot close the last session'});
@@ -469,17 +704,17 @@ app.delete('/api/term/:project/windows/:index', async (req,res)=>{ try {
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/term/:project/', async (req,res)=>{
+app.get('/term/:project/', requireTerminalAccess, async (req,res)=>{ await audit('terminal_open', { project: req.params.project }, req);
  const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); const projectJson = JSON.stringify(p.name);
  const tabPresetsJson = JSON.stringify(Array.isArray(p.tabs) ? p.tabs : []);
  await clearPending(p);
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} terminal</title><style>html,body{margin:0;width:100%;height:100%;overflow:hidden;background:#1f1f1f;color:#e5e7eb;font-family:system-ui,-apple-system,Segoe UI,sans-serif}body{display:flex;flex-direction:column}iframe{border:0;width:100%;flex:1 1 auto;min-height:0;display:block;background:#1f1f1f}#topBar{flex:0 0 34px;width:100%;height:34px;background:linear-gradient(180deg,rgba(15,23,42,.96),rgba(15,23,42,.82));color:#dbeafe;border-bottom:1px solid #334155;font:13px system-ui;box-shadow:0 2px 10px #0008;display:flex;align-items:center;justify-content:space-between;gap:8px;letter-spacing:.01em;padding:0 14px;box-sizing:border-box}.leftInfo{display:flex;align-items:center;gap:12px;min-width:0}.backLink{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:3px 9px;background:#0f172a}.backLink:hover{background:#1e293b;color:#fff}.projectInfo{font-weight:700;color:#f8fafc;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fileInfo{color:#dbeafe;font-weight:500}#fileBtn{background:transparent;border:0;color:#dbeafe;font:inherit;cursor:pointer;display:flex;align-items:center;gap:8px;padding:4px 0}#fileBtn:hover{color:#fff}#fileBtn::before{content:'⬇'}body.shade-open #fileBtn::before{content:'⬆'}#tray{flex:0 0 auto;max-height:0;overflow:hidden;background:rgba(15,23,42,.98);color:#e5e7eb;border-bottom:0 solid #334155;box-shadow:0 6px 18px #0008;transition:max-height .18s ease,padding .18s ease,border-width .18s ease;padding:0 18px;box-sizing:border-box;display:grid;grid-template-columns:minmax(0,1fr) minmax(0,1fr);grid-template-areas:"header header" "list dropzone" "status status";gap:12px;align-items:stretch}#inboxHeader{grid-area:header}#inboxList{grid-area:list}#drop,#preview{grid-area:dropzone}#status{grid-area:status}body.has-preview #drop{display:none}body:not(.has-preview) #preview{display:none}@media(max-width:640px){#tray{grid-template-columns:1fr;grid-template-areas:"header" "dropzone" "list" "status"}#topBar{padding:0 8px;gap:6px}.leftInfo{gap:6px;min-width:0}.backLink{padding:3px 7px;font-size:12px}.projectInfo{display:none}.previewBtn{padding:3px 9px;font-size:12px;margin-right:4px}.fileInfo{display:none}#fileBtn{font-size:18px;padding:4px 6px}.tabStrip{padding:0 4px;gap:3px}.tabStrip .tab{max-width:140px;padding:2px 6px}.tabStrip .tab .name{max-width:100px}.tabStrip .newTab{padding:1px 7px;font-size:13px}}body.shade-open #tray{max-height:560px;border-bottom-width:1px;padding:14px 18px 16px}#drop{border:2px dashed #64748b;border-radius:14px;padding:30px 18px;text-align:center;background:#111827;outline:none;cursor:pointer;min-height:130px;display:flex;flex-direction:column;justify-content:center;width:100%;box-sizing:border-box}#status{white-space:pre-wrap;color:#94a3b8;font-size:13px;line-height:1.35}button,label{font:inherit}.close{display:none}code{color:#bfdbfe}img{max-width:100%;max-height:380px;border-radius:8px;margin-top:0;border:1px solid #334155;display:block}.previewItem{position:relative;display:inline-block;max-width:100%}.previewItem a{display:block}.previewClear{position:absolute;top:6px;right:6px;background:rgba(15,23,42,.9);border:1px solid #334155;color:#fca5a5;border-radius:50%;width:26px;height:26px;line-height:22px;text-align:center;font-size:16px;cursor:pointer;padding:0;font-family:inherit}.previewClear:hover{background:#0f172a;color:#fff;border-color:#94a3b8}.tabStrip{flex:1 1 auto;display:flex;align-items:center;gap:4px;overflow-x:auto;min-width:0;padding:0 10px;scrollbar-width:thin}.tabStrip::-webkit-scrollbar{height:6px}.tabStrip::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}.tabStrip .tab{display:inline-flex;align-items:center;gap:4px;background:#0f172a;border:1px solid #334155;border-radius:6px;padding:3px 8px;color:#cbd5e1;cursor:pointer;font-size:12px;line-height:1.4;white-space:nowrap;user-select:none;max-width:180px;flex:0 0 auto}.tabStrip .tab:hover{background:#1e293b;color:#fff}.tabStrip .tab.active{background:#1e3a8a;border-color:#3b82f6;color:#fff}.tabStrip .tab .name{overflow:hidden;text-overflow:ellipsis;max-width:140px;cursor:pointer}.tabStrip .tab.active .name{cursor:text}.tabStrip .tab .name.editing{outline:1px solid #60a5fa;background:#0f172a;border-radius:3px;padding:0 4px;max-width:none;cursor:text}.inboxHeader{display:flex;justify-content:space-between;align-items:center;color:#cbd5e1;font-size:12px;letter-spacing:.02em;margin-top:2px;min-height:22px}.inboxHeader .clear{font-size:12px;color:#fca5a5;background:transparent;border:1px solid #4b5563;border-radius:6px;padding:3px 8px;cursor:pointer}.inboxHeader .clear:hover{background:#1f2937;color:#fff;border-color:#94a3b8}.inboxList{display:flex;flex-direction:column;gap:3px;max-height:240px;overflow-y:auto;border-top:1px solid #1f2937;padding-top:6px;margin:0;scrollbar-width:thin}.inboxList::-webkit-scrollbar{width:6px}.inboxList::-webkit-scrollbar-thumb{background:#334155;border-radius:3px}.inboxList .row{display:flex;align-items:center;gap:8px;padding:4px 6px;border-radius:6px;cursor:pointer;background:#0f172a;border:1px solid transparent}.inboxList .row:hover{background:#1e293b;border-color:#334155}.inboxList .thumb{width:36px;height:36px;background:#1f2937;border-radius:4px;display:flex;align-items:center;justify-content:center;flex:0 0 36px;overflow:hidden;color:#64748b;font-size:11px;font-weight:600}.inboxList .thumb img{width:100%;height:100%;object-fit:cover;border-radius:4px;border:0;margin:0;max-height:none}.inboxList .nameCol{flex:1 1 auto;min-width:0;overflow:hidden}.inboxList .nameCol .name{font-size:12px;color:#e5e7eb;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.inboxList .nameCol .meta{font-size:11px;color:#94a3b8}.inboxList .del{flex:0 0 auto;color:#fca5a5;background:transparent;border:0;cursor:pointer;font-size:16px;line-height:1;padding:2px 6px;border-radius:4px;font-family:inherit}.inboxList .del:hover{background:#1f2937;color:#fff}#pwHoverPreview{position:fixed;z-index:9999;pointer-events:none;background:#0f172a;border:1px solid #475569;border-radius:8px;padding:6px;box-shadow:0 14px 36px rgba(0,0,0,.7);display:none;max-width:440px}#pwHoverPreview img{display:block;max-width:420px;max-height:420px;border-radius:4px;border:0;margin:0}#pwHoverPreview .card{padding:14px;color:#cbd5e1;font:13px system-ui;max-width:320px;word-break:break-all;line-height:1.45}#pwHoverPreview .card .meta{margin-top:6px;color:#94a3b8;font-size:11px}.tabStrip .tab .x{opacity:.55;font-size:14px;line-height:1;padding:0 3px;border-radius:3px}.tabStrip .tab .x:hover{opacity:1;color:#fca5a5;background:#0f172a}.tabStrip .newTab{background:transparent;border:1px dashed #475569;color:#94a3b8;cursor:pointer;padding:2px 8px;border-radius:6px;font-size:14px;line-height:1.2;flex:0 0 auto}.tabStrip .newTab:hover{color:#fff;border-color:#94a3b8}.tabMenu{position:fixed;z-index:9999;background:#0f172a;border:1px solid #334155;border-radius:8px;box-shadow:0 14px 36px rgba(0,0,0,.65);padding:.35rem;min-width:220px;max-width:380px;display:flex;flex-direction:column;gap:2px;font:13px system-ui,-apple-system,Segoe UI,sans-serif}.tabMenuItem{background:transparent;border:0;color:#e5e7eb;text-align:left;padding:.45rem .6rem;border-radius:6px;cursor:pointer;font:inherit;display:flex;flex-direction:column;gap:2px}.tabMenuItem:hover{background:#1e293b}.tabMenuItem .ti-name{font-weight:600;color:#f8fafc}.tabMenuItem .ti-cmd{color:#94a3b8;font:11px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:340px}.tabMenuItem.blank{border-top:1px solid #1f2937;margin-top:2px;padding-top:.5rem;color:#cbd5e1}.tabMenuItem.empty{color:#64748b;font-style:italic;cursor:default}.tabMenuItem.empty:hover{background:transparent}.previewBtn{background:transparent;border:1px solid #334155;color:#bfdbfe;border-radius:999px;padding:3px 11px;cursor:pointer;font:inherit;margin-right:8px;letter-spacing:.02em}.previewBtn:hover{background:#1e293b;color:#fff;border-color:#94a3b8}${modalBaseCss}${previewCss}</style></head><body><div id="topBar"><div class="leftInfo"><a class="backLink" href="/">← Back</a><span class="projectInfo">Project: ${esc(p.name)}</span></div><div id="tabStrip" class="tabStrip"></div><button class="previewBtn" type="button" data-preview="${esc(p.name)}" title="Open live preview window">Preview</button><button id="fileBtn" type="button" title="Open file shade"><span class="fileInfo">Files / paste or drop into project</span></button></div><div id="tray"><div id="drop" tabindex="0"><div>Paste/drop/select files here</div><div style="color:#94a3b8;margin-top:6px">PDF, txt, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status">Saved files go to <code>${esc(p.path)}/_inbox</code>. The path will be inserted into the terminal.</div><div id="preview"></div><div id="inboxHeader" class="inboxHeader"></div><div id="inboxList" class="inboxList"></div><button class="close" id="close">Close</button></div><iframe id="term" src="/pty/${encodeURIComponent(p.name)}/"></iframe><script>const project=${projectJson};const tabPresets=${tabPresetsJson};const tray=document.getElementById('tray'),drop=document.getElementById('drop'),file=document.getElementById('file'),status=document.getElementById('status'),preview=document.getElementById('preview'),inboxHeader=document.getElementById('inboxHeader'),inboxList=document.getElementById('inboxList'),frame=document.getElementById('term');let previewTimer=null;const hoverPanel=Object.assign(document.createElement('div'),{id:'pwHoverPreview'});document.body.appendChild(hoverPanel);function setStatus(t,bad=false){status.textContent=t;status.style.color=bad?'#fca5a5':'#bbf7d0'}function clearPreview(){preview.innerHTML='';document.body.classList.remove('has-preview');setStatus('');if(previewTimer){clearTimeout(previewTimer);previewTimer=null}}function showPreview(url,name,isImage){if(!url&&!name)return clearPreview();if(previewTimer){clearTimeout(previewTimer);previewTimer=null}document.body.classList.add('has-preview');const safeName=escHtml(name||'file');if(isImage&&url){preview.innerHTML='<div class="previewItem"><a href="'+url+'" target="_blank" rel="noopener"><img src="'+url+'" alt="'+safeName+'"></a><button class="previewClear" type="button" title="Clear preview">×</button></div>'}else{preview.innerHTML='<div class="previewItem"><div style="padding:18px;border:1px solid #334155;border-radius:8px;color:#cbd5e1;text-align:center;display:flex;align-items:center;justify-content:center;min-height:130px;word-break:break-all;background:#111827">'+safeName+'</div><button class="previewClear" type="button" title="Clear preview">×</button></div>'}preview.querySelector('.previewClear').onclick=clearPreview;previewTimer=setTimeout(clearPreview,15000)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function refreshInbox(){try{const r=await fetch('/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const out=await r.json();if(!out?.ok){inboxHeader.innerHTML='';inboxList.innerHTML='';return}const files=out.files||[];if(files.length===0){inboxHeader.innerHTML='<span>No saved files yet.</span>';inboxList.innerHTML='';return}inboxHeader.innerHTML='<span>'+files.length+' saved file'+(files.length===1?'':'s')+' — click a row to insert its path</span><button class="clear" type="button">Clear all</button>';inboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s inbox?'))return;await fetch('/api/inbox/'+encodeURIComponent(project),{method:'DELETE'});refreshInbox()};inboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';row.title='Click to insert path: '+f.path;const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);row.innerHTML='<div class="thumb">'+(isImg?'<img src="'+f.url+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+'</div></div><button class="del" type="button" title="Delete">×</button>';row.onclick=ev=>{if(ev.target.closest('.del'))return;if(insertPath(f.path)){setStatus('Inserted:\\n'+f.path)}else{setStatus('Could not insert (no terminal focus)',true)}};row.onmouseenter=()=>{hoverPanel.innerHTML=isImg?'<img src="'+f.url+'">':'<div class="card">'+escHtml(f.name)+'<div class="meta">'+fmtSize(f.size)+'</div></div>';hoverPanel.style.display='block';const rct=row.getBoundingClientRect(),pw=hoverPanel.offsetWidth,ph=hoverPanel.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;let lf=rct.right+10;if(lf+pw>vw-8)lf=Math.max(8,rct.left-pw-10);let tp=rct.top-4;if(tp+ph>vh-8)tp=Math.max(8,vh-ph-8);if(tp<8)tp=8;hoverPanel.style.left=lf+'px';hoverPanel.style.top=tp+'px'};row.onmouseleave=()=>{hoverPanel.style.display='none'};row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();hoverPanel.style.display='none';await fetch('/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(f.name),{method:'DELETE'});refreshInbox()};inboxList.appendChild(row)}}catch{}}function openTray(msg){document.body.classList.add('shade-open');setTimeout(()=>drop.focus(),50);if(msg)setStatus(msg);refreshInbox()}function closeTray(){document.body.classList.remove('shade-open');clearPreview();frame.contentWindow?.focus()}function toggleTray(){document.body.classList.contains('shade-open')?closeTray():openTray()}document.getElementById('fileBtn').onclick=toggleTray;document.getElementById('close').onclick=closeTray;function insertPath(path){try{if(frame.contentWindow.__pwSendToTerminal?.(path))return true}catch{}try{const ta=frame.contentDocument.querySelector('textarea.xterm-helper-textarea')||frame.contentDocument.querySelector('textarea');if(!ta)return false;ta.focus();const dt=new DataTransfer();dt.setData('text/plain',path);ta.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));return true}catch{return false}}async function upload(blob,name='clipboard-file'){if(!blob)return setStatus('No file received.',true);setStatus('Saving file...');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const res=await fetch('/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name,mime:blob.type||'application/octet-stream',data})});const out=await res.json().catch(()=>null);if(!res.ok||!out?.ok)throw new Error(out?.error||'Upload failed');const ok=insertPath(out.path);try{await navigator.clipboard.writeText(out.path)}catch{}showPreview(out.url,name||'file',(blob.type||'').startsWith('image/'));setStatus('Saved and '+(ok?'inserted':'copied')+':\\n'+out.path);refreshInbox()}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name).catch(e=>setStatus(e.message||String(e),true));drop.addEventListener('dragover',e=>{e.preventDefault();drop.style.borderColor='#60a5fa'});drop.addEventListener('dragleave',()=>drop.style.borderColor='#64748b');drop.addEventListener('drop',e=>{e.preventDefault();drop.style.borderColor='#64748b';upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))});window.addEventListener('paste',e=>{const items=[...(e.clipboardData?.items||[])];const item=items.find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();openTray('Saving pasted file...');upload(f,f?.name||'clipboard-file').catch(err=>setStatus(err.message||String(err),true))},true);let dragDepth=0;window.addEventListener('dragenter',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();dragDepth++;openTray('Drop files here to save them into _inbox.')}},true);window.addEventListener('dragover',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.style.borderColor='#60a5fa'}},true);window.addEventListener('dragleave',e=>{if(e.dataTransfer?.types?.includes('Files')){dragDepth=Math.max(0,dragDepth-1);if(dragDepth===0)drop.style.borderColor='#64748b'}},true);window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();dragDepth=0;drop.style.borderColor='#64748b';openTray();upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))}},true);window.addEventListener('message',e=>{const d=e.data;if(!d||typeof d!=='object')return;if(d.type==='pw-open-image-tray'){openTray(d.message||'Paste the file here.')}else if(d.type==='pw-paste-saved'){openTray();const base=(d.path||'').split('/').pop()||'file';showPreview(d.url,base,/\\.(png|jpe?g|webp|gif|bmp)$/i.test(base));setStatus('Saved and inserted:\\n'+d.path);refreshInbox()}else if(d.type==='pw-paste-error'){openTray();setStatus('Paste failed: '+d.error,true)}});const tabStrip=document.getElementById('tabStrip');const tabsBase='/api/term/'+encodeURIComponent(project)+'/windows';let lastTabsKey='';let editingIdx=null;let editAfterRender=false;function startEdit(label,w){editingIdx=w.index;const original=label.textContent;label.contentEditable='true';label.classList.add('editing');label.focus();const sel=window.getSelection();const range=document.createRange();range.selectNodeContents(label);sel.removeAllRanges();sel.addRange(range);let done=false;const finish=async save=>{if(done)return;done=true;label.contentEditable='false';label.classList.remove('editing');label.removeEventListener('keydown',onKey);label.removeEventListener('blur',onBlur);const next=label.textContent.trim();editingIdx=null;if(save&&next&&next!==w.name){try{await fetch(tabsBase+'/'+w.index+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:next})})}catch{}lastTabsKey='';refreshTabs()}else if(!save){label.textContent=original}};const onKey=ev=>{if(ev.key==='Enter'){ev.preventDefault();finish(true)}else if(ev.key==='Escape'){ev.preventDefault();finish(false)}};const onBlur=()=>finish(true);label.addEventListener('keydown',onKey);label.addEventListener('blur',onBlur)}function closeTabMenu(){document.querySelector('.tabMenu')?.remove();document.removeEventListener('click',closeTabMenu,true);document.removeEventListener('keydown',tabMenuKey,true)}function tabMenuKey(e){if(e.key==='Escape')closeTabMenu()}async function spawnTab(name,cmd){editAfterRender=!name;await fetch(tabsBase,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name||'new task',cmd:cmd||''})});lastTabsKey='';refreshTabs()}function openTabMenu(anchor,windows){closeTabMenu();const menu=document.createElement('div');menu.className='tabMenu';menu.addEventListener('click',e=>e.stopPropagation());const existing=new Set((windows||[]).map(w=>w.name));const usable=(tabPresets||[]).filter(t=>t&&t.name&&!existing.has(t.name));for(const t of usable){const item=document.createElement('button');item.type='button';item.className='tabMenuItem';item.innerHTML='<span class="ti-name">'+escHtml(t.name)+'</span>'+(t.cmd?'<span class="ti-cmd">'+escHtml(t.cmd)+'</span>':'');item.onclick=()=>{spawnTab(t.name,t.cmd||'');closeTabMenu()};menu.appendChild(item)}if(usable.length===0&&(tabPresets||[]).length>0){const note=document.createElement('div');note.className='tabMenuItem empty';note.textContent='All tab templates are already open';menu.appendChild(note)}const blank=document.createElement('button');blank.type='button';blank.className='tabMenuItem blank';blank.innerHTML='<span class="ti-name">+ Blank tab</span><span class="ti-cmd">plain bash, name it after creation</span>';blank.onclick=()=>{spawnTab('','');closeTabMenu()};menu.appendChild(blank);document.body.appendChild(menu);const r=anchor.getBoundingClientRect();const mw=menu.offsetWidth||220;let lf=r.left;if(lf+mw>window.innerWidth-8)lf=Math.max(8,window.innerWidth-mw-8);menu.style.left=lf+'px';menu.style.top=(r.bottom+4)+'px';setTimeout(()=>{document.addEventListener('click',closeTabMenu,true);document.addEventListener('keydown',tabMenuKey,true)},0)}async function refreshTabs(){if(editingIdx!=null)return;try{const r=await fetch(tabsBase,{cache:'no-store'});const out=await r.json();if(!out?.ok){tabStrip.innerHTML='';lastTabsKey='';return}const key=JSON.stringify(out.windows);if(key===lastTabsKey)return;lastTabsKey=key;renderTabs(out.windows)}catch{}}function renderTabs(windows){tabStrip.innerHTML='';for(const w of windows){const tab=document.createElement('div');tab.className='tab'+(w.active?' active':'');tab.title=w.active?'Click name to rename':'Window '+w.index+': '+(w.name||'');const label=document.createElement('span');label.className='name';label.textContent=w.name||('#'+w.index);label.onclick=ev=>{if(!w.active)return;ev.stopPropagation();startEdit(label,w)};tab.appendChild(label);if(windows.length>1){const x=document.createElement('span');x.className='x';x.textContent='×';x.title='Close window';x.onclick=async ev=>{ev.stopPropagation();if(!confirm('Close window "'+(w.name||w.index)+'"? Any running process in it will be killed.'))return;await fetch(tabsBase+'/'+w.index,{method:'DELETE'});lastTabsKey='';refreshTabs()};tab.appendChild(x)}tab.onclick=async()=>{if(w.active)return;await fetch(tabsBase+'/'+w.index+'/select',{method:'POST'});lastTabsKey='';refreshTabs()};tabStrip.appendChild(tab)}const plus=document.createElement('button');plus.className='newTab';plus.textContent='+';plus.title='New tab';plus.onclick=ev=>{ev.stopPropagation();openTabMenu(plus,windows)};tabStrip.appendChild(plus);if(editAfterRender){editAfterRender=false;const ai=windows.find(w=>w.active);if(ai){const tabs=tabStrip.querySelectorAll('.tab');const i=windows.indexOf(ai);const lbl=tabs[i]?.querySelector('.name');if(lbl)startEdit(lbl,ai)}}}refreshTabs();setInterval(()=>{if(!document.hidden)refreshTabs()},2000);async function pwHeartbeat(){if(document.hidden)return;try{await fetch('/api/projects/'+encodeURIComponent(project)+'/clear-pending',{method:'POST'})}catch{}}pwHeartbeat();setInterval(pwHeartbeat,10000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwHeartbeat()});</script>${previewModalHtml}${previewScript}</body></html>`);
 });
 
-app.post('/api/upload/:project', async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); return res.json({ok:true,path:full,url:`/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
-app.get('/file/:project/:file', async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
+app.post('/api/upload/:project', requireTerminalAccess, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); await audit('upload', { project: p.name, filename: path.basename(full), bytes: Buffer.byteLength(data, 'base64') }, req); return res.json({ok:true,path:full,url:`/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
+app.get('/file/:project/:file', requireAuth, requireProjectAccess, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
 
-app.get('/api/inbox/:project', async (req,res)=>{ try {
+app.get('/api/inbox/:project', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const inbox = path.join(p.path, '_inbox');
  let entries; try { entries = await fs.readdir(inbox, {withFileTypes:true}); } catch { return res.json({ok:true,files:[]}); }
@@ -491,59 +726,59 @@ app.get('/api/inbox/:project', async (req,res)=>{ try {
  res.json({ok:true,files});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.delete('/api/inbox/:project/:file', async (req,res)=>{ try {
+app.delete('/api/inbox/:project/:file', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const name = path.basename(req.params.file); if(!name || name==='.' || name==='..') return res.status(400).json({ok:false,error:'Invalid file'});
  await fs.rm(path.join(p.path,'_inbox',name), {force:true});
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.delete('/api/inbox/:project', async (req,res)=>{ try {
+app.delete('/api/inbox/:project', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const inbox = path.join(p.path, '_inbox');
  try { const entries = await fs.readdir(inbox); await Promise.all(entries.map(n => fs.rm(path.join(inbox,n),{force:true,recursive:true}))); } catch {}
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-app.get('/api/preview/:project/status', async (req,res)=>{ try {
+app.get('/api/preview/:project/status', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const status = await previewStatus(p);
  res.json({ ok:true, project:p.name, cmd:p.preview?.cmd || '', ...status });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/preview/:project/start', async (req,res)=>{ try {
+app.post('/api/preview/:project/start', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  if(!hasPreview(p)) return res.status(400).json({ok:false,error:'Preview is not configured for this project. Edit it on the Manage page.'});
  await startPreviewUnit(p);
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/preview/:project/stop', async (req,res)=>{ try {
+app.post('/api/preview/:project/stop', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  await sh('systemctl',['stop',previewUnit(p.name)]).catch(()=>{});
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/preview/:project/restart', async (req,res)=>{ try {
+app.post('/api/preview/:project/restart', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  if(!hasPreview(p)) return res.status(400).json({ok:false,error:'Preview is not configured for this project.'});
  await startPreviewUnit(p);
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/preview/:project/logs', async (req,res)=>{ try {
+app.get('/api/preview/:project/logs', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const lines = Math.min(2000, Math.max(20, Number(req.query.lines) || 200));
  const log = await previewLogs(p.name, lines);
  res.json({ ok:true, log });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/setup/state', async (_req,res)=>{ try {
+app.get('/api/setup/state', requireAdmin, async (_req,res)=>{ try {
  const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatuses()]);
  const updateStamp = await getClaudeUpdateStamp();
  res.json({ ok:true, settings, clis, updateStamp });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/state', async (req,res)=>{ try {
+app.post('/api/setup/state', requireAdmin, async (req,res)=>{ try {
  const s = await loadWorkbenchSettings();
  const body = req.body || {};
  if(typeof body.permissionMode === 'string') s.permissionMode = normalizePermissionMode(body.permissionMode);
@@ -551,16 +786,17 @@ app.post('/api/setup/state', async (req,res)=>{ try {
  if(Array.isArray(body.enabledClis)) s.enabledClis = [...new Set(body.enabledClis.filter(c => c in SUPPORTED_CLIS))];
  if(Array.isArray(body.updateClis)) s.updateClis = [...new Set(body.updateClis.filter(c => c in SUPPORTED_CLIS))];
  await saveWorkbenchSettings(s);
+ await audit('setup_state_change', { permissionMode: s.permissionMode, mcpMode: s.mcpMode, enabledClis: s.enabledClis, updateClis: s.updateClis }, req);
  res.json({ ok:true, settings:s });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/heal/nginx', async (_req,res)=>{ try {
+app.post('/api/setup/heal/nginx', requireAdmin, async (_req,res)=>{ try {
  const projects = await loadProjects();
  await applyRouting(projects);
  res.json({ ok:true, message:`Regenerated nginx config from projects.json (${projects.length} project route${projects.length===1?'':'s'} + /pty/_setup/) and reloaded nginx.` });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/heal/dirs', async (_req,res)=>{ try {
+app.post('/api/setup/heal/dirs', requireAdmin, async (_req,res)=>{ try {
  const steps = [];
  for(const d of [pendingDir,'/etc/project-workbench','/opt/project-workbench/workspaces','/opt/project-workbench/memory']){
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
@@ -575,7 +811,7 @@ app.post('/api/setup/heal/dirs', async (_req,res)=>{ try {
  res.json({ ok:true, message: steps.join('\n') });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/cli/install', async (req,res)=>{ try {
+app.post('/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
  const cli = String(req.body?.cli || '');
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
  const { stdout, stderr } = await sh('npm',['install','-g',`${cfg.pkg}@latest`],{timeout:300000});
@@ -583,7 +819,7 @@ app.post('/api/setup/cli/install', async (req,res)=>{ try {
  res.json({ ok:true, version: version || 'not installed', log:(stdout+stderr).slice(-1500) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/cli/auth', async (req,res)=>{ try {
+app.post('/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
  const cli = String(req.body?.cli || '');
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
  const ready = await ensureSetupTerminal();
@@ -595,5 +831,75 @@ app.post('/api/setup/cli/auth', async (req,res)=>{ try {
 app.get('/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
 app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
 app.get('/healthz', (_req,res)=>res.json({ok:true}));
+
+// ============================================================================
+// Auth routes (Phase 1)
+// ============================================================================
+const loginCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e5e7eb}.card{background:#111827;border:1px solid #334155;border-radius:14px;padding:2rem 1.75rem;max-width:380px;width:calc(100% - 2rem);box-shadow:0 30px 80px rgba(0,0,0,.6)}h1{margin:0 0 .35rem;font-size:1.45rem}.sub{margin:0 0 1.5rem;color:#94a3b8;font-size:.9rem}label{display:block;margin:.75rem 0 .3rem;font-size:.85rem;color:#cbd5e1}input{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.6rem;width:100%;box-sizing:border-box;font:inherit}.button{display:inline-block;background:#2563eb;color:white;padding:.65rem 1rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit;width:100%;margin-top:1rem}.button:hover{background:#1d4ed8}.err{margin-top:.85rem;color:#fca5a5;font-size:.85rem;min-height:1.2em}.foot{margin-top:1.25rem;color:#64748b;font-size:.75rem;text-align:center}`;
+app.get('/login', (req,res) => {
+ if(req.user && !req.user.implicit){ return res.redirect(req.query.next ? String(req.query.next) : '/'); }
+ const next = req.query.next ? String(req.query.next) : '/';
+ const msg = req.query.msg ? String(req.query.msg) : '';
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Project Workbench</title><style>${loginCss}</style></head><body><div class="card"><h1>Project Workbench</h1><p class="sub">Sign in to continue.</p><form id="loginForm"><label>Username<input id="u" name="username" autocomplete="username" autofocus required></label><label>Password<input id="p" name="password" type="password" autocomplete="current-password" required></label><button class="button" type="submit">Sign in</button><div class="err" id="err">${esc(msg)}</div></form><div class="foot">${AUTH_ENFORCE ? 'Authentication enforced (PW_AUTH_ENFORCE=true)' : 'Authentication available; enforcement currently OFF'}</div></div><script>const next=${JSON.stringify(next)};document.getElementById('loginForm').addEventListener('submit',async e=>{e.preventDefault();const u=document.getElementById('u').value;const p=document.getElementById('p').value;const err=document.getElementById('err');err.textContent='Signing in…';try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});const j=await r.json();if(!j.ok){err.textContent=j.error||'Login failed';return}location.href=next}catch(e){err.textContent=e.message||String(e)}});</script></body></html>`);
+});
+
+app.post('/api/auth/login', async (req,res) => {
+ try {
+  const username = String(req.body?.username || '').trim();
+  const password = String(req.body?.password || '');
+  if(!username || !password){ await audit('login_fail', { reason:'missing-fields', username }, req); return res.status(400).json({ ok:false, error:'Username and password required' }); }
+  const users = await loadUsers();
+  const u = users.find(x => x.username === username);
+  if(!u){ await audit('login_fail', { reason:'unknown-user', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
+  const ok = await verifyPassword(password, u.passwordHash);
+  if(!ok){ await audit('login_fail', { reason:'bad-password', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
+  const sid = await createSession(u.id);
+  setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
+  // Record lastLoginAt opportunistically (best-effort, don't fail the login if it can't write).
+  try { u.lastLoginAt = new Date().toISOString(); await saveUsers(users); } catch {}
+  req.user = u;
+  await audit('login_ok', { username }, req);
+  res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.post('/api/auth/logout', async (req,res) => {
+ try {
+  const sid = getCookie(req, SESSION_COOKIE);
+  if(sid) await revokeSession(sid);
+  clearSessionCookie(req, res);
+  await audit('logout', {}, req);
+  res.json({ ok:true });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.get('/api/auth/me', (req,res) => {
+ if(!req.user){ return res.status(401).json({ ok:false, authenticated:false, enforce: AUTH_ENFORCE }); }
+ res.json({ ok:true, authenticated: !req.user.implicit, enforce: AUTH_ENFORCE, user: { username:req.user.username, role:req.user.role, projects:req.user.projects, implicit: !!req.user.implicit } });
+});
+
+// nginx auth_request subrequest. Returns 200 if the cookie's user can access
+// ?project=<name>; 401/403 otherwise. nginx then allows or blocks the parent.
+// ?admin=1 forces an admin-only check regardless of project (used for the
+// shared setup terminal at /pty/_setup/).
+app.get('/api/auth/check', async (req,res) => {
+ try {
+  const project = String(req.query.project || '');
+  const adminOnly = String(req.query.admin || '') === '1';
+  if(!req.user){
+   if(!AUTH_ENFORCE) return res.status(200).end(); // soft mode: allow.
+   return res.status(401).end();
+  }
+  if(adminOnly){
+   return res.status(req.user.role === 'admin' ? 200 : 403).end();
+  }
+  if(req.user.role === 'admin') return res.status(200).end();
+  if(project){
+   if(!TERMINAL_ROLES.has(req.user.role)) return res.status(403).end();
+   if(!userHasProjectAccess(req.user, project)) return res.status(403).end();
+  }
+  return res.status(200).end();
+ } catch { res.status(500).end(); }
+});
 app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
 app.listen(3000,'127.0.0.1',()=>{ console.log('dashboard listening on 127.0.0.1:3000'); sweepOrphanTmuxSessions(); });

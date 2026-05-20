@@ -1,0 +1,253 @@
+#!/usr/bin/env node
+// pw-user — manage Project Workbench users (Phase 1 CLI).
+// Operates directly on /etc/project-workbench/users.json. Same scrypt
+// hash format and role taxonomy as app/server.js.
+//
+// Usage:
+//   pw-user list
+//   pw-user add <username> --role <role> [--projects '*'|'A,B,C']
+//   pw-user passwd <username>
+//   pw-user role <username> <role>
+//   pw-user grant <username> <project|*>
+//   pw-user revoke <username> <project|*>
+//   pw-user delete <username>
+//
+// Roles: admin, developer, content_editor, viewer.
+
+import fs from 'fs/promises';
+import path from 'path';
+import crypto from 'crypto';
+import readline from 'readline';
+import { promisify } from 'util';
+
+const USERS_PATH = '/etc/project-workbench/users.json';
+const ROLES = ['admin', 'developer', 'content_editor', 'viewer'];
+const scryptAsync = promisify(crypto.scrypt);
+
+function usage(code = 0) {
+ const txt = `pw-user — Project Workbench user management
+
+Commands:
+  list
+  add <username> --role <role> [--projects '*'|'A,B,C']
+  passwd <username>
+  role <username> <role>
+  grant <username> <project|*>
+  revoke <username> <project|*>
+  delete <username>
+
+Roles: ${ROLES.join(', ')}
+Users file: ${USERS_PATH}
+Run as a user who can write that file (usually root).`;
+ process.stderr.write(txt + '\n');
+ process.exit(code);
+}
+
+function die(msg) { process.stderr.write('pw-user: ' + msg + '\n'); process.exit(1); }
+
+function validUsername(s) { return typeof s === 'string' && /^[A-Za-z0-9._-]+$/.test(s) && s.length <= 64; }
+
+async function loadUsers() {
+ try {
+  const raw = await fs.readFile(USERS_PATH, 'utf8');
+  const data = JSON.parse(raw);
+  return Array.isArray(data?.users) ? data.users : [];
+ } catch (e) {
+  if (e.code === 'ENOENT') return [];
+  throw e;
+ }
+}
+
+async function saveUsers(users) {
+ await fs.mkdir(path.dirname(USERS_PATH), { recursive: true });
+ const tmp = USERS_PATH + '.tmp';
+ await fs.writeFile(tmp, JSON.stringify({ users }, null, 2) + '\n', { mode: 0o600 });
+ await fs.rename(tmp, USERS_PATH);
+ await fs.chmod(USERS_PATH, 0o600).catch(() => {});
+}
+
+async function hashPassword(plain) {
+ const salt = crypto.randomBytes(16);
+ const hash = await scryptAsync(String(plain), salt, 64, { N: 16384, r: 8, p: 1 });
+ return `scrypt$${salt.toString('base64')}$${Buffer.from(hash).toString('base64')}`;
+}
+
+function parseArgs(argv) {
+ const positional = [];
+ const flags = {};
+ for (let i = 0; i < argv.length; i++) {
+  const a = argv[i];
+  if (a.startsWith('--')) {
+   const k = a.slice(2);
+   const next = argv[i + 1];
+   if (next && !next.startsWith('--')) { flags[k] = next; i++; }
+   else flags[k] = true;
+  } else { positional.push(a); }
+ }
+ return { positional, flags };
+}
+
+function parseProjects(s) {
+ if (s === undefined || s === null || s === '') return [];
+ if (s === '*') return '*';
+ return String(s).split(',').map(x => x.trim()).filter(Boolean);
+}
+
+async function promptHidden(prompt) {
+ // Reads a single line from stdin. If stdin is a TTY, mute echo so the
+ // password doesn't show. If piped, just read the first line.
+ process.stdout.write(prompt);
+ if (!process.stdin.isTTY) {
+  return new Promise((resolve, reject) => {
+   const rl = readline.createInterface({ input: process.stdin });
+   rl.once('line', line => { rl.close(); resolve(line); });
+   rl.once('close', () => resolve(''));
+   rl.once('error', reject);
+  });
+ }
+ return new Promise((resolve, reject) => {
+  const stdin = process.stdin;
+  stdin.setRawMode(true);
+  stdin.resume();
+  stdin.setEncoding('utf8');
+  let buf = '';
+  const onData = (ch) => {
+   if (ch === '\n' || ch === '\r' || ch === '') {
+    stdin.setRawMode(false); stdin.pause(); stdin.removeListener('data', onData);
+    process.stdout.write('\n'); resolve(buf);
+   } else if (ch === '') {
+    process.stdout.write('\n^C\n'); process.exit(130);
+   } else if (ch === '' || ch === '\b') {
+    if (buf.length) buf = buf.slice(0, -1);
+   } else {
+    buf += ch;
+   }
+  };
+  stdin.on('data', onData);
+ });
+}
+
+async function promptPasswordTwice(prompt = 'Password: ', prompt2 = 'Confirm: ') {
+ const p1 = await promptHidden(prompt);
+ if (!p1) die('Password cannot be empty');
+ if (process.stdin.isTTY) {
+  const p2 = await promptHidden(prompt2);
+  if (p1 !== p2) die('Passwords do not match');
+ }
+ return p1;
+}
+
+function newUserId() { return 'u-' + crypto.randomBytes(6).toString('base64url'); }
+
+// --- commands -------------------------------------------------------------
+
+async function cmdList() {
+ const users = await loadUsers();
+ if (users.length === 0) { console.log('(no users)'); return; }
+ const rows = users.map(u => ({
+  username: u.username,
+  role: u.role,
+  projects: Array.isArray(u.projects) ? (u.projects.join(',') || '-') : u.projects,
+  lastLoginAt: u.lastLoginAt || 'never',
+ }));
+ const cols = ['username', 'role', 'projects', 'lastLoginAt'];
+ const widths = cols.map(c => Math.max(c.length, ...rows.map(r => String(r[c]).length)));
+ console.log(cols.map((c, i) => c.padEnd(widths[i])).join('  '));
+ console.log(widths.map(w => '-'.repeat(w)).join('  '));
+ for (const r of rows) console.log(cols.map((c, i) => String(r[c]).padEnd(widths[i])).join('  '));
+}
+
+async function cmdAdd(username, flags) {
+ if (!validUsername(username)) die(`invalid username "${username}" (letters/digits/._- only, max 64)`);
+ const role = flags.role;
+ if (!role || !ROLES.includes(role)) die(`--role must be one of: ${ROLES.join(', ')}`);
+ const projects = parseProjects(flags.projects);
+ const users = await loadUsers();
+ if (users.some(u => u.username === username)) die(`user "${username}" already exists`);
+ const password = flags.password
+  ? String(flags.password)
+  : await promptPasswordTwice(`New password for ${username}: `);
+ const passwordHash = await hashPassword(password);
+ const now = new Date().toISOString();
+ users.push({ id: newUserId(), username, passwordHash, role, projects, createdAt: now, lastLoginAt: null });
+ await saveUsers(users);
+ console.log(`Added user "${username}" (role=${role}, projects=${JSON.stringify(projects)})`);
+}
+
+async function cmdPasswd(username) {
+ const users = await loadUsers();
+ const u = users.find(x => x.username === username);
+ if (!u) die(`unknown user "${username}"`);
+ const password = await promptPasswordTwice(`New password for ${username}: `);
+ u.passwordHash = await hashPassword(password);
+ await saveUsers(users);
+ console.log(`Password reset for "${username}"`);
+}
+
+async function cmdRole(username, role) {
+ if (!ROLES.includes(role)) die(`role must be one of: ${ROLES.join(', ')}`);
+ const users = await loadUsers();
+ const u = users.find(x => x.username === username);
+ if (!u) die(`unknown user "${username}"`);
+ u.role = role;
+ await saveUsers(users);
+ console.log(`"${username}" role set to ${role}`);
+}
+
+async function cmdGrant(username, project) {
+ const users = await loadUsers();
+ const u = users.find(x => x.username === username);
+ if (!u) die(`unknown user "${username}"`);
+ if (project === '*') { u.projects = '*'; }
+ else {
+  if (u.projects === '*') die(`"${username}" already has wildcard ("*") access; revoke it first if you want a specific list`);
+  if (!Array.isArray(u.projects)) u.projects = [];
+  if (!u.projects.includes(project)) u.projects.push(project);
+ }
+ await saveUsers(users);
+ console.log(`"${username}" granted "${project}"`);
+}
+
+async function cmdRevoke(username, project) {
+ const users = await loadUsers();
+ const u = users.find(x => x.username === username);
+ if (!u) die(`unknown user "${username}"`);
+ if (project === '*') { u.projects = []; }
+ else if (Array.isArray(u.projects)) {
+  u.projects = u.projects.filter(p => p !== project);
+ }
+ await saveUsers(users);
+ console.log(`"${username}" projects now: ${JSON.stringify(u.projects)}`);
+}
+
+async function cmdDelete(username) {
+ const users = await loadUsers();
+ const i = users.findIndex(u => u.username === username);
+ if (i < 0) die(`unknown user "${username}"`);
+ users.splice(i, 1);
+ await saveUsers(users);
+ console.log(`Deleted "${username}"`);
+}
+
+// --- entry ---------------------------------------------------------------
+
+const argv = process.argv.slice(2);
+if (argv.length === 0 || argv[0] === '-h' || argv[0] === '--help') usage(0);
+
+const [cmd, ...rest] = argv;
+const { positional, flags } = parseArgs(rest);
+
+try {
+ switch (cmd) {
+  case 'list':   await cmdList(); break;
+  case 'add':    if (!positional[0]) usage(1); await cmdAdd(positional[0], flags); break;
+  case 'passwd': if (!positional[0]) usage(1); await cmdPasswd(positional[0]); break;
+  case 'role':   if (positional.length < 2) usage(1); await cmdRole(positional[0], positional[1]); break;
+  case 'grant':  if (positional.length < 2) usage(1); await cmdGrant(positional[0], positional[1]); break;
+  case 'revoke': if (positional.length < 2) usage(1); await cmdRevoke(positional[0], positional[1]); break;
+  case 'delete': if (!positional[0]) usage(1); await cmdDelete(positional[0]); break;
+  default: usage(1);
+ }
+} catch (e) {
+ die(e.message || String(e));
+}
