@@ -409,14 +409,14 @@ function nginxConfig(projects){
  const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n    }\n`;
  // Setup terminal is admin-only — the wizard signs in CLIs whose tokens land
  // in /home/admin and apply to every project.
- const setupRoute = `    location /pty/_setup/ {\n        auth_request /pw-auth-check?admin=1;\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
+ const setupRoute = `    location /pty/_setup/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
  // Accept-Encoding is cleared so ttyd serves uncompressed HTML — otherwise
  // sub_filter can't match '</head>' inside a gzipped body and the preload
  // script tag is silently dropped, breaking mouse-drag-copy (OSC 52 sniffer).
  // auth_request gates each terminal/preview block per-project; in soft mode
  // (PW_AUTH_ENFORCE=false) the dashboard returns 200 for anonymous callers.
- const locations = projects.map(p => `    location /pty/${p.name}/ {\n        auth_request /pw-auth-check?project=${p.name};\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
- const previewRoutes = previewProjects.map(p => `    location /preview/${p.name}/ {\n        auth_request /pw-auth-check?project=${p.name};\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ /preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
+ const locations = projects.map(p => `    location /pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
+ const previewRoutes = previewProjects.map(p => `    location /preview/${p.name}/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ /preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
  const refererMaps = previewProjects.length ? `map $http_referer $pw_preview_name {\n    default "";\n    "~^https?://[^/]+/preview/(?<pname>[^/]+)/" "$pname";\n}\nmap $pw_preview_name $pw_preview_port {\n    default 0;\n${previewProjects.map(p => `    "${p.name}" ${p.preview.port};`).join('\n')}\n}\n` : '';
  const knownDashboardPaths = '^/(api|pty|term|file|manage|preview|terminal-preload|terminal-paste|healthz|favicon|robots)(/|$|\\.|\\?)';
  const previewFallbackLocation = previewProjects.length ? `    location @pw_preview_fallback {\n        proxy_pass http://127.0.0.1:$pw_preview_port$request_uri;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/$pw_preview_name;\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/)(.*)$ /preview/$pw_preview_name/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n    }\n` : '';
@@ -900,5 +900,121 @@ app.get('/api/auth/check', async (req,res) => {
   return res.status(200).end();
  } catch { res.status(500).end(); }
 });
+
+// ============================================================================
+// User management (admin-only). All mutations audited. Never echoes hashes.
+// Last-admin guard prevents accidental lockout.
+// ============================================================================
+function safeUserShape(u){
+ return { username: u.username, role: u.role, projects: u.projects, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+}
+function isAdmin(u){ return u && u.role === 'admin'; }
+function countAdmins(users){ return users.filter(isAdmin).length; }
+function validNewUsername(s){ return typeof s === 'string' && /^[A-Za-z0-9._-]+$/.test(s) && s.length >= 1 && s.length <= 64; }
+function normalizeProjects(value){
+ if(value === '*' || value === undefined) return value === undefined ? [] : '*';
+ if(!Array.isArray(value)) throw new Error('projects must be "*" or an array of project names');
+ const out = [];
+ for(const v of value){ const s = String(v || '').trim(); if(s && !out.includes(s)) out.push(s); }
+ return out;
+}
+
+app.get('/api/users', requireAdmin, async (_req,res) => {
+ try { const users = await loadUsers(); res.json({ ok:true, users: users.map(safeUserShape) }); }
+ catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.post('/api/users', requireAdmin, async (req,res) => {
+ try {
+  const username = String(req.body?.username || '').trim();
+  const role = String(req.body?.role || '');
+  const password = String(req.body?.password || '');
+  if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
+  if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
+  if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
+  let projects;
+  try { projects = normalizeProjects(req.body?.projects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
+  const users = await loadUsers();
+  if(users.some(u => u.username === username)) return res.status(409).json({ ok:false, error:`User "${username}" already exists` });
+  const passwordHash = await hashPassword(password);
+  const now = new Date().toISOString();
+  const id = 'u-' + crypto.randomBytes(6).toString('base64url');
+  users.push({ id, username, passwordHash, role, projects, createdAt: now, lastLoginAt: null });
+  await saveUsers(users);
+  await audit('user_create', { username, role, projects }, req);
+  res.json({ ok:true, user: safeUserShape({ id, username, role, projects, createdAt: now, lastLoginAt: null }) });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.patch('/api/users/:username', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const users = await loadUsers();
+  const u = users.find(x => x.username === target);
+  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  const newUsername = req.body?.username !== undefined ? String(req.body.username).trim() : undefined;
+  const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
+  const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
+  if(newUsername !== undefined){
+   if(!validNewUsername(newUsername)) return res.status(400).json({ ok:false, error:'Invalid username' });
+   if(newUsername !== u.username && users.some(x => x.username === newUsername)) return res.status(409).json({ ok:false, error:`Username "${newUsername}" already exists` });
+  }
+  if(newRole !== undefined && !ROLES.includes(newRole)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
+  let projectsResolved = u.projects;
+  if(newProjects !== undefined){
+   try { projectsResolved = normalizeProjects(newProjects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
+  }
+  // Last-admin guard: do not allow demoting the only admin.
+  if(newRole !== undefined && newRole !== 'admin' && u.role === 'admin' && countAdmins(users) <= 1){
+   return res.status(409).json({ ok:false, error:'Refusing to demote the last admin (you would lock yourself out)' });
+  }
+  const before = { username: u.username, role: u.role, projects: u.projects };
+  if(newUsername !== undefined) u.username = newUsername;
+  if(newRole !== undefined) u.role = newRole;
+  if(newProjects !== undefined) u.projects = projectsResolved;
+  await saveUsers(users);
+  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects } }, req);
+  res.json({ ok:true, user: safeUserShape(u) });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.post('/api/users/:username/password', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const password = String(req.body?.password || '');
+  if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
+  const users = await loadUsers();
+  const u = users.find(x => x.username === target);
+  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  u.passwordHash = await hashPassword(password);
+  await saveUsers(users);
+  await audit('user_password_change', { target }, req);
+  res.json({ ok:true });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.delete('/api/users/:username', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const users = await loadUsers();
+  const i = users.findIndex(u => u.username === target);
+  if(i < 0) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  // Last-admin guard: do not allow deleting the only admin.
+  if(isAdmin(users[i]) && countAdmins(users) <= 1){
+   return res.status(409).json({ ok:false, error:'Refusing to delete the last admin (you would lock yourself out)' });
+  }
+  const [removed] = users.splice(i, 1);
+  await saveUsers(users);
+  // Best-effort: revoke any of the deleted user's active sessions.
+  try {
+   const sessions = await loadSessions();
+   const remaining = sessions.filter(s => s.userId !== removed.id);
+   if(remaining.length !== sessions.length){ sessionsCache = remaining; await saveSessions(); }
+  } catch {}
+  await audit('user_delete', { target }, req);
+  res.json({ ok:true });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
 app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
 app.listen(3000,'127.0.0.1',()=>{ console.log('dashboard listening on 127.0.0.1:3000'); sweepOrphanTmuxSessions(); });
