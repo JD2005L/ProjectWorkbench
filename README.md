@@ -131,12 +131,14 @@ Phase 1 adds app-level users with hashed passwords, cookie sessions, and per-pro
 
 ### Roles
 
-| Role | Sees | Can open `/term/<n>/` | Can upload / start preview | Can do project CRUD / Setup Wizard |
-|---|---|---|---|---|
-| `admin` | all projects | yes | yes | yes |
-| `developer` | only granted projects | yes | yes | no |
-| `content_editor` | only granted projects | **no** (Phase 2 PVIKPBot workflow) | no | no |
-| `viewer` | only granted projects | no | no (read-only status) | no |
+| Role | Sees | Open `/term/<n>/` (shell) | Open `/files/<n>/` (upload) | Start/stop preview | Project CRUD / Settings |
+|---|---|---|---|---|---|
+| `admin` | all projects | yes | yes | yes | yes |
+| `developer` | only granted projects | yes | yes | yes | no |
+| `content_editor` | only granted projects | **no** | **yes** (drop tray, no shell) | no | no |
+| `viewer` | only granted projects | no | no (read-only inbox listing only) | no | no |
+
+`content_editor` exists for the supervised hand-off flow — they can drop files (images, PDFs, content drafts) into a project's `_inbox` from the dashboard without getting raw shell. The full PVIKPBot supervised-edit workflow is still planned for Phase 2.
 
 `admin` ignores grants and sees everything. The other roles respect `--projects '*'` or an explicit list.
 

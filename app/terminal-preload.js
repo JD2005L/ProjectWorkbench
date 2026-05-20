@@ -8,7 +8,15 @@
   let activeSend = null;
   window.__pwSendToTerminal = function(text) {
     if (activeSend) {
-      activeSend(String(text));
+      // ttyd's WS protocol expects the first byte to be a command code:
+      // '0' = INPUT (write the rest to the PTY).
+      //
+      // Wrap the payload in bracketed-paste markers (ESC[200~ ... ESC[201~)
+      // so Claude (and any other bracketed-paste-aware program) treats it as
+      // a paste — not as keystrokes. Without these markers Claude sees the
+      // path as typed input and skips its image-detection, so the prompt
+      // shows the raw path instead of "[Image #N]".
+      activeSend('0\x1b[200~' + String(text) + '\x1b[201~');
       return true;
     }
     return false;
