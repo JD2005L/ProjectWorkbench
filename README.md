@@ -5,7 +5,7 @@ LAN-internal web workbench that gives every repo on your network a password-prot
 It's the missing piece between "I want to use Claude Code in a browser tab" and "I don't want to run a dev environment on every laptop on the LAN."
 
 > [!WARNING]
-> Project Workbench is **designed for LAN-internal infrastructure**. Once a user authenticates with Basic Auth they get shell access inside every project workspace as the install's runtime user. Do not expose the host to the public Internet without putting it behind HTTPS plus your own auth proxy. The security boundary is the network, not the password.
+> Project Workbench is **designed for LAN-internal infrastructure**. Once a user signs in to the app they get shell access inside every project workspace as the install's runtime user. Keep the host behind a VPN, Cloudflare Access, or similar outer perimeter; the app login is the access gate, not a public-facing perimeter. Phase 2 will tighten the runtime so it can survive direct public exposure.
 
 ![Dashboard](docs/screenshots/dashboard.png)
 
@@ -24,9 +24,9 @@ The installer:
 - detects Ubuntu/Debian and installs apt deps (`nginx`, `apache2-utils`, `ttyd`, `git`, `nodejs`, `npm`, `jq`, `tmux`, `openssl`),
 - creates the `admin` runtime user,
 - clones this repo into `/opt/project-workbench/source`,
-- deploys the dashboard, helper scripts and systemd units,
-- generates a random Basic Auth password (also saved root-readable in `/etc/project-workbench/credentials`),
-- starts the dashboard and prints the URL, username and password at the end.
+- deploys the dashboard, helper scripts, systemd units, and the `pw-user` CLI,
+- seeds `/etc/project-workbench/users.json` with safe `0600` perms (preserves any existing file on rerun) and creates the first admin if there are no users yet — printing a one-time generated password at the end,
+- ships with `PW_AUTH_ENFORCE=false` so the existing dashboard session isn't locked out mid-install; flip to `true` after you've signed in successfully (the end-of-install output spells out the command).
 
 It is **idempotent** — rerun it any time to repair drift or pull a newer release.
 
@@ -38,8 +38,8 @@ It is **idempotent** — rerun it any time to repair drift or pull a newer relea
 | `PW_HTTP_PORT`   | `80`                     | Nginx listen port |
 | `PW_REPO`        | this repo                | Git URL to clone source from |
 | `PW_REF`         | `main`                   | Git branch / tag to install |
-| `PW_AUTH_USER`   | `admin`                  | Basic Auth username |
-| `PW_AUTH_PASS`   | _auto-generated_         | Pre-set Basic Auth password instead of auto-generating |
+| `PW_BOOTSTRAP_ADMIN_USER`     | `admin`          | Username of the initial admin created on a fresh install (only used when `users.json` has zero users) |
+| `PW_BOOTSTRAP_ADMIN_PASSWORD` | _auto-generated_ | Password to use instead of generating one. Printed once at the end of the install; not stored anywhere on disk |
 
 Example: install from a pinned tag on a host that already uses port 80 for something else.
 
@@ -61,8 +61,13 @@ Every project gets its own `ttyd` + persistent `tmux` session backed by Claude C
 
 ![Terminal](docs/screenshots/terminal.png)
 
+### Settings
+A dedicated `/settings` page (admin-only) with sidebar tabs covers the day-to-day controls: **Users & Roles** (full CRUD), **CLIs & Sign-in**, **Environment** (permission mode, MCP mode), **System & Updates** (heal endpoints + readiness checklist), and **First Run** (launches the focused Setup Wizard modal).
+
+![Settings](docs/screenshots/settings.png)
+
 ### Setup Wizard
-Multi-CLI install + sign-in flow (Claude, Codex, Copilot). Auth happens inside a shared `ttyd` setup terminal so tokens land in the runtime user's home and apply to every project. Also exposes the instance-wide permission mode, MCP policy, and self-heal endpoints for nginx and runtime dirs.
+A focused multi-step modal that walks a new operator through CLI install + sign-in and permission/MCP policy. Available from Settings → First Run, and auto-prompts on first dashboard load when no CLI is installed/authenticated or no users exist.
 
 ![Setup Wizard](docs/screenshots/wizard.png)
 
@@ -89,14 +94,14 @@ A nightly `systemd` timer keeps Claude Code (and any other enabled CLIs) on thei
 ## How it works
 
 ```
-                         ┌──────────────────────────────┐
-   browser  ───┐         │  /etc/nginx (port 80 / 8080) │
-   (Basic Auth)│         │  - Basic Auth                │
-               ▼         │  - /pty/<Name>/   → ttyd      ────► tmux session per project
-       ┌──────────────┐  │  - /preview/<Name>/ → Kestrel ────► dotnet watch / npm run dev / …
-       │   nginx      │──┤  - /api, /manage, /, /file/…  ────► Node/Express dashboard (:3000)
+                         ┌──────────────────────────────────┐
+   browser  ───┐         │  /etc/nginx (port 80 / 8080)     │
+   (cookie)    │         │  - auth_request /pw-auth-check   │
+               ▼         │  - /pty/<Name>/   → ttyd          ────► tmux session per project
+       ┌──────────────┐  │  - /preview/<Name>/ → Kestrel     ────► dotnet watch / npm run dev / …
+       │   nginx      │──┤  - /api, /manage, /, /file/…      ────► Node/Express dashboard (:3000)
        └──────────────┘  │  - Referer-based asset fallback for preview iframes
-                         └──────────────────────────────┘
+                         └──────────────────────────────────┘
 ```
 
 - The dashboard runs as `root` so it can regenerate nginx + systemd configs from the `/manage` page.
@@ -110,9 +115,11 @@ A nightly `systemd` timer keeps Claude Code (and any other enabled CLIs) on thei
 
 | Setting | Where | What it does |
 |---|---|---|
-| Permission mode | Setup Wizard → Environment | `--dangerously-skip-permissions` vs. prompt-for-each |
-| MCP mode | Setup Wizard → Environment | `inherit` / `isolated` / `custom` (see `/etc/project-workbench/claude-wrapper.env`) |
-| Enabled CLIs | Setup Wizard → CLIs | Which assistants are offered and which the nightly timer updates |
+| Users & Roles | Settings → Users & Roles | Add / edit / delete users; reset passwords; grant projects |
+| Permission mode | Settings → Environment | `--dangerously-skip-permissions` vs. prompt-for-each |
+| MCP mode | Settings → Environment | `inherit` / `isolated` / `custom` (see `/etc/project-workbench/claude-wrapper.env`) |
+| Enabled CLIs | Settings → CLIs & Sign-in | Which assistants are offered and which the nightly timer updates |
+| Readiness checks | Settings → System & Updates | Versions, last update, ready-or-not checklist for the install |
 | Per-project preview cmd | `/manage` → project card | The command that boots the dev server (`${PORT}` and `${BASEPATH}` are substituted) |
 | Per-project preview env | `/manage` → project card | KEY=VALUE lines exported before the preview cmd runs (`PORT`/`BASEPATH` reserved) |
 
@@ -187,10 +194,12 @@ Phase 1 is **safe to ship with the app login as the primary gate**; Cloudflare A
 | `nginx -t` fails on a port the installer wants | Another service is on port 80 | Set `PW_HTTP_PORT=8080` (or another free port) on the installer run |
 | Installer aborts: "Node.js 18+ is required" | Distro repo Node is too old | Install Node 20 from NodeSource and rerun: `curl -fsSL https://deb.nodesource.com/setup_20.x \| sudo bash - && sudo apt-get install -y nodejs && sudo bash install.sh` |
 | Installer aborts: "ttyd is required" | ttyd not in your distro's default repos | Enable backports or grab a release binary from <https://github.com/tsl0922/ttyd/releases>, drop into `/usr/local/bin/ttyd`, rerun |
-| Terminal opens but Claude says "not signed in" | The `admin` user hasn't completed `claude /login` yet | Setup Wizard → Sign in → "Reauthenticate" on Claude Code |
+| Terminal opens but Claude says "not signed in" | The `admin` user hasn't completed `claude /login` yet | Settings → CLIs & Sign-in → "Reauthenticate" on Claude Code |
 | Preview modal pill stays "starting" | Framework hasn't bound the port yet (or crashed) | Open the Logs panel inside the modal — first dotnet watch boot can take 10–30s |
 | Preview app renders unstyled / broken images | App calls Windows-only APIs in Dev branch, or doesn't honor `--pathbase` | The launcher leaves `ASPNETCORE_ENVIRONMENT` unset so apps fall through to their non-Dev branch. Override via the per-project `Preview env` if your app actually needs `Development`. Root-relative assets are auto-routed via Referer; only JS-built fully-qualified URLs miss this |
-| `/manage` page errors after add/update | nginx reload failed | Setup Wizard → Heal → "Regenerate nginx + reload" |
+| `/manage` page errors after add/update | nginx reload failed | Settings → System & Updates → "Regenerate nginx + reload" |
+| Stuck out of the dashboard after enabling enforce | App login broken | `sudo sed -i 's/PW_AUTH_ENFORCE=true/PW_AUTH_ENFORCE=false/' /etc/systemd/system/project-workbench.service.d/auth.conf && sudo systemctl daemon-reload && sudo systemctl restart project-workbench.service` |
+| Can't sign in / lost the bootstrap password | No way to recover the hash, but admin can rotate from a shell | `sudo /usr/local/sbin/pw-user passwd <username>` |
 
 Useful one-liners:
 
@@ -198,7 +207,9 @@ Useful one-liners:
 journalctl -u project-workbench.service -f               # dashboard logs
 journalctl -u project-terminal@<Name>.service -f          # one project's terminal
 journalctl -u project-preview@<Name>.service -f -o cat    # one project's preview
-sudo cat /etc/project-workbench/credentials               # printed at install time
+sudo tail -F /var/log/project-workbench/audit.log         # login, project, user-mgmt events
+sudo /usr/local/sbin/pw-user list                         # who has access
+sudo /usr/local/sbin/pw-user passwd <username>            # rotate a forgotten password
 ```
 
 ---
@@ -295,7 +306,9 @@ sudo systemctl enable --now project-workbench.service
 sudo systemctl enable --now claude-code-update.timer
 ```
 
-### 6. nginx + Basic Auth
+### 6. nginx (bootstrap site — dashboard rewrites it)
+
+The installer writes a minimal site and lets the dashboard regenerate the full config (with the `/pty/`, `/preview/`, and `auth_request` blocks) once it's running. Manual equivalent:
 
 ```bash
 sudo bash -c 'cat > /etc/nginx/sites-available/project-workbench' <<'NGINX'
@@ -319,17 +332,28 @@ sudo nginx -t
 sudo systemctl reload nginx
 ```
 
-Then hit the dashboard's heal endpoint once so it rewrites the nginx config with any project-specific `/pty/` and `/preview/` blocks:
+Then hit the dashboard's heal endpoint once so it rewrites nginx with project-specific `/pty/`, `/preview/`, and the internal `/pw-auth-check` location:
 
 ```bash
 curl -fsS -X POST http://127.0.0.1:3000/api/setup/heal/nginx
 ```
 
-### 7. Verification
+### 7. Auth bootstrap (first admin)
+
+The dashboard relies on app-level users; nginx does not require Basic Auth. Create the first admin via the CLI, then sign in at `/login`:
+
+```bash
+sudo /usr/local/sbin/pw-user add james --role admin --projects '*'   # prompts for password
+# browse to http://<host>/login and verify
+sudo sed -i 's/PW_AUTH_ENFORCE=false/PW_AUTH_ENFORCE=true/' /etc/systemd/system/project-workbench.service.d/auth.conf
+sudo systemctl daemon-reload && sudo systemctl restart project-workbench.service
+```
+
+### 8. Verification
 
 ```bash
 systemctl is-active project-workbench.service nginx
-curl -u admin:<password> http://127.0.0.1/healthz
+curl http://127.0.0.1/healthz
 ```
 
 </details>

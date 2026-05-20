@@ -521,22 +521,25 @@ app.get('/', requireAuth, async (req,res)=>{
    : `<span class="button" style="opacity:.55;cursor:not-allowed" title="Your role cannot open raw terminals">Terminal — restricted</span>`;
   return `<article data-name="${esc(p.name)}" data-project="${esc(p.name)}"><h2>${esc(p.name)} <span class="pending-dot" aria-hidden="true"></span><span class="pending-label">ready</span></h2><p><code>${esc(p.path)}</code></p><p>${termBtn} ${previewBtn}</p><p><a class="repo" href="${esc(p.repo)}" target="_blank" rel="noopener">Github Repo</a></p></article>`;
  }).join('\n');
- // Empty-state only shown to admins (non-admins with no grants get a clearer message).
  const noGrantsState = `<div class="empty-state"><h2>No projects assigned</h2><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) has no project grants yet. Ask an admin to grant access.</p></div>`;
- const emptyState = `<div class="empty-state"><h2>Welcome to Project Workbench</h2><p>LAN-internal browser terminals backed by Claude Code (or your CLI of choice). Two steps to get started:</p><div class="step"><span class="num">1</span><div class="meta"><b>Sign in your AI CLI</b><span>Authenticate Claude Code (or Codex / Copilot) once in the shared setup terminal.</span></div><button id="emptyWizardBtn" class="button" type="button">Open Setup Wizard</button></div><div class="step"><span class="num">2</span><div class="meta"><b>Add your first project</b><span>Clone a repo into a workspace and get a browser terminal + live preview.</span></div><a class="button" href="/manage">Manage Projects</a></div></div>`;
- const bodyContent = rows
-  ? `<div class="grid order-grid">${rows}</div>`
+ const emptyState = `<div class="empty-state"><h2>Welcome to Project Workbench</h2><p>LAN-internal browser terminals backed by Claude Code (or your CLI of choice). Two steps to get started:</p><div class="step"><span class="num">1</span><div class="meta"><b>Sign in your AI CLI</b><span>Authenticate Claude Code (or Codex / Copilot) and create your first user.</span></div><a class="button" href="/settings#firstrun">Open Settings</a></div><div class="step"><span class="num">2</span><div class="meta"><b>Add your first project</b><span>Clone a repo into a workspace and get a browser terminal + live preview.</span></div><a class="button" href="/manage">Manage Projects</a></div></div>`;
+ const gridSection = rows
+  ? `${isAdmin ? '<div class="grid-tools"><button id="editOrderBtn" class="button secondary pencilBtn tinybtn" type="button" title="Drag cards to reorder">✎ Reorder</button> <a class="button secondary tinybtn" href="/manage">Manage projects</a></div>' : ''}<div class="grid order-grid">${rows}</div>`
   : (isAdmin ? emptyState : (allProjects.length === 0 ? emptyState : noGrantsState));
  const userChip = req.user.implicit
   ? `<span class="subtle" title="PW_AUTH_ENFORCE is OFF; all requests treated as admin">anonymous (enforce off)</span>`
-  : `<span class="badge" title="Role: ${esc(req.user.role)}"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span> <button id="logoutBtn" class="button secondary" type="button" style="padding:.35rem .7rem;font-size:.82rem">Sign out</button>`;
- const adminButtons = isAdmin
-  ? `<button id="editOrderBtn" class="button secondary pencilBtn iconBtn" type="button" title="Drag cards to reorder" aria-label="Edit order">✎</button><button id="setupBtn" class="button secondary" type="button">Setup Wizard</button><a class="button secondary" href="/manage">Manage Projects</a>`
-  : '';
+  : `<span class="badge" title="Role: ${esc(req.user.role)}"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span> <button id="logoutBtn" class="button secondary tinybtn" type="button">Sign out</button>`;
+ const adminCta = isAdmin ? `<a class="button" href="/settings">Settings</a>` : '';
  const adminModals = isAdmin ? `${wizardModalHtml}` : '';
  const adminScripts = isAdmin ? `${reorderScript}${wizardScript}` : '';
  const logoutScript = req.user.implicit ? '' : `<script>document.getElementById('logoutBtn')?.addEventListener('click',async()=>{try{await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='/login'});</script>`;
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Workbench</title><style>${homeCss}${wizardCss}${previewCss}</style></head><body><header class="hero"><div><h1>Project Workbench</h1><p class="subtitle">Protected project terminals with Claude Code CLI</p></div><div class="hero-actions"><div class="meta-row">${userChip}<span class="badge">Claude Code: <b>${esc(claudeVersion)}</b></span></div><div class="subtle">Last update check: ${esc(updateStamp)}</div><div class="action-row">${adminButtons}</div></div></header>${bodyContent}${adminModals}${previewModalHtml}<script>async function pwRefreshStatus(){try{const r=await fetch('/api/projects/status',{cache:'no-store'});const out=await r.json();if(!out?.ok)return;const map=Object.create(null);for(const p of out.projects)map[p.name]=p;document.querySelectorAll('article[data-project]').forEach(a=>{const s=map[a.dataset.project];a.classList.toggle('pending',!!(s&&s.pending))})}catch{}}pwRefreshStatus();setInterval(()=>{if(!document.hidden)pwRefreshStatus()},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwRefreshStatus()});document.getElementById('emptyWizardBtn')?.addEventListener('click',()=>document.getElementById('setupBtn')?.click());</script>${adminScripts}${previewScript}${logoutScript}</body></html>`);
+ // First-run auto-launch (admin only): if claude isn't installed/signed-in or
+ // no users exist, open the wizard modal on dashboard load. One-shot only.
+ const firstRunScript = isAdmin
+  ? `<script>(async()=>{try{const k='pw_firstrun_dismissed';if(sessionStorage.getItem(k))return;const r=await fetch('/api/system/firstrun',{cache:'no-store'});const j=await r.json();if(j?.firstRunNeeded){document.getElementById('setupBackdrop')?.classList.remove('hidden');sessionStorage.setItem(k,'1')}}catch{}})();</script>`
+  : '';
+ const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Workbench</title><style>${homeCss}${wizardCss}${previewCss}${statusBarCss}.grid-tools{display:flex;gap:.5rem;margin:.5rem 0 1rem}.hero{padding-bottom:.6rem;margin-bottom:1rem}</style></head><body><header class="hero"><div><h1>Project Workbench</h1><p class="subtitle">Protected project terminals with Claude Code CLI</p></div><div class="hero-actions"><div class="meta-row">${userChip}</div><div class="action-row">${adminCta}</div></div></header>${gridSection}${adminModals}${previewModalHtml}<script>async function pwRefreshStatus(){try{const r=await fetch('/api/projects/status',{cache:'no-store'});const out=await r.json();if(!out?.ok)return;const map=Object.create(null);for(const p of out.projects)map[p.name]=p;document.querySelectorAll('article[data-project]').forEach(a=>{const s=map[a.dataset.project];a.classList.toggle('pending',!!(s&&s.pending))})}catch{}}pwRefreshStatus();setInterval(()=>{if(!document.hidden)pwRefreshStatus()},5000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwRefreshStatus()});</script>${adminScripts}${previewScript}${logoutScript}${firstRunScript}${footer}</body></html>`);
 });
 
 app.get('/manage', requireAdmin, async (req,res)=>{
@@ -832,6 +835,45 @@ app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascri
 app.get('/healthz', (_req,res)=>res.json({ok:true}));
 
 // ============================================================================
+// Footer status bar shared between dashboard and settings page.
+// ============================================================================
+function statusBarHtml({ claudeVersion, updateStamp, user, enforce }){
+ const u = user && !user.implicit
+  ? `<span class="sb-user"><b>${esc(user.username)}</b> · ${esc(user.role)}</span>`
+  : `<span class="sb-user subtle">anonymous (enforce ${enforce ? 'on' : 'off'})</span>`;
+ const enforceTag = enforce ? '<span class="sb-tag warn">enforce</span>' : '<span class="sb-tag">soft</span>';
+ return `<footer id="pwStatusBar"><span class="sb-item">Claude Code: <b>${esc(claudeVersion)}</b></span><span class="sb-sep">·</span><span class="sb-item">Last update check: <b>${esc(updateStamp)}</b></span><span class="sb-sep">·</span><span class="sb-item">Auth: ${enforceTag}</span><span class="sb-grow"></span>${u}</footer>`;
+}
+const statusBarCss = `#pwStatusBar{position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);border-top:1px solid #1f2937;color:#94a3b8;font:12px system-ui,-apple-system,Segoe UI,sans-serif;padding:5px 14px;display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);z-index:50}#pwStatusBar b{color:#e5e7eb;font-weight:600}#pwStatusBar .sb-sep{opacity:.45}#pwStatusBar .sb-grow{flex:1}#pwStatusBar .sb-tag{padding:1px 7px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:11px;border:1px solid #334155}#pwStatusBar .sb-tag.warn{color:#fde68a;border-color:#854d0e;background:#3b2e0a}body{padding-bottom:32px}`;
+
+// ============================================================================
+// Settings page (admin-only). Tabbed surface — primary settings destination.
+// Setup Wizard still exists as a focused guided modal launched from here.
+// ============================================================================
+const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}`;
+
+const settingsScript = `<script>(function(){const tabs=document.querySelectorAll('.s-tabs button');const sections=document.querySelectorAll('.s-main section');function activate(id){tabs.forEach(b=>b.classList.toggle('active',b.dataset.tab===id));sections.forEach(s=>s.classList.toggle('active',s.id==='tab-'+id));try{history.replaceState(null,'','#'+id)}catch{}}tabs.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));const init=(location.hash||'#users').slice(1);activate(['users','clis','env','system','firstrun'].includes(init)?init:'users');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(el,t,err){if(!el)return;el.textContent=t||'';el.classList.toggle('err',!!err)}
+// --- Users tab ---
+const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddForm=document.getElementById('uAddForm');async function loadUsers(){uTable.innerHTML='<tr><td colspan="5" class="muted">loading…</td></tr>';try{const r=await fetch('/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="5" class="muted">'+esc(e.message)+'</td></tr>'}}function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="5" class="muted">no users yet — add one above</td></tr>';return}uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Projects</th><th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td><td>'+projectsCellHtml(u.projects)+'</td><td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=t.dataset.edit;const newName=prompt('Username (leave blank to keep)','')||undefined;const newRole=prompt('Role (admin / developer / content_editor / viewer; blank to keep)','')||undefined;const newProjStr=prompt('Projects (* for all, or comma list; blank to keep)','');let projects;if(newProjStr!==null&&newProjStr!==''){projects=newProjStr.trim()==='*'?'*':newProjStr.split(',').map(s=>s.trim()).filter(Boolean)}const body={};if(newName)body.username=newName;if(newRole)body.role=newRole;if(projects!==undefined)body.projects=projects;if(Object.keys(body).length===0)return;const r=await fetch('/api/users/'+encodeURIComponent(u),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();setStatus(uStatus,j.ok?'Updated '+u:'Error: '+j.error,!j.ok);loadUsers()}});uAddForm.addEventListener('submit',async e=>{e.preventDefault();const fd=new FormData(uAddForm);const projInput=String(fd.get('projects')||'').trim();const body={username:fd.get('username'),role:fd.get('role'),password:fd.get('password'),projects:projInput==='*'?'*':projInput.split(',').map(s=>s.trim()).filter(Boolean)};const r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});const j=await r.json();setStatus(uStatus,j.ok?'Added '+body.username:'Error: '+j.error,!j.ok);if(j.ok){uAddForm.reset();loadUsers()}});loadUsers();
+// --- CLIs + Environment + System tabs (reuse existing /api/setup/* endpoints) ---
+const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('/pty/_setup/')<0)authFrame.src='/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('/api/setup/heal/dirs',healDirs);loadState();loadSystem();
+// --- First Run tab: launch wizard modal ---
+document.getElementById('rerunWizardBtn')?.addEventListener('click',()=>{document.getElementById('setupBackdrop')?.classList.remove('hidden')});})();</script>`;
+
+app.get('/settings', requireAdmin, async (req,res) => {
+ const claudeVersion = await getClaudeVersion();
+ const updateStamp = await getClaudeUpdateStamp();
+ const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed.</p><div class="s-card"><h3>Add user</h3><form id="uAddForm" class="row-form"><label>Username<input type="text" name="username" required pattern="[A-Za-z0-9._-]+"></label><label>Role<select name="role" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects (<code>*</code> or comma list)<input type="text" name="projects" placeholder="* | AmrikPublic,HarmaniPublic"></label><label>Password (≥8)<input type="password" name="password" minlength="8" required></label><button class="button" type="submit">Add</button></form></div><div class="s-card"><h3>Current users</h3><table class="utable" id="uTable"></table><div class="status-line" id="uStatus"></div></div></section>
+<section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead">Install or update each assistant, then sign in. Tokens land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Sign-in terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
+<section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
+<section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
+<section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
+</main></div>${wizardModalHtml}${wizardScript}${settingsScript}${footer}</body></html>`);
+});
+
+// ============================================================================
 // Auth routes (Phase 1)
 // ============================================================================
 const loginCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e5e7eb}.card{background:#111827;border:1px solid #334155;border-radius:14px;padding:2rem 1.75rem;max-width:380px;width:calc(100% - 2rem);box-shadow:0 30px 80px rgba(0,0,0,.6)}h1{margin:0 0 .35rem;font-size:1.45rem}.sub{margin:0 0 1.5rem;color:#94a3b8;font-size:.9rem}label{display:block;margin:.75rem 0 .3rem;font-size:.85rem;color:#cbd5e1}input{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.6rem;width:100%;box-sizing:border-box;font:inherit}.button{display:inline-block;background:#2563eb;color:white;padding:.65rem 1rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit;width:100%;margin-top:1rem}.button:hover{background:#1d4ed8}.err{margin-top:.85rem;color:#fca5a5;font-size:.85rem;min-height:1.2em}.foot{margin-top:1.25rem;color:#64748b;font-size:.75rem;text-align:center}`;
@@ -900,5 +942,151 @@ app.get('/api/auth/check', async (req,res) => {
   return res.status(200).end();
  } catch { res.status(500).end(); }
 });
+
+// ============================================================================
+// User management (admin-only). All mutations audited. Never echoes hashes.
+// Last-admin guard prevents accidental lockout.
+// ============================================================================
+function safeUserShape(u){
+ return { username: u.username, role: u.role, projects: u.projects, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+}
+function isAdmin(u){ return u && u.role === 'admin'; }
+function countAdmins(users){ return users.filter(isAdmin).length; }
+function validNewUsername(s){ return typeof s === 'string' && /^[A-Za-z0-9._-]+$/.test(s) && s.length >= 1 && s.length <= 64; }
+function normalizeProjects(value){
+ if(value === '*') return '*';
+ if(value === undefined) return [];
+ if(!Array.isArray(value)) throw new Error('projects must be "*" or an array of project names');
+ const out = [];
+ for(const v of value){ const s = String(v || '').trim(); if(s && !out.includes(s)) out.push(s); }
+ return out;
+}
+
+app.get('/api/users', requireAdmin, async (_req,res) => {
+ try { const users = await loadUsers(); res.json({ ok:true, users: users.map(safeUserShape) }); }
+ catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.post('/api/users', requireAdmin, async (req,res) => {
+ try {
+  const username = String(req.body?.username || '').trim();
+  const role = String(req.body?.role || '');
+  const password = String(req.body?.password || '');
+  if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
+  if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
+  if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
+  let projects;
+  try { projects = normalizeProjects(req.body?.projects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
+  const users = await loadUsers();
+  if(users.some(u => u.username === username)) return res.status(409).json({ ok:false, error:`User "${username}" already exists` });
+  const passwordHash = await hashPassword(password);
+  const now = new Date().toISOString();
+  const id = 'u-' + crypto.randomBytes(6).toString('base64url');
+  users.push({ id, username, passwordHash, role, projects, createdAt: now, lastLoginAt: null });
+  await saveUsers(users);
+  await audit('user_create', { username, role, projects }, req);
+  res.json({ ok:true, user: safeUserShape({ username, role, projects, createdAt: now, lastLoginAt: null }) });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.patch('/api/users/:username', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const users = await loadUsers();
+  const u = users.find(x => x.username === target);
+  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  const newUsername = req.body?.username !== undefined ? String(req.body.username).trim() : undefined;
+  const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
+  const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
+  if(newUsername !== undefined){
+   if(!validNewUsername(newUsername)) return res.status(400).json({ ok:false, error:'Invalid username' });
+   if(newUsername !== u.username && users.some(x => x.username === newUsername)) return res.status(409).json({ ok:false, error:`Username "${newUsername}" already exists` });
+  }
+  if(newRole !== undefined && !ROLES.includes(newRole)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
+  let projectsResolved = u.projects;
+  if(newProjects !== undefined){
+   try { projectsResolved = normalizeProjects(newProjects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
+  }
+  if(newRole !== undefined && newRole !== 'admin' && u.role === 'admin' && countAdmins(users) <= 1){
+   return res.status(409).json({ ok:false, error:'Refusing to demote the last admin (you would lock yourself out)' });
+  }
+  const before = { username: u.username, role: u.role, projects: u.projects };
+  if(newUsername !== undefined) u.username = newUsername;
+  if(newRole !== undefined) u.role = newRole;
+  if(newProjects !== undefined) u.projects = projectsResolved;
+  await saveUsers(users);
+  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects } }, req);
+  res.json({ ok:true, user: safeUserShape(u) });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.post('/api/users/:username/password', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const password = String(req.body?.password || '');
+  if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
+  const users = await loadUsers();
+  const u = users.find(x => x.username === target);
+  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  u.passwordHash = await hashPassword(password);
+  await saveUsers(users);
+  await audit('user_password_change', { target }, req);
+  res.json({ ok:true });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+app.delete('/api/users/:username', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const users = await loadUsers();
+  const i = users.findIndex(u => u.username === target);
+  if(i < 0) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  if(isAdmin(users[i]) && countAdmins(users) <= 1){
+   return res.status(409).json({ ok:false, error:'Refusing to delete the last admin (you would lock yourself out)' });
+  }
+  const [removed] = users.splice(i, 1);
+  await saveUsers(users);
+  try {
+   const sessions = await loadSessions();
+   const remaining = sessions.filter(s => s.userId !== removed.id);
+   if(remaining.length !== sessions.length){ sessionsCache = remaining; await saveSessions(); }
+  } catch {}
+  await audit('user_delete', { target }, req);
+  res.json({ ok:true });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+// ============================================================================
+// System status / readiness (admin-only). Used by Settings → System tab and
+// by the first-run wizard auto-trigger to decide whether to prompt.
+// ============================================================================
+app.get('/api/system/status', requireAdmin, async (_req,res) => {
+ try {
+  const [claudeVersion, updateStamp, users, settings] = await Promise.all([
+   getClaudeVersion(), getClaudeUpdateStamp(), loadUsers(), loadWorkbenchSettings(),
+  ]);
+  const checks = {
+   claudeInstalled: claudeVersion !== 'unavailable',
+   claudeAuthenticated: await getCliAuth('claude'),
+   atLeastOneAdmin: users.some(u => u.role === 'admin'),
+   atLeastOneEnabledCli: (settings.enabledClis || []).length > 0,
+   authEnforce: AUTH_ENFORCE,
+   wrapperEnvPresent: await fs.access(wrapperEnvPath).then(() => true).catch(() => false),
+  };
+  const firstRunNeeded = !checks.claudeInstalled || !checks.claudeAuthenticated || !checks.atLeastOneAdmin;
+  res.json({ ok:true, claudeVersion, updateStamp, userCount: users.length, settings, checks, firstRunNeeded });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+// Returns minimal first-run hint to any authenticated/implicit user so the
+// dashboard knows whether to auto-prompt the wizard.
+app.get('/api/system/firstrun', async (_req,res) => {
+ try {
+  const [claudeVersion, users, claudeAuth] = await Promise.all([getClaudeVersion(), loadUsers(), getCliAuth('claude')]);
+  const needed = claudeVersion === 'unavailable' || !claudeAuth || users.length === 0;
+  res.json({ ok:true, firstRunNeeded: needed });
+ } catch { res.json({ ok:true, firstRunNeeded: false }); }
+});
+
 app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
 app.listen(3000,'127.0.0.1',()=>{ console.log('dashboard listening on 127.0.0.1:3000'); sweepOrphanTmuxSessions(); });
