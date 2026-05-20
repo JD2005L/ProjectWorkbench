@@ -115,13 +115,12 @@ A nightly `systemd` timer keeps Claude Code (and any other enabled CLIs) on thei
 | Enabled CLIs | Setup Wizard → CLIs | Which assistants are offered and which the nightly timer updates |
 | Per-project preview cmd | `/manage` → project card | The command that boots the dev server (`${PORT}` and `${BASEPATH}` are substituted) |
 | Per-project preview env | `/manage` → project card | KEY=VALUE lines exported before the preview cmd runs (`PORT`/`BASEPATH` reserved) |
-| Basic Auth | `/etc/nginx/.htpasswd` | Edit with `htpasswd` directly; credentials file at `/etc/project-workbench/credentials` |
 
 ---
 
 ## Users & permissions (Phase 1)
 
-Phase 1 adds app-level users with hashed passwords, cookie sessions, and per-project grants on top of the existing nginx Basic Auth gate. Basic Auth (or Cloudflare Access / a VPN) should stay in front of the dashboard as the outer perimeter until later phases lock the box down further.
+Phase 1 adds app-level users with hashed passwords, cookie sessions, and per-project grants. The legacy nginx Basic Auth gate has been removed; use Cloudflare Access / VPN as an optional outer perimeter until later phases lock the box down further.
 
 ### Roles
 
@@ -170,7 +169,7 @@ Sensitive events (login ok/fail, logout, terminal open, upload, project CRUD, se
 
 ### Public-exposure guidance
 
-Phase 1 is **safe to ship behind an outer gate** (Basic Auth, Cloudflare Access, VPN, etc.). Phase 2 will tighten the runtime further so the dashboard can survive direct public exposure:
+Phase 1 is **safe to ship with the app login as the primary gate**; Cloudflare Access / VPN can still be added as an outer perimeter. Phase 2 will tighten the runtime further so the dashboard can survive direct public exposure:
 
 - Per-user / per-action rate limiting on `/api/auth/login`.
 - WebAuthn / 2FA enrollment.
@@ -192,7 +191,6 @@ Phase 1 is **safe to ship behind an outer gate** (Basic Auth, Cloudflare Access,
 | Preview modal pill stays "starting" | Framework hasn't bound the port yet (or crashed) | Open the Logs panel inside the modal — first dotnet watch boot can take 10–30s |
 | Preview app renders unstyled / broken images | App calls Windows-only APIs in Dev branch, or doesn't honor `--pathbase` | The launcher leaves `ASPNETCORE_ENVIRONMENT` unset so apps fall through to their non-Dev branch. Override via the per-project `Preview env` if your app actually needs `Development`. Root-relative assets are auto-routed via Referer; only JS-built fully-qualified URLs miss this |
 | `/manage` page errors after add/update | nginx reload failed | Setup Wizard → Heal → "Regenerate nginx + reload" |
-| Re-running installer says "Existing /etc/nginx/.htpasswd detected" | Idempotency is working — your existing password is preserved | Edit `/etc/nginx/.htpasswd` with `htpasswd` manually if you need to rotate |
 
 Useful one-liners:
 
@@ -300,14 +298,11 @@ sudo systemctl enable --now claude-code-update.timer
 ### 6. nginx + Basic Auth
 
 ```bash
-sudo htpasswd -c /etc/nginx/.htpasswd admin   # prompts for password
 sudo bash -c 'cat > /etc/nginx/sites-available/project-workbench' <<'NGINX'
 map $http_upgrade $connection_upgrade { default upgrade; '' close; }
 server {
     listen 80 default_server;
     server_name _;
-    auth_basic "Project Workbench";
-    auth_basic_user_file /etc/nginx/.htpasswd;
     client_max_body_size 100m;
     location / {
         proxy_pass http://127.0.0.1:3000;
@@ -350,6 +345,5 @@ MIT — see `LICENSE` if present, otherwise treat this as MIT-licensed for now.
 Issues and PRs welcome. Please do not commit:
 
 - `/opt/project-workbench/workspaces/` content
-- `/etc/nginx/.htpasswd` or `/etc/project-workbench/credentials`
 - Anything under `~/.claude/`
 - npm / GitHub / Anthropic tokens

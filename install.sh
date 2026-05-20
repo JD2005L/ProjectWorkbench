@@ -168,23 +168,8 @@ fi
 log "Refreshing /usr/local/bin/claude wrapper…"
 /usr/local/sbin/update-claude-code >>/var/log/claude-code-update.log 2>&1 || warn "update-claude-code reported a non-zero status — continuing."
 
-if [ ! -f "$HTPASSWD" ]; then
-  if [ -z "$PW_AUTH_PASS" ]; then
-    PW_AUTH_PASS="$(openssl rand -base64 24 | tr -d '/+=' | head -c 24)"
-    PW_AUTH_GENERATED=1
-  fi
-  log "Creating Basic Auth credentials for user '$PW_AUTH_USER'…"
-  htpasswd -bc "$HTPASSWD" "$PW_AUTH_USER" "$PW_AUTH_PASS" >/dev/null
-  install -m 0600 /dev/null "$CRED_FILE"
-  cat > "$CRED_FILE" <<EOF
-# Project Workbench Basic Auth credentials. Root-readable only.
-PW_AUTH_USER=$PW_AUTH_USER
-PW_AUTH_PASS=$PW_AUTH_PASS
-EOF
-  chmod 0600 "$CRED_FILE"
-else
-  log "Existing $HTPASSWD detected — leaving credentials untouched."
-fi
+# Project Workbench now relies on app-level users/sessions instead of nginx Basic Auth.
+# Existing /etc/nginx/.htpasswd files are ignored and left in place for rollback/manual recovery.
 
 log "Writing nginx site (listen $PW_HTTP_PORT)…"
 # Minimal bootstrap site; the dashboard regenerates this file with the full
@@ -194,8 +179,6 @@ map \$http_upgrade \$connection_upgrade { default upgrade; '' close; }
 server {
     listen $PW_HTTP_PORT default_server;
     server_name _;
-    auth_basic "Project Workbench";
-    auth_basic_user_file $HTPASSWD;
     client_max_body_size 100m;
     location / {
         proxy_pass http://127.0.0.1:3000;
