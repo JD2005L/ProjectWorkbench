@@ -27,6 +27,7 @@ PW_SHARED_MEMORY=/opt/project-workbench/memory
 PW_MCP_MODE=inherit
 PW_MCP_CONFIG=/etc/project-workbench/empty-mcp.json
 PW_PERMISSION_MODE=prompt
+PW_REMOTE_CONTROL=true
 if [[ -f "$CONFIG" ]]; then
   # shellcheck source=/etc/project-workbench/claude-wrapper.env
   source "$CONFIG"
@@ -36,6 +37,8 @@ args=()
 has_permission=0
 has_add_dir=0
 has_mcp_config=0
+has_remote_control=0
+has_print=0
 for arg in "$@"; do
   case "$arg" in
     --permission-mode|--permission-mode=*|--dangerously-skip-permissions|--allow-dangerously-skip-permissions)
@@ -47,6 +50,12 @@ for arg in "$@"; do
     --mcp-config|--mcp-config=*|--strict-mcp-config)
       has_mcp_config=1
       ;;
+    --remote-control|--remote-control=*|--remote-control-session-name-prefix|--remote-control-session-name-prefix=*)
+      has_remote_control=1
+      ;;
+    -p|--print)
+      has_print=1
+      ;;
   esac
 done
 
@@ -55,6 +64,11 @@ if [[ "$has_permission" -eq 0 && "${PW_PERMISSION_MODE:-prompt}" == "skip" ]]; t
 fi
 if [[ "$has_add_dir" -eq 0 && -n "${PW_SHARED_MEMORY:-}" && -d "$PW_SHARED_MEMORY" ]]; then
   args+=(--add-dir "$PW_SHARED_MEMORY")
+fi
+# Remote-control is an interactive-only feature; skip for --print runs so we
+# don't break non-interactive pipes.
+if [[ "$has_remote_control" -eq 0 && "$has_print" -eq 0 && "${PW_REMOTE_CONTROL:-true}" == "true" ]]; then
+  args+=(--remote-control)
 fi
 if [[ "$has_mcp_config" -eq 0 ]]; then
   case "${PW_MCP_MODE:-inherit}" in
