@@ -14,11 +14,11 @@
 //
 // Roles: admin, developer, content_editor, viewer.
 
-import fs from 'fs/promises';
-import path from 'path';
-import crypto from 'crypto';
-import readline from 'readline';
-import { promisify } from 'util';
+const fs = require('fs/promises');
+const path = require('path');
+const crypto = require('crypto');
+const readline = require('readline');
+const { promisify } = require('util');
 
 const USERS_PATH = '/etc/project-workbench/users.json';
 const ROLES = ['admin', 'developer', 'content_editor', 'viewer'];
@@ -231,23 +231,27 @@ async function cmdDelete(username) {
 
 // --- entry ---------------------------------------------------------------
 
-const argv = process.argv.slice(2);
-if (argv.length === 0 || argv[0] === '-h' || argv[0] === '--help') usage(0);
+async function main() {
+ const argv = process.argv.slice(2);
+ if (argv.length === 0 || argv[0] === '-h' || argv[0] === '--help') usage(0);
 
-const [cmd, ...rest] = argv;
-const { positional, flags } = parseArgs(rest);
+ const [cmd, ...rest] = argv;
+ const { positional, flags } = parseArgs(rest);
 
-try {
- switch (cmd) {
-  case 'list':   await cmdList(); break;
-  case 'add':    if (!positional[0]) usage(1); await cmdAdd(positional[0], flags); break;
-  case 'passwd': if (!positional[0]) usage(1); await cmdPasswd(positional[0]); break;
-  case 'role':   if (positional.length < 2) usage(1); await cmdRole(positional[0], positional[1]); break;
-  case 'grant':  if (positional.length < 2) usage(1); await cmdGrant(positional[0], positional[1]); break;
-  case 'revoke': if (positional.length < 2) usage(1); await cmdRevoke(positional[0], positional[1]); break;
-  case 'delete': if (!positional[0]) usage(1); await cmdDelete(positional[0]); break;
-  default: usage(1);
+ try {
+  switch (cmd) {
+   case 'list':   await cmdList(); break;
+   case 'add':    if (!positional[0]) usage(1); await cmdAdd(positional[0], flags); break;
+   case 'passwd': if (!positional[0]) usage(1); await cmdPasswd(positional[0]); break;
+   case 'role':   if (positional.length < 2) usage(1); await cmdRole(positional[0], positional[1]); break;
+   case 'grant':  if (positional.length < 2) usage(1); await cmdGrant(positional[0], positional[1]); break;
+   case 'revoke': if (positional.length < 2) usage(1); await cmdRevoke(positional[0], positional[1]); break;
+   case 'delete': if (!positional[0]) usage(1); await cmdDelete(positional[0]); break;
+   default: usage(1);
+  }
+ } catch (e) {
+  die(e.message || String(e));
  }
-} catch (e) {
- die(e.message || String(e));
 }
+
+main();

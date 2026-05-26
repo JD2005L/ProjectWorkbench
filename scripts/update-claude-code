@@ -20,7 +20,7 @@ install_claude_wrapper() {
   cat > /usr/local/bin/claude <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+REAL=/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs
 CONFIG=/etc/project-workbench/claude-wrapper.env
 
 PW_SHARED_MEMORY=/opt/project-workbench/memory
@@ -94,7 +94,7 @@ if [[ "$has_mcp_config" -eq 0 ]]; then
   esac
 fi
 
-exec "$REAL" "${args[@]}" "$@"
+exec /usr/bin/node "$REAL" "${args[@]}" "$@"
 BASH
   chmod +x /usr/local/bin/claude
 }
@@ -109,7 +109,7 @@ update_one() {
   fi
   echo "----- $(date -Is) updating $cli ($pkg) -----"
   if [[ "$cli" == "claude" ]]; then
-    echo "Before: $(/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe --version 2>/dev/null || echo missing)"
+    echo "Before: $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
   else
     echo "Before: $(command -v "$cli" >/dev/null && "$cli" --version 2>/dev/null || echo missing)"
   fi
