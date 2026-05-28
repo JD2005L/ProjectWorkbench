@@ -529,11 +529,13 @@ app.get('/', requireAuth, async (req,res)=>{
   const previewBtn = hasPreview(p)
    ? `<button class="button secondary" type="button" data-preview="${esc(p.name)}">Preview</button>`
    : `<button class="button secondary" type="button" data-preview="${esc(p.name)}" title="Preview command not yet configured — click to set up">Preview…</button>`;
-  // Show a primary "Open Claude terminal" for admin/developer; show a
+  // Show a primary "Open terminal" for admin/developer; show a
   // primary "Drop files" for content_editor (no terminal, but they upload
   // to _inbox). viewer gets only the disabled "Terminal — restricted" label.
+  // Labeled generically because a project's tmux tabs can run any CLI
+  // (Claude, Codex, Copilot, plain bash, dev servers, etc.).
   const termBtn = canOpenTerminal
-   ? `<a class="button" href="/term/${encodeURIComponent(p.name)}/">Open Claude terminal</a>`
+   ? `<a class="button" href="/term/${encodeURIComponent(p.name)}/">Open terminal</a>`
    : (canUpload
       ? `<a class="button" href="/files/${encodeURIComponent(p.name)}/">Drop files</a>`
       : `<span class="button" style="opacity:.55;cursor:not-allowed" title="Your role cannot open raw terminals">Terminal — restricted</span>`);
