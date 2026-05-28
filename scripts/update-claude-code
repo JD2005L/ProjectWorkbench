@@ -20,7 +20,17 @@ install_claude_wrapper() {
   cat > /usr/local/bin/claude <<'BASH'
 #!/usr/bin/env bash
 set -euo pipefail
-REAL=/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs
+NPM_ROOT="$(npm root -g 2>/dev/null || true)"
+REAL="${NPM_ROOT}/@anthropic-ai/claude-code/cli-wrapper.cjs"
+if [[ ! -f "$REAL" && -f /usr/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs ]]; then
+  REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs
+fi
+if [[ ! -f "$REAL" && -f /usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs ]]; then
+  REAL=/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli-wrapper.cjs
+fi
+if [[ ! -f "$REAL" && -x /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe ]]; then
+  REAL=/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+fi
 CONFIG=/etc/project-workbench/claude-wrapper.env
 
 PW_SHARED_MEMORY=/opt/project-workbench/memory
@@ -94,7 +104,10 @@ if [[ "$has_mcp_config" -eq 0 ]]; then
   esac
 fi
 
-exec /usr/bin/node "$REAL" "${args[@]}" "$@"
+case "$REAL" in
+  *.cjs) exec /usr/bin/node "$REAL" "${args[@]}" "$@" ;;
+  *)     exec "$REAL" "${args[@]}" "$@" ;;
+esac
 BASH
   chmod +x /usr/local/bin/claude
 }
