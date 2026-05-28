@@ -99,6 +99,10 @@ fi
 
 log "Installing dashboard app…"
 cp -a "$SRC_DIR/app/." "$APP_DIR/"
+# AGENTS.md is served unauthenticated at /agents.md so external automation
+# can discover the instance. Mirror it next to the dashboard so the route
+# resolves even when the source tree is wiped after install.
+install -m 0644 "$SRC_DIR/AGENTS.md" "$APP_DIR/AGENTS.md" 2>/dev/null || true
 ( cd "$APP_DIR" && npm install --omit=dev --silent --no-audit --no-fund )
 
 if [ ! -f "$PW_INSTALL_DIR/projects.json" ]; then

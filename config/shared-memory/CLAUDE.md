@@ -9,3 +9,8 @@ Rules:
 - Record credentials/secrets only in `CREDENTIALS.md`; never commit them to project repositories.
 - Record cross-project decisions or standing instructions in `DECISIONS.md`.
 - Keep project-specific implementation details in the project repo unless they are useful across multiple PW workspaces.
+
+For external AI agents (automation, collaborator agents that need to inject
+prompts into the user's interactive Claude session): see `AGENTS.md` at the
+PW repo root, or fetch it unauthenticated from any live instance at
+`http://<workbench-host>/agents.md`.

@@ -866,6 +866,20 @@ app.post('/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
 app.get('/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
 app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
 app.get('/healthz', (_req,res)=>res.json({ok:true}));
+// Public-readable agent guide. Lives in the repo at AGENTS.md and is the
+// canonical place for an external AI agent to learn how to discover sessions,
+// inject prompts, hand off files, etc. on this PW instance. No auth so a
+// remote agent can curl it without first negotiating credentials.
+app.get('/agents.md', async (_req,res) => {
+ try {
+  // Prefer the live-deployed source-tree copy; fall back to the dashboard's
+  // installed copy if the source tree isn't present (e.g. tarball install).
+  for(const candidate of ['/opt/project-workbench/source/AGENTS.md','/opt/project-workbench/app/AGENTS.md']){
+   try { const txt = await fs.readFile(candidate,'utf8'); res.type('text/markdown; charset=utf-8').send(txt); return; } catch {}
+  }
+  res.status(404).type('text/plain').send('AGENTS.md not installed on this instance.');
+ } catch(e){ res.status(500).type('text/plain').send(String(e.message||e)); }
+});
 
 // ============================================================================
 // Footer status bar shared between dashboard and settings page.

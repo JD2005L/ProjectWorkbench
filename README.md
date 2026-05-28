@@ -189,6 +189,22 @@ Phase 1 is **safe to ship with the app login as the primary gate**; Cloudflare A
 
 ---
 
+## For external AI agents
+
+If you are an AI agent (Claude Code, an MCP server, an automation script,
+or another collaborator's session) that needs to discover this instance's
+projects and inject prompts into the user's active Claude session, read
+[`AGENTS.md`](AGENTS.md). It documents the tmux/session model, the
+`claude agents --json` discovery surface, `tmux send-keys` injection
+patterns, the dashboard HTTP API, and the role/permission model for agent
+users.
+
+Every live PW instance also serves the same file unauthenticated at
+`http://<workbench-host>/agents.md` so a remote agent can `curl` it
+without first negotiating credentials.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Most likely cause | Fix |
