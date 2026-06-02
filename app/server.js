@@ -593,6 +593,7 @@ async function applyRouting(projects){
 }
 async function cloneWorkspace(p){
  await fs.mkdir(workspaceRoot,{recursive:true});
+ await sh('chown',['admin:admin',workspaceRoot]).catch(()=>{});
  try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R','admin:admin',p.path]).catch(()=>{}); return; } catch {}
  try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
  await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
