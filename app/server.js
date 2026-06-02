@@ -971,6 +971,10 @@ app.post('/api/setup/heal/dirs', requireAdmin, async (_req,res)=>{ try {
  for(const d of [pendingDir,'/etc/project-workbench','/opt/project-workbench/workspaces','/opt/project-workbench/memory']){
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
  }
+ // Ensure workspaces is writable by admin (git clone runs as admin)
+ await sh('chown',['admin:admin','/opt/project-workbench/workspaces']).catch(()=>{});
+ await sh('chmod',['755','/opt/project-workbench/workspaces']).catch(()=>{});
+ steps.push('chown admin:admin /opt/project-workbench/workspaces');
  try { await fs.access(emptyMcpPath); steps.push(`ok file: ${emptyMcpPath}`); }
  catch { await fs.writeFile(emptyMcpPath,'{}\n'); steps.push(`created: ${emptyMcpPath}`); }
  await syncWrapperEnv(await loadWorkbenchSettings()); steps.push(`refreshed: ${wrapperEnvPath}`);
