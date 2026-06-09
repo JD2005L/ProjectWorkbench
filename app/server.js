@@ -460,6 +460,18 @@ async function applyRouting(projects){
 async function cloneWorkspace(p){
  await fs.mkdir(workspaceRoot,{recursive:true});
  try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R','admin:admin',p.path]).catch(()=>{}); return; } catch {}
+ if(!p.repo){
+  // No repo configured: stand up an empty local workspace on demand and
+  // initialise it as a git repo so Claude/tools get a sane git context, the
+  // .git check above keeps a re-add idempotent, and a remote can be attached
+  // later from the terminal. An existing folder at this path is adopted in
+  // place — git init never touches existing files.
+  await fs.mkdir(p.path,{recursive:true});
+  await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
+  await sh('sudo',['-u','admin','git','-C',p.path,'init','-b','main']).catch(()=>{});
+  await sh('sudo',['-u','admin','git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
+  return;
+ }
  try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
  await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
  await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
@@ -539,10 +551,13 @@ app.get('/', requireAuth, async (req,res)=>{
    : (canUpload
       ? `<a class="button" href="/files/${encodeURIComponent(p.name)}/">Drop files</a>`
       : `<span class="button" style="opacity:.55;cursor:not-allowed" title="Your role cannot open raw terminals">Terminal — restricted</span>`);
-  return `<article data-name="${esc(p.name)}" data-project="${esc(p.name)}"><h2>${esc(p.name)} <span class="pending-dot" aria-hidden="true"></span><span class="pending-label">ready</span></h2><p><code>${esc(p.path)}</code></p><p>${termBtn} ${previewBtn}</p><p><a class="repo" href="${esc(p.repo)}" target="_blank" rel="noopener">Github Repo</a></p></article>`;
+  const repoLine = p.repo
+   ? `<p><a class="repo" href="${esc(p.repo)}" target="_blank" rel="noopener">Github Repo</a></p>`
+   : `<p class="muted" style="font-size:.9rem">Local workspace</p>`;
+  return `<article data-name="${esc(p.name)}" data-project="${esc(p.name)}"><h2>${esc(p.name)} <span class="pending-dot" aria-hidden="true"></span><span class="pending-label">ready</span></h2><p><code>${esc(p.path)}</code></p><p>${termBtn} ${previewBtn}</p>${repoLine}</article>`;
  }).join('\n');
  const noGrantsState = `<div class="empty-state"><h2>No projects assigned</h2><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) has no project grants yet. Ask an admin to grant access.</p></div>`;
- const emptyState = `<div class="empty-state"><h2>Welcome to Project Workbench</h2><p>LAN-internal browser terminals backed by Claude Code (or your CLI of choice). Two steps to get started:</p><div class="step"><span class="num">1</span><div class="meta"><b>Sign in your AI CLI</b><span>Authenticate Claude Code (or Codex / Copilot) and create your first user.</span></div><a class="button" href="/settings#firstrun">Open Settings</a></div><div class="step"><span class="num">2</span><div class="meta"><b>Add your first project</b><span>Clone a repo into a workspace and get a browser terminal + live preview.</span></div><a class="button" href="/manage">Manage Projects</a></div></div>`;
+ const emptyState = `<div class="empty-state"><h2>Welcome to Project Workbench</h2><p>LAN-internal browser terminals backed by Claude Code (or your CLI of choice). Two steps to get started:</p><div class="step"><span class="num">1</span><div class="meta"><b>Sign in your AI CLI</b><span>Authenticate Claude Code (or Codex / Copilot) and create your first user.</span></div><a class="button" href="/settings#firstrun">Open Settings</a></div><div class="step"><span class="num">2</span><div class="meta"><b>Add your first project</b><span>Clone a repo — or start an empty local workspace — and get a browser terminal + live preview.</span></div><a class="button" href="/manage">Manage Projects</a></div></div>`;
  const gridSection = rows
   ? `${isAdmin ? '<div class="grid-tools"><button id="editOrderBtn" class="button secondary pencilBtn tinybtn" type="button" title="Drag cards to reorder">✎ Reorder</button> <a class="button secondary tinybtn" href="/manage">Manage projects</a></div>' : ''}<div class="grid order-grid">${rows}</div>`
   : (isAdmin ? emptyState : (allProjects.length === 0 ? emptyState : noGrantsState));
@@ -573,24 +588,23 @@ app.get('/manage', requireAdmin, async (req,res)=>{
   const tabs = Array.isArray(p.tabs) ? p.tabs : [];
   const tabsJson = esc(JSON.stringify(tabs));
   const tabRows = tabs.map(t => `<div class="tab-tpl"><input type="text" class="tt-name" placeholder="Tab name" value="${esc(t.name||'')}"><input type="text" class="tt-cmd" placeholder="Optional command (typed on first session creation)" value="${esc(t.cmd||'')}"><label class="cb"><input type="checkbox" class="tt-auto"${t.autoStart?' checked':''}> auto-start</label><button type="button" class="tt-rm" title="Remove">×</button></div>`).join('');
-  return `<article data-name="${esc(p.name)}"><form method="post" action="/manage/update/${encodeURIComponent(p.name)}" class="pwForm"><div class="row"><label>Name<input name="name" value="${esc(p.name)}" required></label><label>Repo<input name="repo" value="${esc(p.repo)}" required></label><label>Port<input name="port" type="number" value="${esc(p.port)}" required></label></div><div class="prow"><label>Preview command<br><span class="muted">Use <code>\${PORT}</code> and <code>\${BASEPATH}</code> (= <code>/preview/${esc(p.name)}</code>). Empty disables preview.</span><textarea name="previewCmd" rows="2" placeholder="${esc(placeholder)}">${cmd}</textarea></label><label>Preview port<input name="previewPort" type="number" value="${previewPortVal}" placeholder="auto"></label></div><div class="prow envrow"><label>Preview env<br><span class="muted">Per-project env vars exported before the cmd runs. Reserved: <code>PORT</code>, <code>BASEPATH</code>.</span><textarea name="previewEnv" rows="3" placeholder="${esc(envPlaceholder)}">${envText}</textarea></label></div><div class="prow tabrow"><label>Tab templates<br><span class="muted">Named tabs that show in the terminal's <b>+</b> dropdown. Mark <b>auto-start</b> to spawn the tab the first time this project's tmux session is created. Empty cmd = plain bash named after the tab. Cmd is typed via <code>send-keys</code> so the shell stays open after it exits.</span><div class="tab-tpls">${tabRows}</div><button type="button" class="button secondary tinybtn" data-add-tab>+ Add tab</button><input type="hidden" name="tabs" value="${tabsJson}"></label></div><p class="muted"><code>${esc(p.path)}</code></p><button class="button" type="submit">Update</button></form><form method="post" action="/manage/delete/${encodeURIComponent(p.name)}" onsubmit="return confirm('Delete ${esc(p.name)} and remove its local workspace?')"><label class="muted"><input type="checkbox" name="confirm" value="yes" required style="width:auto"> Delete local workspace content too</label><button class="button danger" type="submit">Delete project</button></form></article>`;
+  return `<article data-name="${esc(p.name)}"><form method="post" action="/manage/update/${encodeURIComponent(p.name)}" class="pwForm"><div class="row"><label>Name<input name="name" value="${esc(p.name)}" required></label><label>Repo <span class="muted">(optional)</span><input name="repo" value="${esc(p.repo)}" placeholder="blank = local-only workspace"></label><label>Port<input name="port" type="number" value="${esc(p.port)}" required></label></div><div class="prow"><label>Preview command<br><span class="muted">Use <code>\${PORT}</code> and <code>\${BASEPATH}</code> (= <code>/preview/${esc(p.name)}</code>). Empty disables preview.</span><textarea name="previewCmd" rows="2" placeholder="${esc(placeholder)}">${cmd}</textarea></label><label>Preview port<input name="previewPort" type="number" value="${previewPortVal}" placeholder="auto"></label></div><div class="prow envrow"><label>Preview env<br><span class="muted">Per-project env vars exported before the cmd runs. Reserved: <code>PORT</code>, <code>BASEPATH</code>.</span><textarea name="previewEnv" rows="3" placeholder="${esc(envPlaceholder)}">${envText}</textarea></label></div><div class="prow tabrow"><label>Tab templates<br><span class="muted">Named tabs that show in the terminal's <b>+</b> dropdown. Mark <b>auto-start</b> to spawn the tab the first time this project's tmux session is created. Empty cmd = plain bash named after the tab. Cmd is typed via <code>send-keys</code> so the shell stays open after it exits.</span><div class="tab-tpls">${tabRows}</div><button type="button" class="button secondary tinybtn" data-add-tab>+ Add tab</button><input type="hidden" name="tabs" value="${tabsJson}"></label></div><p class="muted"><code>${esc(p.path)}</code></p><button class="button" type="submit">Update</button></form><form method="post" action="/manage/delete/${encodeURIComponent(p.name)}" onsubmit="return confirm('Delete ${esc(p.name)} and remove its local workspace?')"><label class="muted"><input type="checkbox" name="confirm" value="yes" required style="width:auto"> Delete local workspace content too</label><button class="button danger" type="submit">Delete project</button></form></article>`;
  }).join('\n');
- const emptyHint = projects.length === 0 ? `<p class="empty-add">No projects yet — fill in the form below to clone your first one. Workspaces live at <code>${esc(workspaceRoot)}/&lt;Name&gt;</code> and get their own browser terminal at <code>/term/&lt;Name&gt;/</code>.</p>` : '';
+ const emptyHint = projects.length === 0 ? `<p class="empty-add">No projects yet — fill in the form below to clone or create your first one. Workspaces live at <code>${esc(workspaceRoot)}/&lt;Name&gt;</code> and get their own browser terminal at <code>/term/&lt;Name&gt;/</code>.</p>` : '';
  const tabsScript = `<script>(function(){function rowHtml(t){t=t||{};return '<div class="tab-tpl"><input type="text" class="tt-name" placeholder="Tab name" value="'+esc(t.name||'')+'"><input type="text" class="tt-cmd" placeholder="Optional command (typed on first session creation)" value="'+esc(t.cmd||'')+'"><label class="cb"><input type="checkbox" class="tt-auto"'+(t.autoStart?' checked':'')+'> auto-start</label><button type="button" class="tt-rm" title="Remove">×</button></div>'}function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function sync(form){const tpls=form.querySelector('.tab-tpls');const hidden=form.querySelector('input[name=tabs]');if(!tpls||!hidden)return;const arr=[];tpls.querySelectorAll('.tab-tpl').forEach(r=>{const n=r.querySelector('.tt-name').value.trim();if(!n)return;arr.push({name:n,cmd:r.querySelector('.tt-cmd').value,autoStart:r.querySelector('.tt-auto').checked})});hidden.value=JSON.stringify(arr)}document.querySelectorAll('form.pwForm').forEach(form=>{const tpls=form.querySelector('.tab-tpls');const addBtn=form.querySelector('[data-add-tab]');if(tpls){tpls.addEventListener('input',()=>sync(form));tpls.addEventListener('change',()=>sync(form));tpls.addEventListener('click',e=>{const rm=e.target.closest('.tt-rm');if(rm){rm.closest('.tab-tpl').remove();sync(form)}})}if(addBtn){addBtn.addEventListener('click',()=>{tpls.insertAdjacentHTML('beforeend',rowHtml({autoStart:true}));tpls.lastElementChild.querySelector('.tt-name').focus()})}form.addEventListener('submit',()=>sync(form))})})();</script>`;
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manage Projects</title><style>${homeCss}</style></head><body><div class="top"><h1>Manage Projects</h1><a class="button secondary" href="/">Dashboard</a></div>${msg}${emptyHint}<article><h2>Add project</h2><form method="post" action="/manage/add"><div class="row"><label>Name<input name="name" placeholder="RepoName" required pattern="[A-Za-z0-9._-]+"></label><label>Repo URL<input name="repo" placeholder="https://github.com/owner/RepoName.git" required></label><label>Port<input name="port" type="number" placeholder="auto"></label><button class="button" type="submit">Add + clone</button></div><p class="muted">Configure preview and tab templates after the project is added.</p></form></article><div class="grid manage-grid">${rows}</div>${tabsScript}</body></html>`);
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Manage Projects</title><style>${homeCss}</style></head><body><div class="top"><h1>Manage Projects</h1><a class="button secondary" href="/">Dashboard</a></div>${msg}${emptyHint}<article><h2>Add project</h2><form method="post" action="/manage/add"><div class="row"><label>Name<input name="name" placeholder="RepoName" required pattern="[A-Za-z0-9._-]+"></label><label>Repo URL <span class="muted">(optional)</span><input name="repo" placeholder="https://github.com/owner/RepoName.git — blank for a local-only workspace"></label><label>Port<input name="port" type="number" placeholder="auto"></label><button class="button" type="submit">Add project</button></div><p class="muted">Leave <b>Repo URL</b> blank to start an empty local workspace (initialised as a git repo). Configure preview and tab templates after the project is added.</p></form></article><div class="grid manage-grid">${rows}</div>${tabsScript}</body></html>`);
 });
 
 app.post('/manage/add', requireAdmin, async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
  if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
- if(!repo) throw new Error('Repository URL is required');
  await withProjectsLock(async () => {
   const projects = await loadProjects();
   if(projects.some(p=>p.name===name)) throw new Error('A project named "'+name+'" already exists');
   const port = Number(req.body.port) || nextPort(projects);
   if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
   if(allUsedPorts(projects).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
-  const p = { name, repo, path: workspacePath(name), port };
+  const p = repo ? { name, repo, path: workspacePath(name), port } : { name, path: workspacePath(name), port };
   await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
  });
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
@@ -603,7 +617,6 @@ app.post('/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
  const previewPortRaw = String(req.body.previewPort || '').trim();
  const previewEnvRaw = String(req.body.previewEnv || '');
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
- if(!repo) throw new Error('Repository URL is required');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
  await withProjectsLock(async () => {
  const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project "'+oldName+'" not found');
@@ -646,7 +659,7 @@ app.post('/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
    tabs.push({ name, cmd: String(raw?.cmd || '').replace(/\r/g,''), autoStart: !!raw?.autoStart });
   }
  }
- await stopProject(oldName); const oldPath = p.path; p.name = newName; p.repo = repo; p.port = port; p.path = workspacePath(newName);
+ await stopProject(oldName); const oldPath = p.path; p.name = newName; if(repo) p.repo = repo; else delete p.repo; p.port = port; p.path = workspacePath(newName);
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }

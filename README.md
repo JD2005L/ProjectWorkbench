@@ -82,7 +82,7 @@ The preview process is owned by `systemd` (one unit instance per project), so cl
 Each terminal page has a drop-shade for drag-and-drop, paste, and file picker. Uploaded files land in `<workspace>/_inbox/` and the absolute path is auto-inserted into the active terminal — useful for handing screenshots or PDFs to Claude. Pasted images skip the picker and go straight in.
 
 ### Project CRUD
-A `/manage` page clones repos into workspaces, allocates ports, regenerates nginx, registers systemd units, and tears down cleanly on delete. Per-project preview command and env vars live in the same form. Port collisions across terminals and previews are caught before they bite.
+A `/manage` page clones repos into workspaces — or stands up empty local workspaces (`git init`'d) when no repo URL is given — allocates ports, regenerates nginx, registers systemd units, and tears down cleanly on delete. Per-project preview command and env vars live in the same form. Port collisions across terminals and previews are caught before they bite.
 
 ![Manage Projects](docs/screenshots/manage.png)
 
