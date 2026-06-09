@@ -5,6 +5,22 @@
   const project = decodeURIComponent((location.pathname.match(/^\/pty\/([^/]+)/) || [])[1] || '');
   if (!project) return;
 
+  // Suppress ttyd's "Leave site?" beforeunload prompt. This terminal is a
+  // persistent tmux session — navigating back, refreshing, or closing the tab
+  // never loses work (the session just reattaches), so the confirmation is pure
+  // friction. ttyd's disableLeaveAlert option isn't reliable here, so block both
+  // registration styles at the source instead.
+  try {
+    const _add = window.addEventListener.bind(window);
+    window.addEventListener = function (type, ...rest) {
+      if (String(type).toLowerCase() === 'beforeunload') return;
+      return _add(type, ...rest);
+    };
+  } catch {}
+  try {
+    Object.defineProperty(window, 'onbeforeunload', { configurable: true, get: () => null, set: () => {} });
+  } catch {}
+
   let activeSend = null;
   window.__pwSendToTerminal = function(text) {
     if (activeSend) {
