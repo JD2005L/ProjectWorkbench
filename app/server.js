@@ -30,6 +30,18 @@ const SUPPORTED_CLIS = {
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
+// A request is "trusted local" only when it reaches the loopback-bound app
+// (127.0.0.1:3000) directly rather than through nginx — which always sets
+// X-Forwarded-For / X-Real-IP on its proxy to :3000. Such a caller is an on-box
+// process (the installer / deploy) that already has root, so it is safe to let
+// past the CSRF and admin gates for self-heal. Browser/LAN traffic always
+// arrives via nginx and therefore carries those forwarding headers.
+function isTrustedLocal(req){
+ if(req.headers['x-forwarded-for'] || req.headers['x-real-ip']) return false;
+ const ip = req.socket?.remoteAddress || '';
+ return ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1';
+}
+
 // CSRF guard: require that mutating requests come from a page on this workbench.
 // nginx in front gates with Basic Auth (which the browser caches and replays on
 // any origin), so we additionally check that Origin or Referer matches Host on
@@ -38,6 +50,7 @@ app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 app.use((req, res, next) => {
  const method = req.method.toUpperCase();
  if(method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
+ if(isTrustedLocal(req)) return next();
  const host = req.get('host') || '';
  const origin = req.get('origin');
  const referer = req.get('referer');
@@ -231,6 +244,13 @@ function requireAdmin(req, res, next){
  if(req.user.role === 'admin') return next();
  if(wantsJson(req)) return res.status(403).json({ ok:false, error:'Admin role required' });
  return res.status(403).type('html').send(`<h1>403 — Admin access required</h1><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) cannot access this page.</p><p><a href="/">Back to dashboard</a></p>`);
+}
+// Self-heal endpoints accept either an admin session or a trusted on-box caller
+// (installer/deploy hitting 127.0.0.1:3000 directly), so a redeploy can heal
+// nginx without an interactive admin login even when auth enforcement is on.
+function requireAdminOrLocal(req, res, next){
+ if(isTrustedLocal(req)) return next();
+ return requireAdmin(req, res, next);
 }
 function requireProjectAccess(req, res, next){
  const projectName = req.params.project || req.params.name || req.params.oldName;
@@ -838,13 +858,13 @@ app.post('/api/setup/state', requireAdmin, async (req,res)=>{ try {
  res.json({ ok:true, settings:s });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/heal/nginx', requireAdmin, async (_req,res)=>{ try {
+app.post('/api/setup/heal/nginx', requireAdminOrLocal, async (_req,res)=>{ try {
  const projects = await loadProjects();
  await applyRouting(projects);
  res.json({ ok:true, message:`Regenerated nginx config from projects.json (${projects.length} project route${projects.length===1?'':'s'} + /pty/_setup/) and reloaded nginx.` });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/heal/dirs', requireAdmin, async (_req,res)=>{ try {
+app.post('/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{ try {
  const steps = [];
  for(const d of [pendingDir,'/etc/project-workbench','/opt/project-workbench/workspaces','/opt/project-workbench/memory']){
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
