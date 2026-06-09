@@ -164,8 +164,11 @@ install -m 0644 "$SRC_DIR/systemd/claude-code-update.service"     /etc/systemd/s
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.timer"       /etc/systemd/system/claude-code-update.timer
 # Drop-in for app-level auth enforcement (Phase 1: defaults to OFF for safe
 # rollout — flip PW_AUTH_ENFORCE=true after creating an admin via `pw-user`).
+# Only seed the default when none exists: a redeploy must never silently flip an
+# operator's PW_AUTH_ENFORCE=true back to OFF on a live instance.
 install -d -m 0755 /etc/systemd/system/project-workbench.service.d
-install -m 0644 "$SRC_DIR/systemd/project-workbench.service.d/auth.conf" /etc/systemd/system/project-workbench.service.d/auth.conf
+[ -f /etc/systemd/system/project-workbench.service.d/auth.conf ] || \
+  install -m 0644 "$SRC_DIR/systemd/project-workbench.service.d/auth.conf" /etc/systemd/system/project-workbench.service.d/auth.conf
 systemctl daemon-reload
 
 if ! command -v claude >/dev/null 2>&1; then
@@ -242,17 +245,23 @@ rm -f /etc/nginx/sites-enabled/default
 nginx -t >/dev/null 2>&1 || die "nginx config test failed. Review $NGINX_SITE."
 
 log "Starting services…"
-systemctl enable --now project-workbench.service >/dev/null
+systemctl enable project-workbench.service >/dev/null
+# Restart (not just enable --now) so a re-run actually loads the freshly copied
+# app code instead of leaving the previous process running on the old code.
+systemctl restart project-workbench.service
 systemctl reload nginx
 systemctl enable --now claude-code-update.timer >/dev/null
 
-# Once the dashboard is up, ask it to regenerate the real nginx config so
-# any existing projects.json entries get their /pty/ and /preview/ routes.
+# Once the dashboard is up, ask it to regenerate the real nginx config so any
+# existing projects.json entries get their /pty/ and /preview/ routes. The
+# Origin header satisfies the CSRF guard; direct 127.0.0.1 callers also bypass
+# the admin gate (see isTrustedLocal), so this works whether or not app-auth
+# enforcement is on.
 for i in 1 2 3 4 5 6 7 8 9 10; do
   if curl -fsS -o /dev/null --max-time 2 http://127.0.0.1:3000/healthz; then break; fi
   sleep 1
 done
-curl -fsS -X POST http://127.0.0.1:3000/api/setup/heal/nginx -o /dev/null || warn "Heal endpoint did not respond; nginx still serves the bootstrap site."
+curl -fsS -X POST -H 'Origin: http://127.0.0.1:3000' http://127.0.0.1:3000/api/setup/heal/nginx -o /dev/null || warn "Heal endpoint did not respond; nginx still serves the bootstrap site."
 
 HOST_IP="$(hostname -I 2>/dev/null | awk '{print $1}')"
 URL_SUFFIX="$( [ "$PW_HTTP_PORT" = "80" ] && echo '' || printf ':%s' "$PW_HTTP_PORT" )"
