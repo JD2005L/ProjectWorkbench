@@ -1,0 +1,114 @@
+#!/usr/bin/env bash
+# Project Workbench: snapshot tmux sessions so a reboot can restore them.
+#
+# tmux keeps everything (windows, cwds, running programs, scrollback) in RAM, so
+# a host reboot wipes it all. This script writes a durable manifest of every
+# managed `pw_*` session — one row per window — plus, for windows running an
+# interactive Claude Code session, that conversation's stable sessionId (read
+# from ~/.claude/sessions/<pid>.json). pw-tmux-restore replays it on boot.
+#
+# Run periodically (systemd timer) and best-effort on shutdown. Safe anytime;
+# it only reads tmux/proc and writes under the state dir.
+set -uo pipefail
+
+# tmux mangles literal tabs in an -F format to underscores under a non-UTF-8
+# locale, which breaks field splitting below. systemd runs us with a minimal
+# environment, so pin the locale ourselves (matches how the ttyd terminals run).
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+STATE_DIR="${PW_TMUX_STATE_DIR:-/var/lib/project-workbench/tmux-persist}"
+CONTENT_DIR="$STATE_DIR/content"
+SESS_REG="${PW_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+SCROLLBACK_LINES="${PW_TMUX_SCROLLBACK_LINES:-2000}"
+LOG="${PW_TMUX_LOG:-$STATE_DIR/persist.log}"
+# Sessions we never persist (space padded for substring match).
+EXCLUDE=" pw_setup "
+# Field separator for the manifest: US (0x1f). Must be non-whitespace so `read`
+# preserves empty fields (an empty sid or content file) instead of collapsing
+# adjacent separators the way it does with tab/space.
+SEP=$'\x1f'
+
+log() { printf '%s save: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+# No tmux server → nothing to snapshot. Do NOT clobber an existing manifest, so
+# a save that fires after the server is already gone can't erase a good one.
+tmux list-sessions >/dev/null 2>&1 || { log "no tmux server; keeping existing manifest"; exit 0; }
+
+mkdir -p "$CONTENT_DIR" 2>/dev/null || true
+
+# ppid of a pid, robust to spaces/parens in the process comm field (field 2).
+ppid_of() {
+	local stat rest
+	stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	rest=${stat##*') '}          # strip up to and incl. ") " → "<state> <ppid> ..."
+	awk '{print $2}' <<<"$rest"
+}
+
+# Walk up from a pid until we hit one of the known pane pids; echo that pane pid.
+walk_to_pane() {
+	local pid="$1" hops=0 p
+	while [[ -n "$pid" && "$pid" != 0 && $hops -lt 12 ]]; do
+		[[ -n "${PP2KEY[$pid]:-}" ]] && { printf '%s' "$pid"; return 0; }
+		p=$(ppid_of "$pid") || return 1
+		pid="$p"; hops=$((hops + 1))
+	done
+	return 1
+}
+
+declare -A K_CWD K_NAME K_ACTIVE K_SID PP2KEY
+nwin=0
+
+# One row per window (represented by its active pane). Split panes collapse to
+# the active pane's cwd — these sessions are single-pane in practice.
+while IFS=$'\t' read -r s w wn pp cwd wact pact; do
+	[[ "$s" == pw_* ]] || continue
+	[[ "$EXCLUDE" == *" $s "* ]] && continue
+	[[ "$pact" == "1" ]] || continue
+	key="$s"$'\t'"$w"
+	K_CWD[$key]="$cwd"; K_NAME[$key]="$wn"; K_ACTIVE[$key]="$wact"
+	PP2KEY[$pp]="$key"
+	nwin=$((nwin + 1))
+done < <(tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_pid}	#{pane_current_path}	#{window_active}	#{pane_active}' 2>/dev/null)
+
+# Refuse to clobber a good manifest with an empty one: if we somehow found no
+# windows (server vanished mid-run, format mangled, etc.), keep what we have.
+if [[ "$nwin" -eq 0 ]]; then
+	log "captured 0 windows; keeping existing manifest"
+	exit 0
+fi
+
+# Map each live Claude session to the window whose process tree contains it.
+if [[ -d "$SESS_REG" ]]; then
+	for jf in "$SESS_REG"/*.json; do
+		[[ -e "$jf" ]] || continue
+		pid=$(grep -o '"pid":[0-9]*' "$jf" | head -1 | cut -d: -f2)
+		sid=$(grep -o '"sessionId":"[^"]*"' "$jf" | head -1 | cut -d'"' -f4)
+		[[ -n "$pid" && -n "$sid" && -d "/proc/$pid" ]] || continue
+		panepid=$(walk_to_pane "$pid") || continue
+		K_SID["${PP2KEY[$panepid]}"]="$sid"
+	done
+fi
+
+tmp=$(mktemp "$STATE_DIR/.manifest.XXXXXX") || { log "mktemp failed"; exit 0; }
+claude=0
+for key in "${!K_CWD[@]}"; do
+	s="${key%%$'\t'*}"; w="${key##*$'\t'}"
+	cwd="${K_CWD[$key]}"; wn="${K_NAME[$key]}"; sid="${K_SID[$key]:-}"
+	hasc=0; cfile=""
+	if [[ -n "$sid" ]]; then
+		hasc=1; claude=$((claude + 1))
+	else
+		# Capture scrollback only for non-Claude windows (Claude redraws its own
+		# UI on --resume, so a captured TUI dump would just be noise).
+		cf="${s}__${w}.txt"
+		if tmux capture-pane -p -S -"$SCROLLBACK_LINES" -t "$s:$w" >"$CONTENT_DIR/$cf" 2>/dev/null; then
+			cfile="$cf"
+		fi
+	fi
+	printf '%s\n' "$s$SEP$w$SEP$wn$SEP$cwd$SEP$hasc$SEP$sid$SEP$cfile" >>"$tmp"
+done
+
+sort -t "$SEP" -k1,1 -k2,2n "$tmp" -o "$tmp"
+mv -f "$tmp" "$STATE_DIR/manifest.tsv"
+date -Iseconds >"$STATE_DIR/last-save"
+log "wrote manifest: ${#K_CWD[@]} windows, $claude with Claude"
