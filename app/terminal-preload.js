@@ -64,22 +64,52 @@
     return out;
   }
 
+  // Ctrl+V handling.
+  //
+  // Image: upload to _inbox, drop the resulting path into the terminal,
+  //   surface the preview via the parent drawer (existing flow).
+  // Text:  route through __pwSendToTerminal (which wraps in bracketed-paste
+  //   markers and sends via the ttyd WS). This sidesteps the async clipboard
+  //   permission gauntlet that breaks xterm.js's native Ctrl+V on plain-HTTP
+  //   instances. Same final effect as right-click "Paste as plain text".
+  // Anything else: fall through to xterm.js's default handling.
+  //
+  // stopImmediatePropagation (not just stopPropagation) so xterm.js's own
+  // paste path doesn't *also* try to handle it and end up sending the raw
+  // image bytes / fighting us for the WS write.
+  //
+  // Wrapped in try/catch — if anything throws we fall through silently so a
+  // future browser quirk can't permanently break paste.
   document.addEventListener('paste', async (e) => {
-    const items = Array.from(e.clipboardData?.items || []);
-    const imgItem = items.find(i => i.type?.startsWith('image/'));
-    if (!imgItem) return; // Non-image paste: let ttyd handle it normally.
-    e.preventDefault();
-    e.stopPropagation();
     try {
-      const blob = imgItem.getAsFile();
-      const filename = 'clipboard-image' + extFor(blob?.type);
-      const out = await uploadImageBlob(blob, filename);
-      window.__pwSendToTerminal?.(out.path);
-      try { await navigator.clipboard.writeText(out.path); } catch {}
-      window.parent?.postMessage({ type: 'pw-paste-saved', path: out.path, url: out.url }, '*');
-    } catch (err) {
-      window.parent?.postMessage({ type: 'pw-paste-error', error: err?.message || String(err) }, '*');
-    }
+      const cd = e.clipboardData;
+      if (!cd) return;
+      const items = Array.from(cd.items || []);
+      const imgItem = items.find(i => i.type?.startsWith('image/'));
+      if (imgItem) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        try {
+          const blob = imgItem.getAsFile();
+          const filename = 'clipboard-image' + extFor(blob?.type);
+          const out = await uploadImageBlob(blob, filename);
+          window.__pwSendToTerminal?.(out.path);
+          try { await navigator.clipboard.writeText(out.path); } catch {}
+          window.parent?.postMessage({ type: 'pw-paste-saved', path: out.path, url: out.url }, '*');
+        } catch (err) {
+          window.parent?.postMessage({ type: 'pw-paste-error', error: err?.message || String(err) }, '*');
+        }
+        return;
+      }
+      const text = cd.getData('text/plain') || cd.getData('text') || '';
+      if (text) {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        // Normalize line endings: terminals expect \r for Enter inside a paste.
+        const normalized = text.replace(/\r?\n/g, '\r');
+        window.__pwSendToTerminal?.(normalized);
+      }
+    } catch {}
   }, true);
 
   // tmux mouse-on makes tmux own drag-selection, so xterm.js never sees a
