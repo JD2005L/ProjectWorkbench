@@ -1,0 +1,25 @@
+[Unit]
+Description=Project Workbench: restore tmux sessions on boot, snapshot on stop
+# Restore must finish before the per-project ttyd terminals attach, so that
+# `tmux new-session -A` in project-terminal-start attaches to a restored session
+# instead of creating an empty one. project-terminal@.service orders itself
+# After= this unit.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Never let stopping/restarting this unit tear down the shared tmux server.
+KillMode=none
+User=admin
+Group=admin
+Environment=HOME=/home/admin
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+ExecStart=/usr/local/bin/pw-tmux-restore
+ExecStop=/usr/local/bin/pw-tmux-save
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

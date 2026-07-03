@@ -1,0 +1,13 @@
+[Unit]
+Description=Project Workbench: periodic tmux session snapshot
+
+[Timer]
+# First snapshot a few minutes after boot (once sessions are back up), then
+# every couple of minutes. Bounds worst-case loss to one interval on a crash;
+# a clean shutdown also snapshots via pw-tmux-persist.service ExecStop.
+OnBootSec=3min
+OnUnitActiveSec=2min
+Unit=pw-tmux-save.service
+
+[Install]
+WantedBy=timers.target

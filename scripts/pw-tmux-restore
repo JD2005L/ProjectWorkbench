@@ -1,0 +1,106 @@
+#!/usr/bin/env bash
+# Project Workbench: restore tmux sessions saved by pw-tmux-save.
+#
+# Runs once at boot (systemd), ordered BEFORE the per-project ttyd terminals so
+# that when `project-terminal-start` runs `tmux new-session -A`, the session it
+# wants already exists and it simply attaches. Recreates each window in its old
+# cwd, replays captured scrollback for plain shells, and re-launches Claude Code
+# for windows that had it — resuming the exact conversation via `claude --resume
+# <sessionId>` (the /usr/local/bin/claude wrapper re-adds MCP/permission flags).
+#
+# Idempotent: sessions that already exist are left untouched, and a Claude
+# session that is already running is never launched a second time. Always exits
+# 0 so it can never block terminal startup.
+set -uo pipefail
+
+# Pin locale (systemd gives us a minimal env); keeps tmux/format handling and
+# any non-ASCII window names/keystrokes consistent with the ttyd terminals.
+export LANG=C.UTF-8 LC_ALL=C.UTF-8
+
+STATE_DIR="${PW_TMUX_STATE_DIR:-/var/lib/project-workbench/tmux-persist}"
+CONTENT_DIR="$STATE_DIR/content"
+MANIFEST="$STATE_DIR/manifest.tsv"
+SESS_REG="${PW_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+PROJECTS_DIR="${PW_CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+RESTORE_CLAUDE="${PW_TMUX_RESTORE_CLAUDE:-1}"   # set 0 to restore shells but not Claude
+MAX_CLAUDE="${PW_TMUX_MAX_CLAUDE:-30}"          # safety cap on auto-launched sessions
+LOG="${PW_TMUX_LOG:-$STATE_DIR/persist.log}"
+SEP=$'\x1f'                                      # manifest field separator (matches pw-tmux-save)
+
+# Match how project-terminal-start launches its shells, so restored panes behave
+# identically to freshly created ones.
+ENVBASH='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
+
+log() { printf '%s restore: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+[[ -f "$MANIFEST" ]] || { log "no manifest; nothing to restore"; exit 0; }
+tmux start-server 2>/dev/null || true
+
+# Conversations already running right now (idempotency guard).
+declare -A LIVE_SID
+if [[ -d "$SESS_REG" ]]; then
+	for jf in "$SESS_REG"/*.json; do
+		[[ -e "$jf" ]] || continue
+		pid=$(grep -o '"pid":[0-9]*' "$jf" | head -1 | cut -d: -f2)
+		sid=$(grep -o '"sessionId":"[^"]*"' "$jf" | head -1 | cut -d'"' -f4)
+		[[ -n "$pid" && -n "$sid" && -d "/proc/$pid" ]] && LIVE_SID[$sid]=1
+	done
+fi
+
+# ---- Pass 1: recreate sessions/windows as plain shells; record created index.
+declare -A CREATED IDX
+while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
+	[[ -n "$s" ]] || continue
+	if [[ ! -d "$cwd" ]]; then
+		[[ -z "${CREATED[$s]:-}" ]] && log "workspace gone, skip session $s ($cwd)"
+		CREATED[$s]="skip"; continue
+	fi
+	if [[ -z "${CREATED[$s]:-}" ]]; then
+		if tmux has-session -t "=$s" 2>/dev/null; then
+			CREATED[$s]="skip"; log "session $s already exists; skipping"
+			continue
+		fi
+		idx=$(tmux new-session -d -P -F '#{window_index}' -s "$s" -c "$cwd" "$ENVBASH" 2>>"$LOG") \
+			&& CREATED[$s]="own" || { CREATED[$s]="skip"; log "failed to create session $s"; continue; }
+		IDX["$s"$'\t'"$w"]="$idx"
+		tmux rename-window -t "$s:$idx" "$wn" 2>/dev/null || true
+		continue
+	fi
+	[[ "${CREATED[$s]}" == "skip" ]] && continue
+	idx=$(tmux new-window -d -P -F '#{window_index}' -t "$s:" -c "$cwd" "$ENVBASH" 2>>"$LOG") || continue
+	IDX["$s"$'\t'"$w"]="$idx"
+	tmux rename-window -t "$s:$idx" "$wn" 2>/dev/null || true
+done <"$MANIFEST"
+
+# Give the freshly spawned shells a moment to reach their prompt before we type.
+sleep 1
+
+# ---- Pass 2: replay scrollback / re-launch Claude in each restored window.
+claude_count=0
+while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
+	[[ -n "$s" ]] || continue
+	[[ "${CREATED[$s]:-}" == "own" ]] || continue
+	idx="${IDX["$s"$'\t'"$w"]:-}"
+	[[ -n "$idx" ]] || continue
+
+	if [[ "$hasc" == "1" && -n "$sid" ]]; then
+		if [[ "$RESTORE_CLAUDE" != "1" ]]; then
+			continue
+		elif [[ -n "${LIVE_SID[$sid]:-}" ]]; then
+			log "claude $sid already live; skip $s:$idx"
+		elif ! compgen -G "$PROJECTS_DIR/*/$sid.jsonl" >/dev/null 2>&1; then
+			log "no transcript for $sid; leaving shell in $s:$idx"
+		elif (( claude_count >= MAX_CLAUDE )); then
+			log "MAX_CLAUDE=$MAX_CLAUDE reached; leaving shell in $s:$idx ($sid)"
+		else
+			tmux send-keys -t "$s:$idx" "claude --resume $sid" C-m
+			claude_count=$((claude_count + 1))
+			log "resumed claude $sid in $s:$idx"
+		fi
+	elif [[ -n "$cfile" && -f "$CONTENT_DIR/$cfile" ]]; then
+		tmux send-keys -t "$s:$idx" "cat -- $(printf '%q' "$CONTENT_DIR/$cfile")" C-m
+	fi
+done <"$MANIFEST"
+
+log "restore complete; launched $claude_count Claude session(s)"
+exit 0
