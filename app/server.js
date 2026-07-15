@@ -2,7 +2,7 @@ import express from 'express';
 import fs from 'fs/promises';
 import path from 'path';
 import crypto from 'crypto';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const app = express();
@@ -151,12 +151,18 @@ async function saveUsers(users){
 // against the system CA bundle (LDAPTLS_CACERT).
 function ldapBindOnce(bindDn, password){
  return new Promise((resolve, reject) => {
-  execFile('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-w', password],
-   { timeout: 10000, env: { ...process.env, LDAPTLS_CACERT: LDAP_CACERT, LDAPTLS_REQCERT: 'demand' } },
-   (err, stdout, stderr) => {
-    if(err) reject(new Error((stderr || err.message || 'LDAP bind failed').trim()));
-    else resolve(true);
-   });
+  // Feed the bind password via stdin (-y /dev/stdin), NOT `-w <pw>`, so it never
+  // appears in argv / world-readable /proc/<pid>/cmdline (this host also grants
+  // interactive shells to terminal roles). Written without a trailing newline so
+  // `-y` reads the password verbatim regardless of its newline handling.
+  const child = spawn('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-y', '/dev/stdin'],
+   { timeout: 10000, env: { ...process.env, LDAPTLS_CACERT: LDAP_CACERT, LDAPTLS_REQCERT: 'demand' } });
+  let stderr = '';
+  child.stderr.on('data', d => { stderr += d; });
+  child.on('error', e => reject(new Error(e.message || 'LDAP bind failed')));
+  child.on('close', code => { if(code === 0) resolve(true); else reject(new Error((stderr.trim() || `ldapwhoami exited ${code}`))); });
+  child.stdin.on('error', () => {});   // ignore EPIPE if the child exits before reading
+  child.stdin.end(String(password));
  });
 }
 // True only for connection/TLS-level failures (retryable across a DC round-robin);
@@ -191,6 +197,7 @@ function normalizeUsername(raw){
 // in `ldap` mode MAY throw when the bind itself fails (caller treats as invalid).
 async function authenticate(rawUsername, password){
  if(AUTH_MODE === 'ldap'){
+  if(!password) return null;   // never attempt an (unauthenticated) empty-password bind
   await ldapBind(String(rawUsername || ''), password);
   const username = normalizeUsername(rawUsername);
   const users = await loadUsers();

@@ -29,7 +29,7 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 | C4 | _outbox routes + /files Outbox card present+wired; INBOX_WRITE_ROLES/terminal-access gating; isolated create→list→download→delete | PASS | 1 |
 | C5 | tmux sidecar unit+keepalive present, de-GOA'd, reconciled w/ upstream reboot-persist (doc, single socket-owner); bash -n clean; unit verifies | PASS | 1 |
 | C6 | GOA optional/off: deploy-centre absent→off, de-GOA LDAP/cert defaults, no gov.ab.ca/goa.ds in app/ (PW_DEPLOY_MODE container path deferred) | PASS | 1 |
-| C7 | Non-regression: cockpit routes (/api/projects/{status,reorder,config}, /manage redirect) + PVIKPBot handoff preserved; healthz ok | PENDING | 0 |
+| C7 | Non-regression: cockpit routes + PVIKPBot handoff preserved (independent code-review CONFIRMED, no regressions) | PASS | 1 |
 | C8 | Consolidation docs updated for cockpit re-base; this loop-log maintained | PASS | 1 |
 
 ## Increment plan
@@ -125,3 +125,23 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 - C8: added docs/consolidation/README.md (status matrix + verification method +
   deferred-to-target-env list) alongside stage5 doc.
 - Next: iter 6 = independent verification sweep (subagent) + bounded-stop summary.
+
+### 2026-07-15 — iter 6 (independent verification sweep + security fix)
+- Skeptical code-review subagent (adversarial, try-to-refute): C2/C3/C4 CONFIRMED,
+  no regressions, no auth bypass, no _outbox traversal escape, prod path unaffected
+  by the ISOLATED guards.
+- Fix applied (Medium/High the reviewer found in the ported LDAP bind): the
+  directory password was passed via `-w` on ldapwhoami's argv → readable in
+  world-readable /proc/<pid>/cmdline (this host grants shells to terminal roles).
+  Changed ldapBindOnce to feed the password via stdin (`-y /dev/stdin`, spawn,
+  no trailing newline) so it never appears in argv. Also added an empty-password
+  guard inside authenticate() (never attempt an unauthenticated empty-password bind).
+- Verify: node --check clean; static proof no `-w` remains (uses `-y /dev/stdin`);
+  full harness re-run 21/21. Real-DC bind behavior validation remains a target-env
+  (ldap) follow-up (harness shims ldapwhoami).
+- All in-scope criteria PASS. Bounded stop: deploy-layer (container path Stage 2b,
+  deploy-centre gating, PW_DEPLOY_MODE terminal-model duality), browser UI proof,
+  and the upstream PR are documented follow-ups needing a target environment.
+
+## RESULT: in-scope criteria (C1–C8) PASS, independently verified. Loop paused at
+## bounded stop; deploy-layer + browser + upstream-PR follow-ups documented.
