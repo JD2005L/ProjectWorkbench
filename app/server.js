@@ -7,9 +7,14 @@ import { promisify } from 'util';
 
 const app = express();
 const execFileAsync = promisify(execFile);
-const registryPath = '/opt/project-workbench/projects.json';
-const workspaceRoot = '/opt/project-workbench/workspaces';
-const nginxPath = '/etc/nginx/sites-available/project-workbench';
+// Data/host paths are env-overridable so an isolated test/verify instance never
+// mutates the shared host. ISOLATED = an explicit PW_ISOLATED=1, or a registry
+// path pointed away from the canonical location (e.g. a throwaway test registry).
+const CANONICAL_REGISTRY = '/opt/project-workbench/projects.json';
+const registryPath = process.env.PW_REGISTRY_PATH || CANONICAL_REGISTRY;
+const workspaceRoot = process.env.PW_WORKSPACES || '/opt/project-workbench/workspaces';
+const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/project-workbench';
+const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath !== CANONICAL_REGISTRY;
 const managedProjects = ['AmrikPublic','HarmaniPublic','IPSpeaker_ESP32','ProVisionIPortal','ProVisionIPublic','SunEstateHomesCA'];
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
@@ -87,12 +92,26 @@ async function withProjectsLock(fn){
 // working until an operator creates a real admin via `pw-user add` and flips
 // the env var. Throughout Phase 1, nginx Basic Auth remains the outer gate.
 // ============================================================================
-const usersPath = '/etc/project-workbench/users.json';
-const sessionsPath = '/var/lib/project-workbench/sessions.json';
-const auditLogPath = '/var/log/project-workbench/audit.log';
+// PW_AUTH_MODE selects the credential backend: `local` (default) verifies a
+// scrypt password stored on the user record; `ldap` authenticates against a
+// directory via simple bind over TLS and treats the local record as an access
+// whitelist. Both modes share ONE user record and ONE server-side revocable
+// session store. Data paths are env-overridable (for tests / alt layouts).
+const AUTH_MODE = (process.env.PW_AUTH_MODE || 'local').toLowerCase() === 'ldap' ? 'ldap' : 'local';
+const usersPath = process.env.PW_USERS_PATH || '/etc/project-workbench/users.json';
+const sessionsPath = process.env.PW_SESSIONS_PATH || '/var/lib/project-workbench/sessions.json';
+const auditLogPath = process.env.PW_AUDIT_LOG || '/var/log/project-workbench/audit.log';
 const AUTH_ENFORCE = String(process.env.PW_AUTH_ENFORCE || '').toLowerCase() === 'true';
+console.log(`[auth] mode=${AUTH_MODE} enforce=${AUTH_ENFORCE}`);
+// LDAP settings (ldap mode only). Generic, de-GOA'd defaults; a directory
+// deployment overlays PW_LDAP_URL / PW_LDAP_SUFFIX / PW_LOGIN_ORG via env.
+const LDAP_URL = process.env.PW_LDAP_URL || 'ldaps://ldap.example.com:636';
+const LDAP_SUFFIX = process.env.PW_LDAP_SUFFIX || '@example.com';
+const LDAP_CACERT = process.env.PW_LDAP_CACERT || '/etc/ssl/certs/ca-certificates.crt';
+const LDAP_BIND_ATTEMPTS = Number(process.env.PW_LDAP_BIND_ATTEMPTS) || 4;
+const LOGIN_ORG = process.env.PW_LOGIN_ORG || (AUTH_MODE === 'ldap' ? 'your directory account' : '');
 const SESSION_COOKIE = 'pw_session';
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_MS = (Number(process.env.PW_SESSION_HOURS) || 720) * 60 * 60 * 1000;
 const ROLES = ['admin','developer','content_editor','viewer'];
 const TERMINAL_ROLES = new Set(['admin','developer']);
 // Roles allowed to drop files into a project's _inbox (uploads + per-file
@@ -125,6 +144,63 @@ async function saveUsers(users){
  await fs.mkdir(path.dirname(usersPath),{recursive:true});
  await fs.writeFile(usersPath, JSON.stringify({ users }, null, 2)+'\n');
  await fs.chmod(usersPath, 0o600).catch(()=>{});
+}
+
+// ---- LDAP (ldap mode) --------------------------------------------------------
+// Simple bind over TLS via ldapwhoami (no native deps). The DC cert is validated
+// against the system CA bundle (LDAPTLS_CACERT).
+function ldapBindOnce(bindDn, password){
+ return new Promise((resolve, reject) => {
+  execFile('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-w', password],
+   { timeout: 10000, env: { ...process.env, LDAPTLS_CACERT: LDAP_CACERT, LDAPTLS_REQCERT: 'demand' } },
+   (err, stdout, stderr) => {
+    if(err) reject(new Error((stderr || err.message || 'LDAP bind failed').trim()));
+    else resolve(true);
+   });
+ });
+}
+// True only for connection/TLS-level failures (retryable across a DC round-robin);
+// a real bind result (bad password, signing-required, success) is never retried.
+function isRetryableLdapError(msg){
+ if(/Invalid credentials|AcceptSecurityContext|Strong\(er\) authentication|data 5[0-9a-f]{2}/i.test(msg)) return false;
+ return /Can't contact LDAP server|Connect error|ldap_start_tls|\(-1\)|\(-11\)|ETIMEDOUT|Timed out|Connection refused|connection reset|Network is unreachable/i.test(msg);
+}
+async function ldapBind(username, password){
+ const bindDn = username.includes('@') ? username : username + LDAP_SUFFIX;
+ let lastErr;
+ for(let attempt = 1; attempt <= LDAP_BIND_ATTEMPTS; attempt++){
+  try { return await ldapBindOnce(bindDn, password); }
+  catch(e){ lastErr = e; if(!isRetryableLdapError(e.message) || attempt === LDAP_BIND_ATTEMPTS) throw e; }
+ }
+ throw lastErr;
+}
+/** Normalise a directory identity to a bare lowercase username (ldap mode only):
+ *  EXAMPLE\jane.doe → jane.doe · jane.doe@example.com → jane.doe · jane.doe.z → jane.doe */
+function normalizeUsername(raw){
+ if(!raw) return '';
+ let s = String(raw).trim();
+ const bsIdx = s.lastIndexOf('\\'); if(bsIdx >= 0) s = s.slice(bsIdx + 1);
+ const atIdx = s.indexOf('@'); if(atIdx >= 0) s = s.slice(0, atIdx);
+ s = s.toLowerCase().trim();
+ if(/\.[a-z]$/.test(s)) s = s.slice(0, -2);   // strip admin-account suffix (.z, .a…)
+ return s;
+}
+// Shared credential check for every login entry point. `ldap`: bind is
+// authoritative and the account must already exist on the whitelist; `local`:
+// the scrypt hash on the record is verified. Returns the user record or null;
+// in `ldap` mode MAY throw when the bind itself fails (caller treats as invalid).
+async function authenticate(rawUsername, password){
+ if(AUTH_MODE === 'ldap'){
+  await ldapBind(String(rawUsername || ''), password);
+  const username = normalizeUsername(rawUsername);
+  const users = await loadUsers();
+  return users.find(x => x.username === username) || null;
+ }
+ const username = String(rawUsername || '').trim();
+ const users = await loadUsers();
+ const u = users.find(x => x.username === username);
+ if(!u || !u.passwordHash) return null;
+ return (await verifyPassword(password, u.passwordHash)) ? u : null;
 }
 
 let sessionsCache = null;
@@ -550,6 +626,9 @@ function nginxConfig(projects){
  return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
 }
 async function applyRouting(projects){
+ // An isolated instance must never rewrite the shared host nginx config unless
+ // an explicit PW_NGINX_CONF (a throwaway path) was provided.
+ if(ISOLATED && !process.env.PW_NGINX_CONF){ console.log('[isolated] skip host nginx write'); return; }
  const newConfig = nginxConfig(projects);
  let prev = null;
  try { prev = await fs.readFile(nginxPath,'utf8'); } catch {}
@@ -1522,7 +1601,9 @@ app.get('/login', (req,res) => {
  if(req.user && !req.user.implicit){ return res.redirect(req.query.next ? String(req.query.next) : '/'); }
  const next = req.query.next ? String(req.query.next) : '/';
  const msg = req.query.msg ? String(req.query.msg) : '';
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Project Workbench</title><style>${loginCss}</style></head><body><div class="card"><h1>Project Workbench</h1><p class="sub">Sign in to continue.</p><form id="loginForm"><label>Username<input id="u" name="username" autocomplete="username" autofocus required></label><label>Password<input id="p" name="password" type="password" autocomplete="current-password" required></label><button class="button" type="submit">Sign in</button><div class="err" id="err">${esc(msg)}</div></form></div><script>const next=${JSON.stringify(next)};document.getElementById('loginForm').addEventListener('submit',async e=>{e.preventDefault();const u=document.getElementById('u').value;const p=document.getElementById('p').value;const err=document.getElementById('err');err.textContent='Signing in…';try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});const j=await r.json();if(!j.ok){err.textContent=j.error||'Login failed';return}location.href=next}catch(e){err.textContent=e.message||String(e)}});</script></body></html>`);
+ const sub = AUTH_MODE === 'ldap' ? `Sign in with ${esc(LOGIN_ORG || 'your directory account')}.` : 'Sign in to continue.';
+ const uph = AUTH_MODE === 'ldap' ? 'firstname.lastname' : 'username';
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Project Workbench</title><style>${loginCss}</style></head><body><div class="card"><h1>Project Workbench</h1><p class="sub">${sub}</p><form id="loginForm"><label>Username<input id="u" name="username" autocomplete="username" placeholder="${uph}" autofocus required></label><label>Password<input id="p" name="password" type="password" autocomplete="current-password" required></label><button class="button" type="submit">Sign in</button><div class="err" id="err">${esc(msg)}</div></form></div><script>const next=${JSON.stringify(next)};document.getElementById('loginForm').addEventListener('submit',async e=>{e.preventDefault();const u=document.getElementById('u').value;const p=document.getElementById('p').value;const err=document.getElementById('err');err.textContent='Signing in…';try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});const j=await r.json();if(!j.ok){err.textContent=j.error||'Login failed';return}location.href=next}catch(e){err.textContent=e.message||String(e)}});</script></body></html>`);
 });
 
 app.post('/api/auth/login', async (req,res) => {
@@ -1530,15 +1611,14 @@ app.post('/api/auth/login', async (req,res) => {
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
   if(!username || !password){ await audit('login_fail', { reason:'missing-fields', username }, req); return res.status(400).json({ ok:false, error:'Username and password required' }); }
-  const users = await loadUsers();
-  const u = users.find(x => x.username === username);
-  if(!u){ await audit('login_fail', { reason:'unknown-user', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  const ok = await verifyPassword(password, u.passwordHash);
-  if(!ok){ await audit('login_fail', { reason:'bad-password', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
+  let u = null;
+  try { u = await authenticate(username, password); }
+  catch(e){ await audit('login_fail', { reason:'ldap-bind', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
+  if(!u){ await audit('login_fail', { reason:'invalid', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
   const sid = await createSession(u.id);
   setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
-  // Record lastLoginAt opportunistically (best-effort, don't fail the login if it can't write).
-  try { u.lastLoginAt = new Date().toISOString(); await saveUsers(users); } catch {}
+  // Record lastLoginAt opportunistically (best-effort; re-load so we mutate the persisted record).
+  try { const list = await loadUsers(); const rec = list.find(x => x.id === u.id); if(rec){ rec.lastLoginAt = new Date().toISOString(); await saveUsers(list); } } catch {}
   req.user = u;
   await audit('login_ok', { username }, req);
   res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
@@ -1615,15 +1695,17 @@ app.post('/api/users', requireAdmin, async (req,res) => {
   const password = String(req.body?.password || '');
   if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
   if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
-  if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
+  if(AUTH_MODE !== 'ldap' && password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   let projects;
   try { projects = normalizeProjects(req.body?.projects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
   const users = await loadUsers();
   if(users.some(u => u.username === username)) return res.status(409).json({ ok:false, error:`User "${username}" already exists` });
-  const passwordHash = await hashPassword(password);
+  const passwordHash = AUTH_MODE === 'ldap' ? undefined : await hashPassword(password);
   const now = new Date().toISOString();
   const id = 'u-' + crypto.randomBytes(6).toString('base64url');
-  users.push({ id, username, passwordHash, role, projects, createdAt: now, lastLoginAt: null });
+  const rec = { id, username, role, projects, createdAt: now, lastLoginAt: null };
+  if(passwordHash) rec.passwordHash = passwordHash;
+  users.push(rec);
   await saveUsers(users);
   await audit('user_create', { username, role, projects }, req);
   res.json({ ok:true, user: safeUserShape({ username, role, projects, createdAt: now, lastLoginAt: null }) });
@@ -1663,6 +1745,7 @@ app.patch('/api/users/:username', requireAdmin, async (req,res) => {
 
 app.post('/api/users/:username/password', requireAdmin, async (req,res) => {
  try {
+  if(AUTH_MODE === 'ldap') return res.status(400).json({ ok:false, error:'Passwords are managed by the directory (ldap mode)' });
   const target = req.params.username;
   const password = String(req.body?.password || '');
   if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
@@ -1730,4 +1813,5 @@ app.get('/api/system/firstrun', async (_req,res) => {
 });
 
 app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
-app.listen(3000,'127.0.0.1',()=>{ console.log('dashboard listening on 127.0.0.1:3000'); sweepOrphanTmuxSessions(); });
+const PORT = parseInt(process.env.PORT || '3000', 10);
+app.listen(PORT,'127.0.0.1',()=>{ console.log(`dashboard listening on 127.0.0.1:${PORT}`); if(!ISOLATED) sweepOrphanTmuxSessions(); });
