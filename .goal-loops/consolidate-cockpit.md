@@ -27,7 +27,7 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 | C2 | PW_AUTH_MODE=local|ldap (default local); isolated boot local login→cookie, authed /→200, unauth→/login under enforce; ldap boots + pw reset→400 | PASS | 1 |
 | C3 | Quick Switcher absent from app/ (no openSwitcher/projSwitch/pw-open-switcher/Shift+P); cockpit rail present | PENDING | 0 |
 | C4 | _outbox routes + /files Outbox card present+wired; INBOX_WRITE_ROLES/terminal-access gating; isolated create→list→download→delete | PASS | 1 |
-| C5 | tmux sidecar files present, reconciled w/ upstream reboot-persist (no double socket-ownership); bash -n clean; CA mount de-GOA'd | PENDING | 0 |
+| C5 | tmux sidecar unit+keepalive present, de-GOA'd, reconciled w/ upstream reboot-persist (doc, single socket-owner); bash -n clean; unit verifies | PASS | 1 |
 | C6 | GOA optional/off: PW_DEPLOY_CENTRE default off (deploy routes 404), PW_DEPLOY_MODE host|container, de-GOA LDAP/cert defaults; no gov.ab.ca/goa.ds in app/ | PENDING | 0 |
 | C7 | Non-regression: cockpit routes (/api/projects/{status,reorder,config}, /manage redirect) + PVIKPBot handoff preserved; healthz ok | PENDING | 0 |
 | C8 | Consolidation docs updated for cockpit re-base; this loop-log maintained | PENDING | 0 |
@@ -99,3 +99,18 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 - (Deferred drawer) If the in-terminal tabbed drawer is later grafted into /term:
   verify it opens over the cockpit without breaking the left rail hover-peek, tab
   switching Inbox/Outbox, paste-to-inbox, and OSC-52 copy.
+
+### 2026-07-15 — iter 4 (increment 3: tmux sidecar consolidation, scoped)
+- Upstream cockpit is HOST-ONLY (no Containerfile/entrypoint/deploy-local); it has
+  reboot-persistence (pw-tmux-save/restore + pw-tmux-persist) + project-terminal@.
+  Our sidecar is a CONTAINER-mode artifact (restart-survival).
+- Change: added systemd/pw-tmux.service (de-GOA'd: removed /etc/pki/goa-ca mount +
+  pw-trust-goa-ca.sh ExecStartPost) + scripts/pw-tmux-keepalive.sh (generic) +
+  docs/consolidation/stage5-tmux-persistence.md (reconciliation: host reboot-persist
+  vs container restart-survival; single socket-owner boundary via TMUX_TMPDIR).
+- Verify: bash -n keepalive OK; systemd-analyze verify pw-tmux.service clean; no GOA
+  literals in the unit/keepalive.
+- C5 PASS (artifact + reconciliation scope). DEFERRED (needs target env, Stage 2b):
+  full container path — Containerfile, scripts/entrypoint.sh TMUX_TMPDIR wait,
+  deploy-local.sh, DEPLOY.md, and PW_DEPLOY_MODE host|container terminal-spawn
+  duality in server.js. Documented in stage5 doc.
