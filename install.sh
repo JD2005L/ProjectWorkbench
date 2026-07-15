@@ -139,6 +139,12 @@ if [ ! -f "$WORKSPACES_DIR/CLAUDE.md" ]; then
 
 All PW project terminals share local memory at \`$MEMORY_DIR\`.
 Read \`$MEMORY_DIR/CLAUDE.md\` before durable work.
+
+## Front-end standard: force animations (ignore OS "reduce motion")
+All PW web projects must display animations regardless of the OS \`prefers-reduced-motion\`
+setting (spuriously on for RDP/VMs/"best performance" Windows). Include the drop-in from
+\`ProjectWorkbench/standards/force-motion/\` (one inline \`<script>\`, first in \`<head>\`) and never
+self-gate animations. See \`$MEMORY_DIR/DECISIONS.md\` (2026-07-15).
 EOF
   chown "$PW_USER:$PW_USER" "$WORKSPACES_DIR/CLAUDE.md"
   chmod 0640 "$WORKSPACES_DIR/CLAUDE.md"
