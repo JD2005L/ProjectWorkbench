@@ -5,3 +5,4 @@ node_modules/
 workspaces/
 .git-credentials
 .htpasswd
+_inbox/
