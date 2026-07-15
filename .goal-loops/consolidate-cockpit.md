@@ -145,3 +145,37 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 
 ## RESULT: in-scope criteria (C1–C8) PASS, independently verified. Loop paused at
 ## bounded stop; deploy-layer + browser + upstream-PR follow-ups documented.
+
+## 2026-07-15 — Loop 2: env-optional parity (verifiable-here increments)
+Scope: advance canonical toward env-optional feature-superset (browser/target-env/PR
+items deferred). Goal-loop skill installed at ~/.copilot/skills/goal-loop.
+
+### iter 7 — de-bake managedProjects + port admin-only gating (commit ff3ac94)
+- Removed dead `managedProjects` PVI list (no env project names baked in).
+- Ported admin-only project gating (GOA→canonical, generically useful): hidden from
+  non-admins (filterProjectsForUser), 403 on page/API (requireProjectAccess) and on
+  the nginx auth_request /api/auth/check (gates the ttyd pty), config carries it,
+  /manage/add+update set-or-delete, Manage modal "Admin only" checkbox.
+- PVIKPBot handoff already optional (only entry is the PW_INTERNAL_HANDOFF_TOKEN-gated
+  route → 403 without token); no change needed.
+- Verify: isolated boot w/ REAL non-admin login (PW_AUTH_MODE=local, enforce): admin-only
+  project hidden from developer rail; /term + auth/check 403 for dev, 200 for admin;
+  config adminOnly present; modal field present; adminOnly preserved on update; scripts
+  parse; node --check clean. Independent code-review in progress.
+
+## REMAINING TO FULLY UNIFY (roadmap) — what each needs
+Verifiable-here (candidates for future canonical loops):
+- Contribute more GOA generic fields to the modal/config: primaryUser (git identity),
+  devUrl/prodUrl (server links). Small.
+- Pulse: make its nginx routes optional in canonical behind a flag (PW_PULSE). Medium.
+DEFERRED — needs a capability this box lacks:
+- Full cockpit restyle in the GOA deploy (shell/stage, tokens, top-bar/tabs/tray) +
+  mobile rail toggle → needs a BROWSER to verify.
+- Stage 2b PW_DEPLOY_MODE=host|container (BASE prefixing, container ttyd model vs
+  project-terminal@.service, Containerfile/entrypoint/deploy-local, nginx gen) — the
+  true unifier that lets GOA run FROM this canonical repo → needs a TARGET HOST + podman.
+- Deployment Centre → PW_DEPLOY_CENTRE (WinRM/SMB deploy UI+toolchain) → GOA machinery,
+  large, needs deploy targets.
+- Real host+container install matrix; real-DC LDAP bind → target env.
+- PR: consolidate-cockpit → JD2005L/ProjectWorkbench; then point GOA at the canonical
+  repo and retire the GOA-specific server.js.
