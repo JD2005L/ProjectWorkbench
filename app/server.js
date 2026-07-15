@@ -15,7 +15,6 @@ const registryPath = process.env.PW_REGISTRY_PATH || CANONICAL_REGISTRY;
 const workspaceRoot = process.env.PW_WORKSPACES || '/opt/project-workbench/workspaces';
 const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/project-workbench';
 const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath !== CANONICAL_REGISTRY;
-const managedProjects = ['AmrikPublic','HarmaniPublic','IPSpeaker_ESP32','ProVisionIPortal','ProVisionIPublic','SunEstateHomesCA'];
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
 const emptyMcpPath = '/etc/project-workbench/empty-mcp.json';
@@ -271,9 +270,12 @@ function userHasProjectAccess(user, projectName){
  return Array.isArray(user.projects) && user.projects.includes(projectName);
 }
 function filterProjectsForUser(projects, user){
- if(!user || user.role === 'admin' || user.projects === '*') return projects;
+ if(!user) return projects;
+ if(user.role === 'admin') return projects;
+ const visible = projects.filter(p => !p.adminOnly);
+ if(user.projects === '*') return visible;
  const allowed = new Set(Array.isArray(user.projects) ? user.projects : []);
- return projects.filter(p => allowed.has(p.name));
+ return visible.filter(p => allowed.has(p.name));
 }
 
 // Cookie helpers (cookie-parser kept out of the dep tree to avoid native build).
@@ -336,13 +338,23 @@ function requireAdminOrLocal(req, res, next){
  if(isTrustedLocal(req)) return next();
  return requireAdmin(req, res, next);
 }
-function requireProjectAccess(req, res, next){
- const projectName = req.params.project || req.params.name || req.params.oldName;
- if(!projectName){ if(wantsJson(req)) return res.status(400).json({ok:false,error:'No project in route'}); return res.status(400).send('No project in route'); }
- if(!req.user) return requireAuth(req, res, next);
- if(userHasProjectAccess(req.user, projectName)) return next();
- if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
- return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="/">Back to dashboard</a></p>`);
+async function requireProjectAccess(req, res, next){
+ try {
+  const projectName = req.params.project || req.params.name || req.params.oldName;
+  if(!projectName){ if(wantsJson(req)) return res.status(400).json({ok:false,error:'No project in route'}); return res.status(400).send('No project in route'); }
+  if(!req.user) return requireAuth(req, res, next);
+  if(req.user.role !== 'admin'){
+   const projects = await loadProjects();
+   const proj = projects.find(x => x.name === projectName);
+   if(proj?.adminOnly){
+    if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
+    return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="/">Back to dashboard</a></p>`);
+   }
+  }
+  if(userHasProjectAccess(req.user, projectName)) return next();
+  if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
+  return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="/">Back to dashboard</a></p>`);
+ } catch(e){ next(e); }
 }
 function requireTerminalAccess(req, res, next){
  if(!req.user) return requireAuth(req, res, next);
@@ -1058,6 +1070,7 @@ const manageModalHtml = `<style>
 .pmField input:focus,.pmField textarea:focus{outline:none;border-color:var(--cyan)}
 .pmField .pmHelp{font-size:11.5px;color:var(--faint);line-height:1.5;text-transform:none;letter-spacing:0;font-weight:400}
 .pmField .pmHelp code{font-family:var(--mono);color:#9fd3ff;font-size:11px}
+.pmField input[type=checkbox]{width:auto;padding:0;accent-color:var(--cyan)}
 .pmRow2{display:grid;grid-template-columns:2fr 1fr;gap:12px}
 .pmCallout{border:1px solid #4a3a10;background:#1a1404;color:#fde68a;border-radius:10px;padding:10px 12px;font-size:12px;line-height:1.5}
 .pmCallout.red{border-color:#5b1a1a;background:#180808;color:#fecaca}
@@ -1090,7 +1103,7 @@ const manageModalHtml = `<style>
 @media(max-width:760px){.pmBody{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}.pmListWrap{border-right:0;border-bottom:1px solid var(--line);max-height:200px}.modal-box.pm{height:94vh}}
 </style>
 <div id="pmBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Manage projects"><div class="modal-box pm"><header><h2>Projects<span class="pmHint">drag to reorder — the rail follows this order</span></h2><button class="modal-close" id="pmClose" aria-label="Close" type="button">×</button></header><div class="body"><div class="pmBody"><div class="pmListWrap"><button class="pmAdd" id="pmAddBtn" type="button">+ New project</button><div class="pmItems" id="pmItems"></div></div><div class="pmDetail" id="pmDetail"><div class="pmTabs" id="pmTabs" role="tablist"><button type="button" data-t="general" class="active">General</button><button type="button" data-t="preview">Preview</button><button type="button" data-t="tabs">Terminal tabs</button><button type="button" data-t="danger" class="dangerTab">Danger</button></div><div class="pmPanes">
-<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
+<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><label class="pmField"><span>Admin only</span><span class="pmHelp"><input type="checkbox" id="pmAdminOnly"> Admin only — hidden from non-admins</span></label><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
 <section class="pmPane" data-p="preview"><div class="pmField"><span>Preview command</span><textarea id="pmPrevCmd" rows="3" placeholder="empty = preview disabled"></textarea><span class="pmHelp">Runs inside the workspace. Use <code>\${PORT}</code> and <code>\${BASEPATH}</code>; the app must bind <code>127.0.0.1:\${PORT}</code>.</span></div><details class="pmExamples"><summary>Examples — click one to use it</summary><div><code>npm run dev -- --host 127.0.0.1 --port \${PORT}</code><code>dotnet watch run --project Foo/Foo.csproj --urls http://127.0.0.1:\${PORT} --non-interactive</code><code>hugo server --bind 127.0.0.1 --port \${PORT} --baseURL http://127.0.0.1:\${PORT}\${BASEPATH}/ --appendPort=false</code><code>python3 -m http.server \${PORT} --bind 127.0.0.1</code></div></details><div class="pmRow2"><div class="pmField"><span>Preview port</span><input id="pmPrevPort" type="number" min="1024" max="65535" placeholder="auto"></div><div></div></div><div class="pmField"><span>Environment</span><textarea id="pmPrevEnv" rows="4" placeholder="# one KEY=VALUE per line&#10;# ASPNETCORE_ENVIRONMENT=Development"></textarea><span class="pmHelp">Exported before the command runs. <code>PORT</code> and <code>BASEPATH</code> are reserved.</span></div></section>
 <section class="pmPane" data-p="tabs"><div class="pmField"><span>Tab templates</span><span class="pmHelp">Named tabs offered in the terminal's <b>+</b> menu. <b>auto-start</b> spawns the tab when the project's tmux session is first created. Empty command = plain bash.</span></div><div class="pmTabRows" id="pmTabRows"></div><button class="pmAddTab" id="pmAddTabBtn" type="button">+ Add tab template</button></section>
 <section class="pmPane" data-p="danger"><div class="pmCallout red"><b>Delete project</b> — stops its terminal service, kills its tmux session, removes it from the registry <b>and deletes the workspace folder</b> shown in General. Repos without a remote copy are gone for good.</div><div class="pmDelArm"><input id="pmDelName" type="text" placeholder="type the project name to arm" autocomplete="off"><button class="pmDelBtn" id="pmDelBtn" type="button" disabled>Delete project</button></div></section>
@@ -1099,7 +1112,7 @@ const manageModalHtml = `<style>
 const manageModalScript = `<script>(function(){
 const backdrop=document.getElementById('pmBackdrop');if(!backdrop)return;
 const items=document.getElementById('pmItems'),addBtn=document.getElementById('pmAddBtn'),tabsBar=document.getElementById('pmTabs'),panes=[...document.querySelectorAll('.pmPane')],saveBtn=document.getElementById('pmSave'),statusEl=document.getElementById('pmStatus'),closeBtn=document.getElementById('pmClose');
-const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
+const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fAdminOnly=document.getElementById('pmAdminOnly'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
 const CUR=(typeof project!=='undefined')?project:null;
 let cfg=null,sel=null,mode='edit',formDirty=false,reloadOnClose=false,navTarget=null,busy=false,curNow=CUR;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -1107,7 +1120,8 @@ function hue(name){let h=5381;const s=String(name);for(let i=0;i<s.length;i++)h=
 function mono(name){const p=String(name).replace(/[_\\-.]+/g,' ').replace(/([a-z0-9])([A-Z])/g,'$1 $2').split(/\\s+/).filter(Boolean);if(p.length>=2)return(p[0][0]+p[1][0]).toUpperCase();return(p[0]||'?').slice(0,2).toUpperCase()}
 function setStatus(t,err){statusEl.textContent=t||'';statusEl.classList.toggle('err',!!err)}
 function markDirty(){formDirty=true}
-[fName,fRepo,fPort,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
+[fName,fRepo,fPort,fAdminOnly,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
+fAdminOnly.addEventListener('change',markDirty);
 function activatePane(id){tabsBar.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.t===id));panes.forEach(p=>p.classList.toggle('active',p.dataset.p===id))}
 tabsBar.addEventListener('click',e=>{const b=e.target.closest('button[data-t]');if(b&&mode==='edit')activatePane(b.dataset.t)});
 function renderList(){items.innerHTML='';for(const p of cfg.projects){const row=document.createElement('div');row.className='pmItem'+(mode==='edit'&&p.name===sel?' sel':'');row.dataset.name=p.name;row.draggable=true;row.style.setProperty('--h',hue(p.name));row.innerHTML='<span class="pmDrag" title="Drag to reorder">⠿</span><span class="pmMono">'+esc(mono(p.name))+'</span><span class="pmIname">'+esc(p.name)+'</span><span class="pmPort">:'+esc(p.port)+'</span>';row.onclick=()=>select(p.name);items.appendChild(row)}addBtn.classList.toggle('sel',mode==='add')}
@@ -1117,7 +1131,7 @@ tabRows.addEventListener('input',markDirty);
 addTabBtn.onclick=()=>{tabRows.insertAdjacentHTML('beforeend',tabRowHtml({autoStart:true}));tabRows.lastElementChild.querySelector('.tt-name').focus();markDirty()};
 document.querySelectorAll('.pmExamples code').forEach(c=>c.addEventListener('click',()=>{fPrevCmd.value=c.textContent;markDirty()}));
 function envText(env){return Object.entries(env||{}).map(([k,v])=>k+'='+v).join('\\n')}
-function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
+function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fAdminOnly.checked=!!(p&&p.adminOnly);fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
 function select(name){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='edit';sel=name;const p=cfg.projects.find(x=>x.name===name);fillForm(p);restartNote.textContent=(name===CUR?'You are looking at this project\\u2019s terminal right now — saving restarts it and kills this very session\\u2019s processes.':'Saving restarts this project\\u2019s terminal service — running processes in its tabs are killed.');tabsBar.style.display='';saveBtn.textContent='Save changes';activatePane('general');renderList();setStatus('')}
 function startAdd(){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='add';sel=null;fillForm(null);tabsBar.style.display='none';activatePane('general');saveBtn.textContent='Create project';renderList();setStatus('Preview, tab templates and more are configurable after the project exists.');setTimeout(()=>fName.focus(),40)}
 addBtn.onclick=startAdd;
@@ -1126,8 +1140,8 @@ async function api(url,params){const r=await fetch(url,{method:'POST',headers:{'
 async function refreshCfg(){const r=await fetch('/api/projects/config',{cache:'no-store'});cfg=await r.json();if(!cfg.ok)throw new Error(cfg.error||'config load failed')}
 function collectTabs(){const arr=[];tabRows.querySelectorAll('.pmTabRow').forEach(row=>{const n=row.querySelector('.tt-name').value.trim();if(!n)return;arr.push({name:n,cmd:row.querySelector('.tt-cmd').value,autoStart:row.querySelector('.tt-auto').checked})});return arr}
 saveBtn.onclick=async()=>{if(busy)return;busy=true;saveBtn.disabled=true;try{
-if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),port:fPort.value||''});await api('/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
-else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),port:fPort.value||'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
+if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),port:fPort.value||'',adminOnly:fAdminOnly.checked?'yes':''});await api('/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
+else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),port:fPort.value||'',adminOnly:fAdminOnly.checked?'yes':'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
 }catch(e){setStatus(e.message||String(e),true)}finally{busy=false;saveBtn.disabled=false}};
 delBtn.onclick=async()=>{if(busy||delBtn.disabled)return;if(!confirm('Really delete "'+sel+'" AND its workspace folder? This cannot be undone.'))return;busy=true;delBtn.disabled=true;try{setStatus('Deleting '+sel+'…');await api('/manage/delete/'+encodeURIComponent(sel),new URLSearchParams({confirm:'yes'}));reloadOnClose=true;if(sel===curNow)navTarget='/';await refreshCfg();busy=false;sel=null;formDirty=false;if(cfg.projects.length){select(cfg.projects[0].name);setStatus('Deleted.')}else{navTarget=navTarget||'/';closeModal()}}catch(e){setStatus(e.message||String(e),true)}finally{busy=false}};
 let dragSrc=null;
@@ -1216,6 +1230,7 @@ app.post('/manage/add', requireAdmin, async (req,res,next)=>{ try {
   if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
   if(allUsedPorts(projects).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
   const p = repo ? { name, repo, path: workspacePath(name), port } : { name, path: workspacePath(name), port };
+  if(req.body.adminOnly === 'yes') p.adminOnly = true;
   await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
  });
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
@@ -1272,6 +1287,7 @@ app.post('/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
   }
  }
  await stopProject(oldName); const oldPath = p.path; p.name = newName; if(repo) p.repo = repo; else delete p.repo; p.port = port; p.path = workspacePath(newName);
+ if(req.body.adminOnly === 'yes') p.adminOnly = true; else delete p.adminOnly;
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
@@ -1341,7 +1357,7 @@ app.post('/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
 app.get('/api/projects/config', requireAdmin, async (_req,res)=>{ try {
  const projects = await loadProjects();
  res.json({ ok:true,
-  projects: projects.map(p => ({ name:p.name, repo:p.repo||'', port:p.port, path:p.path,
+  projects: projects.map(p => ({ name:p.name, repo:p.repo||'', port:p.port, path:p.path, adminOnly: !!p.adminOnly,
    preview: p.preview ? { cmd:p.preview.cmd||'', port:p.preview.port||'', env:p.preview.env||{} } : null,
    tabs: Array.isArray(p.tabs) ? p.tabs : [] })),
   suggestedPort: nextPort(projects), suggestedPreviewPort: nextPreviewPort(projects) });
@@ -1697,6 +1713,9 @@ app.get('/api/auth/check', async (req,res) => {
   if(project){
    if(!TERMINAL_ROLES.has(req.user.role)) return res.status(403).end();
    if(!userHasProjectAccess(req.user, project)) return res.status(403).end();
+   const projects = await loadProjects();
+   const proj = projects.find(x => x.name === project);
+   if(proj?.adminOnly) return res.status(403).end();
   }
   return res.status(200).end();
  } catch { res.status(500).end(); }
