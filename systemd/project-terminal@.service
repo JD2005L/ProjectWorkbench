@@ -2,6 +2,12 @@
 Description=ttyd terminal for project %i
 After=network-online.target
 Wants=network-online.target
+# Let tmux sessions be restored before this terminal attaches, so
+# `tmux new-session -A` reattaches to the restored session instead of creating
+# an empty one. Wants= (not Requires=) so a restore failure never blocks the
+# terminal — it just comes up fresh, as it did before persistence existed.
+After=pw-tmux-persist.service
+Wants=pw-tmux-persist.service
 [Service]
 Type=simple
 User=admin

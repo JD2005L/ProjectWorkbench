@@ -156,6 +156,12 @@ install -m 0755 "$SRC_DIR/scripts/project-preview-start"  /usr/local/bin/project
 install -m 0755 "$SRC_DIR/scripts/setup-terminal-start"   /usr/local/bin/setup-terminal-start
 install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update-claude-code
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+
+# State dir for tmux-session persistence (manifest + captured scrollback).
+install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/tmux-persist
+install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/tmux-persist/content
 
 if [ -f "$SRC_DIR/config/tmux.conf" ]; then
   install -o "$PW_USER" -g "$PW_USER" -m 0644 "$SRC_DIR/config/tmux.conf" "/home/$PW_USER/.tmux.conf"
@@ -168,6 +174,9 @@ install -m 0644 "$SRC_DIR/systemd/project-setup-terminal.service" /etc/systemd/s
 install -m 0644 "$SRC_DIR/systemd/project-preview@.service"       /etc/systemd/system/project-preview@.service
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.service"     /etc/systemd/system/claude-code-update.service
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.timer"       /etc/systemd/system/claude-code-update.timer
+install -m 0644 "$SRC_DIR/systemd/pw-tmux-persist.service"        /etc/systemd/system/pw-tmux-persist.service
+install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.service"           /etc/systemd/system/pw-tmux-save.service
+install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.timer"             /etc/systemd/system/pw-tmux-save.timer
 # Drop-in for app-level auth enforcement (Phase 1: defaults to OFF for safe
 # rollout — flip PW_AUTH_ENFORCE=true after creating an admin via `pw-user`).
 # Only seed the default when none exists: a redeploy must never silently flip an
@@ -176,6 +185,12 @@ install -d -m 0755 /etc/systemd/system/project-workbench.service.d
 [ -f /etc/systemd/system/project-workbench.service.d/auth.conf ] || \
   install -m 0644 "$SRC_DIR/systemd/project-workbench.service.d/auth.conf" /etc/systemd/system/project-workbench.service.d/auth.conf
 systemctl daemon-reload
+
+# tmux-session persistence: restore-on-boot unit + periodic snapshot timer.
+# enable --now so the timer starts snapshotting immediately and the persist unit
+# is armed (its restore is a no-op until a manifest exists).
+systemctl enable --now pw-tmux-persist.service >/dev/null 2>&1 || warn "could not enable pw-tmux-persist.service"
+systemctl enable --now pw-tmux-save.timer >/dev/null 2>&1 || warn "could not enable pw-tmux-save.timer"
 
 if ! command -v claude >/dev/null 2>&1; then
   log "Installing Claude Code CLI globally…"
