@@ -104,3 +104,8 @@ modal, sharp dark animated design (force-motion standard applied).
 - Smoke users (_smoke_admin/_smoke_dev/_smoke_editor) deleted at loop end.
 
 ## RESULT: all 16 criteria PASS, independently verified. Loop complete 2026-07-15.
+
+### 2026-07-15 — iter 7 (user adjustments: left rail + peek + bar cleanup)
+- User asked: (1) rail on the LEFT; (2) collapsed-hover shows names as part of the design, not a bubble; (3) drop Workbench brand + project chip from the top bar, brand → top of side menu, project identified by selected key. Reminder: finished-session highlighting must persist.
+- Change: #railPanel absolute layer inside #rail with container-query-driven labels; hover/focus peek widens the panel OVER the terminal (140ms intent delay, no iframe reflow); railHead = brand glyph + WORKBENCH + chevron as the pin toggle (#railToggle); pk-fly bubble removed; keys flipped (rounded-right, +X hover/strike, edge on wall side); mobile drawer from left; leftInfo/brand/projChip removed from top bar and CSS.
+- Verify: node --check, deploy, healthz OK. Screenshots: L1 collapsed-left, L2 hover-peek with HarmaniPublic LIT amber "finished — click to view" (real pending marker), L3 pinned (lit key persists), L4 mobile-left drawer (lit key persists). Full pw-verify re-run on new layout: 28/28 PASS (bell chain, persistence, roles, a11y, C10 handoff intact). Marker cleaned; smoke users deleted after.
