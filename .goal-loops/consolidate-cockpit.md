@@ -179,3 +179,17 @@ DEFERRED — needs a capability this box lacks:
 - Real host+container install matrix; real-DC LDAP bind → target env.
 - PR: consolidate-cockpit → JD2005L/ProjectWorkbench; then point GOA at the canonical
   repo and retire the GOA-specific server.js.
+
+### iter 8 — independent review + security fix (auth_request project forwarding)
+- Review verdict: adminOnly visibility/app-route gating CONFIRMED clean; but found a
+  HIGH gap (pre-existing, exposed by the port): the nginx auth_request for the raw
+  ttyd pty/preview never forwarded `project`, so /api/auth/check returned 200 → a
+  non-admin could load an adminOnly project's raw shell directly (bypassing /term).
+- Fix: /pw-auth-check sends X-Original-URI=$request_uri; /api/auth/check derives the
+  project (+ _setup admin scope) from the path (BASE-agnostic).
+- Verified end-to-end: empirical nginx auth_request test proved $request_uri is
+  forwarded (X-Original-URI=/pty/SecretProj/…); handler 403s dev at
+  /pty|/preview/<adminOnly>/ + /pty/_setup/, 200 at granted; admin ok. node --check clean.
+- NOTE: the GOA live deploy (deploy-cockpit-ui) has the SAME latent gap (auth_request
+  doesn't forward project). Not currently exploitable (no non-admin users exist), but
+  the same fix should be ported there. FLAGGED for the user.
