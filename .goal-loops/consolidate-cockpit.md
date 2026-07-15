@@ -216,3 +216,27 @@ DEFERRED — needs a capability this box lacks:
   upstream to match project pattern). Re-checked: node --check ok, upstreams symmetric.
 - Deferred (needs target host/browser): real nginx -t of generated conf under BASE;
   ttyd container base-path wiring is part of #1 PW_DEPLOY_MODE.
+
+### iter 10 — #3 optional AD/proxy login + sibling-app (Pulse) SSO — DONE
+- Goal: canonical serves BOTH AD and non-AD envs. Fold GOA's two auth extras as
+  OPT-IN (default OFF → non-AD byte-identical, no spoofable-header trust).
+- Change (app/server.js): 3 env consts +
+  * PW_AUTH_HEADER (default '') — trusted reverse-proxy/AD pre-auth. attachUser,
+    after the session-cookie lookup, reads that header, normalizeUsername, and
+    authenticates IFF the user exists in users.json (allowlist preserved).
+  * PW_DEV_USER (default '') — dev-only bypass (warns loudly).
+  * PW_SSO_USER_HEADER (default '') — /api/auth/check emits the username in that
+    response header for sibling-app SSO (Pulse); only for REAL (non-implicit) users.
+  Session cookie keeps precedence; unknown header user → falls through to
+  enforce(null)/soft implicit-admin. Boot [auth] log shows proxyHeader/ssoHeader
+  when enabled. Sister-app nginx wiring (auth_request_set + proxy_set_header) is
+  env-specific → deferred to target env.
+- Verified (isolated boot, enforce=true, seeded users.json {users:[…]}):
+  * opt-in ON: admin header+admin=1 →200; dev+admin=1 →403; ghost(not allowlisted)
+    →401; dev @/pty/Demo/ →200, @/pty/Other/ →403; X-PW-User: adminuser emitted.
+  * DEFAULTS (opt-in OFF): spoofed X-Remote-User IGNORED →401; NO X-PW-User leak.
+  * soft mode: implicit-admin unchanged →200, no X-PW-User for implicit admin.
+  * node --check clean.
+- Independent code-review subagent: no defects; default-off invariant holds; cookie
+  precedence, allowlist, no-crash fall-through, no SSO leak for implicit admin, and
+  req.user shape parity all confirmed.

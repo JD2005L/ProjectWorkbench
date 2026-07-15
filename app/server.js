@@ -102,7 +102,24 @@ const usersPath = process.env.PW_USERS_PATH || '/etc/project-workbench/users.jso
 const sessionsPath = process.env.PW_SESSIONS_PATH || '/var/lib/project-workbench/sessions.json';
 const auditLogPath = process.env.PW_AUDIT_LOG || '/var/log/project-workbench/audit.log';
 const AUTH_ENFORCE = String(process.env.PW_AUTH_ENFORCE || '').toLowerCase() === 'true';
-console.log(`[auth] mode=${AUTH_MODE} enforce=${AUTH_ENFORCE}`);
+// Optional reverse-proxy / AD pre-auth. When PW_AUTH_HEADER is set (e.g.
+// 'x-remote-user'), a TRUSTED upstream (an AD-authenticated nginx that
+// overwrites the header on every request) supplies the signed-in username and
+// attachUser trusts it — no login page needed. Default '' = DISABLED, so a
+// non-AD install never trusts a client-spoofable header. The header user must
+// still exist in users.json (the allowlist) to gain a role/projects.
+const AUTH_HEADER = (process.env.PW_AUTH_HEADER || '').toLowerCase();
+// Dev-only bypass: treat this username as authenticated when no cookie/header
+// resolves. Never set in production.
+const DEV_USER = process.env.PW_DEV_USER || '';
+if(DEV_USER) console.warn('[auth] PW_DEV_USER is set — dev-only bypass active. Do not use in production.');
+// Optional sibling-app SSO: when PW_SSO_USER_HEADER is set (e.g. 'X-PW-User'),
+// /api/auth/check emits the authenticated username in that response header so
+// an nginx auth_request can propagate it to sister apps (e.g. Pulse). The
+// sister-app nginx wiring (auth_request_set + proxy_set_header) is env-specific.
+// Default '' = DISABLED.
+const SSO_USER_HEADER = process.env.PW_SSO_USER_HEADER || '';
+console.log(`[auth] mode=${AUTH_MODE} enforce=${AUTH_ENFORCE}${AUTH_HEADER ? ` proxyHeader=${AUTH_HEADER}` : ''}${SSO_USER_HEADER ? ` ssoHeader=${SSO_USER_HEADER}` : ''}`);
 // LDAP settings (ldap mode only). Generic, de-GOA'd defaults; a directory
 // deployment overlays PW_LDAP_URL / PW_LDAP_SUFFIX / PW_LOGIN_ORG via env.
 const LDAP_URL = process.env.PW_LDAP_URL || 'ldaps://ldap.example.com:636';
@@ -311,6 +328,18 @@ async function attachUser(req, res, next){
     const users = await loadUsers();
     const u = users.find(x => x.id === sess.userId);
     if(u){ req.user = u; req.sessionId = sid; return next(); }
+   }
+  }
+  // Optional trusted reverse-proxy / AD pre-auth (PW_AUTH_HEADER) or dev bypass
+  // (PW_DEV_USER). Only consulted when explicitly enabled; the resolved user
+  // must exist in users.json to authenticate (preserves the allowlist gate).
+  if(AUTH_HEADER || DEV_USER){
+   const raw = (AUTH_HEADER ? req.get(AUTH_HEADER) : '') || DEV_USER || '';
+   const username = normalizeUsername(raw);
+   if(username){
+    const users = await loadUsers();
+    const u = users.find(x => x.username === username);
+    if(u){ req.user = u; return next(); }
    }
   }
   req.user = AUTH_ENFORCE ? null : IMPLICIT_ADMIN;
@@ -1716,6 +1745,9 @@ app.get(BASE + '/api/auth/check', async (req,res) => {
    if(!AUTH_ENFORCE) return res.status(200).end(); // soft mode: allow.
    return res.status(401).end();
   }
+  // Optional sibling-app SSO: propagate the authenticated username so an
+  // nginx auth_request can forward it to sister apps (opt-in via PW_SSO_USER_HEADER).
+  if(SSO_USER_HEADER && !req.user.implicit) res.set(SSO_USER_HEADER, req.user.username);
   if(adminOnly){
    return res.status(req.user.role === 'admin' ? 200 : 403).end();
   }
