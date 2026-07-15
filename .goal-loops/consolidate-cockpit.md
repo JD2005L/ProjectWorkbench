@@ -26,7 +26,7 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 | C1 | Branch off upstream cockpit; cockpit is git ancestor; node --check clean | PASS | 1 |
 | C2 | PW_AUTH_MODE=local|ldap (default local); isolated boot local login→cookie, authed /→200, unauth→/login under enforce; ldap boots + pw reset→400 | PASS | 1 |
 | C3 | Quick Switcher absent from app/ (no openSwitcher/projSwitch/pw-open-switcher/Shift+P); cockpit rail present | PENDING | 0 |
-| C4 | _outbox + tabbed Inbox/Outbox drawer present+wired; outbox routes; INBOX_WRITE_ROLES; isolated create→list→delete | PENDING | 0 |
+| C4 | _outbox routes + /files Outbox card present+wired; INBOX_WRITE_ROLES/terminal-access gating; isolated create→list→download→delete | PASS | 1 |
 | C5 | tmux sidecar files present, reconciled w/ upstream reboot-persist (no double socket-ownership); bash -n clean; CA mount de-GOA'd | PENDING | 0 |
 | C6 | GOA optional/off: PW_DEPLOY_CENTRE default off (deploy routes 404), PW_DEPLOY_MODE host|container, de-GOA LDAP/cert defaults; no gov.ab.ca/goa.ds in app/ | PENDING | 0 |
 | C7 | Non-regression: cockpit routes (/api/projects/{status,reorder,config}, /manage redirect) + PVIKPBot handoff preserved; healthz ok | PENDING | 0 |
@@ -73,3 +73,29 @@ Quick Project Switcher dropped (superseded by cockpit rail).
   tmux + project-terminal@.service; GOA uses root tmux + node-spawned ttyd) DEFERRED to a
   later increment; `managedProjects` PVI list still hardcoded (de-env later).
 - Next: iter 3 = increment 2 (_outbox + tabbed drawer into cockpit).
+
+### 2026-07-15 — iter 3 (increment 2: _outbox consolidation)
+- Change (app/server.js): ported the 4 _outbox routes from the GOA fork (de-BASE'd
+  to cockpit's bare-path convention): GET /api/outbox/:project (list), GET
+  /api/outbox/:project/file/:name (download), DELETE .../file/:name, DELETE
+  /api/outbox/:project (clear). Gating reused from cockpit: list/download =
+  requireAuth+requireProjectAccess; mutations = requireTerminalAccess. Added an
+  "Outbox" card + refreshOutbox() client JS to the existing /files/:project/ page
+  (reuses cockpit's own .f-card/.ilist/.irow pattern).
+- Verify: node --check clean; harness now 21/21 — new: outbox list shows agent
+  file, download returns body, /files renders Outbox card (id="olist"), delete
+  file, file gone from disk. No GOA literals.
+- C4 PASS (verifiable scope). DEFERRED to browser stage (documented manual test
+  plan): grafting the GOA fork's richer IN-TERMINAL tabbed Inbox/Outbox drawer
+  overlay into the cockpit /term page — needs interactive validation and risks the
+  cockpit rail/hover-drawer layout, so not done blind here. Outbox capability +
+  management is fully present via /files.
+- Next: iter 4 = increment 3 (tmux sidecar + reconcile with upstream reboot-persist).
+
+## Manual test plan (browser stage, deferred items)
+- /files/<proj>/: Inbox drop/paste/upload still works; Outbox card lists agent
+  files, Download saves, Delete removes; role gating (content_editor can view+
+  download, terminal roles can delete).
+- (Deferred drawer) If the in-terminal tabbed drawer is later grafted into /term:
+  verify it opens over the cockpit without breaking the left rail hover-peek, tab
+  switching Inbox/Outbox, paste-to-inbox, and OSC-52 copy.
