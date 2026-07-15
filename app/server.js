@@ -625,7 +625,7 @@ function nginxConfig(projects){
  const previewProjects = projects.filter(hasPreview);
  // Internal endpoint that nginx auth_request calls. Forwards Cookie to the
  // dashboard so it can decide based on the app session.
- const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n    }\n`;
+ const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n        proxy_set_header X-Original-URI $request_uri;\n    }\n`;
  // Setup terminal is admin-only — the wizard signs in CLIs whose tokens land
  // in /home/admin and apply to every project.
  const setupRoute = `    location /pty/_setup/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
@@ -1700,8 +1700,17 @@ app.get('/api/auth/me', (req,res) => {
 // shared setup terminal at /pty/_setup/).
 app.get('/api/auth/check', async (req,res) => {
  try {
-  const project = String(req.query.project || '');
-  const adminOnly = String(req.query.admin || '') === '1';
+  // nginx's auth_request does NOT forward the parent request's query string, so
+  // derive the project/setup scope from the ORIGINAL request path (X-Original-URI)
+  // when the query params are absent. Without this, the raw ttyd pty and live
+  // preview would be reachable regardless of per-project grants or adminOnly.
+  const orig = String(req.headers['x-original-uri'] || '');
+  let project = String(req.query.project || '');
+  let adminOnly = String(req.query.admin || '') === '1';
+  if(!project && !adminOnly && orig){
+   if(/\/pty\/_setup\//.test(orig)) adminOnly = true;
+   else { const m = orig.match(/\/(?:pty|preview)\/([^\/?]+)/); if(m){ try { project = decodeURIComponent(m[1]); } catch { project = m[1]; } } }
+  }
   if(!req.user){
    if(!AUTH_ENFORCE) return res.status(200).end(); // soft mode: allow.
    return res.status(401).end();
