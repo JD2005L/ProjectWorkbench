@@ -77,3 +77,9 @@ modal, sharp dark animated design (force-motion standard applied).
 - C1/C2(visual)/C3(marker path)/C8 partial PASS pending independent verify; C4 needs live bell test; persistence (C9) needs reload test.
 - Tab strip restyled in same pass (pwTabPulse amber). Rail foot: Manage → /manage (temporary until modal).
 - Next: Manage modal + JSON endpoints (inc 5).
+
+### 2026-07-15 — iter 3 (increment 5: Manage modal)
+- Change: manageModalHtml/Script consts + /manage → cockpit?manage=1 redirect + JSON-aware add/update/delete + GET /api/projects/config; glyph fixes (fullwidth ＋ → +, brand ⌁ → >_ mono).
+- Verify: node --check OK, deployed, healthz OK. Playwright CRUD end-to-end with throwaway _SmokeTest: modal auto-open via /manage ✓, create local project ✓, duplicate name → inline .err ✓, update preview cmd + tab template ✓ (config API round-trip exact), delete arming (disabled until typed name) ✓, delete ✓, registry clean ✓, workspace + unit removed ✓ (checked below). Only console entry = expected 400 from dup test.
+- C5 + C6 implemented; independent verify pending in sweep.
+- Next: inc 6 cockpit-first routing + landing variants.
