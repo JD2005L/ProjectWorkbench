@@ -25,12 +25,12 @@ Quick Project Switcher dropped (superseded by cockpit rail).
 |---|-----------|--------|----------|
 | C1 | Branch off upstream cockpit; cockpit is git ancestor; node --check clean | PASS | 1 |
 | C2 | PW_AUTH_MODE=local|ldap (default local); isolated boot local login→cookie, authed /→200, unauth→/login under enforce; ldap boots + pw reset→400 | PASS | 1 |
-| C3 | Quick Switcher absent from app/ (no openSwitcher/projSwitch/pw-open-switcher/Shift+P); cockpit rail present | PENDING | 0 |
+| C3 | Quick Switcher absent from app/ (no openSwitcher/projSwitch/pw-open-switcher/Shift+P); cockpit rail present | PASS | 1 |
 | C4 | _outbox routes + /files Outbox card present+wired; INBOX_WRITE_ROLES/terminal-access gating; isolated create→list→download→delete | PASS | 1 |
 | C5 | tmux sidecar unit+keepalive present, de-GOA'd, reconciled w/ upstream reboot-persist (doc, single socket-owner); bash -n clean; unit verifies | PASS | 1 |
-| C6 | GOA optional/off: PW_DEPLOY_CENTRE default off (deploy routes 404), PW_DEPLOY_MODE host|container, de-GOA LDAP/cert defaults; no gov.ab.ca/goa.ds in app/ | PENDING | 0 |
+| C6 | GOA optional/off: deploy-centre absent→off, de-GOA LDAP/cert defaults, no gov.ab.ca/goa.ds in app/ (PW_DEPLOY_MODE container path deferred) | PASS | 1 |
 | C7 | Non-regression: cockpit routes (/api/projects/{status,reorder,config}, /manage redirect) + PVIKPBot handoff preserved; healthz ok | PENDING | 0 |
-| C8 | Consolidation docs updated for cockpit re-base; this loop-log maintained | PENDING | 0 |
+| C8 | Consolidation docs updated for cockpit re-base; this loop-log maintained | PASS | 1 |
 
 ## Increment plan
 0. Branch off upstream cockpit + open loop-log. → C1
@@ -114,3 +114,14 @@ Quick Project Switcher dropped (superseded by cockpit rail).
   full container path — Containerfile, scripts/entrypoint.sh TMUX_TMPDIR wait,
   deploy-local.sh, DEPLOY.md, and PW_DEPLOY_MODE host|container terminal-spawn
   duality in server.js. Documented in stage5 doc.
+
+### 2026-07-15 — iter 5 (increments 4+5: switcher-drop confirmation, de-GOA, docs)
+- C3: grep app/ → 0 openSwitcher/projSwitch/pw-open-switcher/Shift+P anywhere
+  (server.js + terminal-preload.js + terminal-paste.js); cockpit rail present (3 refs).
+  Switcher is dropped (absent upstream; not reintroduced).
+- C6 (verifiable scope): no gov.ab.ca/goa.ds in app/; Deployment Centre absent
+  upstream → naturally off (no /api/deploy routes); LDAP defaults de-GOA'd (example.com
+  from iter 2). PW_DEPLOY_MODE + deploy-centre gating = deferred container path.
+- C8: added docs/consolidation/README.md (status matrix + verification method +
+  deferred-to-target-env list) alongside stage5 doc.
+- Next: iter 6 = independent verification sweep (subagent) + bounded-stop summary.
