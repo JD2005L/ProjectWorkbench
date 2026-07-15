@@ -193,3 +193,26 @@ DEFERRED — needs a capability this box lacks:
 - NOTE: the GOA live deploy (deploy-cockpit-ui) has the SAME latent gap (auth_request
   doesn't forward project). Not currently exploitable (no non-admin users exist), but
   the same fix should be ported there. FLAGGED for the user.
+
+### iter 9 — #2 PW_BASE_PATH (URL base-path prefix) — DONE
+- Goal: canonical serves+links under `PW_BASE_PATH` (e.g. /workbench); default ''
+  = byte-identical to upstream (root-served). Foundational for PW_DEPLOY_MODE=container.
+- Change (app/server.js only): `const BASE=(process.env.PW_BASE_PATH||'').replace(/\/+$/,'')`;
+  prefixed all 54 route decls with `BASE +`; prefixed 86 client URLs (fetch/href/src/
+  action/iframe/location.href/res.redirect) with `${BASE}`; nginxConfig locations +
+  auth_check upstream + knownDashboardPaths + preview X-Forwarded-Prefix/redirect + pw_last
+  referer map made BASE-aware. Cookie Path stays `/` (sibling SSO). ttyd upstreams stay
+  bare (ttyd --base-path is bare) — only the nginx `location` carries BASE.
+- Verified (isolated boot, both modes):
+  * BASE=/workbench: / →302 /workbench/term/Demo/; /workbench/api/projects/status 200;
+    /workbench/term/Demo/ 200; /workbench/manage →302 …?manage=1; root / and /api →404;
+    rendered pages: all href/src/iframe carry /workbench; ZERO bare-path leaks.
+  * BASE='' (default): / →302 /term/Demo/; routes root-served 200; client URLs bare;
+    NO double-slash `//`. Byte-identical behavior.
+  * node --check clean.
+- Independent code-review subagent: found 1 HIGH — setup-terminal nginx UPSTREAM
+  proxy_pass had `${BASE}` while its ttyd base-path is bare `/pty/_setup` (project block
+  was correctly bare) → setup terminal 404 under BASE. FIXED (dropped BASE from setup
+  upstream to match project pattern). Re-checked: node --check ok, upstreams symmetric.
+- Deferred (needs target host/browser): real nginx -t of generated conf under BASE;
+  ttyd container base-path wiring is part of #1 PW_DEPLOY_MODE.
