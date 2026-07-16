@@ -20,6 +20,13 @@ const deployLogPath = process.env.PW_DEPLOY_LOG || '/etc/project-workbench/deplo
 const SECRET_KEY_PATH = process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key';
 const workspaceRoot = process.env.PW_WORKSPACES || '/opt/project-workbench/workspaces';
 const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/project-workbench';
+// Optional operator-supplied nginx locations injected into the generated server
+// block (e.g. sibling-app reverse proxies like /pulse/, /n8n/, /teamkb/ that are
+// specific to one deployment). Keeps env-specific service names OUT of the common
+// repo. The file's contents are pasted verbatim at server scope, ahead of the
+// catch-all `location /`; nginx -t validates it and applyRouting rolls back on
+// error. Default: file absent → nothing injected (byte-identical output).
+const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/extra-nginx.conf';
 const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath !== CANONICAL_REGISTRY;
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
@@ -821,6 +828,12 @@ async function ensureSetupTerminal(){
 
 function nginxConfig(projects){
  const previewProjects = projects.filter(hasPreview);
+ // Optional env-specific sibling-app locations (see extraNginxPath). Read at
+ // generation time so an operator can drop/edit the file and re-heal nginx
+ // without an app restart. Best-effort: a missing file injects nothing.
+ let extraLocations = '';
+ try { extraLocations = fsSync.readFileSync(extraNginxPath, 'utf8'); } catch {}
+ if(extraLocations && !extraLocations.endsWith('\n')) extraLocations += '\n';
  // Internal endpoint that nginx auth_request calls. Forwards Cookie to the
  // dashboard so it can decide based on the app session.
  const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000${BASE}/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n        proxy_set_header X-Original-URI $request_uri;\n    }\n`;
@@ -842,7 +855,7 @@ function nginxConfig(projects){
   ? `    location / {\n        set $pw_route dashboard;\n        if ($pw_preview_port) { set $pw_route preview; }\n        if ($request_uri ~ "${knownDashboardPaths}") { set $pw_route dashboard; }\n        if ($pw_route = preview) { return 418; }\n        error_page 418 = @pw_preview_fallback;\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n`
   : `    location / { proxy_pass http://127.0.0.1:3000; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; }\n`;
  const deployRoute = DEPLOY_CENTRE ? `    location ${BASE}/api/deploy/ {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout 600s;\n        proxy_send_timeout 600s;\n    }\n` : '';
- return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${deployRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
+ return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${extraLocations}${deployRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
 }
 async function applyRouting(projects){
  // An isolated instance must never rewrite the shared host nginx config unless

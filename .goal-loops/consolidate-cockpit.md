@@ -285,3 +285,25 @@ Brought canonical in line with JD2005L's last-24h visual upgrade:
   byte-identical to upstream; client pin logic correct. (tools/verify is browser-
   based host-model dev tooling — parses clean, would need base config to run on a
   based deploy → target-env concern, not runtime.)
+
+### iter 13 — #4b sibling-app nginx routes optional (PW_EXTRA_NGINX) — DONE (completes #4)
+- Instead of one flag per GOA sibling service (pulse/n8n/teamkb/visual-identity),
+  added a GENERIC operator-supplied injection: nginxConfig reads PW_EXTRA_NGINX
+  (default /etc/project-workbench/extra-nginx.conf) via fsSync.readFileSync and
+  injects it verbatim at SERVER scope, right after client_max_body_size and before
+  the catch-all `location /`. Keeps ALL env-specific service names out of the
+  common repo. Missing file → injects nothing (byte-identical default).
+- applyRouting already does nginx -t + rollback-on-failure, so a bad snippet can't
+  brick the proxy. Path is fixed env/default (no user-input surface).
+- Docs: docs/consolidation/extra-nginx.example.conf (mirrors GOA's n8n/teamkb/
+  visual-identity/pulse + pulse/admin auth_request→X-Pulse-User). README updated:
+  env-optional GOA features section (PW_BASE_PATH, PW_AUTH_HEADER/DEV_USER/
+  SSO_USER_HEADER, PW_DEPLOY_CENTRE, PW_EXTRA_NGINX); Deploy Centre moved from
+  deferred → done. pulse/admin SSO ties to PW_SSO_USER_HEADER=X-PW-User (iter 10).
+- Verified (isolated boot + heal/nginx regen, nginx/systemctl shimmed):
+  OFF (no file) → generated conf has standard locations, 0 pulse. ON (file with
+  /pulse/ + /n8n/) → both injected at server scope, after client_max_body_size,
+  before `location /`. heal/nginx 200 both. node --check clean.
+- Independent review: no defects; default-off byte-identical; server-scope
+  ordering safe (nginx longest-prefix; only exact loc is =/pw-auth-check, no regex
+  locations to shadow); no attacker surface; nginx -t+rollback prevents bad reload.
