@@ -240,3 +240,23 @@ DEFERRED — needs a capability this box lacks:
 - Independent code-review subagent: no defects; default-off invariant holds; cookie
   precedence, allowlist, no-crash fall-through, no SSO leak for implicit admin, and
   req.user shape parity all confirmed.
+
+### iter 11 — #4a Deploy Centre behind PW_DEPLOY_CENTRE (default off) — DONE
+- Ported the GOA Deploy Centre (Windows WinRM/SMB deploy) into canonical, OPT-IN
+  via PW_DEPLOY_CENTRE ('true'/'1'); default OFF = byte-identical, boots with NO
+  secret-key file (lazy getEncryptionKey). Env-parameterized: PW_SECRET_KEY_PATH,
+  PW_DEPLOY_CONFIG, PW_DEPLOY_LOG (generic /etc/project-workbench defaults).
+- Routes (all inside if(DEPLOY_CENTRE), BASE-prefixed): /deploy, /api/deploy/config
+  (admin), /api/deploy/status, POST /api/deploy/:p/:target (auth+projectAccess),
+  /api/deploy/:p/log, /api/deploy/:p/:target/version, /api/deploy/:p/card.
+- UI: rail deployEntry + deploy modal + deployCss render only when
+  DEPLOY_CENTRE && hasDeployConfigFor(project). Client URLs all ${BASE}.
+- Verified (isolated boot): OFF → /deploy+/api/deploy 404, no button, boots w/o key;
+  ON → all 200, button present for configured project; ON+BASE=/wb → /wb/deploy 200,
+  root /deploy 404, rail href /wb/deploy. node --check clean.
+- Independent review: no defects; hardened vs prod (adds requireProjectAccess on the
+  deploy trigger the GOA ref lacks); option passed as bash positional $1 + allowlist
+  validated (no injection); deploy password env-only, never logged/returned; lazy key
+  confirmed. Notes: settings page keeps an inert deployPwCellHtml()=>'' when off
+  (DOM-identical); getDeployEnv version-probe shares any stored cred (same as ref).
+- Remaining for #4: Pulse /pulse/ nginx route optional (sibling-service infra) — next.
