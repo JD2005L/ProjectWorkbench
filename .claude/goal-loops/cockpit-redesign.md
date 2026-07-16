@@ -119,3 +119,8 @@ modal, sharp dark animated design (force-motion standard applied).
 ### 2026-07-16 — feature: "actively working" indicators
 - Rail keys + tab strip now show a pulsing green live dot for sessions actively working; expanded rail shows "working…". Detection is hook-free: tmux #{window_activity} freshness ≤5s (Claude's TUI repaints its spinner ~1/s all turn), suppressed on windows whose turn-end bell just flagged. projectHasUnreadBell folded into projectSignals (one tmux call → {bell,working}); /api/projects/status + windows API gained `working`.
 - Verified: _worktest tick-loop window → rail key .working + "working…" + tab live dot; dot clears ≤15s after C-c; screenshots caught REAL sessions lighting organically (ProjectWorkbench=this session, TRYGGBUILTPortal, PVIKPBot idle=dotless). Full sweep 29/29.
+
+### 2026-07-16 — fix: working-detection false positives (v2: sustained streak)
+- Reported: idle sessions flagged working, especially right after viewing them. Cause: attaching resizes the window (SIGWINCH) → idle TUIs repaint → activity stamps; attach+fit+focus produce 2-3 stamps a few seconds apart, defeating naive freshness AND naive advance checks.
+- Fix: streak model — working only when activity keeps advancing with gaps <3s (WORK_FRESH_S=3) sustained for ≥8s (WORK_HOLD_S=8, > fresh window so bursts can never reach it). In-memory paneWorkTracker keyed session:window.
+- Verified: less-in-pane idle-TUI view test — 0/7 working samples over 14s viewing (previously flipped true); steady 1s tick loop lights at ~9s and clears ~15s after C-c; REAL mid-turn Claude window stamps every ~1-1.5s (sampled live), idle windows hours stale. Sweep 29/29.

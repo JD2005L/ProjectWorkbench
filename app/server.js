@@ -338,7 +338,6 @@ async function startPreviewUnit(p){ if(!hasPreview(p)) throw new Error('Preview 
 async function stopPreviewUnit(name){ await sh('systemctl',['stop',previewUnit(name)]).catch(()=>{}); await sh('systemctl',['disable',previewUnit(name)]).catch(()=>{}); }
 async function tmux(args,opts={}){ return execFileAsync('sudo',['-u','admin','tmux',...args],{timeout:10000,...opts}); }
 function parseTmuxWindows(stdout){
- const now = Math.floor(Date.now()/1000);
  return String(stdout || '').split('\n').filter(Boolean).map(line=>{
   const parts = line.split('|');
   const index = Number(parts[0]);
@@ -347,19 +346,47 @@ function parseTmuxWindows(stdout){
   // it finishes a turn). tmux clears it automatically when the window is
   // selected, so the front-end gets "clear on click" for free.
   const bell = parts[3] === '1';
-  const activity = Number(parts[5]) || 0;
-  // working = the pane produced output within the last few seconds and its
-  // turn hasn't just ended (bell). Claude's TUI repaints its spinner about
-  // once a second for the whole turn (including silent tool runs), so
-  // activity stays fresh while it works and goes stale at the idle prompt.
-  // Works for any CLI or long-running command, no hooks needed.
-  const working = !bell && activity > 0 && (now - activity) <= 5;
-  return { index, name:parts[1] || `#${parts[0]}`, active:parts[2] === '1', bell, attached:Number(parts[4]) || 0, working };
+  return { index, name:parts[1] || `#${parts[0]}`, active:parts[2] === '1', bell, attached:Number(parts[4]) || 0, activity:Number(parts[5]) || 0 };
  }).filter(w=>Number.isFinite(w.index));
+}
+// "Working" detection. Raw output-freshness is not enough: merely VIEWING a
+// session makes tmux resize the window to the client (SIGWINCH), and any
+// full-screen TUI — idle Claude included — repaints itself, which stamps
+// window_activity once. So a window only counts as working when its activity
+// timestamp keeps ADVANCING across server samples for a sustained streak:
+// Claude's spinner repaints ~1/s for the whole turn (including silent tool
+// runs) and qualifies within ~WORK_HOLD_S seconds, while a one-shot
+// attach/resize/keystroke redraw stamps one time, never advances, and is
+// dropped at the next sample. Applies to any CLI or long-running command that
+// produces steady output; no hooks needed. Tracker is in-memory: a dashboard
+// restart just re-arms the streaks within a few seconds.
+const WORK_FRESH_S = 3;  // streak dies at the first >3s output gap — Claude stamps ~1/s, attach/resize redraw bursts stop within ~3s
+const WORK_HOLD_S = 8;   // streak must outlive any one-shot burst (> WORK_FRESH_S) to display
+const paneWorkTracker = new Map(); // "session:windowIndex" → {activity, sampleAt, freshSince}
+function computeWorking(sessionName, w, now){
+ if(paneWorkTracker.size > 2000){
+  for(const [k,v] of paneWorkTracker){ if(now - v.sampleAt > 600) paneWorkTracker.delete(k); }
+ }
+ const key = sessionName + ':' + w.index;
+ const fresh = w.activity > 0 && (now - w.activity) <= WORK_FRESH_S;
+ const prev = paneWorkTracker.get(key);
+ let freshSince = null;
+ if(fresh){
+  if(prev && prev.freshSince != null && (w.activity > prev.activity || now - prev.sampleAt < 3)){
+   freshSince = prev.freshSince; // streak continues: output advanced (or we resampled instantly)
+  } else if(!prev || prev.freshSince == null || w.activity > prev.activity){
+   freshSince = now; // new streak candidate
+  }
+  // else: fresh but identical timestamp across a real gap → stale burst, no streak
+ }
+ paneWorkTracker.set(key, { activity: w.activity, sampleAt: now, freshSince });
+ return !!(freshSince != null && now - freshSince >= WORK_HOLD_S && !w.bell);
 }
 async function listTmuxWindows(project){
  const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}']);
- return parseTmuxWindows(stdout);
+ const now = Math.floor(Date.now()/1000);
+ const session = tmuxSession(project);
+ return parseTmuxWindows(stdout).map(w => ({ ...w, working: computeWorking(session, w, now) }));
 }
 
 async function tmuxWindowDetails(project){
