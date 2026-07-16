@@ -360,35 +360,44 @@ function parseTmuxWindows(stdout){
 // dropped at the next sample. Applies to any CLI or long-running command that
 // produces steady output; no hooks needed. Tracker is in-memory: a dashboard
 // restart just re-arms the streaks within a few seconds.
-const WORK_FRESH_S = 5;  // output this recent counts as live — Claude's TUI stamps ~1/s all turn
-const WORK_HOLD_S = 8;   // attached-only: streak must outlive any redraw burst (> WORK_FRESH_S) to display
-const paneWorkTracker = new Map(); // "session:windowIndex" → {activity, sampleAt, freshSince}
+const WORK_GRACE_S = 15; // once working, output pauses up to this long don't drop it
+const paneWorkTracker = new Map(); // "session:windowIndex" → {activity, sampleAt, slots, changes, lastSustainedAt, on}
 function computeWorking(sessionName, w, now){
  if(paneWorkTracker.size > 2000){
   for(const [k,v] of paneWorkTracker){ if(now - v.sampleAt > 600) paneWorkTracker.delete(k); }
  }
+ // Cadence model. Real work (Claude's TUI repaints ~1/s for the whole turn,
+ // builds, dev servers) moves the activity stamp at nearly EVERY look; every
+ // noise source — window creation + command echo, attach/resize/focus
+ // repaints, a user clicking around — moves it a handful of times and then
+ // freezes. So we track observed stamp CHANGES against observed sample SLOTS
+ // over a sliding window and require an ongoing change cadence to enter:
+ //   any window:        ≥3 changes spanning ≥5s, latest output ≤6s old
+ //   + active+attached: ≥70% of slots saw a change, slots spanning ≥8s
+ //     (that's where viewer-induced repaints live, so demand real density)
+ // Once ON, the state is held server-side through pauses up to the grace
+ // window — it survives page refreshes and quiet stretches, and ends at the
+ // done-bell or when the cadence truly stops.
  const key = sessionName + ':' + w.index;
- const fresh = w.activity > 0 && (now - w.activity) <= WORK_FRESH_S;
  const prev = paneWorkTracker.get(key);
- let freshSince = null;
- if(fresh){
-  if(prev && prev.freshSince != null && (w.activity > prev.activity || now - prev.sampleAt < 3)){
-   freshSince = prev.freshSince; // streak continues: output advanced (or we resampled instantly)
-  } else if(!prev || prev.freshSince == null || w.activity > prev.activity){
-   freshSince = now; // new streak candidate
-  }
-  // else: fresh but identical timestamp across a real gap → stale burst, no streak
- }
- paneWorkTracker.set(key, { activity: w.activity, sampleAt: now, freshSince });
- if(!fresh || w.bell) return false;
- // Client-induced repaints (attach, resize, focus) only ever reach the ACTIVE
- // window of an ATTACHED session — nothing can spontaneously repaint an idle
- // TUI in a detached session or a background window. So those get the
- // stateless instant path: fresh output there IS work. Only active+attached
- // windows need the sustained-streak hold to filter viewer-induced bursts,
- // and there the viewer's own 2s/4s polls keep the tracker fed.
- if(w.attached === 0 || !w.active) return true;
- return !!(freshSince != null && now - freshSince >= WORK_HOLD_S);
+ const stampAge = w.activity > 0 ? now - w.activity : Infinity;
+ const advanced = prev ? w.activity > prev.activity : stampAge <= 2;
+ const slots = prev ? prev.slots.filter(t => now - t <= 12) : [];
+ const changes = prev ? prev.changes.filter(t => now - t <= 12) : [];
+ if(advanced) changes.push(now);
+ if(!slots.length || now - slots[slots.length - 1] >= 1.5) slots.push(now);
+ const changeSpan = changes.length ? changes[changes.length - 1] - changes[0] : 0;
+ const slotSpan = slots.length ? now - slots[0] : 0;
+ const ratio = slots.length ? Math.min(changes.length, slots.length) / slots.length : 0;
+ const base = changes.length >= 3 && changeSpan >= 5 && stampAge <= 6;
+ const sustained = (w.attached === 0 || !w.active)
+  ? base
+  : (base && slots.length >= 4 && slotSpan >= 8 && ratio >= 0.7);
+ let lastSustainedAt = sustained ? now : (prev ? prev.lastSustainedAt : null);
+ const on = !w.bell && (sustained || (!!(prev && prev.on) && lastSustainedAt != null && now - lastSustainedAt <= WORK_GRACE_S));
+ paneWorkTracker.set(key, { activity: w.activity, sampleAt: now, slots, changes, lastSustainedAt, on });
+ if(process.env.PW_WORK_DEBUG && sessionName === 'pw_AmrikPublic') console.log('[workdbg]', JSON.stringify({ key, now, act: w.activity, stampAge, ch: changes.length, chSpan: changeSpan, sl: slots.length, slSpan: slotSpan, ratio: +ratio.toFixed(2), sustained, active: w.active, attached: w.attached, on }));
+ return on;
 }
 async function listTmuxWindows(project){
  const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}']);
