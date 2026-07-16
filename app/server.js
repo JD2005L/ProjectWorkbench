@@ -459,14 +459,20 @@ const pendingDir = '/var/lib/project-workbench/pending';
 function pendingMarkerPath(p){ return path.join(pendingDir, p.name); }
 async function readPending(p){ try { const stat = await fs.stat(pendingMarkerPath(p)); return { pending: true, since: stat.mtime.toISOString() }; } catch { return { pending: false }; } }
 async function clearPending(p){ await fs.rm(pendingMarkerPath(p), { force: true }).catch(()=>{}); }
-// True when the project has a finished-but-unviewed tab: any background tmux
-// window (not the one currently shown) whose terminal-bell flag is set. This is
-// the same per-window signal the terminal tab strip flashes on, and it clears
-// itself when the user selects that window. Used to light the dashboard project
-// card. Returns false if the session isn't running.
 async function projectHasUnreadBell(p){
- try { return (await listTmuxWindows(p.name)).some(w => w.bell && !w.active); }
- catch { return false; }
+ // A bell on a background window counts (finished-but-unviewed tab), and so
+ // does a bell on the ACTIVE window when no client is attached — tmux sets
+ // window_bell_flag in that case and clears it on the next attach (verified
+ // empirically), so simply opening the project's terminal self-heals the
+ // flag. A bell on the active window of an attached session never flags
+ // (the viewer saw it live). Returns false if the session isn't running.
+ try {
+  const { stdout } = await tmux(['list-windows','-t',tmuxSession(p.name),'-F','#{window_active}|#{window_bell_flag}|#{session_attached}']);
+  return String(stdout || '').split('\n').filter(Boolean).some(line => {
+   const [active, bell, attached] = line.split('|');
+   return bell === '1' && (active !== '1' || Number(attached) === 0);
+  });
+ } catch { return false; }
 }
 async function getClaudeVersion(){ try { const { stdout } = await sh('claude',['--version'],{timeout:5000}); return stdout.trim() || 'unknown'; } catch { return 'unavailable'; } }
 async function getClaudeUpdateStamp(){ try { const stat = await fs.stat('/var/log/claude-code-update.log'); return stat.mtime.toISOString().replace('T',' ').replace(/\.\d+Z$/,' UTC'); } catch { return 'never'; } }
@@ -1410,6 +1416,8 @@ app.post('/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{ try {
  for(const d of [pendingDir,'/etc/project-workbench','/opt/project-workbench/workspaces','/opt/project-workbench/memory']){
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
  }
+ // The Stop hook runs as admin and must be able to drop markers in pendingDir.
+ await sh('chown',['admin:admin',pendingDir]).catch(()=>{}); steps.push(`ok owner admin: ${pendingDir}`);
  try { await fs.access(emptyMcpPath); steps.push(`ok file: ${emptyMcpPath}`); }
  catch { await fs.writeFile(emptyMcpPath,'{}\n'); steps.push(`created: ${emptyMcpPath}`); }
  await syncWrapperEnv(await loadWorkbenchSettings()); steps.push(`refreshed: ${wrapperEnvPath}`);

@@ -84,7 +84,10 @@ log "Creating directory tree…"
 install -d -m 0755 "$PW_INSTALL_DIR" "$APP_DIR" "$CONF_DIR"
 install -d -o "$PW_USER" -g "$PW_USER" -m 0755 "$WORKSPACES_DIR"
 install -d -o "$PW_USER" -g "$PW_USER" -m 0700 "$MEMORY_DIR"
-install -d -m 0755 /var/lib/project-workbench /var/lib/project-workbench/pending
+install -d -m 0755 /var/lib/project-workbench
+# pending/ must be writable by $PW_USER: the Claude Stop hook (running as that
+# user) drops per-project "turn finished" markers here for the dashboard rail.
+install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/pending
 install -d -m 0750 /var/log/project-workbench
 
 if [ -d "$SRC_DIR/.git" ]; then
