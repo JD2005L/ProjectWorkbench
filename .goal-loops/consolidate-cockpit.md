@@ -307,3 +307,29 @@ Brought canonical in line with JD2005L's last-24h visual upgrade:
 - Independent review: no defects; default-off byte-identical; server-scope
   ordering safe (nginx longest-prefix; only exact loc is =/pw-auth-check, no regex
   locations to shadow); no attacker surface; nginx -t+rollback prevents bad reload.
+
+### iter 14 — #1 PW_DEPLOY_MODE=host|container (the unifier) — CODE+ARTIFACTS DONE (runtime deferred)
+Part A (app/server.js): added PW_DEPLOY_MODE (default host). Host branch UNCHANGED
+(systemd project-terminal@/setup/preview units + sudo -u admin tmux). Container
+branch (mirrors the GOA container server): tmux -L TMUX_SOCKET (no sudo);
+startProject node-spawns a tracked ttyd (projectTerminals Map) with BASE-prefixed
+--base-path + socket-aware inner `tmux attach-session`; ensureSetupTerminal
+node-spawns the _setup ttyd; stopProject kills the tracked proc; boot spawn-loop
+(guarded !ISOLATED); container preview = node-spawned bash -c + bounded in-memory
+logs (previewProcs). nginx reload PARAMETERIZED via PW_NGINX_TEST_CMD/
+PW_NGINX_RELOAD_CMD (runConfiguredCommand → argv split, no shell; default =
+nginx -t + systemctl reload nginx). NO nsenter/GOA hardcodes — a container install
+supplies host-bridge commands via env. TMUX_SOCKET applied to BOTH outer tmux()
+and inner attach (fixes a latent GOA-ref inconsistency).
+Part B (artifacts, de-GOA'd, static-review — no podman here): Containerfile
+(generic node:20-slim base; AD-CA + Deploy-Centre .NET/pywinrm/smbclient as
+commented OPTIONAL sections), .containerignore, scripts/entrypoint.sh (respawn
+loop + TMUX_TMPDIR sidecar wait + guarded optional heal hooks), deploy-local.sh
+(env-parameterized hot-deploy), DEPLOY.md (host vs container + full env-knob table).
+Verified: node --check clean; bash -n both scripts; isolated boot both modes —
+HOST uses `sudo -u admin tmux` + default nginx -t/systemctl reload; CONTAINER uses
+direct `tmux -u -L pwprev-<pid>` (no sudo); PW_NGINX_RELOAD_CMD override honored.
+No GOA-isms in artifacts. Independent review: host mode byte-identical, container
+sound, injection-safe param, bounded preview logs, no nsenter hardcode.
+DEFERRED (needs target host + podman): `podman build`, real container run, host-
+nginx bridge, ttyd node-spawn runtime, real install matrix.

@@ -28,6 +28,10 @@ const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/proje
 // error. Default: file absent → nothing injected (byte-identical output).
 const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/extra-nginx.conf';
 const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath !== CANONICAL_REGISTRY;
+const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
+const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
+const nginxTestCmd = process.env.PW_NGINX_TEST_CMD || '';
+const nginxReloadCmd = process.env.PW_NGINX_RELOAD_CMD || '';
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
 const emptyMcpPath = '/etc/project-workbench/empty-mcp.json';
@@ -541,8 +545,32 @@ function previewUnit(name){ return `project-preview@${name}.service`; }
 async function sh(cmd,args,opts={}){ return execFileAsync(cmd,args,{timeout:120000,...opts}); }
 function tmuxSession(name){ return 'pw_' + String(name).replace(/[^A-Za-z0-9_]/g,'_'); }
 async function probePreviewReady(port){ try { await execFileAsync('bash',['-c',`exec 3<>/dev/tcp/127.0.0.1/${Number(port)}`],{timeout:1500}); return true; } catch { return false; } }
+// Container mode has no project-preview@.service, so preview runs are managed
+// by this node process with recent stdout/stderr kept for the logs endpoint.
+const previewProcs = new Map();
+const PREVIEW_LOG_MAX = 500;
+function previewState(name){ return previewProcs.get(name) || null; }
+function previewCommand(p){
+ const port = Number(p.preview.port);
+ const basepath = `${BASE}/preview/${p.name}`;
+ return p.preview.cmd.replace(/\$\{PORT\}/g, String(port)).replace(/\$\{BASEPATH\}/g, basepath);
+}
 async function previewStatus(p){
  if(!hasPreview(p)) return { configured:false, active:false, ready:false };
+ if(DEPLOY_MODE === 'container'){
+  const state = previewState(p.name);
+  const active = !!(state && state.proc && state.proc.exitCode === null);
+  const pid = active ? state.pid : null;
+  const since = state ? state.since : null;
+  const result = state ? state.result : null;
+  const exitCode = state ? state.exitCode : null;
+  const ready = active ? await probePreviewReady(p.preview.port) : false;
+  let lastError = null;
+  if(!active && state && result && result !== 'success'){
+   lastError = state.log.slice(-15).join('\n').slice(-1500);
+  }
+  return { configured:true, active, ready, since, pid, port:Number(p.preview.port), basepath:`${BASE}/preview/${p.name}`, url:`${BASE}/preview/${p.name}/`, result, exitCode, lastError, cmd:previewCommand(p) };
+ }
  const unit = previewUnit(p.name);
  let active = false, since = null, pid = null, result = null, exitCode = null;
  try {
@@ -565,12 +593,46 @@ async function previewStatus(p){
  return { configured:true, active, ready, since, pid, port:Number(p.preview.port), basepath:`${BASE}/preview/${p.name}`, url:`${BASE}/preview/${p.name}/`, result, exitCode, lastError };
 }
 async function previewLogs(name, lines=200){
+ if(DEPLOY_MODE === 'container'){
+  const state = previewState(name);
+  if(!state) return '(no preview has been started)';
+  return state.log.slice(-lines).join('\n');
+ }
  try { const { stdout } = await execFileAsync('journalctl',['-u',previewUnit(name),'--no-pager','-n',String(Number(lines)||200),'-o','cat'],{timeout:5000}); return stdout; }
  catch(e){ return `[no logs] ${e.message || e}`; }
 }
-async function startPreviewUnit(p){ if(!hasPreview(p)) throw new Error('Preview is not configured for this project'); await sh('systemctl',['restart',previewUnit(p.name)]); }
-async function stopPreviewUnit(name){ await sh('systemctl',['stop',previewUnit(name)]).catch(()=>{}); await sh('systemctl',['disable',previewUnit(name)]).catch(()=>{}); }
-async function tmux(args,opts={}){ return execFileAsync('sudo',['-u','admin','tmux',...args],{timeout:10000,...opts}); }
+async function startPreviewUnit(p){
+ if(!hasPreview(p)) throw new Error('Preview is not configured for this project');
+ if(DEPLOY_MODE !== 'container'){ await sh('systemctl',['restart',previewUnit(p.name)]); return; }
+ await stopPreviewUnit(p.name);
+ const port = Number(p.preview.port);
+ const basepath = `${BASE}/preview/${p.name}`;
+ const cwd = p.path || workspacePath(p.name);
+ const userEnv = (p.preview && p.preview.env && typeof p.preview.env === 'object') ? p.preview.env : {};
+ const env = { ...process.env, ...userEnv, PORT:String(port), BASEPATH:basepath, DOTNET_ENVIRONMENT:'Development', ASPNETCORE_ENVIRONMENT:'Development', DOTNET_CLI_HOME:path.join(cwd,'.dotnet'), HOME:cwd };
+ const proc = spawn('bash',['-c',previewCommand(p)],{cwd,env,stdio:['ignore','pipe','pipe']});
+ const state = { proc, pid:proc.pid, since:new Date().toISOString(), exitCode:null, result:null, log:[], stopping:false };
+ function appendLog(line){ state.log.push(line); if(state.log.length > PREVIEW_LOG_MAX) state.log.shift(); }
+ proc.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(appendLog));
+ proc.stderr.on('data', d => d.toString().split('\n').filter(Boolean).forEach(appendLog));
+ proc.on('exit', (code, signal) => { state.exitCode = state.stopping ? null : code; state.result = state.stopping ? null : (code === 0 ? 'success' : (signal ? 'signal' : 'exit-code')); state.proc = null; state.stopping = false; });
+ proc.on('error', e => { appendLog(`[spawn error] ${e.message}`); state.result = 'spawn-error'; state.proc = null; });
+ previewProcs.set(p.name, state);
+}
+async function stopPreviewUnit(name){
+ if(DEPLOY_MODE !== 'container'){ await sh('systemctl',['stop',previewUnit(name)]).catch(()=>{}); await sh('systemctl',['disable',previewUnit(name)]).catch(()=>{}); return; }
+ const state = previewState(name);
+ if(state && state.proc && state.proc.exitCode === null){
+  state.stopping = true;
+  state.proc.kill('SIGTERM');
+  await new Promise(r=>setTimeout(r,2000));
+  if(state.proc && state.proc.exitCode === null) state.proc.kill('SIGKILL');
+ }
+}
+async function tmux(args,opts={}){
+ if(DEPLOY_MODE === 'container') return execFileAsync('tmux',['-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+ return execFileAsync('sudo',['-u','admin','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+}
 function parseTmuxWindows(stdout){
  return String(stdout || '').split('\n').filter(Boolean).map(line=>{
   const parts = line.split('|');
@@ -649,6 +711,23 @@ async function tmuxWindowDetails(project){
  }).filter(w=>Number.isFinite(w.index));
 }
 function shellQuote(s){ return JSON.stringify(String(s)); }
+const projectTerminals = new Map();
+async function ensureTmuxSession(p){
+ const sess = tmuxSession(p.name);
+ try { await tmux(['has-session','-t',sess]); return; } catch {}
+ const cwd = p.path || workspacePath(p.name);
+ const env = ['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin'];
+ const tabs = Array.isArray(p.tabs) ? p.tabs : [];
+ const firstName = tabs[0]?.name || 'Base';
+ await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash','--noprofile','--norc']);
+ if(tabs[0]?.cmd?.trim()) await tmux(['send-keys','-t',`${sess}:${firstName}`,tabs[0].cmd.trim(),'C-m']);
+ for(let i=1; i<tabs.length; i++){
+  const t = tabs[i]; if(!t?.name) continue;
+  await tmux(['new-window','-t',sess,'-c',cwd,'-n',t.name,...env,'bash','--noprofile','--norc']);
+  if(t.cmd?.trim()){ await new Promise(r=>setTimeout(r,80)); await tmux(['send-keys','-t',`${sess}:${t.name}`,t.cmd.trim(),'C-m']); }
+ }
+ await tmux(['select-window','-t',`${sess}:0`]).catch(()=>{});
+}
 async function ensureProjectTmuxSession(p){
  try { await tmux(['has-session','-t',tmuxSession(p.name)]); return; } catch {}
  const cmd = `env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc`;
@@ -816,7 +895,22 @@ async function getCliStatuses(){
  }
  return out;
 }
+let setupTtydProc = null;
 async function ensureSetupTerminal(){
+ if(DEPLOY_MODE === 'container'){
+  if(ISOLATED) return true;
+  if(setupTtydProc && setupTtydProc.exitCode === null) return true;
+  setupTtydProc = spawn('ttyd',['--interface','127.0.0.1','--port',String(setupTtydPort),'--base-path',`${BASE}/pty/_setup/`,'--writable','bash','--login'],{
+   stdio:'ignore', detached:true, env:{...process.env, HOME:'/root'}
+  });
+  setupTtydProc.unref();
+  setupTtydProc.on('exit',()=>{ setupTtydProc = null; });
+  for(let i=0;i<20;i++){
+   try { const r = await fetch(`http://127.0.0.1:${setupTtydPort}${BASE}/pty/_setup/`); if(r.ok) return true; } catch {}
+   await new Promise(r=>setTimeout(r,250));
+  }
+  return false;
+ }
  await sh('systemctl',['enable','project-setup-terminal.service']).catch(()=>{});
  await sh('systemctl',['start','project-setup-terminal.service']).catch(()=>{});
  for(let i=0;i<20;i++){
@@ -834,18 +928,19 @@ function nginxConfig(projects){
  let extraLocations = '';
  try { extraLocations = fsSync.readFileSync(extraNginxPath, 'utf8'); } catch {}
  if(extraLocations && !extraLocations.endsWith('\n')) extraLocations += '\n';
+ const ttydProxyBase = DEPLOY_MODE === 'container' ? BASE : '';
  // Internal endpoint that nginx auth_request calls. Forwards Cookie to the
  // dashboard so it can decide based on the app session.
  const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000${BASE}/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n        proxy_set_header X-Original-URI $request_uri;\n    }\n`;
  // Setup terminal is admin-only — the wizard signs in CLIs whose tokens land
  // in /home/admin and apply to every project.
- const setupRoute = `    location ${BASE}/pty/_setup/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
+ const setupRoute = `    location ${BASE}/pty/_setup/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${setupTtydPort}${ttydProxyBase}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
  // Accept-Encoding is cleared so ttyd serves uncompressed HTML — otherwise
  // sub_filter can't match '</head>' inside a gzipped body and the preload
  // script tag is silently dropped, breaking mouse-drag-copy (OSC 52 sniffer).
  // auth_request gates each terminal/preview block per-project; in soft mode
  // (PW_AUTH_ENFORCE=false) the dashboard returns 200 for anonymous callers.
- const locations = projects.map(p => `    location ${BASE}/pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="${BASE}/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
+ const locations = projects.map(p => `    location ${BASE}/pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="${BASE}/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}${ttydProxyBase}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
  const previewRoutes = previewProjects.map(p => `    location ${BASE}/preview/${p.name}/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix ${BASE}/preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ ${BASE}/preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
  const refererMaps = previewProjects.length ? `map $http_referer $pw_preview_name {\n    default "";\n    "~^https?://[^/]+${BASE}/preview/(?<pname>[^/]+)/" "$pname";\n}\nmap $pw_preview_name $pw_preview_port {\n    default 0;\n${previewProjects.map(p => `    "${p.name}" ${p.preview.port};`).join('\n')}\n}\n` : '';
  const dashboardPathNames = ['api','pty','term','file','manage','preview','terminal-preload','terminal-paste','healthz','favicon','robots',...(DEPLOY_CENTRE?['deploy']:[])].join('|');
@@ -857,6 +952,30 @@ function nginxConfig(projects){
  const deployRoute = DEPLOY_CENTRE ? `    location ${BASE}/api/deploy/ {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout 600s;\n        proxy_send_timeout 600s;\n    }\n` : '';
  return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${extraLocations}${deployRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
 }
+function splitCommandLine(cmd){
+ const out = [];
+ let cur = '', quote = null, escNext = false;
+ for(const ch of String(cmd || '')){
+  if(escNext){ cur += ch; escNext = false; continue; }
+  if(ch === '\\' && quote !== "'"){ escNext = true; continue; }
+  if(quote){ if(ch === quote) quote = null; else cur += ch; continue; }
+  if(ch === '"' || ch === "'"){ quote = ch; continue; }
+  if(/\s/.test(ch)){ if(cur){ out.push(cur); cur = ''; } continue; }
+  cur += ch;
+ }
+ if(escNext) cur += '\\';
+ if(quote) throw new Error(`Unclosed quote in command: ${cmd}`);
+ if(cur) out.push(cur);
+ return out;
+}
+async function runConfiguredCommand(configured, fallbackCmd, fallbackArgs, opts={}){
+ if(configured){
+  const argv = splitCommandLine(configured);
+  if(!argv.length) throw new Error('Configured command is empty');
+  return sh(argv[0], argv.slice(1), opts);
+ }
+ return sh(fallbackCmd, fallbackArgs, opts);
+}
 async function applyRouting(projects){
  // An isolated instance must never rewrite the shared host nginx config unless
  // an explicit PW_NGINX_CONF (a throwaway path) was provided.
@@ -866,7 +985,7 @@ async function applyRouting(projects){
  try { prev = await fs.readFile(nginxPath,'utf8'); } catch {}
  await fs.writeFile(nginxPath, newConfig);
  try {
-  await sh('nginx',['-t']);
+  await runConfiguredCommand(nginxTestCmd, 'nginx', ['-t']);
  } catch(e){
   // Roll back to the previous working config so an unrelated edit doesn't
   // brick the reverse proxy. Surface nginx's diagnostic (it usually pinpoints
@@ -877,8 +996,8 @@ async function applyRouting(projects){
   wrapped.cause = e;
   throw wrapped;
  }
- await sh('systemctl',['reload','nginx']);
- await sh('systemctl',['daemon-reload']);
+ await runConfiguredCommand(nginxReloadCmd, 'systemctl', ['reload','nginx']);
+ if(!nginxReloadCmd) await sh('systemctl',['daemon-reload']);
 }
 async function cloneWorkspace(p){
  await fs.mkdir(workspaceRoot,{recursive:true});
@@ -928,11 +1047,35 @@ os.replace(tmp, conf)
  await sh('sudo',['-u','admin','python3','-c',script,p.path]).catch(()=>{});
 }
 async function startProject(p){
+ if(DEPLOY_MODE === 'container'){
+  if(ISOLATED){ await ensureTmuxSession(p); return; }
+  if(projectTerminals.has(p.name)){ const t = projectTerminals.get(p.name); try { t.proc.kill(); } catch {} projectTerminals.delete(p.name); }
+  const basePath = `${BASE}/pty/${p.name}/`;
+  try { await execFileAsync('pkill',['-f',`ttyd.*--base-path.*${basePath}`],{timeout:3000}); await new Promise(r=>setTimeout(r,500)); } catch {}
+  await ensureTmuxSession(p);
+  const port = Number(p.port);
+  const sess = tmuxSession(p.name);
+  const proc = spawn('ttyd',['--interface','127.0.0.1','--port',String(port),'--base-path',basePath,'--writable','-t','disableLeaveAlert=true','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),'attach-session','-t',sess],{
+   stdio:'ignore', detached:true, env:{...process.env, HOME:'/root', TERM:'xterm-256color'}
+  });
+  proc.unref();
+  proc.on('exit',()=>{ projectTerminals.delete(p.name); });
+  projectTerminals.set(p.name, { proc, port });
+  return;
+ }
  await trustClaudeProject(p);
  await sh('systemctl',['enable',`project-terminal@${p.name}.service`]);
  await sh('systemctl',['restart',`project-terminal@${p.name}.service`]);
 }
-async function stopProject(name){ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await stopPreviewUnit(name); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{}); }
+async function stopProject(name){
+ if(DEPLOY_MODE === 'container'){
+  if(projectTerminals.has(name)){ const t = projectTerminals.get(name); try { t.proc.kill(); } catch {} projectTerminals.delete(name); }
+  await tmux(['kill-session','-t',tmuxSession(name)]).catch(()=>{});
+  await stopPreviewUnit(name);
+  return;
+ }
+ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await stopPreviewUnit(name); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{});
+}
 async function removeWorkspace(p){ const full = path.resolve(p.path); const root = path.resolve(workspaceRoot); if(!full.startsWith(root + path.sep)) throw new Error('Refusing to delete outside workspace root'); await fs.rm(full,{recursive:true,force:true}); }
 
 
@@ -1923,7 +2066,8 @@ app.post(BASE + '/api/preview/:project/start', requireTerminalAccess, async (req
 
 app.post(BASE + '/api/preview/:project/stop', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- await sh('systemctl',['stop',previewUnit(p.name)]).catch(()=>{});
+ if(DEPLOY_MODE === 'container') await stopPreviewUnit(p.name);
+ else await sh('systemctl',['stop',previewUnit(p.name)]).catch(()=>{});
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
@@ -2536,4 +2680,21 @@ if(DEPLOY_CENTRE){
 
 app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="${BASE}/manage">Back to Manage</a></p>`); });
 const PORT = parseInt(process.env.PORT || '3000', 10);
-app.listen(PORT,'127.0.0.1',()=>{ console.log(`dashboard listening on 127.0.0.1:${PORT}`); if(!ISOLATED) sweepOrphanTmuxSessions(); });
+app.listen(PORT,'127.0.0.1',()=>{
+ console.log(`dashboard listening on 127.0.0.1:${PORT}`);
+ console.log(`[deploy-mode] ${DEPLOY_MODE}`);
+ if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
+ if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
+ sweepOrphanTmuxSessions();
+ setTimeout(async ()=>{
+  try {
+   const projects = await loadProjects();
+   for(const p of projects){
+    try { await startProject(p); console.log(`[boot] started terminal for ${p.name} on port ${p.port}`); }
+    catch(e){ console.error(`[boot] failed to start ${p.name}:`, e.message); }
+   }
+   await applyRouting(projects);
+   console.log(`[boot] auto-start complete (${projects.length} project${projects.length===1?'':'s'})`);
+  } catch(e){ console.error('[boot] auto-start error:', e.message); }
+ }, 2000);
+});
