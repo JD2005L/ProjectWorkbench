@@ -130,3 +130,7 @@ modal, sharp dark animated design (force-motion standard applied).
 - Pinned keys: pk-pin control (visible when rail wide, hover), .pkey.pinned leans translateX(5px/7px hover) inside the rail; auto-pin on lit rising/observed (toggleable, rail-foot switch, default on, localStorage pwPinned/pwAutoPin, stale names pruned).
 - BUG FOUND VIA TEST: pkIn/lIn animation fill 'both' permanently pinned transform:none, suppressing pinned lean AND the hover press since day one → fill 'backwards'. Computed transform now matrix(...,7,0) ✓.
 - Verified: pintest.mjs (manual pin/unpin, persistence across reload, auto-pin on done, toggle off persists), worktest2 (false-pos 0/7, true-pos 1.7s), sweep 29/29. Screenshots: pin-open, pin-collapsed (lean visible collapsed), pin-auto (lit+pinned combo).
+
+### 2026-07-16 — pin visibility v2 (user: "not noticeable")
+- Collapsed rail widened 58→64px; pinned keys: lean 10px (12px hover), INVERTED bright monogram in project hue, 📌 badge top-left (always visible), glow border; unpinned idle keys recede (opacity .5 + desaturate) whenever pins exist — current/lit/working keys exempt from dimming.
+- Both states verified by screenshot (pin-collapsed-true, pin-open); pintest green; sweep 29/29. Note: clicking collapse keeps the panel peeked while pointer/focus stays on the rail (hover/focus-within peek) — collapses on mouse-away; intentional.

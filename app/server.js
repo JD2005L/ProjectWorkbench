@@ -779,7 +779,7 @@ function projMonogram(name){
  return (parts[0]||'?').slice(0,2).toUpperCase();
 }
 
-const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--panel2:#101a2e;--line:#1b2740;--line2:#2b3d61;--text:#e7eef9;--dim:#8ea3c0;--faint:#5b6d89;--cyan:#38bdf8;--blue:#2563eb;--amber:#fbbf24;--amber2:#f59e0b;--ok:#34d399;--err:#f87171;--topbar-h:42px;--rail-w:58px;--rail-wo:246px;--font:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;--mono:ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
+const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--panel2:#101a2e;--line:#1b2740;--line2:#2b3d61;--text:#e7eef9;--dim:#8ea3c0;--faint:#5b6d89;--cyan:#38bdf8;--blue:#2563eb;--amber:#fbbf24;--amber2:#f59e0b;--ok:#34d399;--err:#f87171;--topbar-h:42px;--rail-w:64px;--rail-wo:246px;--font:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;--mono:ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
 @view-transition{navigation:auto}
 ::view-transition-old(root),::view-transition-new(root){animation-duration:.16s}\n@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}`;
 const cockpitCss = `html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--font)}
@@ -876,8 +876,8 @@ body.rail-open #railPanel{width:var(--rail-wo)}
 .railBrandName{flex:1 1 auto;text-align:left;font-size:11.5px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:#dbe9fb;white-space:nowrap;opacity:0;transform:translateX(-8px);transition:opacity .2s .05s,transform .2s .05s}
 #railToggle .chev{display:inline-block;color:var(--faint);font-size:16px;line-height:1;opacity:0;transition:transform .3s cubic-bezier(.32,.72,.24,1),opacity .2s}
 body.rail-open #railToggle .chev{transform:rotate(180deg)}
-.railKeys{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:10px 8px 10px 0;display:flex;flex-direction:column;gap:7px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
-.pkey{position:relative;display:flex;align-items:center;gap:9px;height:46px;flex:0 0 46px;padding:0 10px 0 12px;border:1px solid var(--line);border-left:0;border-radius:0 11px 11px 0;background:linear-gradient(180deg,var(--panel),#0a1120);color:var(--dim);text-decoration:none;box-sizing:border-box;transition:transform .18s cubic-bezier(.34,1.4,.44,1),background .18s,border-color .18s,box-shadow .18s,color .18s;animation:pkIn .5s cubic-bezier(.22,.9,.3,1) backwards;animation-delay:calc(var(--i)*38ms)}
+.railKeys{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:10px 14px 10px 0;display:flex;flex-direction:column;gap:7px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+.pkey{position:relative;display:flex;align-items:center;gap:9px;height:46px;flex:0 0 46px;padding:0 10px 0 12px;border:1px solid var(--line);border-left:0;border-radius:0 11px 11px 0;background:linear-gradient(180deg,var(--panel),#0a1120);color:var(--dim);text-decoration:none;box-sizing:border-box;transition:transform .18s cubic-bezier(.34,1.4,.44,1),background .18s,border-color .18s,box-shadow .18s,color .18s,opacity .2s,filter .2s;animation:pkIn .5s cubic-bezier(.22,.9,.3,1) backwards;animation-delay:calc(var(--i)*38ms)}
 @keyframes pkIn{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:none}}
 .pkey:hover{transform:translateX(4px);color:#fff;border-color:var(--line2);background:linear-gradient(180deg,var(--panel2),#0c1424)}
 .pkey:focus-visible{outline:2px solid var(--cyan);outline-offset:-2px}
@@ -899,9 +899,13 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pkey.lit .pk-mono{border-color:#b45309;color:#ffd98a;background:#271c04;box-shadow:0 0 14px -2px rgba(245,158,11,.35)}
 .pkey.lit .pk-dot{opacity:1;background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pkGlow 1.8s ease-in-out infinite}
 @keyframes pkGlow{0%,100%{opacity:.6}50%{opacity:1}}
-.pkey.pinned{transform:translateX(5px);border-color:var(--line2);box-shadow:0 4px 14px -8px rgba(0,0,0,.9)}
-.pkey.pinned:hover{transform:translateX(7px)}
-.pkey.pinned:not(.current):not(.lit) .pk-edge{background:hsl(var(--h) 65% 50% / .95);box-shadow:0 0 8px hsl(var(--h) 70% 55% / .45)}
+.pkey.pinned{transform:translateX(10px);border-color:hsl(var(--h) 60% 45%);box-shadow:0 6px 18px -8px rgba(0,0,0,.95),0 0 14px -4px hsl(var(--h) 70% 55% / .5)}
+.pkey.pinned:hover{transform:translateX(12px)}
+.pkey.pinned:not(.current):not(.lit) .pk-edge{background:hsl(var(--h) 65% 52% / .95);box-shadow:0 0 10px hsl(var(--h) 70% 55% / .6)}
+.pkey.pinned:not(.lit) .pk-mono{background:hsl(var(--h) 78% 58%);color:#070b12;border-color:hsl(var(--h) 90% 75%);box-shadow:0 0 12px -2px hsl(var(--h) 75% 60% / .6);font-weight:800}
+.pkey.pinned::after{content:'📌';position:absolute;top:1px;left:2px;font-size:9px;line-height:1;transform:rotate(-24deg);text-shadow:0 1px 2px rgba(0,0,0,.9);pointer-events:none}
+.railKeys.has-pins .pkey:not(.pinned):not(.current):not(.lit):not(.working){opacity:.5;filter:saturate(.5) brightness(.82)}
+.railKeys.has-pins .pkey:not(.pinned):hover{opacity:1;filter:none}
 .pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2}
 .pkey:hover .pk-pin{opacity:.55}
 .pk-pin:hover{opacity:1;background:rgba(255,255,255,.07)}
@@ -977,7 +981,7 @@ if(logout)logout.onclick=async()=>{try{await fetch('/api/auth/logout',{method:'P
 let pinned=new Set();try{pinned=new Set(JSON.parse(localStorage.getItem('pwPinned')||'[]'))}catch{}
 let autoPin=true;try{autoPin=(localStorage.getItem('pwAutoPin')||'1')==='1'}catch{}
 function savePins(){try{localStorage.setItem('pwPinned',JSON.stringify([...pinned]))}catch{}}
-function applyPins(){KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const pb=k.querySelector('.pk-pin');if(pb)pb.title=on?'Unpin':'Pin — lean this project out while you work with it'})}
+function applyPins(){KEYS.classList.toggle('has-pins',pinned.size>0);KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const pb=k.querySelector('.pk-pin');if(pb)pb.title=on?'Unpin':'Pin — lean this project out while you work with it'})}
 const autoBtn=document.getElementById('autoPinBtn');
 function renderAuto(){if(!autoBtn)return;autoBtn.setAttribute('aria-pressed',autoPin?'true':'false');autoBtn.classList.toggle('off',!autoPin);const st=document.getElementById('autoPinState');if(st)st.textContent=autoPin?'on':'off'}
 if(autoBtn)autoBtn.onclick=()=>{autoPin=!autoPin;try{localStorage.setItem('pwAutoPin',autoPin?'1':'0')}catch{}renderAuto()};
