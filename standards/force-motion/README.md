@@ -74,3 +74,10 @@ One inline `<script>` — [`force-motion.html`](./force-motion.html) — handles
   CSS strip. Self-host framework CSS or avoid self-gating.
 - If you truly need to honor reduced motion for one critical, seizure-risk effect,
   that's a conscious per-element exception — not the default.
+
+## Razor (.cshtml) placement note
+
+When pasting the drop-in into a Razor layout, escape the two `@` tokens in the
+JS comments (`@media` → `@@media`, `@import` → `@@import`) or the build fails
+with CS0103 — Razor parses bare `@` inside `<script>` as directives. (Hit on
+AmrikPublic, 2026-07-15.)

@@ -6,3 +6,5 @@ workspaces/
 .git-credentials
 .htpasswd
 _inbox/
+tools/*.pw
+tools/verify/*.png

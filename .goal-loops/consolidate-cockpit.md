@@ -260,3 +260,28 @@ DEFERRED — needs a capability this box lacks:
   confirmed. Notes: settings page keeps an inert deployPwCellHtml()=>'' when off
   (DOM-identical); getDeployEnv version-probe shares any stored cred (same as ref).
 - Remaining for #4: Pulse /pulse/ nginx route optional (sibling-service infra) — next.
+
+### iter 12 — Upstream visual upgrade (072aa78→a305ee3) ported — DONE
+Brought canonical in line with JD2005L's last-24h visual upgrade:
+- Server-side WORKING DETECTOR: computeWorking + paneWorkTracker + WORK_GRACE_S
+  (cadence model), parseTmuxWindows +attached/+activity, listTmuxWindows extends
+  -F to 6 fields + maps working. projectSignals replaces projectHasUnreadBell.
+- DONE-STATE LATCH in /api/projects/status (writes pending marker when
+  bell&&!attached&&!recentlyViewed>12s) + returns `working`. recentlyViewed map
+  in clearPending suppresses re-latch while viewing.
+- PINNED rail keys + AUTO-PIN-on-done (client localStorage pwPinned/pwAutoPin),
+  LIVE pulse dots (rail .pk-live + tab .live), TOP-BAR project chip (.projChip),
+  --rail-w 58→64, animation both→backwards. All CSS/rail/tab/chip deltas applied.
+- PRESERVED canonical divergences: BASE prefixing, Deploy Centre (deployEntry/
+  deployBits/deployConfigured), optional auth, _outbox. Verbatim detector/latch.
+- Ancillary from same commit set: install.sh pending/ → $PW_USER ownership (Stop
+  hook writes markers); .gitignore tools/*.pw + tools/verify/*.png; force-motion
+  README Razor note; tools/verify/ suite (8 files) brought for repo parity.
+- Verified: node --check (server + all mjs); /api/projects/status returns working;
+  detector flips on under sustained advancing activity (workdbg: sustained/on=true
+  at chSpan≥5,ch≥3,stampAge≤6 — matches model); rendered term page has projChip +
+  pk-pin + pk-live + autoPinBtn; deploy gating intact; default BASE='' unchanged.
+- Independent review: no defects; canonical divergences intact; detector/latch
+  byte-identical to upstream; client pin logic correct. (tools/verify is browser-
+  based host-model dev tooling — parses clean, would need base config to run on a
+  based deploy → target-env concern, not runtime.)
