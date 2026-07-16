@@ -115,3 +115,7 @@ modal, sharp dark animated design (force-motion standard applied).
 - tmux semantics verified empirically: bell on active window of DETACHED session sets window_bell_flag; ATTACH clears it (and stays cleared); bell while attached+active never flags; select-window same-index does NOT clear.
 - Fix: projectHasUnreadBell counts bell && (!active || session_attached==0) — self-healing, zero hook changes needed for running sessions; pending dir chown admin:admin (live + install.sh + heal/dirs); Stop hook now also writes the marker (new/restarted sessions).
 - Verified: ui3 single-window bell → key lit + ● title → opening ui3 auto-clears (attach) → unlit; marker write as plain admin works and clears on visit; full sweep 29/29 incl. new C3b-active-detached regression check.
+
+### 2026-07-16 — feature: "actively working" indicators
+- Rail keys + tab strip now show a pulsing green live dot for sessions actively working; expanded rail shows "working…". Detection is hook-free: tmux #{window_activity} freshness ≤5s (Claude's TUI repaints its spinner ~1/s all turn), suppressed on windows whose turn-end bell just flagged. projectHasUnreadBell folded into projectSignals (one tmux call → {bell,working}); /api/projects/status + windows API gained `working`.
+- Verified: _worktest tick-loop window → rail key .working + "working…" + tab live dot; dot clears ≤15s after C-c; screenshots caught REAL sessions lighting organically (ProjectWorkbench=this session, TRYGGBUILTPortal, PVIKPBot idle=dotless). Full sweep 29/29.
