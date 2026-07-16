@@ -511,7 +511,13 @@ async function sweepOrphanTmuxSessions(){
 const pendingDir = '/var/lib/project-workbench/pending';
 function pendingMarkerPath(p){ return path.join(pendingDir, p.name); }
 async function readPending(p){ try { const stat = await fs.stat(pendingMarkerPath(p)); return { pending: true, since: stat.mtime.toISOString() }; } catch { return { pending: false }; } }
-async function clearPending(p){ await fs.rm(pendingMarkerPath(p), { force: true }).catch(()=>{}); }
+// Viewing suppresses re-latching: the cockpit GET clears the marker ~500ms
+// BEFORE the iframe's tmux client attaches, and the page's first status poll
+// lands inside that gap (bell still flagged, attached still false) — without
+// suppression it would re-latch a state the user is in the middle of viewing.
+// The visible page's 10s heartbeat keeps this fresh for the whole visit.
+const recentlyViewed = new Map(); // project name → ms epoch of last clearPending
+async function clearPending(p){ recentlyViewed.set(p.name, Date.now()); await fs.rm(pendingMarkerPath(p), { force: true }).catch(()=>{}); }
 async function projectSignals(p){
  // bell: finished-but-unviewed — a bell on a background window, or on the
  // ACTIVE window while no client is attached (tmux sets window_bell_flag in
@@ -524,8 +530,9 @@ async function projectSignals(p){
   return {
    bell: ws.some(w => w.bell && (!w.active || w.attached === 0)),
    working: ws.some(w => w.working),
+   attached: ws.length > 0 && ws[0].attached > 0,
   };
- } catch { return { bell:false, working:false }; }
+ } catch { return { bell:false, working:false, attached:false }; }
 }
 async function getClaudeVersion(){ try { const { stdout } = await sh('claude',['--version'],{timeout:5000}); return stdout.trim() || 'unknown'; } catch { return 'unavailable'; } }
 async function getClaudeUpdateStamp(){ try { const stat = await fs.stat('/var/log/claude-code-update.log'); return stat.mtime.toISOString().replace('T',' ').replace(/\.\d+Z$/,' UTC'); } catch { return 'never'; } }
@@ -917,6 +924,7 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pkey.pinned:not(.lit) .pk-mono{background:hsl(var(--h) 78% 58%);color:#070b12;border-color:hsl(var(--h) 90% 75%);box-shadow:0 0 12px -2px hsl(var(--h) 75% 60% / .6);font-weight:800}
 .railKeys.has-pins .pkey:not(.pinned):not(.current):not(.lit):not(.working){opacity:.5;filter:saturate(.5) brightness(.82)}
 .railKeys.has-pins .pkey:not(.pinned):hover{opacity:1;filter:none}
+.pkey.pinned.lit{border-color:#a16207;box-shadow:0 6px 18px -8px rgba(0,0,0,.95),0 0 16px -3px rgba(251,191,36,.6)}
 .pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2}
 .pkey:hover .pk-pin{opacity:.55}
 .pk-pin:hover{opacity:1;background:rgba(255,255,255,.07)}
@@ -1308,8 +1316,19 @@ app.get('/api/projects/status', requireAuth, async (req,res)=>{ try {
  const projects = filterProjectsForUser(all, req.user);
  const out = await Promise.all(projects.map(async p => {
   const [pend, sig] = await Promise.all([readPending(p), projectSignals(p)]);
-  // OR the (hook-driven) file marker with the live tmux-bell signal so the
-  // rail key lights on a finished-but-unviewed turn even if one leg misses.
+  // Latch: the live tmux bell is one-shot — ANY attach (stray old tab, test
+  // visit, automation selecting windows) clears it. So the moment a poll
+  // observes it, persist the done state as the pending marker; it then
+  // survives everything and clears only when the user actually views the
+  // project (cockpit GET / visible-tab heartbeat → clearPending).
+  // …but never latch while a client is attached: the viewer's live flag
+  // governs then, and re-latching would outlive their genuine view of the
+  // finished tab. Leaving without viewing it re-latches on the next
+  // detached poll (the background-window flag survives detach).
+  if(sig.bell && !sig.attached && !pend.pending && Date.now() - (recentlyViewed.get(p.name) || 0) > 12000){
+   await fs.writeFile(pendingMarkerPath(p), new Date().toISOString()+'\n').catch(()=>{});
+   pend.pending = true; pend.since = new Date().toISOString();
+  }
   return { name: p.name, ...pend, bell: sig.bell, working: sig.working, pending: pend.pending || sig.bell };
  }));
  res.json({ ok:true, projects: out });
