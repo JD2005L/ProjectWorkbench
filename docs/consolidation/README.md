@@ -29,14 +29,20 @@ Static + isolated boot only (no real install / podman / browser here):
 - `grep -rniE 'gov\.ab\.ca|goa\.ds' app/` → none.
 
 ## Deferred to a target environment (cannot verify on the consolidation box)
-- **Container deploy path (Stage 2b):** `Containerfile`, `.containerignore`,
-  `scripts/entrypoint.sh` (TMUX_TMPDIR wait), `deploy-local.sh`, `DEPLOY.md`, and
-  `PW_DEPLOY_MODE=host|container` terminal-spawn duality in `app/server.js`
-  (host: `project-terminal@.service` + `sudo -u admin tmux`; container:
-  node-spawned ttyd + root tmux on the shared socket). Needs `podman build` + a
-  real install.
+- **Container deploy runtime (Stage 2b):** the code + artifacts are DONE —
+  `PW_DEPLOY_MODE=host|container` in `app/server.js` (host: systemd units +
+  `sudo -u admin tmux`; container: node-spawned ttyd + `tmux -L <socket>` + boot
+  spawn-loop + node-spawned preview), nginx reload parameterized via
+  `PW_NGINX_TEST_CMD`/`PW_NGINX_RELOAD_CMD`, plus `Containerfile`,
+  `.containerignore`, `scripts/entrypoint.sh`, `deploy-local.sh`, `DEPLOY.md`.
+  What remains needs a target host: `podman build`, a real container run, the
+  out-of-namespace nginx bridge, ttyd node-spawn at runtime, install matrix.
 - **Browser UI validation:** cockpit rail/hover-drawer + the richer in-terminal
   tabbed Inbox/Outbox drawer overlay; force-motion; a11y. Needs a real browser.
+- **GOA git-credential-sync (reclassified `primaryUser`):** per-project git
+  identity driven by an encrypted per-user `ghToken` + `syncProjectCredentials`.
+  A flag-gated subsystem port (uses the encrypt primitive already added for the
+  Deploy Centre); `devUrl`/`prodUrl` are minor display links. Not yet ported.
 - **Upstream PR:** open a PR from `consolidate-cockpit` to `JD2005L/ProjectWorkbench`.
 - **PVI/GOA de-environment:** `managedProjects` is a hardcoded PVI list upstream;
   should become config so neither org's project names are baked in.
