@@ -360,8 +360,8 @@ function parseTmuxWindows(stdout){
 // dropped at the next sample. Applies to any CLI or long-running command that
 // produces steady output; no hooks needed. Tracker is in-memory: a dashboard
 // restart just re-arms the streaks within a few seconds.
-const WORK_FRESH_S = 3;  // streak dies at the first >3s output gap — Claude stamps ~1/s, attach/resize redraw bursts stop within ~3s
-const WORK_HOLD_S = 8;   // streak must outlive any one-shot burst (> WORK_FRESH_S) to display
+const WORK_FRESH_S = 5;  // output this recent counts as live — Claude's TUI stamps ~1/s all turn
+const WORK_HOLD_S = 8;   // attached-only: streak must outlive any redraw burst (> WORK_FRESH_S) to display
 const paneWorkTracker = new Map(); // "session:windowIndex" → {activity, sampleAt, freshSince}
 function computeWorking(sessionName, w, now){
  if(paneWorkTracker.size > 2000){
@@ -380,7 +380,15 @@ function computeWorking(sessionName, w, now){
   // else: fresh but identical timestamp across a real gap → stale burst, no streak
  }
  paneWorkTracker.set(key, { activity: w.activity, sampleAt: now, freshSince });
- return !!(freshSince != null && now - freshSince >= WORK_HOLD_S && !w.bell);
+ if(!fresh || w.bell) return false;
+ // Client-induced repaints (attach, resize, focus) only ever reach the ACTIVE
+ // window of an ATTACHED session — nothing can spontaneously repaint an idle
+ // TUI in a detached session or a background window. So those get the
+ // stateless instant path: fresh output there IS work. Only active+attached
+ // windows need the sustained-streak hold to filter viewer-induced bursts,
+ // and there the viewer's own 2s/4s polls keep the tracker fed.
+ if(w.attached === 0 || !w.active) return true;
+ return !!(freshSince != null && now - freshSince >= WORK_HOLD_S);
 }
 async function listTmuxWindows(project){
  const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}']);
@@ -676,7 +684,7 @@ const landingCss = `body.landing{margin:0;min-height:100vh;background:radial-gra
 .lActions{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
 .lMain{max-width:1080px;margin:32px auto 60px;padding:0 26px;display:flex;flex-direction:column;gap:18px}
 .lGrid{display:grid;grid-template-columns:repeat(auto-fill,minmax(300px,1fr));gap:14px}
-.lCard{background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);border-radius:16px;padding:20px 22px;animation:lIn .5s cubic-bezier(.22,.9,.3,1) both;animation-delay:calc(var(--i,0)*55ms)}
+.lCard{background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);border-radius:16px;padding:20px 22px;animation:lIn .5s cubic-bezier(.22,.9,.3,1) backwards;animation-delay:calc(var(--i,0)*55ms)}
 @keyframes lIn{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
 .lProj{transition:transform .2s,border-color .2s,box-shadow .2s}
 .lProj:hover{border-color:var(--line2);transform:translateY(-2px);box-shadow:0 18px 40px -18px rgba(0,0,0,.9)}
@@ -869,7 +877,7 @@ body.rail-open #railPanel{width:var(--rail-wo)}
 #railToggle .chev{display:inline-block;color:var(--faint);font-size:16px;line-height:1;opacity:0;transition:transform .3s cubic-bezier(.32,.72,.24,1),opacity .2s}
 body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railKeys{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:10px 8px 10px 0;display:flex;flex-direction:column;gap:7px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
-.pkey{position:relative;display:flex;align-items:center;gap:9px;height:46px;flex:0 0 46px;padding:0 10px 0 12px;border:1px solid var(--line);border-left:0;border-radius:0 11px 11px 0;background:linear-gradient(180deg,var(--panel),#0a1120);color:var(--dim);text-decoration:none;box-sizing:border-box;transition:transform .18s cubic-bezier(.34,1.4,.44,1),background .18s,border-color .18s,box-shadow .18s,color .18s;animation:pkIn .5s cubic-bezier(.22,.9,.3,1) both;animation-delay:calc(var(--i)*38ms)}
+.pkey{position:relative;display:flex;align-items:center;gap:9px;height:46px;flex:0 0 46px;padding:0 10px 0 12px;border:1px solid var(--line);border-left:0;border-radius:0 11px 11px 0;background:linear-gradient(180deg,var(--panel),#0a1120);color:var(--dim);text-decoration:none;box-sizing:border-box;transition:transform .18s cubic-bezier(.34,1.4,.44,1),background .18s,border-color .18s,box-shadow .18s,color .18s;animation:pkIn .5s cubic-bezier(.22,.9,.3,1) backwards;animation-delay:calc(var(--i)*38ms)}
 @keyframes pkIn{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:none}}
 .pkey:hover{transform:translateX(4px);color:#fff;border-color:var(--line2);background:linear-gradient(180deg,var(--panel2),#0c1424)}
 .pkey:focus-visible{outline:2px solid var(--cyan);outline-offset:-2px}
@@ -891,6 +899,16 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pkey.lit .pk-mono{border-color:#b45309;color:#ffd98a;background:#271c04;box-shadow:0 0 14px -2px rgba(245,158,11,.35)}
 .pkey.lit .pk-dot{opacity:1;background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pkGlow 1.8s ease-in-out infinite}
 @keyframes pkGlow{0%,100%{opacity:.6}50%{opacity:1}}
+.pkey.pinned{transform:translateX(5px);border-color:var(--line2);box-shadow:0 4px 14px -8px rgba(0,0,0,.9)}
+.pkey.pinned:hover{transform:translateX(7px)}
+.pkey.pinned:not(.current):not(.lit) .pk-edge{background:hsl(var(--h) 65% 50% / .95);box-shadow:0 0 8px hsl(var(--h) 70% 55% / .45)}
+.pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2}
+.pkey:hover .pk-pin{opacity:.55}
+.pk-pin:hover{opacity:1;background:rgba(255,255,255,.07)}
+.pkey.pinned .pk-pin{opacity:.95;filter:none}
+.railAct.off .autoPinIco{filter:grayscale(1);opacity:.5}
+#autoPinState{color:var(--ok);font-weight:800}
+.railAct.off #autoPinState{color:var(--faint)}
 .pkey.struck{animation:pkStrike .85s cubic-bezier(.2,.8,.3,1)}
 @keyframes pkStrike{0%{transform:translateX(0)}18%{transform:translateX(9px);box-shadow:0 0 0 1px var(--amber),0 0 34px rgba(251,191,36,.85);background:#3a2b07}60%{transform:translateX(2px)}100%{transform:none}}
 .railFoot{flex:0 0 auto;border-top:1px solid var(--line);padding:8px;display:flex;flex-direction:column;gap:4px}
@@ -901,7 +919,7 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railWho{display:flex;align-items:center;gap:2px;padding:4px 4px 2px;color:var(--faint);font-size:11.5px;min-width:0}
 .railWhoDot{width:8px;height:8px;flex:0 0 8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px rgba(52,211,153,.5);margin:0 9px}
 .railWhoName{opacity:0;transition:opacity .22s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-@container (min-width:180px){.railBrandName{opacity:1;transform:none}#railToggle .chev{opacity:1}.pk-meta{opacity:1;transform:none}.railActLabel{opacity:1;transform:none}.railWhoName{opacity:1}}
+@container (min-width:180px){.railBrandName{opacity:1;transform:none}#railToggle .chev{opacity:1}.pk-meta{opacity:1;transform:none}.railActLabel{opacity:1;transform:none}.railWhoName{opacity:1}.pk-pin{display:grid}}
 #railScrim{display:none}
 @media(max-width:640px){
 #rail{position:fixed;top:0;left:0;bottom:0;z-index:60;transform:translateX(-100%);transition:transform .3s cubic-bezier(.32,.72,.24,1);width:var(--rail-wo);flex-basis:var(--rail-wo)}
@@ -926,7 +944,7 @@ function railHtml(projects, currentName, user){
  const isAdmin = user.role === 'admin';
  const keys = projects.map((p,i)=>{
   const cur = p.name === currentName;
-  return `<a class="pkey${cur?' current':''}" href="/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a>`;
+  return `<a class="pkey${cur?' current':''}" href="/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-pin" role="button" tabindex="-1" title="Pin">📌</span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a>`;
  }).join('');
  const adminActs = isAdmin
   ? `<a class="railAct" id="manageEntry" href="/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
@@ -934,7 +952,8 @@ function railHtml(projects, currentName, user){
  const who = user.implicit
   ? `<span class="railWho" title="PW_AUTH_ENFORCE off — anonymous admin"><span class="railWhoDot"></span><span class="railWhoName">anonymous</span></span>`
   : `<span class="railWho" title="${esc(user.username)} · ${esc(user.role)}"><span class="railWhoDot"></span><span class="railWhoName">${esc(user.username)} · ${esc(user.role)}</span></span><button id="railLogout" class="railAct" type="button" title="Sign out"><span class="railActIco">↪</span><span class="railActLabel">Sign out</span></button>`;
- return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div><nav id="railKeys" class="railKeys">${keys}</nav><div class="railFoot">${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
+ const autoPinBtn = `<button id="autoPinBtn" class="railAct" type="button" role="switch" aria-pressed="true" title="Auto-pin projects when a session finishes"><span class="railActIco autoPinIco">📌</span><span class="railActLabel">Auto-pin on done · <b id="autoPinState">on</b></span></button>`;
+ return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div><nav id="railKeys" class="railKeys">${keys}</nav><div class="railFoot">${autoPinBtn}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
 }
 
 const railScript = `<script>(function(){
@@ -955,6 +974,15 @@ if(scrim)scrim.onclick=()=>setMobileOpen(false);
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.classList.contains('rail-mobile-open'))setMobileOpen(false)});
 const logout=document.getElementById('railLogout');
 if(logout)logout.onclick=async()=>{try{await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='/login'};
+let pinned=new Set();try{pinned=new Set(JSON.parse(localStorage.getItem('pwPinned')||'[]'))}catch{}
+let autoPin=true;try{autoPin=(localStorage.getItem('pwAutoPin')||'1')==='1'}catch{}
+function savePins(){try{localStorage.setItem('pwPinned',JSON.stringify([...pinned]))}catch{}}
+function applyPins(){KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const pb=k.querySelector('.pk-pin');if(pb)pb.title=on?'Unpin':'Pin — lean this project out while you work with it'})}
+const autoBtn=document.getElementById('autoPinBtn');
+function renderAuto(){if(!autoBtn)return;autoBtn.setAttribute('aria-pressed',autoPin?'true':'false');autoBtn.classList.toggle('off',!autoPin);const st=document.getElementById('autoPinState');if(st)st.textContent=autoPin?'on':'off'}
+if(autoBtn)autoBtn.onclick=()=>{autoPin=!autoPin;try{localStorage.setItem('pwAutoPin',autoPin?'1':'0')}catch{}renderAuto()};
+KEYS.addEventListener('click',e=>{const pb=e.target.closest('.pk-pin');if(!pb)return;e.preventDefault();e.stopPropagation();const k=pb.closest('.pkey');if(!k)return;const n=k.dataset.project;if(pinned.has(n))pinned.delete(n);else pinned.add(n);savePins();applyPins()});
+applyPins();renderAuto();
 const baseTitle=(CUR?CUR+' — ':'')+'Workbench';
 document.title=baseTitle;
 let first=true;
@@ -970,7 +998,11 @@ key.classList.toggle('working',!!p.working);
 const sub=key.querySelector('.pk-sub');
 if(sub)sub.textContent=(p.name===CUR)?(p.working?'working…':'active session'):(lit?'finished — click to view':(p.working?'working…':''));
 if(lit&&!was&&!first){key.classList.add('struck');key.addEventListener('animationend',()=>key.classList.remove('struck'),{once:true})}
+if(lit&&autoPin&&!pinned.has(p.name)){pinned.add(p.name);savePins();applyPins()}
 }
+const known=new Set((j.projects||[]).map(x=>x.name));
+let pruned=false;for(const n of [...pinned]){if(!known.has(n)){pinned.delete(n);pruned=true}}
+if(pruned){savePins();applyPins()}
 document.title=(anyLit?'● ':'')+baseTitle;
 first=false;
 }catch{}}
