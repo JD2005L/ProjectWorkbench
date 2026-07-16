@@ -903,13 +903,12 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pkey.pinned:hover{transform:translateX(12px)}
 .pkey.pinned:not(.current):not(.lit) .pk-edge{background:hsl(var(--h) 65% 52% / .95);box-shadow:0 0 10px hsl(var(--h) 70% 55% / .6)}
 .pkey.pinned:not(.lit) .pk-mono{background:hsl(var(--h) 78% 58%);color:#070b12;border-color:hsl(var(--h) 90% 75%);box-shadow:0 0 12px -2px hsl(var(--h) 75% 60% / .6);font-weight:800}
-.pkey.pinned::after{content:'📌';position:absolute;top:1px;left:2px;font-size:9px;line-height:1;transform:rotate(-24deg);text-shadow:0 1px 2px rgba(0,0,0,.9);pointer-events:none}
 .railKeys.has-pins .pkey:not(.pinned):not(.current):not(.lit):not(.working){opacity:.5;filter:saturate(.5) brightness(.82)}
 .railKeys.has-pins .pkey:not(.pinned):hover{opacity:1;filter:none}
 .pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2}
 .pkey:hover .pk-pin{opacity:.55}
 .pk-pin:hover{opacity:1;background:rgba(255,255,255,.07)}
-.pkey.pinned .pk-pin{opacity:.95;filter:none}
+.pkey.pinned .pk-pin{filter:none}
 .railAct.off .autoPinIco{filter:grayscale(1);opacity:.5}
 #autoPinState{color:var(--ok);font-weight:800}
 .railAct.off #autoPinState{color:var(--faint)}
