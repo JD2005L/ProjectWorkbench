@@ -89,6 +89,31 @@ app.use(attachUser);
 
 async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
 async function saveProjects(projects){ await fs.writeFile(registryPath, JSON.stringify(projects, null, 2)+'\n'); }
+
+// Configure per-workspace git credentials based on the project's primaryUser token.
+async function syncProjectCredentials(project, users){
+ if(!project?.path) return;
+ const gitDir = path.join(project.path, '.git');
+ try { await fs.access(gitDir); } catch { return; } // no .git dir yet
+ const user = users && project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
+ const credFile = path.join(gitDir, '.pw-credentials');
+ if(user?.ghToken){
+  const token = decrypt(user.ghToken);
+  await fs.writeFile(credFile, `https://${token}:x-oauth-basic@github.com\n`, { mode: 0o600 });
+  // Use ONLY our project-local store: clear any prior local entries, then add an
+  // empty reset (drops inherited global/system helpers for this repo so the token
+  // is never dispatched to — and duplicated into — a global store) followed by our
+  // per-project store. Two --add (not --replace-all, which would drop the reset).
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', '']).catch(()=>{});
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', `store --file=${credFile}`]).catch(()=>{});
+ } else {
+  // Remove credential file and unset the helper
+  await fs.unlink(credFile).catch(()=>{});
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+ }
+}
+
 // Serialize every projects.json read-modify-write transaction. Concurrent POSTs
 // from two browser tabs would otherwise both loadProjects() against the same
 // pre-edit snapshot, mutate independently, then last-write-wins on saveProjects.
@@ -999,7 +1024,7 @@ async function applyRouting(projects){
  await runConfiguredCommand(nginxReloadCmd, 'systemctl', ['reload','nginx']);
  if(!nginxReloadCmd) await sh('systemctl',['daemon-reload']);
 }
-async function cloneWorkspace(p){
+async function cloneWorkspace(p, token){
  await fs.mkdir(workspaceRoot,{recursive:true});
  try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R','admin:admin',p.path]).catch(()=>{}); return; } catch {}
  if(!p.repo){
@@ -1015,7 +1040,17 @@ async function cloneWorkspace(p){
   return;
  }
  try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
- await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+ if(token){
+  // Authenticate the clone via a temporary credential store, so the token never
+  // appears in argv, the remote URL, or any error output shown to the user.
+  const credFile = path.join(workspaceRoot, '.pw-clone-' + slug(p.name));
+  try {
+   await fs.writeFile(credFile, 'https://' + token + ':x-oauth-basic@github.com\n', { mode: 0o600 });
+   await execFileAsync('git',['-c','credential.helper=','-c','credential.helper=store --file=' + credFile,'clone','--',p.repo,p.path],{timeout:300000});
+  } finally { await fs.rm(credFile,{force:true}).catch(()=>{}); }
+ } else {
+  await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+ }
  await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
  await sh('sudo',['-u','admin','git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
 }
@@ -1615,9 +1650,9 @@ const manageModalHtml = `<style>
 .pmPane.active{display:flex}
 .pmField{display:flex;flex-direction:column;gap:5px}
 .pmField>span{font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
-.pmField input,.pmField textarea{background:#070d19;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font:13px var(--font);box-sizing:border-box;width:100%;transition:border-color .15s}
+.pmField input,.pmField textarea,.pmField select{background:#070d19;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font:13px var(--font);box-sizing:border-box;width:100%;transition:border-color .15s}
 .pmField textarea{font:12px/1.5 var(--mono);resize:vertical}
-.pmField input:focus,.pmField textarea:focus{outline:none;border-color:var(--cyan)}
+.pmField input:focus,.pmField textarea:focus,.pmField select:focus{outline:none;border-color:var(--cyan)}
 .pmField .pmHelp{font-size:11.5px;color:var(--faint);line-height:1.5;text-transform:none;letter-spacing:0;font-weight:400}
 .pmField .pmHelp code{font-family:var(--mono);color:#9fd3ff;font-size:11px}
 .pmField input[type=checkbox]{width:auto;padding:0;accent-color:var(--cyan)}
@@ -1653,7 +1688,7 @@ const manageModalHtml = `<style>
 @media(max-width:760px){.pmBody{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}.pmListWrap{border-right:0;border-bottom:1px solid var(--line);max-height:200px}.modal-box.pm{height:94vh}}
 </style>
 <div id="pmBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Manage projects"><div class="modal-box pm"><header><h2>Projects<span class="pmHint">drag to reorder — the rail follows this order</span></h2><button class="modal-close" id="pmClose" aria-label="Close" type="button">×</button></header><div class="body"><div class="pmBody"><div class="pmListWrap"><button class="pmAdd" id="pmAddBtn" type="button">+ New project</button><div class="pmItems" id="pmItems"></div></div><div class="pmDetail" id="pmDetail"><div class="pmTabs" id="pmTabs" role="tablist"><button type="button" data-t="general" class="active">General</button><button type="button" data-t="preview">Preview</button><button type="button" data-t="tabs">Terminal tabs</button><button type="button" data-t="danger" class="dangerTab">Danger</button></div><div class="pmPanes">
-<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><label class="pmField"><span>Admin only</span><span class="pmHelp"><input type="checkbox" id="pmAdminOnly"> Admin only — hidden from non-admins</span></label><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
+<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmField"><span>Git identity <em style="text-transform:none;font-style:normal;font-weight:400">(for private repos)</em></span><select id="pmPrimaryUser"></select><span class="pmHelp">Choose which user's GitHub token authenticates this workspace's git. Blank leaves git unauthenticated.</span></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><label class="pmField"><span>Admin only</span><span class="pmHelp"><input type="checkbox" id="pmAdminOnly"> Admin only — hidden from non-admins</span></label><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
 <section class="pmPane" data-p="preview"><div class="pmField"><span>Preview command</span><textarea id="pmPrevCmd" rows="3" placeholder="empty = preview disabled"></textarea><span class="pmHelp">Runs inside the workspace. Use <code>\${PORT}</code> and <code>\${BASEPATH}</code>; the app must bind <code>127.0.0.1:\${PORT}</code>.</span></div><details class="pmExamples"><summary>Examples — click one to use it</summary><div><code>npm run dev -- --host 127.0.0.1 --port \${PORT}</code><code>dotnet watch run --project Foo/Foo.csproj --urls http://127.0.0.1:\${PORT} --non-interactive</code><code>hugo server --bind 127.0.0.1 --port \${PORT} --baseURL http://127.0.0.1:\${PORT}\${BASEPATH}/ --appendPort=false</code><code>python3 -m http.server \${PORT} --bind 127.0.0.1</code></div></details><div class="pmRow2"><div class="pmField"><span>Preview port</span><input id="pmPrevPort" type="number" min="1024" max="65535" placeholder="auto"></div><div></div></div><div class="pmField"><span>Environment</span><textarea id="pmPrevEnv" rows="4" placeholder="# one KEY=VALUE per line&#10;# ASPNETCORE_ENVIRONMENT=Development"></textarea><span class="pmHelp">Exported before the command runs. <code>PORT</code> and <code>BASEPATH</code> are reserved.</span></div></section>
 <section class="pmPane" data-p="tabs"><div class="pmField"><span>Tab templates</span><span class="pmHelp">Named tabs offered in the terminal's <b>+</b> menu. <b>auto-start</b> spawns the tab when the project's tmux session is first created. Empty command = plain bash.</span></div><div class="pmTabRows" id="pmTabRows"></div><button class="pmAddTab" id="pmAddTabBtn" type="button">+ Add tab template</button></section>
 <section class="pmPane" data-p="danger"><div class="pmCallout red"><b>Delete project</b> — stops its terminal service, kills its tmux session, removes it from the registry <b>and deletes the workspace folder</b> shown in General. Repos without a remote copy are gone for good.</div><div class="pmDelArm"><input id="pmDelName" type="text" placeholder="type the project name to arm" autocomplete="off"><button class="pmDelBtn" id="pmDelBtn" type="button" disabled>Delete project</button></div></section>
@@ -1662,7 +1697,7 @@ const manageModalHtml = `<style>
 const manageModalScript = `<script>(function(){
 const backdrop=document.getElementById('pmBackdrop');if(!backdrop)return;
 const items=document.getElementById('pmItems'),addBtn=document.getElementById('pmAddBtn'),tabsBar=document.getElementById('pmTabs'),panes=[...document.querySelectorAll('.pmPane')],saveBtn=document.getElementById('pmSave'),statusEl=document.getElementById('pmStatus'),closeBtn=document.getElementById('pmClose');
-const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fAdminOnly=document.getElementById('pmAdminOnly'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
+const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fAdminOnly=document.getElementById('pmAdminOnly'),fPrimaryUser=document.getElementById('pmPrimaryUser'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
 const CUR=(typeof project!=='undefined')?project:null;
 let cfg=null,sel=null,mode='edit',formDirty=false,reloadOnClose=false,navTarget=null,busy=false,curNow=CUR;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -1670,8 +1705,8 @@ function hue(name){let h=5381;const s=String(name);for(let i=0;i<s.length;i++)h=
 function mono(name){const p=String(name).replace(/[_\\-.]+/g,' ').replace(/([a-z0-9])([A-Z])/g,'$1 $2').split(/\\s+/).filter(Boolean);if(p.length>=2)return(p[0][0]+p[1][0]).toUpperCase();return(p[0]||'?').slice(0,2).toUpperCase()}
 function setStatus(t,err){statusEl.textContent=t||'';statusEl.classList.toggle('err',!!err)}
 function markDirty(){formDirty=true}
-[fName,fRepo,fPort,fAdminOnly,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
-fAdminOnly.addEventListener('change',markDirty);
+[fName,fRepo,fPort,fPrimaryUser,fAdminOnly,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
+fAdminOnly.addEventListener('change',markDirty);fPrimaryUser.addEventListener('change',markDirty);
 function activatePane(id){tabsBar.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.t===id));panes.forEach(p=>p.classList.toggle('active',p.dataset.p===id))}
 tabsBar.addEventListener('click',e=>{const b=e.target.closest('button[data-t]');if(b&&mode==='edit')activatePane(b.dataset.t)});
 function renderList(){items.innerHTML='';for(const p of cfg.projects){const row=document.createElement('div');row.className='pmItem'+(mode==='edit'&&p.name===sel?' sel':'');row.dataset.name=p.name;row.draggable=true;row.style.setProperty('--h',hue(p.name));row.innerHTML='<span class="pmDrag" title="Drag to reorder">⠿</span><span class="pmMono">'+esc(mono(p.name))+'</span><span class="pmIname">'+esc(p.name)+'</span><span class="pmPort">:'+esc(p.port)+'</span>';row.onclick=()=>select(p.name);items.appendChild(row)}addBtn.classList.toggle('sel',mode==='add')}
@@ -1681,7 +1716,8 @@ tabRows.addEventListener('input',markDirty);
 addTabBtn.onclick=()=>{tabRows.insertAdjacentHTML('beforeend',tabRowHtml({autoStart:true}));tabRows.lastElementChild.querySelector('.tt-name').focus();markDirty()};
 document.querySelectorAll('.pmExamples code').forEach(c=>c.addEventListener('click',()=>{fPrevCmd.value=c.textContent;markDirty()}));
 function envText(env){return Object.entries(env||{}).map(([k,v])=>k+'='+v).join('\\n')}
-function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fAdminOnly.checked=!!(p&&p.adminOnly);fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
+function primaryOptions(selected){return '<option value="">— none —</option>'+((cfg&&cfg.users)||[]).map(u=>'<option value="'+esc(u.username)+'"'+(selected===u.username?' selected':'')+'>'+esc(u.username)+(u.hasToken?' ✓':'')+'</option>').join('')}
+function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fPrimaryUser.innerHTML=primaryOptions(p?p.primaryUser:'');fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fAdminOnly.checked=!!(p&&p.adminOnly);fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
 function select(name){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='edit';sel=name;const p=cfg.projects.find(x=>x.name===name);fillForm(p);restartNote.textContent=(name===CUR?'You are looking at this project\\u2019s terminal right now — saving restarts it and kills this very session\\u2019s processes.':'Saving restarts this project\\u2019s terminal service — running processes in its tabs are killed.');tabsBar.style.display='';saveBtn.textContent='Save changes';activatePane('general');renderList();setStatus('')}
 function startAdd(){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='add';sel=null;fillForm(null);tabsBar.style.display='none';activatePane('general');saveBtn.textContent='Create project';renderList();setStatus('Preview, tab templates and more are configurable after the project exists.');setTimeout(()=>fName.focus(),40)}
 addBtn.onclick=startAdd;
@@ -1690,8 +1726,8 @@ async function api(url,params){const r=await fetch(url,{method:'POST',headers:{'
 async function refreshCfg(){const r=await fetch('${BASE}/api/projects/config',{cache:'no-store'});cfg=await r.json();if(!cfg.ok)throw new Error(cfg.error||'config load failed')}
 function collectTabs(){const arr=[];tabRows.querySelectorAll('.pmTabRow').forEach(row=>{const n=row.querySelector('.tt-name').value.trim();if(!n)return;arr.push({name:n,cmd:row.querySelector('.tt-cmd').value,autoStart:row.querySelector('.tt-auto').checked})});return arr}
 saveBtn.onclick=async()=>{if(busy)return;busy=true;saveBtn.disabled=true;try{
-if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),port:fPort.value||'',adminOnly:fAdminOnly.checked?'yes':''});await api('${BASE}/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
-else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),port:fPort.value||'',adminOnly:fAdminOnly.checked?'yes':'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('${BASE}/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'${BASE}/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
+if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':''});await api('${BASE}/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
+else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('${BASE}/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'${BASE}/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
 }catch(e){setStatus(e.message||String(e),true)}finally{busy=false;saveBtn.disabled=false}};
 delBtn.onclick=async()=>{if(busy||delBtn.disabled)return;if(!confirm('Really delete "'+sel+'" AND its workspace folder? This cannot be undone.'))return;busy=true;delBtn.disabled=true;try{setStatus('Deleting '+sel+'…');await api('${BASE}/manage/delete/'+encodeURIComponent(sel),new URLSearchParams({confirm:'yes'}));reloadOnClose=true;if(sel===curNow)navTarget='${BASE}/';await refreshCfg();busy=false;sel=null;formDirty=false;if(cfg.projects.length){select(cfg.projects[0].name);setStatus('Deleted.')}else{navTarget=navTarget||'${BASE}/';closeModal()}}catch(e){setStatus(e.message||String(e),true)}finally{busy=false}};
 let dragSrc=null;
@@ -1781,7 +1817,16 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
   if(allUsedPorts(projects).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
   const p = repo ? { name, repo, path: workspacePath(name), port } : { name, path: workspacePath(name), port };
   if(req.body.adminOnly === 'yes') p.adminOnly = true;
-  await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
+  const primaryUser = String(req.body.primaryUser || '').trim();
+  if(primaryUser) p.primaryUser = primaryUser;
+  const users = await loadUsers();
+  // Default the project's git identity to the adding admin when they have a token
+  // and none was chosen, so the clone (and later pull/push) can authenticate.
+  if(!p.primaryUser && users.find(u=>u.username===req.user?.username)?.ghToken) p.primaryUser = req.user.username;
+  const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
+  let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
+  await cloneWorkspace(p, cloneToken); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
+  if(p.primaryUser){ await syncProjectCredentials(p, users); }
  });
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
  if(wantsJson(req)) return res.json({ok:true,name});
@@ -1793,6 +1838,7 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  const previewCmd = String(req.body.previewCmd || '').trim();
  const previewPortRaw = String(req.body.previewPort || '').trim();
  const previewEnvRaw = String(req.body.previewEnv || '');
+ const primaryUser = String(req.body.primaryUser || '').trim();
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
  await withProjectsLock(async () => {
@@ -1838,10 +1884,13 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  }
  await stopProject(oldName); const oldPath = p.path; p.name = newName; if(repo) p.repo = repo; else delete p.repo; p.port = port; p.path = workspacePath(newName);
  if(req.body.adminOnly === 'yes') p.adminOnly = true; else delete p.adminOnly;
+ if(primaryUser) p.primaryUser = primaryUser; else delete p.primaryUser;
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
+ const users = await loadUsers();
  await saveProjects(projects); await applyRouting(projects); await startProject(p);
+ await syncProjectCredentials(p, users);
  });
  await audit('project_update', { oldName, newName, port }, req);
  if(wantsJson(req)) return res.json({ok:true,name:newName});
@@ -1916,11 +1965,12 @@ app.post(BASE + '/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.get(BASE + '/api/projects/config', requireAdmin, async (_req,res)=>{ try {
- const projects = await loadProjects();
+ const [projects, users] = await Promise.all([loadProjects(), loadUsers()]);
  res.json({ ok:true,
-  projects: projects.map(p => ({ name:p.name, repo:p.repo||'', port:p.port, path:p.path, adminOnly: !!p.adminOnly,
+  projects: projects.map(p => ({ name:p.name, repo:p.repo||'', port:p.port, path:p.path, adminOnly: !!p.adminOnly, primaryUser:p.primaryUser||'',
    preview: p.preview ? { cmd:p.preview.cmd||'', port:p.preview.port||'', env:p.preview.env||{} } : null,
    tabs: Array.isArray(p.tabs) ? p.tabs : [] })),
+  users: users.map(u => ({ username:u.username, hasToken: !!u.ghToken })),
   suggestedPort: nextPort(projects), suggestedPreviewPort: nextPreviewPort(projects) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
@@ -2183,21 +2233,22 @@ const settingsScript = `<script>(function(){const tabs=document.querySelectorAll
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
 let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '6' : '5'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '6' : '5'}" class="muted">'+esc(e.message)+'</td></tr>'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '6' : '5'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td><td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+function tokenCellHtml(u){return u.hasToken?'<td><span class="role-pill" style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)">✓ token</span></td>':'<td><span class="role-pill">none</span></td>'}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
 uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
 // --- User modal (used for both Add and Edit) ---
-const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
+const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
 function renderProjList(selected){if(!pwProjects.length){umProjList.innerHTML='<span class="empty">No projects in <code>projects.json</code> yet — add one from the dashboard\\'s Manage page first.</span>';return}const sel=new Set(Array.isArray(selected)?selected:[]);umProjList.innerHTML=pwProjects.map(p=>'<label><input type="checkbox" value="'+esc(p)+'"'+(sel.has(p)?' checked':'')+'>'+esc(p)+'</label>').join('')}
 function syncStarDisabled(){umProjList.classList.toggle('disabled',umProjStar.checked)}
 umProjStar.addEventListener('change',syncStarDisabled);
-function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
+function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';umGhToken.value='';umGhToken.placeholder=user?.hasToken?'(stored — leave blank to keep)':'ghp_… (optional)';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
 function umCloseFn(){umBackdrop.classList.add('hidden')}
 umCancel.addEventListener('click',umCloseFn);umClose.addEventListener('click',umCloseFn);umBackdrop.addEventListener('click',e=>{if(e.target===umBackdrop)umCloseFn()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!umBackdrop.classList.contains('hidden'))umCloseFn()});
 uAddBtn.addEventListener('click',()=>{if(!pwProjects.length){loadProjectList().then(()=>umOpen('add',null))}else{umOpen('add',null)}});
-umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects};if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={};if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
+umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects};const ghToken=umGhToken.value.trim();if(ghToken)body.ghToken=ghToken;${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();" : ''}if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={};if(ghToken)patchBody.ghToken=ghToken;if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
 loadProjectList();loadUsers();
 // --- CLIs + Environment + System tabs (reuse existing /api/setup/* endpoints) ---
 const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('${BASE}/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);loadState();loadSystem();
@@ -2215,7 +2266,7 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
 <section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
-<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
+<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
 ${wizardModalHtml}${wizardScript}${settingsScript}${footer}</body></html>`);
 });
 
@@ -2310,7 +2361,7 @@ app.get(BASE + '/api/auth/check', async (req,res) => {
 // Last-admin guard prevents accidental lockout.
 // ============================================================================
 function safeUserShape(u){
- const out = { username: u.username, role: u.role, projects: u.projects, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+ const out = { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
  if(DEPLOY_CENTRE) out.hasDeployPassword = !!u.deployPassword;
  return out;
 }
@@ -2336,6 +2387,7 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   const username = String(req.body?.username || '').trim();
   const role = String(req.body?.role || '');
   const password = String(req.body?.password || '');
+  const ghToken = typeof req.body?.ghToken === 'string' ? req.body.ghToken.trim() : '';
   const deployPassword = DEPLOY_CENTRE && typeof req.body?.deployPassword === 'string' ? req.body.deployPassword.trim() : '';
   if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
   if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
@@ -2349,10 +2401,11 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   const id = 'u-' + crypto.randomBytes(6).toString('base64url');
   const rec = { id, username, role, projects, createdAt: now, lastLoginAt: null };
   if(passwordHash) rec.passwordHash = passwordHash;
+  if(ghToken) rec.ghToken = encrypt(ghToken);
   if(deployPassword) rec.deployPassword = encrypt(deployPassword);
   users.push(rec);
   await saveUsers(users);
-  await audit('user_create', { username, role, projects }, req);
+  await audit('user_create', { username, role, projects, hasToken: !!ghToken }, req);
   res.json({ ok:true, user: safeUserShape(rec) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
@@ -2366,6 +2419,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   const newUsername = req.body?.username !== undefined ? String(req.body.username).trim() : undefined;
   const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
   const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
+  const newToken = req.body?.ghToken !== undefined ? String(req.body.ghToken || '').trim() : undefined;
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
   if(newUsername !== undefined){
    if(!validNewUsername(newUsername)) return res.status(400).json({ ok:false, error:'Invalid username' });
@@ -2383,9 +2437,16 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   if(newUsername !== undefined) u.username = newUsername;
   if(newRole !== undefined) u.role = newRole;
   if(newProjects !== undefined) u.projects = projectsResolved;
+  if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
   if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
   await saveUsers(users);
-  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects } }, req);
+  if(newToken !== undefined){
+   const projects = await loadProjects();
+   for(const p of projects){
+    if(p.primaryUser === u.username) await syncProjectCredentials(p, users);
+   }
+  }
+  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken } }, req);
   res.json({ ok:true, user: safeUserShape(u) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
@@ -2417,6 +2478,19 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   }
   const [removed] = users.splice(i, 1);
   await saveUsers(users);
+  // Revoke any on-disk git credentials this user seeded: for every project that
+  // named them primaryUser, drop the reference and re-sync (the user is already
+  // gone from `users`, so syncProjectCredentials takes the clear path — removes
+  // the 0600 cred file and unsets the local helper). Otherwise the deleted
+  // account's token would keep authenticating git in those workspaces.
+  try {
+   const projects = await loadProjects();
+   let changed = false;
+   for(const p of projects){
+    if(p.primaryUser === target){ delete p.primaryUser; await syncProjectCredentials(p, users); changed = true; }
+   }
+   if(changed) await saveProjects(projects);
+  } catch {}
   try {
    const sessions = await loadSessions();
    const remaining = sessions.filter(s => s.userId !== removed.id);

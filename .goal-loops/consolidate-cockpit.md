@@ -344,3 +344,29 @@ nginx bridge, ttyd node-spawn runtime, real install matrix.
 - Verified isolated: helper + both 401 checks render; login redirect is
   `${BASE}/login` (/login default, /workbench/login under BASE). node --check clean.
 - Also deployed to live GOA (deploy-cockpit-ui).
+
+### iter 16 — per-project git credentials (universal, closes last feature gap) — DONE
+- Ported GOA's git-credential feature GENERICALLY (inert by default): per-user
+  encrypted ghToken (POST/PATCH /api/users → encrypt at rest; safeUserShape +
+  /api/projects/config expose only hasToken boolean, never the token), per-project
+  primaryUser (Manage modal fPrimaryUser select + /manage/add|update),
+  syncProjectCredentials (writes <proj>/.git/.pw-credentials 0600 + local
+  credential.helper), and cloneWorkspace(p, token) (token via temp 0600 store,
+  never in argv/URL). Reuses the encrypt/decrypt primitive from the Deploy Centre.
+- Verified isolated: token encrypted (enc:, 0 plaintext leak), never echoed
+  (hasToken only); set primaryUser → cred file 0600 + helper set + decrypt
+  round-trips; clear token → cred+helper removed. node --check clean.
+- Independent review found + FIXED 2 real defects (both also latent in the GOA
+  reference — flag for the GOA deploy):
+  * HIGH: DELETE /api/users left the deleted user's plaintext token live on disk
+    for projects where they were primaryUser → now clears primaryUser + re-syncs
+    (removes cred file + unsets helper). Verified: delete → cred revoked.
+  * MED: syncProjectCredentials used `config ''` then `--replace-all` which DROPPED
+    the empty reset, so a global writable credential.helper survived and could
+    duplicate the token into a global store → now --unset-all + two --add
+    ('' reset THEN store), matching the clone path. Verified with a global
+    store/cache present: git resets the chain at '' → only the per-project store
+    is used.
+- NOTE: the live GOA deploy (deploy-cockpit-ui) has the SAME two latent bugs
+  (verbatim syncProjectCredentials + no delete-revocation). Not currently
+  exploitable (admin gitconfig empty), but the same fixes should be ported.
