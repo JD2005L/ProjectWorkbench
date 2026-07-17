@@ -333,3 +333,14 @@ No GOA-isms in artifacts. Independent review: host mode byte-identical, containe
 sound, injection-safe param, bounded preview logs, no nsenter hardcode.
 DEFERRED (needs target host + podman): `podman build`, real container run, host-
 nginx bridge, ttyd node-spawn runtime, real install matrix.
+
+### iter 15 — upstream sync: cockpit session-expiry auto-redirect (5400565) — DONE
+- Upstream added 1 commit since a305ee3: pollers treat a 401 as auth-lost and
+  redirect to login (terminal websocket outlives the session → cockpit was
+  half-dark on 401s). Ported to canonical (BASE-aware):
+  * window.pwAuthLost() helper (guarded, one-shot) → location.href=
+    `${BASE}/login?next=`+encodeURIComponent(location.pathname).
+  * refreshRail status poll + refreshTabs tab poll: `if(r.status===401)` → pwAuthLost.
+- Verified isolated: helper + both 401 checks render; login redirect is
+  `${BASE}/login` (/login default, /workbench/login under BASE). node --check clean.
+- Also deployed to live GOA (deploy-cockpit-ui).
