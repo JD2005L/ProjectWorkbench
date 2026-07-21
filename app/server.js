@@ -1,16 +1,37 @@
 import express from 'express';
 import fs from 'fs/promises';
+import fsSync from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { execFile } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 
 const app = express();
+const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
 const execFileAsync = promisify(execFile);
-const registryPath = '/opt/project-workbench/projects.json';
-const workspaceRoot = '/opt/project-workbench/workspaces';
-const nginxPath = '/etc/nginx/sites-available/project-workbench';
-const managedProjects = ['AmrikPublic','HarmaniPublic','IPSpeaker_ESP32','ProVisionIPortal','ProVisionIPublic','SunEstateHomesCA'];
+const DEPLOY_CENTRE = ['true','1'].includes(String(process.env.PW_DEPLOY_CENTRE || '').toLowerCase());
+// Data/host paths are env-overridable so an isolated test/verify instance never
+// mutates the shared host. ISOLATED = an explicit PW_ISOLATED=1, or a registry
+// path pointed away from the canonical location (e.g. a throwaway test registry).
+const CANONICAL_REGISTRY = '/opt/project-workbench/projects.json';
+const registryPath = process.env.PW_REGISTRY_PATH || CANONICAL_REGISTRY;
+const deployConfigPath = process.env.PW_DEPLOY_CONFIG || '/etc/project-workbench/deploy-config.json';
+const deployLogPath = process.env.PW_DEPLOY_LOG || '/etc/project-workbench/deploy-log.jsonl';
+const SECRET_KEY_PATH = process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key';
+const workspaceRoot = process.env.PW_WORKSPACES || '/opt/project-workbench/workspaces';
+const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/project-workbench';
+// Optional operator-supplied nginx locations injected into the generated server
+// block (e.g. sibling-app reverse proxies like /pulse/, /n8n/, /teamkb/ that are
+// specific to one deployment). Keeps env-specific service names OUT of the common
+// repo. The file's contents are pasted verbatim at server scope, ahead of the
+// catch-all `location /`; nginx -t validates it and applyRouting rolls back on
+// error. Default: file absent → nothing injected (byte-identical output).
+const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/extra-nginx.conf';
+const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath !== CANONICAL_REGISTRY;
+const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
+const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
+const nginxTestCmd = process.env.PW_NGINX_TEST_CMD || '';
+const nginxReloadCmd = process.env.PW_NGINX_RELOAD_CMD || '';
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
 const emptyMcpPath = '/etc/project-workbench/empty-mcp.json';
@@ -68,6 +89,31 @@ app.use(attachUser);
 
 async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
 async function saveProjects(projects){ await fs.writeFile(registryPath, JSON.stringify(projects, null, 2)+'\n'); }
+
+// Configure per-workspace git credentials based on the project's primaryUser token.
+async function syncProjectCredentials(project, users){
+ if(!project?.path) return;
+ const gitDir = path.join(project.path, '.git');
+ try { await fs.access(gitDir); } catch { return; } // no .git dir yet
+ const user = users && project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
+ const credFile = path.join(gitDir, '.pw-credentials');
+ if(user?.ghToken){
+  const token = decrypt(user.ghToken);
+  await fs.writeFile(credFile, `https://${token}:x-oauth-basic@github.com\n`, { mode: 0o600 });
+  // Use ONLY our project-local store: clear any prior local entries, then add an
+  // empty reset (drops inherited global/system helpers for this repo so the token
+  // is never dispatched to — and duplicated into — a global store) followed by our
+  // per-project store. Two --add (not --replace-all, which would drop the reset).
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', '']).catch(()=>{});
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', `store --file=${credFile}`]).catch(()=>{});
+ } else {
+  // Remove credential file and unset the helper
+  await fs.unlink(credFile).catch(()=>{});
+  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+ }
+}
+
 // Serialize every projects.json read-modify-write transaction. Concurrent POSTs
 // from two browser tabs would otherwise both loadProjects() against the same
 // pre-edit snapshot, mutate independently, then last-write-wins on saveProjects.
@@ -87,12 +133,44 @@ async function withProjectsLock(fn){
 // working until an operator creates a real admin via `pw-user add` and flips
 // the env var. Throughout Phase 1, nginx Basic Auth remains the outer gate.
 // ============================================================================
-const usersPath = '/etc/project-workbench/users.json';
-const sessionsPath = '/var/lib/project-workbench/sessions.json';
-const auditLogPath = '/var/log/project-workbench/audit.log';
+// PW_AUTH_MODE selects the credential backend: `local` (default) verifies a
+// scrypt password stored on the user record; `ldap` authenticates against a
+// directory via simple bind over TLS and treats the local record as an access
+// whitelist. Both modes share ONE user record and ONE server-side revocable
+// session store. Data paths are env-overridable (for tests / alt layouts).
+const AUTH_MODE = (process.env.PW_AUTH_MODE || 'local').toLowerCase() === 'ldap' ? 'ldap' : 'local';
+const usersPath = process.env.PW_USERS_PATH || '/etc/project-workbench/users.json';
+const sessionsPath = process.env.PW_SESSIONS_PATH || '/var/lib/project-workbench/sessions.json';
+const auditLogPath = process.env.PW_AUDIT_LOG || '/var/log/project-workbench/audit.log';
 const AUTH_ENFORCE = String(process.env.PW_AUTH_ENFORCE || '').toLowerCase() === 'true';
+// Optional reverse-proxy / AD pre-auth. When PW_AUTH_HEADER is set (e.g.
+// 'x-remote-user'), a TRUSTED upstream (an AD-authenticated nginx that
+// overwrites the header on every request) supplies the signed-in username and
+// attachUser trusts it — no login page needed. Default '' = DISABLED, so a
+// non-AD install never trusts a client-spoofable header. The header user must
+// still exist in users.json (the allowlist) to gain a role/projects.
+const AUTH_HEADER = (process.env.PW_AUTH_HEADER || '').toLowerCase();
+// Dev-only bypass: treat this username as authenticated when no cookie/header
+// resolves. Never set in production.
+const DEV_USER = process.env.PW_DEV_USER || '';
+if(DEV_USER) console.warn('[auth] PW_DEV_USER is set — dev-only bypass active. Do not use in production.');
+// Optional sibling-app SSO: when PW_SSO_USER_HEADER is set (e.g. 'X-PW-User'),
+// /api/auth/check emits the authenticated username in that response header so
+// an nginx auth_request can propagate it to sister apps (e.g. Pulse). The
+// sister-app nginx wiring (auth_request_set + proxy_set_header) is env-specific.
+// Default '' = DISABLED.
+const SSO_USER_HEADER = process.env.PW_SSO_USER_HEADER || '';
+console.log(`[auth] mode=${AUTH_MODE} enforce=${AUTH_ENFORCE}${AUTH_HEADER ? ` proxyHeader=${AUTH_HEADER}` : ''}${SSO_USER_HEADER ? ` ssoHeader=${SSO_USER_HEADER}` : ''}`);
+console.log(`[deploy] centre=${DEPLOY_CENTRE ? 'on' : 'off'}`);
+// LDAP settings (ldap mode only). Generic, de-GOA'd defaults; a directory
+// deployment overlays PW_LDAP_URL / PW_LDAP_SUFFIX / PW_LOGIN_ORG via env.
+const LDAP_URL = process.env.PW_LDAP_URL || 'ldaps://ldap.example.com:636';
+const LDAP_SUFFIX = process.env.PW_LDAP_SUFFIX || '@example.com';
+const LDAP_CACERT = process.env.PW_LDAP_CACERT || '/etc/ssl/certs/ca-certificates.crt';
+const LDAP_BIND_ATTEMPTS = Number(process.env.PW_LDAP_BIND_ATTEMPTS) || 4;
+const LOGIN_ORG = process.env.PW_LOGIN_ORG || (AUTH_MODE === 'ldap' ? 'your directory account' : '');
 const SESSION_COOKIE = 'pw_session';
-const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000;
+const SESSION_TTL_MS = (Number(process.env.PW_SESSION_HOURS) || 720) * 60 * 60 * 1000;
 const ROLES = ['admin','developer','content_editor','viewer'];
 const TERMINAL_ROLES = new Set(['admin','developer']);
 // Roles allowed to drop files into a project's _inbox (uploads + per-file
@@ -125,6 +203,70 @@ async function saveUsers(users){
  await fs.mkdir(path.dirname(usersPath),{recursive:true});
  await fs.writeFile(usersPath, JSON.stringify({ users }, null, 2)+'\n');
  await fs.chmod(usersPath, 0o600).catch(()=>{});
+}
+
+// ---- LDAP (ldap mode) --------------------------------------------------------
+// Simple bind over TLS via ldapwhoami (no native deps). The DC cert is validated
+// against the system CA bundle (LDAPTLS_CACERT).
+function ldapBindOnce(bindDn, password){
+ return new Promise((resolve, reject) => {
+  // Feed the bind password via stdin (-y /dev/stdin), NOT `-w <pw>`, so it never
+  // appears in argv / world-readable /proc/<pid>/cmdline (this host also grants
+  // interactive shells to terminal roles). Written without a trailing newline so
+  // `-y` reads the password verbatim regardless of its newline handling.
+  const child = spawn('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-y', '/dev/stdin'],
+   { timeout: 10000, env: { ...process.env, LDAPTLS_CACERT: LDAP_CACERT, LDAPTLS_REQCERT: 'demand' } });
+  let stderr = '';
+  child.stderr.on('data', d => { stderr += d; });
+  child.on('error', e => reject(new Error(e.message || 'LDAP bind failed')));
+  child.on('close', code => { if(code === 0) resolve(true); else reject(new Error((stderr.trim() || `ldapwhoami exited ${code}`))); });
+  child.stdin.on('error', () => {});   // ignore EPIPE if the child exits before reading
+  child.stdin.end(String(password));
+ });
+}
+// True only for connection/TLS-level failures (retryable across a DC round-robin);
+// a real bind result (bad password, signing-required, success) is never retried.
+function isRetryableLdapError(msg){
+ if(/Invalid credentials|AcceptSecurityContext|Strong\(er\) authentication|data 5[0-9a-f]{2}/i.test(msg)) return false;
+ return /Can't contact LDAP server|Connect error|ldap_start_tls|\(-1\)|\(-11\)|ETIMEDOUT|Timed out|Connection refused|connection reset|Network is unreachable/i.test(msg);
+}
+async function ldapBind(username, password){
+ const bindDn = username.includes('@') ? username : username + LDAP_SUFFIX;
+ let lastErr;
+ for(let attempt = 1; attempt <= LDAP_BIND_ATTEMPTS; attempt++){
+  try { return await ldapBindOnce(bindDn, password); }
+  catch(e){ lastErr = e; if(!isRetryableLdapError(e.message) || attempt === LDAP_BIND_ATTEMPTS) throw e; }
+ }
+ throw lastErr;
+}
+/** Normalise a directory identity to a bare lowercase username (ldap mode only):
+ *  EXAMPLE\jane.doe → jane.doe · jane.doe@example.com → jane.doe · jane.doe.z → jane.doe */
+function normalizeUsername(raw){
+ if(!raw) return '';
+ let s = String(raw).trim();
+ const bsIdx = s.lastIndexOf('\\'); if(bsIdx >= 0) s = s.slice(bsIdx + 1);
+ const atIdx = s.indexOf('@'); if(atIdx >= 0) s = s.slice(0, atIdx);
+ s = s.toLowerCase().trim();
+ if(/\.[a-z]$/.test(s)) s = s.slice(0, -2);   // strip admin-account suffix (.z, .a…)
+ return s;
+}
+// Shared credential check for every login entry point. `ldap`: bind is
+// authoritative and the account must already exist on the whitelist; `local`:
+// the scrypt hash on the record is verified. Returns the user record or null;
+// in `ldap` mode MAY throw when the bind itself fails (caller treats as invalid).
+async function authenticate(rawUsername, password){
+ if(AUTH_MODE === 'ldap'){
+  if(!password) return null;   // never attempt an (unauthenticated) empty-password bind
+  await ldapBind(String(rawUsername || ''), password);
+  const username = normalizeUsername(rawUsername);
+  const users = await loadUsers();
+  return users.find(x => x.username === username) || null;
+ }
+ const username = String(rawUsername || '').trim();
+ const users = await loadUsers();
+ const u = users.find(x => x.username === username);
+ if(!u || !u.passwordHash) return null;
+ return (await verifyPassword(password, u.passwordHash)) ? u : null;
 }
 
 let sessionsCache = null;
@@ -188,9 +330,12 @@ function userHasProjectAccess(user, projectName){
  return Array.isArray(user.projects) && user.projects.includes(projectName);
 }
 function filterProjectsForUser(projects, user){
- if(!user || user.role === 'admin' || user.projects === '*') return projects;
+ if(!user) return projects;
+ if(user.role === 'admin') return projects;
+ const visible = projects.filter(p => !p.adminOnly);
+ if(user.projects === '*') return visible;
  const allowed = new Set(Array.isArray(user.projects) ? user.projects : []);
- return projects.filter(p => allowed.has(p.name));
+ return visible.filter(p => allowed.has(p.name));
 }
 
 // Cookie helpers (cookie-parser kept out of the dep tree to avoid native build).
@@ -227,24 +372,36 @@ async function attachUser(req, res, next){
     if(u){ req.user = u; req.sessionId = sid; return next(); }
    }
   }
+  // Optional trusted reverse-proxy / AD pre-auth (PW_AUTH_HEADER) or dev bypass
+  // (PW_DEV_USER). Only consulted when explicitly enabled; the resolved user
+  // must exist in users.json to authenticate (preserves the allowlist gate).
+  if(AUTH_HEADER || DEV_USER){
+   const raw = (AUTH_HEADER ? req.get(AUTH_HEADER) : '') || DEV_USER || '';
+   const username = normalizeUsername(raw);
+   if(username){
+    const users = await loadUsers();
+    const u = users.find(x => x.username === username);
+    if(u){ req.user = u; return next(); }
+   }
+  }
   req.user = AUTH_ENFORCE ? null : IMPLICIT_ADMIN;
   return next();
  } catch(e){ next(e); }
 }
 
 function wantsJson(req){
- return req.path.startsWith('/api/') || (req.get('accept') || '').includes('json');
+ return req.path.startsWith(BASE + '/api/') || (req.get('accept') || '').includes('json');
 }
 function requireAuth(req, res, next){
  if(req.user) return next();
  if(wantsJson(req)) return res.status(401).json({ ok:false, error:'Authentication required' });
- return res.redirect('/login?next=' + encodeURIComponent(req.originalUrl || req.url));
+ return res.redirect(BASE + '/login?next=' + encodeURIComponent(req.originalUrl || req.url));
 }
 function requireAdmin(req, res, next){
  if(!req.user) return requireAuth(req, res, next);
  if(req.user.role === 'admin') return next();
  if(wantsJson(req)) return res.status(403).json({ ok:false, error:'Admin role required' });
- return res.status(403).type('html').send(`<h1>403 — Admin access required</h1><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) cannot access this page.</p><p><a href="/">Back to dashboard</a></p>`);
+ return res.status(403).type('html').send(`<h1>403 — Admin access required</h1><p>Your account (<b>${esc(req.user.username)}</b>, role: <b>${esc(req.user.role)}</b>) cannot access this page.</p><p><a href="${BASE}/">Back to dashboard</a></p>`);
 }
 // Self-heal endpoints accept either an admin session or a trusted on-box caller
 // (installer/deploy hitting 127.0.0.1:3000 directly), so a redeploy can heal
@@ -253,20 +410,30 @@ function requireAdminOrLocal(req, res, next){
  if(isTrustedLocal(req)) return next();
  return requireAdmin(req, res, next);
 }
-function requireProjectAccess(req, res, next){
- const projectName = req.params.project || req.params.name || req.params.oldName;
- if(!projectName){ if(wantsJson(req)) return res.status(400).json({ok:false,error:'No project in route'}); return res.status(400).send('No project in route'); }
- if(!req.user) return requireAuth(req, res, next);
- if(userHasProjectAccess(req.user, projectName)) return next();
- if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
- return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="/">Back to dashboard</a></p>`);
+async function requireProjectAccess(req, res, next){
+ try {
+  const projectName = req.params.project || req.params.name || req.params.oldName;
+  if(!projectName){ if(wantsJson(req)) return res.status(400).json({ok:false,error:'No project in route'}); return res.status(400).send('No project in route'); }
+  if(!req.user) return requireAuth(req, res, next);
+  if(req.user.role !== 'admin'){
+   const projects = await loadProjects();
+   const proj = projects.find(x => x.name === projectName);
+   if(proj?.adminOnly){
+    if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
+    return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="${BASE}/">Back to dashboard</a></p>`);
+   }
+  }
+  if(userHasProjectAccess(req.user, projectName)) return next();
+  if(wantsJson(req)) return res.status(403).json({ ok:false, error:`Not authorized for project "${projectName}"` });
+  return res.status(403).type('html').send(`<h1>403 — Project access denied</h1><p>You are not authorized to access <b>${esc(projectName)}</b>.</p><p><a href="${BASE}/">Back to dashboard</a></p>`);
+ } catch(e){ next(e); }
 }
 function requireTerminalAccess(req, res, next){
  if(!req.user) return requireAuth(req, res, next);
  if(!TERMINAL_ROLES.has(req.user.role)){
   if(wantsJson(req)) return res.status(403).json({ ok:false, error:'Terminal/Claude access requires admin or developer role' });
   const hint = req.user.role === 'content_editor' ? ' The PVIKPBot supervised workflow is planned for Phase 2.' : '';
-  return res.status(403).type('html').send(`<h1>403 — Terminal access denied</h1><p>Your role (<b>${esc(req.user.role)}</b>) cannot open project terminals.${hint}</p><p><a href="/">Back to dashboard</a></p>`);
+  return res.status(403).type('html').send(`<h1>403 — Terminal access denied</h1><p>Your role (<b>${esc(req.user.role)}</b>) cannot open project terminals.${hint}</p><p><a href="${BASE}/">Back to dashboard</a></p>`);
  }
  return requireProjectAccess(req, res, next);
 }
@@ -274,7 +441,7 @@ function requireInboxWrite(req, res, next){
  if(!req.user) return requireAuth(req, res, next);
  if(!INBOX_WRITE_ROLES.has(req.user.role)){
   if(wantsJson(req)) return res.status(403).json({ ok:false, error:'Uploading requires admin, developer, or content_editor role' });
-  return res.status(403).type('html').send(`<h1>403 — Upload denied</h1><p>Your role (<b>${esc(req.user.role)}</b>) cannot upload to project inboxes.</p><p><a href="/">Back to dashboard</a></p>`);
+  return res.status(403).type('html').send(`<h1>403 — Upload denied</h1><p>Your role (<b>${esc(req.user.role)}</b>) cannot upload to project inboxes.</p><p><a href="${BASE}/">Back to dashboard</a></p>`);
  }
  return requireProjectAccess(req, res, next);
 }
@@ -296,6 +463,102 @@ async function audit(event, detail = {}, req = null){
 function esc(s){ return String(s ?? '').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
 function slug(s){ return String(s ?? '').replace(/[^A-Za-z0-9._-]/g,'_').slice(0,120) || 'clipboard-file'; }
 function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
+
+// ── Deploy Centre credential encryption (AES-256-GCM) ───────────────────────
+let _encKey = null;
+function getEncryptionKey() {
+ if (_encKey) return _encKey;
+ try {
+  const hex = fsSync.readFileSync(SECRET_KEY_PATH, 'utf8').trim();
+  _encKey = Buffer.from(hex, 'hex');
+  if (_encKey.length !== 32) throw new Error('Key must be 32 bytes');
+  return _encKey;
+ } catch (e) {
+  throw new Error('Encryption key not found at ' + SECRET_KEY_PATH + ': ' + e.message);
+ }
+}
+function encrypt(plaintext) {
+ if (!plaintext) return '';
+ const key = getEncryptionKey();
+ const iv = crypto.randomBytes(12);
+ const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+ const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+ const tag = cipher.getAuthTag();
+ return 'enc:' + Buffer.concat([iv, tag, enc]).toString('base64');
+}
+function decrypt(ciphertext) {
+ if (!ciphertext) return '';
+ if (!ciphertext.startsWith('enc:')) return ciphertext;
+ const key = getEncryptionKey();
+ const buf = Buffer.from(ciphertext.slice(4), 'base64');
+ const iv = buf.subarray(0, 12);
+ const tag = buf.subarray(12, 28);
+ const enc = buf.subarray(28);
+ const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+ decipher.setAuthTag(tag);
+ return decipher.update(enc, null, 'utf8') + decipher.final('utf8');
+}
+
+// ─── Deploy Centre helpers ──────────────────────────────────────────────────
+async function loadDeployConfig(){ try { return JSON.parse(await fs.readFile(deployConfigPath,'utf8')); } catch { return {}; } }
+async function saveDeployConfig(cfg){ await fs.mkdir(path.dirname(deployConfigPath),{recursive:true}); await fs.writeFile(deployConfigPath, JSON.stringify(cfg,null,2)+'\n'); }
+async function appendDeployLog(entry){ await fs.mkdir(path.dirname(deployLogPath),{recursive:true}); await fs.appendFile(deployLogPath, JSON.stringify(entry)+'\n'); }
+async function readDeployLog(project){
+ try {
+  const raw = await fs.readFile(deployLogPath,'utf8');
+  const lines = raw.trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+  return project ? lines.filter(e => e.project === project) : lines;
+ } catch { return []; }
+}
+async function getDeployedVersion(project, target, cfg, env){
+ const pc = cfg[project]; if(!pc || !pc[target]) return null;
+ const versionCmd = pc[target].versionCmd;
+ if(!versionCmd) return null;
+ try {
+  const execEnv = env ? {...process.env, ...env} : process.env;
+  const { stdout } = await execFileAsync('bash',['-c',versionCmd],{timeout:30000, env:execEnv});
+  return stdout.trim() || null;
+ } catch { return null; }
+}
+function getDeployEnv(users, preferredUser){
+ if(preferredUser?.deployPassword) return { DEPLOY_USER: preferredUser.deployUser || preferredUser.username, DEPLOY_PASSWORD: decrypt(preferredUser.deployPassword) };
+ const fallback = users.find(u => u.deployPassword);
+ if(fallback) return { DEPLOY_USER: fallback.deployUser || fallback.username, DEPLOY_PASSWORD: decrypt(fallback.deployPassword) };
+ return null;
+}
+const DEFAULT_DEPLOY_SLOTS = { dev:{ label:'Development', icon:'🧪' }, prod:{ label:'Production', icon:'🚀' } };
+function deploySlot(project, target){
+ const d = DEFAULT_DEPLOY_SLOTS[target] || { label:target, icon:'' };
+ const o = (project && project.deploySlots && project.deploySlots[target]) || {};
+ return { label: o.label || d.label, icon: (o.icon != null ? o.icon : d.icon), options: Array.isArray(o.options) ? o.options : [] };
+}
+function deployOptionSelect(slot){
+ if(!slot.options || !slot.options.length) return '';
+ const opts = slot.options.map(o => `<option value="${esc(String(o.value))}">${esc(String(o.label||o.value))}</option>`).join('');
+ return `<select class="deploy-option" title="Release level" style="background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:6px;padding:.25rem .4rem;font-size:.8rem;margin-right:.4rem">${opts}</select>`;
+}
+async function getLocalVersion(projectPath){
+ try {
+  const { stdout } = await execFileAsync('bash',['-c',
+   "find . \\( -name .git -o -name node_modules -o -name bin -o -name obj -o -name .vs -o -name dist -o -name .publish-output \\) -prune -o -type f -printf '%T@\\n' 2>/dev/null | sort -nr | head -1"
+  ],{timeout:15000, cwd:projectPath});
+  const epoch = parseFloat(stdout.trim());
+  if(!Number.isFinite(epoch) || epoch <= 0) return null;
+  const d = new Date(epoch*1000);
+  const p2 = n => String(n).padStart(2,'0');
+  const version = `V1.${p2(d.getFullYear()%100)}.${p2(d.getMonth()+1)}${p2(d.getDate())}.${p2(d.getHours())}${p2(d.getMinutes())}`;
+  let hash = '';
+  try { hash = (await execFileAsync('git',['rev-parse','--short','HEAD'],{timeout:5000,cwd:projectPath})).stdout.trim(); } catch {}
+  return { version, hash };
+ } catch { return null; }
+}
+const DEPLOY_STAMP_RE = /^V1\.\d{2}\.\d{4}\.\d{4}$/;
+function sourceNewer(src, dep){
+ return !!src && !!dep && DEPLOY_STAMP_RE.test(src) && DEPLOY_STAMP_RE.test(dep) && src > dep;
+}
+function hasDeployConfigFor(projectName, cfg){
+ return !!(cfg && cfg[projectName]);
+}
 function workspacePath(name){ return path.join(workspaceRoot, name); }
 async function projectByName(name){ return (await loadProjects()).find(p => p.name === name); }
 function allUsedPorts(projects){ const out = new Set(); for(const p of projects){ const a = Number(p?.port); if(Number.isFinite(a)) out.add(a); const b = Number(p?.preview?.port); if(Number.isFinite(b) && b > 0) out.add(b); } return out; }
@@ -307,8 +570,32 @@ function previewUnit(name){ return `project-preview@${name}.service`; }
 async function sh(cmd,args,opts={}){ return execFileAsync(cmd,args,{timeout:120000,...opts}); }
 function tmuxSession(name){ return 'pw_' + String(name).replace(/[^A-Za-z0-9_]/g,'_'); }
 async function probePreviewReady(port){ try { await execFileAsync('bash',['-c',`exec 3<>/dev/tcp/127.0.0.1/${Number(port)}`],{timeout:1500}); return true; } catch { return false; } }
+// Container mode has no project-preview@.service, so preview runs are managed
+// by this node process with recent stdout/stderr kept for the logs endpoint.
+const previewProcs = new Map();
+const PREVIEW_LOG_MAX = 500;
+function previewState(name){ return previewProcs.get(name) || null; }
+function previewCommand(p){
+ const port = Number(p.preview.port);
+ const basepath = `${BASE}/preview/${p.name}`;
+ return p.preview.cmd.replace(/\$\{PORT\}/g, String(port)).replace(/\$\{BASEPATH\}/g, basepath);
+}
 async function previewStatus(p){
  if(!hasPreview(p)) return { configured:false, active:false, ready:false };
+ if(DEPLOY_MODE === 'container'){
+  const state = previewState(p.name);
+  const active = !!(state && state.proc && state.proc.exitCode === null);
+  const pid = active ? state.pid : null;
+  const since = state ? state.since : null;
+  const result = state ? state.result : null;
+  const exitCode = state ? state.exitCode : null;
+  const ready = active ? await probePreviewReady(p.preview.port) : false;
+  let lastError = null;
+  if(!active && state && result && result !== 'success'){
+   lastError = state.log.slice(-15).join('\n').slice(-1500);
+  }
+  return { configured:true, active, ready, since, pid, port:Number(p.preview.port), basepath:`${BASE}/preview/${p.name}`, url:`${BASE}/preview/${p.name}/`, result, exitCode, lastError, cmd:previewCommand(p) };
+ }
  const unit = previewUnit(p.name);
  let active = false, since = null, pid = null, result = null, exitCode = null;
  try {
@@ -328,15 +615,49 @@ async function previewStatus(p){
  if(!active && result && result !== 'success'){
   try { lastError = (await previewLogs(p.name, 15)).trim().slice(-1500); } catch {}
  }
- return { configured:true, active, ready, since, pid, port:Number(p.preview.port), basepath:`/preview/${p.name}`, url:`/preview/${p.name}/`, result, exitCode, lastError };
+ return { configured:true, active, ready, since, pid, port:Number(p.preview.port), basepath:`${BASE}/preview/${p.name}`, url:`${BASE}/preview/${p.name}/`, result, exitCode, lastError };
 }
 async function previewLogs(name, lines=200){
+ if(DEPLOY_MODE === 'container'){
+  const state = previewState(name);
+  if(!state) return '(no preview has been started)';
+  return state.log.slice(-lines).join('\n');
+ }
  try { const { stdout } = await execFileAsync('journalctl',['-u',previewUnit(name),'--no-pager','-n',String(Number(lines)||200),'-o','cat'],{timeout:5000}); return stdout; }
  catch(e){ return `[no logs] ${e.message || e}`; }
 }
-async function startPreviewUnit(p){ if(!hasPreview(p)) throw new Error('Preview is not configured for this project'); await sh('systemctl',['restart',previewUnit(p.name)]); }
-async function stopPreviewUnit(name){ await sh('systemctl',['stop',previewUnit(name)]).catch(()=>{}); await sh('systemctl',['disable',previewUnit(name)]).catch(()=>{}); }
-async function tmux(args,opts={}){ return execFileAsync('sudo',['-u','admin','tmux',...args],{timeout:10000,...opts}); }
+async function startPreviewUnit(p){
+ if(!hasPreview(p)) throw new Error('Preview is not configured for this project');
+ if(DEPLOY_MODE !== 'container'){ await sh('systemctl',['restart',previewUnit(p.name)]); return; }
+ await stopPreviewUnit(p.name);
+ const port = Number(p.preview.port);
+ const basepath = `${BASE}/preview/${p.name}`;
+ const cwd = p.path || workspacePath(p.name);
+ const userEnv = (p.preview && p.preview.env && typeof p.preview.env === 'object') ? p.preview.env : {};
+ const env = { ...process.env, ...userEnv, PORT:String(port), BASEPATH:basepath, DOTNET_ENVIRONMENT:'Development', ASPNETCORE_ENVIRONMENT:'Development', DOTNET_CLI_HOME:path.join(cwd,'.dotnet'), HOME:cwd };
+ const proc = spawn('bash',['-c',previewCommand(p)],{cwd,env,stdio:['ignore','pipe','pipe']});
+ const state = { proc, pid:proc.pid, since:new Date().toISOString(), exitCode:null, result:null, log:[], stopping:false };
+ function appendLog(line){ state.log.push(line); if(state.log.length > PREVIEW_LOG_MAX) state.log.shift(); }
+ proc.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(appendLog));
+ proc.stderr.on('data', d => d.toString().split('\n').filter(Boolean).forEach(appendLog));
+ proc.on('exit', (code, signal) => { state.exitCode = state.stopping ? null : code; state.result = state.stopping ? null : (code === 0 ? 'success' : (signal ? 'signal' : 'exit-code')); state.proc = null; state.stopping = false; });
+ proc.on('error', e => { appendLog(`[spawn error] ${e.message}`); state.result = 'spawn-error'; state.proc = null; });
+ previewProcs.set(p.name, state);
+}
+async function stopPreviewUnit(name){
+ if(DEPLOY_MODE !== 'container'){ await sh('systemctl',['stop',previewUnit(name)]).catch(()=>{}); await sh('systemctl',['disable',previewUnit(name)]).catch(()=>{}); return; }
+ const state = previewState(name);
+ if(state && state.proc && state.proc.exitCode === null){
+  state.stopping = true;
+  state.proc.kill('SIGTERM');
+  await new Promise(r=>setTimeout(r,2000));
+  if(state.proc && state.proc.exitCode === null) state.proc.kill('SIGKILL');
+ }
+}
+async function tmux(args,opts={}){
+ if(DEPLOY_MODE === 'container') return execFileAsync('tmux',['-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+ return execFileAsync('sudo',['-u','admin','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+}
 function parseTmuxWindows(stdout){
  return String(stdout || '').split('\n').filter(Boolean).map(line=>{
   const parts = line.split('|');
@@ -415,6 +736,23 @@ async function tmuxWindowDetails(project){
  }).filter(w=>Number.isFinite(w.index));
 }
 function shellQuote(s){ return JSON.stringify(String(s)); }
+const projectTerminals = new Map();
+async function ensureTmuxSession(p){
+ const sess = tmuxSession(p.name);
+ try { await tmux(['has-session','-t',sess]); return; } catch {}
+ const cwd = p.path || workspacePath(p.name);
+ const env = ['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin'];
+ const tabs = Array.isArray(p.tabs) ? p.tabs : [];
+ const firstName = tabs[0]?.name || 'Base';
+ await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash','--noprofile','--norc']);
+ if(tabs[0]?.cmd?.trim()) await tmux(['send-keys','-t',`${sess}:${firstName}`,tabs[0].cmd.trim(),'C-m']);
+ for(let i=1; i<tabs.length; i++){
+  const t = tabs[i]; if(!t?.name) continue;
+  await tmux(['new-window','-t',sess,'-c',cwd,'-n',t.name,...env,'bash','--noprofile','--norc']);
+  if(t.cmd?.trim()){ await new Promise(r=>setTimeout(r,80)); await tmux(['send-keys','-t',`${sess}:${t.name}`,t.cmd.trim(),'C-m']); }
+ }
+ await tmux(['select-window','-t',`${sess}:0`]).catch(()=>{});
+}
 async function ensureProjectTmuxSession(p){
  try { await tmux(['has-session','-t',tmuxSession(p.name)]); return; } catch {}
  const cmd = `env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc`;
@@ -582,7 +920,22 @@ async function getCliStatuses(){
  }
  return out;
 }
+let setupTtydProc = null;
 async function ensureSetupTerminal(){
+ if(DEPLOY_MODE === 'container'){
+  if(ISOLATED) return true;
+  if(setupTtydProc && setupTtydProc.exitCode === null) return true;
+  setupTtydProc = spawn('ttyd',['--interface','127.0.0.1','--port',String(setupTtydPort),'--base-path',`${BASE}/pty/_setup/`,'--writable','bash','--login'],{
+   stdio:'ignore', detached:true, env:{...process.env, HOME:'/root'}
+  });
+  setupTtydProc.unref();
+  setupTtydProc.on('exit',()=>{ setupTtydProc = null; });
+  for(let i=0;i<20;i++){
+   try { const r = await fetch(`http://127.0.0.1:${setupTtydPort}${BASE}/pty/_setup/`); if(r.ok) return true; } catch {}
+   await new Promise(r=>setTimeout(r,250));
+  }
+  return false;
+ }
  await sh('systemctl',['enable','project-setup-terminal.service']).catch(()=>{});
  await sh('systemctl',['start','project-setup-terminal.service']).catch(()=>{});
  for(let i=0;i<20;i++){
@@ -594,34 +947,70 @@ async function ensureSetupTerminal(){
 
 function nginxConfig(projects){
  const previewProjects = projects.filter(hasPreview);
+ // Optional env-specific sibling-app locations (see extraNginxPath). Read at
+ // generation time so an operator can drop/edit the file and re-heal nginx
+ // without an app restart. Best-effort: a missing file injects nothing.
+ let extraLocations = '';
+ try { extraLocations = fsSync.readFileSync(extraNginxPath, 'utf8'); } catch {}
+ if(extraLocations && !extraLocations.endsWith('\n')) extraLocations += '\n';
+ const ttydProxyBase = DEPLOY_MODE === 'container' ? BASE : '';
  // Internal endpoint that nginx auth_request calls. Forwards Cookie to the
  // dashboard so it can decide based on the app session.
- const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n    }\n`;
+ const authCheckRoute = `    location = /pw-auth-check {\n        internal;\n        proxy_pass http://127.0.0.1:3000${BASE}/api/auth/check$is_args$args;\n        proxy_pass_request_body off;\n        proxy_set_header Content-Length "";\n        proxy_set_header Host $host;\n        proxy_set_header Cookie $http_cookie;\n        proxy_set_header X-Original-URI $request_uri;\n    }\n`;
  // Setup terminal is admin-only — the wizard signs in CLIs whose tokens land
  // in /home/admin and apply to every project.
- const setupRoute = `    location /pty/_setup/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${setupTtydPort}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
+ const setupRoute = `    location ${BASE}/pty/_setup/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${setupTtydPort}${ttydProxyBase}/pty/_setup/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`;
  // Accept-Encoding is cleared so ttyd serves uncompressed HTML — otherwise
  // sub_filter can't match '</head>' inside a gzipped body and the preload
  // script tag is silently dropped, breaking mouse-drag-copy (OSC 52 sniffer).
  // auth_request gates each terminal/preview block per-project; in soft mode
  // (PW_AUTH_ENFORCE=false) the dashboard returns 200 for anonymous callers.
- const locations = projects.map(p => `    location /pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
- const previewRoutes = previewProjects.map(p => `    location /preview/${p.name}/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ /preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
- const refererMaps = previewProjects.length ? `map $http_referer $pw_preview_name {\n    default "";\n    "~^https?://[^/]+/preview/(?<pname>[^/]+)/" "$pname";\n}\nmap $pw_preview_name $pw_preview_port {\n    default 0;\n${previewProjects.map(p => `    "${p.name}" ${p.preview.port};`).join('\n')}\n}\n` : '';
- const knownDashboardPaths = '^/(api|pty|term|file|manage|preview|terminal-preload|terminal-paste|healthz|favicon|robots)(/|$|\\.|\\?)';
- const previewFallbackLocation = previewProjects.length ? `    location @pw_preview_fallback {\n        proxy_pass http://127.0.0.1:$pw_preview_port$request_uri;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix /preview/$pw_preview_name;\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/)(.*)$ /preview/$pw_preview_name/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n    }\n` : '';
+ const locations = projects.map(p => `    location ${BASE}/pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="${BASE}/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}${ttydProxyBase}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
+ const previewRoutes = previewProjects.map(p => `    location ${BASE}/preview/${p.name}/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix ${BASE}/preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ ${BASE}/preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
+ const refererMaps = previewProjects.length ? `map $http_referer $pw_preview_name {\n    default "";\n    "~^https?://[^/]+${BASE}/preview/(?<pname>[^/]+)/" "$pname";\n}\nmap $pw_preview_name $pw_preview_port {\n    default 0;\n${previewProjects.map(p => `    "${p.name}" ${p.preview.port};`).join('\n')}\n}\n` : '';
+ const dashboardPathNames = ['api','pty','term','file','manage','preview','terminal-preload','terminal-paste','healthz','favicon','robots',...(DEPLOY_CENTRE?['deploy']:[])].join('|');
+ const knownDashboardPaths = `^${BASE || ''}/(${dashboardPathNames})(/|$|\\.|\\?)`;
+ const previewFallbackLocation = previewProjects.length ? `    location @pw_preview_fallback {\n        proxy_pass http://127.0.0.1:$pw_preview_port$request_uri;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix ${BASE}/preview/$pw_preview_name;\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/)(.*)$ ${BASE}/preview/$pw_preview_name/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n    }\n` : '';
  const rootLocation = previewProjects.length
   ? `    location / {\n        set $pw_route dashboard;\n        if ($pw_preview_port) { set $pw_route preview; }\n        if ($request_uri ~ "${knownDashboardPaths}") { set $pw_route dashboard; }\n        if ($pw_route = preview) { return 418; }\n        error_page 418 = @pw_preview_fallback;\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n    }\n`
   : `    location / { proxy_pass http://127.0.0.1:3000; proxy_set_header Host $host; proxy_set_header X-Real-IP $remote_addr; proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for; proxy_set_header X-Forwarded-Proto $scheme; }\n`;
- return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
+ const deployRoute = DEPLOY_CENTRE ? `    location ${BASE}/api/deploy/ {\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout 600s;\n        proxy_send_timeout 600s;\n    }\n` : '';
+ return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${extraLocations}${deployRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
+}
+function splitCommandLine(cmd){
+ const out = [];
+ let cur = '', quote = null, escNext = false;
+ for(const ch of String(cmd || '')){
+  if(escNext){ cur += ch; escNext = false; continue; }
+  if(ch === '\\' && quote !== "'"){ escNext = true; continue; }
+  if(quote){ if(ch === quote) quote = null; else cur += ch; continue; }
+  if(ch === '"' || ch === "'"){ quote = ch; continue; }
+  if(/\s/.test(ch)){ if(cur){ out.push(cur); cur = ''; } continue; }
+  cur += ch;
+ }
+ if(escNext) cur += '\\';
+ if(quote) throw new Error(`Unclosed quote in command: ${cmd}`);
+ if(cur) out.push(cur);
+ return out;
+}
+async function runConfiguredCommand(configured, fallbackCmd, fallbackArgs, opts={}){
+ if(configured){
+  const argv = splitCommandLine(configured);
+  if(!argv.length) throw new Error('Configured command is empty');
+  return sh(argv[0], argv.slice(1), opts);
+ }
+ return sh(fallbackCmd, fallbackArgs, opts);
 }
 async function applyRouting(projects){
+ // An isolated instance must never rewrite the shared host nginx config unless
+ // an explicit PW_NGINX_CONF (a throwaway path) was provided.
+ if(ISOLATED && !process.env.PW_NGINX_CONF){ console.log('[isolated] skip host nginx write'); return; }
  const newConfig = nginxConfig(projects);
  let prev = null;
  try { prev = await fs.readFile(nginxPath,'utf8'); } catch {}
  await fs.writeFile(nginxPath, newConfig);
  try {
-  await sh('nginx',['-t']);
+  await runConfiguredCommand(nginxTestCmd, 'nginx', ['-t']);
  } catch(e){
   // Roll back to the previous working config so an unrelated edit doesn't
   // brick the reverse proxy. Surface nginx's diagnostic (it usually pinpoints
@@ -632,10 +1021,10 @@ async function applyRouting(projects){
   wrapped.cause = e;
   throw wrapped;
  }
- await sh('systemctl',['reload','nginx']);
- await sh('systemctl',['daemon-reload']);
+ await runConfiguredCommand(nginxReloadCmd, 'systemctl', ['reload','nginx']);
+ if(!nginxReloadCmd) await sh('systemctl',['daemon-reload']);
 }
-async function cloneWorkspace(p){
+async function cloneWorkspace(p, token){
  await fs.mkdir(workspaceRoot,{recursive:true});
  try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R','admin:admin',p.path]).catch(()=>{}); return; } catch {}
  if(!p.repo){
@@ -651,7 +1040,17 @@ async function cloneWorkspace(p){
   return;
  }
  try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
- await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+ if(token){
+  // Authenticate the clone via a temporary credential store, so the token never
+  // appears in argv, the remote URL, or any error output shown to the user.
+  const credFile = path.join(workspaceRoot, '.pw-clone-' + slug(p.name));
+  try {
+   await fs.writeFile(credFile, 'https://' + token + ':x-oauth-basic@github.com\n', { mode: 0o600 });
+   await execFileAsync('git',['-c','credential.helper=','-c','credential.helper=store --file=' + credFile,'clone','--',p.repo,p.path],{timeout:300000});
+  } finally { await fs.rm(credFile,{force:true}).catch(()=>{}); }
+ } else {
+  await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+ }
  await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
  await sh('sudo',['-u','admin','git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
 }
@@ -683,11 +1082,35 @@ os.replace(tmp, conf)
  await sh('sudo',['-u','admin','python3','-c',script,p.path]).catch(()=>{});
 }
 async function startProject(p){
+ if(DEPLOY_MODE === 'container'){
+  if(ISOLATED){ await ensureTmuxSession(p); return; }
+  if(projectTerminals.has(p.name)){ const t = projectTerminals.get(p.name); try { t.proc.kill(); } catch {} projectTerminals.delete(p.name); }
+  const basePath = `${BASE}/pty/${p.name}/`;
+  try { await execFileAsync('pkill',['-f',`ttyd.*--base-path.*${basePath}`],{timeout:3000}); await new Promise(r=>setTimeout(r,500)); } catch {}
+  await ensureTmuxSession(p);
+  const port = Number(p.port);
+  const sess = tmuxSession(p.name);
+  const proc = spawn('ttyd',['--interface','127.0.0.1','--port',String(port),'--base-path',basePath,'--writable','-t','disableLeaveAlert=true','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),'attach-session','-t',sess],{
+   stdio:'ignore', detached:true, env:{...process.env, HOME:'/root', TERM:'xterm-256color'}
+  });
+  proc.unref();
+  proc.on('exit',()=>{ projectTerminals.delete(p.name); });
+  projectTerminals.set(p.name, { proc, port });
+  return;
+ }
  await trustClaudeProject(p);
  await sh('systemctl',['enable',`project-terminal@${p.name}.service`]);
  await sh('systemctl',['restart',`project-terminal@${p.name}.service`]);
 }
-async function stopProject(name){ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await stopPreviewUnit(name); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{}); }
+async function stopProject(name){
+ if(DEPLOY_MODE === 'container'){
+  if(projectTerminals.has(name)){ const t = projectTerminals.get(name); try { t.proc.kill(); } catch {} projectTerminals.delete(name); }
+  await tmux(['kill-session','-t',tmuxSession(name)]).catch(()=>{});
+  await stopPreviewUnit(name);
+  return;
+ }
+ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await stopPreviewUnit(name); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{});
+}
 async function removeWorkspace(p){ const full = path.resolve(p.path); const root = path.resolve(workspaceRoot); if(!full.startsWith(root + path.sep)) throw new Error('Refusing to delete outside workspace root'); await fs.rm(full,{recursive:true,force:true}); }
 
 
@@ -728,9 +1151,9 @@ const landingCss = `body.landing{margin:0;min-height:100vh;background:radial-gra
 
 const wizardCss = `.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem}.modal-backdrop.hidden{display:none}.modal-box{background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:14px;max-width:920px;width:100%;max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7)}.modal-box header{display:flex;justify-content:space-between;align-items:center;padding:.95rem 1.25rem;border-bottom:1px solid #1f2937}.modal-box header h2{margin:0;font-size:1.2rem}.modal-box .body{padding:1rem 1.25rem;overflow:auto;flex:1 1 auto}.modal-box footer{display:flex;justify-content:flex-end;gap:.5rem;padding:.8rem 1.25rem;border-top:1px solid #1f2937;align-items:center}.modal-close{background:transparent;border:0;color:#cbd5e1;font-size:1.6rem;cursor:pointer;line-height:1;padding:0 .25rem}.modal-close:hover{color:#fff}.modal-box section{margin-bottom:1.25rem}.modal-box section h3{margin:0 0 .35rem;font-size:1rem;color:#bfdbfe}.section-help{margin:0 0 .55rem;color:#94a3b8;font-size:.85rem}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .75rem;align-items:center;padding:.55rem .7rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#111827}.cli-row .meta{display:flex;flex-direction:column;gap:.15rem;min-width:0}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.8rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .5rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}.cli-row .actions .button{padding:.4rem .65rem;font-size:.82rem;margin:0}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}.env-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}.env-grid label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.env-grid select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.45rem;font:inherit}.env-grid .opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.15rem;min-height:2.6em}.env-grid .opt-help.warn{color:#fca5a5}.env-grid .opt-help b{color:#fde68a}.heal-row{display:flex;gap:.5rem;flex-wrap:wrap}.heal-out{margin:.5rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.6rem .8rem;font-size:.82rem;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block}#authFrame.hidden{display:none}#authHint{color:#94a3b8;font-size:.85rem;margin:.3rem 0 .5rem}#saveStatus{color:#bbf7d0;font-size:.85rem;margin-right:auto}#saveStatus.err{color:#fca5a5}@media(max-width:640px){.cli-row{grid-template-columns:1fr}.env-grid{grid-template-columns:1fr}}`;
 
-const wizardScript = `<script>(function(){const open=document.getElementById('setupBtn');const backdrop=document.getElementById('setupBackdrop');if(!backdrop)return;const closeBtn=document.getElementById('setupCloseBtn');const cancelBtn=document.getElementById('setupCancelBtn');const saveBtn=document.getElementById('setupSaveBtn');const cliRows=document.getElementById('cliRows');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const saveStatus=document.getElementById('saveStatus');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setHealOut(t,err){healOut.textContent=t||'';healOut.classList.toggle('show',!!t);healOut.classList.toggle('err',!!err)}function setSave(t,err){saveStatus.textContent=t||'';saveStatus.classList.toggle('err',!!err)}function render(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+escHtml(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+escHtml(c.version)+'</span>'+(c.authenticated?'<span class="signed-in" title="Credentials detected on disk">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button type="button" class="button secondary inst">'+(c.installed?'Update':'Install')+'</button><button type="button" class="button auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+escHtml(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');const orig=btn.textContent;btn.disabled=true;btn.textContent='Installing…';setSave('');try{const r=await fetch('/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');const v=row.querySelector('.version');v.textContent=j.version;v.classList.add('installed');btn.textContent='Update';setSave(c.label+': '+j.version)}catch(e){btn.textContent=orig;setSave(e.message,true)}finally{btn.disabled=false}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setSave('');try{const r=await fetch('/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('/pty/_setup/')<0)authFrame.src='/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setSave(e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderOptHelp()}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest. Use this unless you fully trust everyone with dashboard access.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude will execute any shell command, file write, or tool call without asking. Anyone with basic-auth access effectively has shell on this box.'};const MCP_HELP={inherit:'Claude uses the MCP servers configured on your Anthropic account (whatever <code>~/.claude.json</code> currently has).',isolated:'Forces Claude to use an empty MCP config so no external MCP servers load. Good when you want this box self-contained or your account MCP is unreachable from the LAN.',custom:'Use a custom MCP JSON config file. Path is set via the <code>PW_MCP_CONFIG</code> env var the wrapper reads.'};function renderOptHelp(){const ph=document.getElementById('permHelp');const mh=document.getElementById('mcpHelp');if(ph){ph.innerHTML=PERM_HELP[permMode.value]||'';ph.classList.toggle('warn',permMode.value==='skip')}if(mh)mh.innerHTML=MCP_HELP[mcpMode.value]||''}permMode&&permMode.addEventListener('change',renderOptHelp);mcpMode&&mcpMode.addEventListener('change',renderOptHelp);async function load(){setSave('Loading…');try{const r=await fetch('/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');render();setSave('')}catch(e){setSave(e.message,true)}}function show(){backdrop.classList.remove('hidden');load()}function hide(){backdrop.classList.add('hidden');authFrame.src='about:blank';authFrame.classList.add('hidden');authHint.textContent='Click "Sign in" on a CLI above to send its login command here.';setHealOut('');setSave('')}if(open)open.onclick=show;if(closeBtn)closeBtn.onclick=hide;if(cancelBtn)cancelBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});saveBtn.onclick=async()=>{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);saveBtn.disabled=true;setSave('Saving…');try{const r=await fetch('/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setSave('Saved.')}catch(e){setSave(e.message,true)}finally{saveBtn.disabled=false}};async function heal(url,btn){btn.disabled=true;setHealOut('Working…');try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');setHealOut(j.message||'OK')}catch(e){setHealOut(e.message,true)}finally{btn.disabled=false}}healNginx.onclick=()=>heal('/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('/api/setup/heal/dirs',healDirs);load()})();</script>`;
+const wizardScript = `<script>(function(){const open=document.getElementById('setupBtn');const backdrop=document.getElementById('setupBackdrop');if(!backdrop)return;const closeBtn=document.getElementById('setupCloseBtn');const cancelBtn=document.getElementById('setupCancelBtn');const saveBtn=document.getElementById('setupSaveBtn');const cliRows=document.getElementById('cliRows');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const saveStatus=document.getElementById('saveStatus');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setHealOut(t,err){healOut.textContent=t||'';healOut.classList.toggle('show',!!t);healOut.classList.toggle('err',!!err)}function setSave(t,err){saveStatus.textContent=t||'';saveStatus.classList.toggle('err',!!err)}function render(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+escHtml(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+escHtml(c.version)+'</span>'+(c.authenticated?'<span class="signed-in" title="Credentials detected on disk">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button type="button" class="button secondary inst">'+(c.installed?'Update':'Install')+'</button><button type="button" class="button auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+escHtml(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');const orig=btn.textContent;btn.disabled=true;btn.textContent='Installing…';setSave('');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');const v=row.querySelector('.version');v.textContent=j.version;v.classList.add('installed');btn.textContent='Update';setSave(c.label+': '+j.version)}catch(e){btn.textContent=orig;setSave(e.message,true)}finally{btn.disabled=false}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setSave('');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setSave(e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderOptHelp()}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest. Use this unless you fully trust everyone with dashboard access.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude will execute any shell command, file write, or tool call without asking. Anyone with basic-auth access effectively has shell on this box.'};const MCP_HELP={inherit:'Claude uses the MCP servers configured on your Anthropic account (whatever <code>~/.claude.json</code> currently has).',isolated:'Forces Claude to use an empty MCP config so no external MCP servers load. Good when you want this box self-contained or your account MCP is unreachable from the LAN.',custom:'Use a custom MCP JSON config file. Path is set via the <code>PW_MCP_CONFIG</code> env var the wrapper reads.'};function renderOptHelp(){const ph=document.getElementById('permHelp');const mh=document.getElementById('mcpHelp');if(ph){ph.innerHTML=PERM_HELP[permMode.value]||'';ph.classList.toggle('warn',permMode.value==='skip')}if(mh)mh.innerHTML=MCP_HELP[mcpMode.value]||''}permMode&&permMode.addEventListener('change',renderOptHelp);mcpMode&&mcpMode.addEventListener('change',renderOptHelp);async function load(){setSave('Loading…');try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');render();setSave('')}catch(e){setSave(e.message,true)}}function show(){backdrop.classList.remove('hidden');load()}function hide(){backdrop.classList.add('hidden');authFrame.src='about:blank';authFrame.classList.add('hidden');authHint.textContent='Click "Sign in" on a CLI above to send its login command here.';setHealOut('');setSave('')}if(open)open.onclick=show;if(closeBtn)closeBtn.onclick=hide;if(cancelBtn)cancelBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});saveBtn.onclick=async()=>{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);saveBtn.disabled=true;setSave('Saving…');try{const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setSave('Saved.')}catch(e){setSave(e.message,true)}finally{saveBtn.disabled=false}};async function heal(url,btn){btn.disabled=true;setHealOut('Working…');try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');setHealOut(j.message||'OK')}catch(e){setHealOut(e.message,true)}finally{btn.disabled=false}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);load()})();</script>`;
 
-const wizardModalHtml = `<div id="setupBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box"><header><h2>Setup Wizard</h2><button class="modal-close" id="setupCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><section><h3>CLIs</h3><p class="section-help">Pick which assistants this instance offers. "Auto-update" CLIs are upgraded nightly by the update timer.</p><div id="cliRows"></div></section><section><h3>Sign in</h3><p class="section-help">Sign-in opens the shared setup terminal at <code>/pty/_setup/</code>. Tokens land in <code>/home/admin</code> and apply to every project.</p><div id="authHint">Click "Sign in" on a CLI above to send its login command here.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></section><section><h3>Environment</h3><div class="env-grid"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div></section><section><h3>Heal</h3><p class="section-help">Self-repair common installation drift. Run if a route is missing or a runtime path looks broken.</p><div class="heal-row"><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button><button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button></div><pre class="heal-out" id="healOut"></pre></section></div><footer><span id="saveStatus"></span><button class="button secondary" id="setupCancelBtn" type="button">Close</button><button class="button" id="setupSaveBtn" type="button">Save settings</button></footer></div></div>`;
+const wizardModalHtml = `<div id="setupBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box"><header><h2>Setup Wizard</h2><button class="modal-close" id="setupCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><section><h3>CLIs</h3><p class="section-help">Pick which assistants this instance offers. "Auto-update" CLIs are upgraded nightly by the update timer.</p><div id="cliRows"></div></section><section><h3>Sign in</h3><p class="section-help">Sign-in opens the shared setup terminal at <code>${BASE}/pty/_setup/</code>. Tokens land in <code>/home/admin</code> and apply to every project.</p><div id="authHint">Click "Sign in" on a CLI above to send its login command here.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></section><section><h3>Environment</h3><div class="env-grid"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div></section><section><h3>Heal</h3><p class="section-help">Self-repair common installation drift. Run if a route is missing or a runtime path looks broken.</p><div class="heal-row"><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button><button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button></div><pre class="heal-out" id="healOut"></pre></section></div><footer><span id="saveStatus"></span><button class="button secondary" id="setupCancelBtn" type="button">Close</button><button class="button" id="setupSaveBtn" type="button">Save settings</button></footer></div></div>`;
 
 const modalBaseCss = `.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem}.modal-backdrop.hidden{display:none}.modal-box{background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:14px;max-width:920px;width:100%;max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7)}.modal-box header{display:flex;justify-content:space-between;align-items:center;padding:.95rem 1.25rem;border-bottom:1px solid #1f2937}.modal-box header h2{margin:0;font-size:1.2rem}.modal-box .body{padding:1rem 1.25rem;overflow:auto;flex:1 1 auto}.modal-close{background:transparent;border:0;color:#cbd5e1;font-size:1.6rem;cursor:pointer;line-height:1;padding:0 .25rem}.modal-close:hover{color:#fff}.button{display:inline-block;background:#2563eb;color:#fff;padding:.6rem .85rem;border-radius:8px;text-decoration:none;margin:.15rem;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button:disabled{opacity:.55;cursor:not-allowed}.subtle{color:#94a3b8;font-size:.8rem}`;
 
@@ -738,7 +1161,7 @@ const previewCss = `.modal-box.preview{max-width:1180px;height:90vh}.modal-box.p
 
 const previewModalHtml = `<div id="previewBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box preview"><header><h2 id="previewTitle">Preview</h2><button class="modal-close" id="previewCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><div class="preview-toolbar"><span class="pill" id="previewPill"><span class="dot"></span><span id="previewPillLabel">checking…</span></span><span class="subtle" id="previewMeta"></span><span class="spacer"></span><button class="button" id="previewStartBtn" type="button">Start</button><button class="button secondary" id="previewRestartBtn" type="button">Restart</button><button class="button secondary" id="previewStopBtn" type="button">Stop</button><button class="button secondary" id="previewReloadBtn" type="button" title="Reload iframe">↻</button><a class="button secondary" id="previewOpenBtn" target="_blank" rel="noopener" title="Open in new tab">Open ↗</a><button class="button secondary" id="previewLogsBtn" type="button">Logs</button></div><div class="preview-statusline" id="previewStatusline"></div><div class="preview-body"><div class="preview-empty" id="previewEmpty">Preview is not running.</div><iframe id="previewFrame" class="hidden" title="Project preview"></iframe><pre class="preview-logs" id="previewLogs"></pre></div></div></div></div>`;
 
-const previewScript = `<script>(function(){const backdrop=document.getElementById('previewBackdrop');if(!backdrop)return;const title=document.getElementById('previewTitle');const pill=document.getElementById('previewPill');const pillLabel=document.getElementById('previewPillLabel');const meta=document.getElementById('previewMeta');const startBtn=document.getElementById('previewStartBtn');const stopBtn=document.getElementById('previewStopBtn');const restartBtn=document.getElementById('previewRestartBtn');const reloadBtn=document.getElementById('previewReloadBtn');const openBtn=document.getElementById('previewOpenBtn');const logsBtn=document.getElementById('previewLogsBtn');const closeBtn=document.getElementById('previewCloseBtn');const empty=document.getElementById('previewEmpty');const frame=document.getElementById('previewFrame');const logs=document.getElementById('previewLogs');const statusline=document.getElementById('previewStatusline');let project=null;let pollTimer=null;let logsTimer=null;let lastIframeUrl='';let showingLogs=false;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatusLine(t,err){statusline.textContent=t||'';statusline.classList.toggle('show',!!t);statusline.classList.toggle('err',!!err)}function setPill(state,label){pill.classList.remove('running','starting','error');if(state)pill.classList.add(state);pillLabel.textContent=label}function setEmpty(msg){empty.innerHTML='<div>'+msg+'</div>';empty.classList.remove('hidden');frame.classList.add('hidden');if(frame.src!=='about:blank'){frame.src='about:blank';lastIframeUrl=''}}function loadIframe(url){if(lastIframeUrl===url)return;lastIframeUrl=url;empty.classList.add('hidden');frame.classList.remove('hidden');frame.src=url}async function fetchStatus(){if(!project)return;try{const r=await fetch('/api/preview/'+encodeURIComponent(project)+'/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');applyStatus(j)}catch(e){setStatusLine(e.message||String(e),true)}}function applyStatus(s){meta.textContent=s.port?'port '+s.port+(s.pid?' · pid '+s.pid:''):'';if(!s.configured){setPill('error','not configured');setEmpty('Preview is not configured for this project.<br><br>Open <a class="repo" href="/manage">Manage Projects</a> and set a <strong>Preview command</strong>.<br><br>Examples:<code>dotnet watch run --project ProVisionI_Portal/ProVisionI_Portal.csproj --urls http://127.0.0.1:\${PORT} --non-interactive</code><code>npm run dev -- --host 127.0.0.1 --port \${PORT}</code><code>hugo server --bind 127.0.0.1 --port \${PORT} --baseURL http://127.0.0.1:\${PORT}\${BASEPATH}/ --appendPort=false</code>');startBtn.disabled=true;stopBtn.disabled=true;restartBtn.disabled=true;openBtn.removeAttribute('href');return}openBtn.href=s.url||'#';if(s.active&&s.ready){setPill('running','running');setStatusLine('');loadIframe(s.url);startBtn.disabled=true;stopBtn.disabled=false;restartBtn.disabled=false}else if(s.active&&!s.ready){setPill('starting','waiting for port '+s.port);setStatusLine('Server unit is active; waiting for the dev server to bind to 127.0.0.1:'+s.port+'…');setEmpty('Starting… waiting for the framework to bind to port <strong>'+s.port+'</strong>.<br><span class="subtle">First boot of dotnet watch can take 10–30s.</span>');startBtn.disabled=true;stopBtn.disabled=false;restartBtn.disabled=false}else{if(s.result&&s.result!=='success'){const tag=s.result==='exit-code'?('exit code '+(s.exitCode??'?')):s.result;setPill('error','exited ('+tag+')');setStatusLine('');let msg='Preview process exited ('+tag+').';if(s.lastError){msg+='<br><br>Recent log output:<code>'+escHtml(s.lastError)+'</code>'}msg+='<br>Click <strong>Start</strong> to retry:<code>'+escHtml(s.cmd||'')+'</code>';setEmpty(msg)}else{setPill('','stopped');setStatusLine('');setEmpty('Preview is stopped. Click <strong>Start</strong> to launch:<code>'+escHtml(s.cmd||'')+'</code>')}startBtn.disabled=false;stopBtn.disabled=true;restartBtn.disabled=false}}async function action(url){startBtn.disabled=true;stopBtn.disabled=true;restartBtn.disabled=true;setStatusLine('Working…');try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');applyStatus(j);if(showingLogs)refreshLogs()}catch(e){setStatusLine(e.message||String(e),true)}}async function refreshLogs(){if(!project||!showingLogs)return;try{const r=await fetch('/api/preview/'+encodeURIComponent(project)+'/logs?lines=300',{cache:'no-store'});const j=await r.json();if(j.ok){logs.textContent=j.log||'(no log output yet)';logs.scrollTop=logs.scrollHeight}}catch{}}function toggleLogs(){showingLogs=!showingLogs;logs.classList.toggle('show',showingLogs);logsBtn.textContent=showingLogs?'Hide logs':'Logs';if(showingLogs){refreshLogs();logsTimer=setInterval(refreshLogs,3000)}else{clearInterval(logsTimer);logsTimer=null}}function show(name){project=name;title.textContent='Preview — '+name;showingLogs=false;logs.classList.remove('show');logs.textContent='';logsBtn.textContent='Logs';setPill('','checking…');setStatusLine('');setEmpty('Loading…');backdrop.classList.remove('hidden');fetchStatus();pollTimer=setInterval(fetchStatus,2500)}function hide(){backdrop.classList.add('hidden');project=null;if(pollTimer){clearInterval(pollTimer);pollTimer=null}if(logsTimer){clearInterval(logsTimer);logsTimer=null}if(frame.src&&frame.src!=='about:blank'){frame.src='about:blank';lastIframeUrl=''}}startBtn.onclick=()=>action('/api/preview/'+encodeURIComponent(project)+'/start');stopBtn.onclick=()=>action('/api/preview/'+encodeURIComponent(project)+'/stop');restartBtn.onclick=()=>action('/api/preview/'+encodeURIComponent(project)+'/restart');reloadBtn.onclick=()=>{if(frame.src&&frame.src!=='about:blank'){const u=frame.src;frame.src='about:blank';setTimeout(()=>{lastIframeUrl='';loadIframe(u)},50)}};logsBtn.onclick=toggleLogs;closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});window.pwPreview={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-preview]');if(!btn)return;e.preventDefault();show(btn.dataset.preview)})})();</script>`;
+const previewScript = `<script>(function(){const backdrop=document.getElementById('previewBackdrop');if(!backdrop)return;const title=document.getElementById('previewTitle');const pill=document.getElementById('previewPill');const pillLabel=document.getElementById('previewPillLabel');const meta=document.getElementById('previewMeta');const startBtn=document.getElementById('previewStartBtn');const stopBtn=document.getElementById('previewStopBtn');const restartBtn=document.getElementById('previewRestartBtn');const reloadBtn=document.getElementById('previewReloadBtn');const openBtn=document.getElementById('previewOpenBtn');const logsBtn=document.getElementById('previewLogsBtn');const closeBtn=document.getElementById('previewCloseBtn');const empty=document.getElementById('previewEmpty');const frame=document.getElementById('previewFrame');const logs=document.getElementById('previewLogs');const statusline=document.getElementById('previewStatusline');let project=null;let pollTimer=null;let logsTimer=null;let lastIframeUrl='';let showingLogs=false;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatusLine(t,err){statusline.textContent=t||'';statusline.classList.toggle('show',!!t);statusline.classList.toggle('err',!!err)}function setPill(state,label){pill.classList.remove('running','starting','error');if(state)pill.classList.add(state);pillLabel.textContent=label}function setEmpty(msg){empty.innerHTML='<div>'+msg+'</div>';empty.classList.remove('hidden');frame.classList.add('hidden');if(frame.src!=='about:blank'){frame.src='about:blank';lastIframeUrl=''}}function loadIframe(url){if(lastIframeUrl===url)return;lastIframeUrl=url;empty.classList.add('hidden');frame.classList.remove('hidden');frame.src=url}async function fetchStatus(){if(!project)return;try{const r=await fetch('${BASE}/api/preview/'+encodeURIComponent(project)+'/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');applyStatus(j)}catch(e){setStatusLine(e.message||String(e),true)}}function applyStatus(s){meta.textContent=s.port?'port '+s.port+(s.pid?' · pid '+s.pid:''):'';if(!s.configured){setPill('error','not configured');setEmpty('Preview is not configured for this project.<br><br>Open <a class="repo" href="${BASE}/manage">Manage Projects</a> and set a <strong>Preview command</strong>.<br><br>Examples:<code>dotnet watch run --project ProVisionI_Portal/ProVisionI_Portal.csproj --urls http://127.0.0.1:\${PORT} --non-interactive</code><code>npm run dev -- --host 127.0.0.1 --port \${PORT}</code><code>hugo server --bind 127.0.0.1 --port \${PORT} --baseURL http://127.0.0.1:\${PORT}\${BASEPATH}/ --appendPort=false</code>');startBtn.disabled=true;stopBtn.disabled=true;restartBtn.disabled=true;openBtn.removeAttribute('href');return}openBtn.href=s.url||'#';if(s.active&&s.ready){setPill('running','running');setStatusLine('');loadIframe(s.url);startBtn.disabled=true;stopBtn.disabled=false;restartBtn.disabled=false}else if(s.active&&!s.ready){setPill('starting','waiting for port '+s.port);setStatusLine('Server unit is active; waiting for the dev server to bind to 127.0.0.1:'+s.port+'…');setEmpty('Starting… waiting for the framework to bind to port <strong>'+s.port+'</strong>.<br><span class="subtle">First boot of dotnet watch can take 10–30s.</span>');startBtn.disabled=true;stopBtn.disabled=false;restartBtn.disabled=false}else{if(s.result&&s.result!=='success'){const tag=s.result==='exit-code'?('exit code '+(s.exitCode??'?')):s.result;setPill('error','exited ('+tag+')');setStatusLine('');let msg='Preview process exited ('+tag+').';if(s.lastError){msg+='<br><br>Recent log output:<code>'+escHtml(s.lastError)+'</code>'}msg+='<br>Click <strong>Start</strong> to retry:<code>'+escHtml(s.cmd||'')+'</code>';setEmpty(msg)}else{setPill('','stopped');setStatusLine('');setEmpty('Preview is stopped. Click <strong>Start</strong> to launch:<code>'+escHtml(s.cmd||'')+'</code>')}startBtn.disabled=false;stopBtn.disabled=true;restartBtn.disabled=false}}async function action(url){startBtn.disabled=true;stopBtn.disabled=true;restartBtn.disabled=true;setStatusLine('Working…');try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');applyStatus(j);if(showingLogs)refreshLogs()}catch(e){setStatusLine(e.message||String(e),true)}}async function refreshLogs(){if(!project||!showingLogs)return;try{const r=await fetch('${BASE}/api/preview/'+encodeURIComponent(project)+'/logs?lines=300',{cache:'no-store'});const j=await r.json();if(j.ok){logs.textContent=j.log||'(no log output yet)';logs.scrollTop=logs.scrollHeight}}catch{}}function toggleLogs(){showingLogs=!showingLogs;logs.classList.toggle('show',showingLogs);logsBtn.textContent=showingLogs?'Hide logs':'Logs';if(showingLogs){refreshLogs();logsTimer=setInterval(refreshLogs,3000)}else{clearInterval(logsTimer);logsTimer=null}}function show(name){project=name;title.textContent='Preview — '+name;showingLogs=false;logs.classList.remove('show');logs.textContent='';logsBtn.textContent='Logs';setPill('','checking…');setStatusLine('');setEmpty('Loading…');backdrop.classList.remove('hidden');fetchStatus();pollTimer=setInterval(fetchStatus,2500)}function hide(){backdrop.classList.add('hidden');project=null;if(pollTimer){clearInterval(pollTimer);pollTimer=null}if(logsTimer){clearInterval(logsTimer);logsTimer=null}if(frame.src&&frame.src!=='about:blank'){frame.src='about:blank';lastIframeUrl=''}}startBtn.onclick=()=>action('${BASE}/api/preview/'+encodeURIComponent(project)+'/start');stopBtn.onclick=()=>action('${BASE}/api/preview/'+encodeURIComponent(project)+'/stop');restartBtn.onclick=()=>action('${BASE}/api/preview/'+encodeURIComponent(project)+'/restart');reloadBtn.onclick=()=>{if(frame.src&&frame.src!=='about:blank'){const u=frame.src;frame.src='about:blank';setTimeout(()=>{lastIframeUrl='';loadIframe(u)},50)}};logsBtn.onclick=toggleLogs;closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});window.pwPreview={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-preview]');if(!btn)return;e.preventDefault();show(btn.dataset.preview)})})();</script>`;
 
 
 // ============================================================================
@@ -798,6 +1221,159 @@ function projMonogram(name){
 const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--panel2:#101a2e;--line:#1b2740;--line2:#2b3d61;--text:#e7eef9;--dim:#8ea3c0;--faint:#5b6d89;--cyan:#38bdf8;--blue:#2563eb;--amber:#fbbf24;--amber2:#f59e0b;--ok:#34d399;--err:#f87171;--topbar-h:42px;--rail-w:64px;--rail-wo:246px;--font:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;--mono:ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
 @view-transition{navigation:auto}
 ::view-transition-old(root),::view-transition-new(root){animation-duration:.16s}\n@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}`;
+const deployCss = `
+body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:1.5rem 2rem;background:#0f172a;color:#e5e7eb}
+h1{margin:0 0 .2rem}
+.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem}
+.subtitle{color:#94a3b8;margin:0}
+.button{display:inline-block;padding:.5rem 1rem;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;text-decoration:none;font-size:.9rem}
+.button:hover{filter:brightness(1.1)}
+.button.secondary{background:#374151;color:#e5e7eb}.button.secondary:hover{background:#4b5563}
+.button.danger{background:#991b1b}.button.danger:hover{background:#b91c1c}
+.button.small{padding:.3rem .7rem;font-size:.8rem}
+.button:disabled{opacity:.5;cursor:not-allowed}
+.project-card{background:#111827;border:1px solid #374151;border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1.2rem}
+.project-card h2{margin:0 0 .8rem;font-size:1.2rem;color:#f8fafc}
+.targets{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+.target-card{border:1px solid #334155;border-radius:8px;padding:1rem;background:#0b1220}
+.target-card h3{margin:0 0 .5rem;font-size:.95rem;text-transform:uppercase;letter-spacing:.05em}
+.target-card.dev h3{color:#6ee7b7}
+.target-card.prod h3{color:#fca5a5}
+.version{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85rem;background:#020617;border:1px solid #334155;padding:.2rem .5rem;border-radius:4px;display:inline-block;margin:.3rem 0;color:#bbf7d0}
+.version-line{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
+.probe-btn{padding:.15rem .45rem;line-height:1;font-size:.85rem}
+.top-actions{display:flex;gap:.6rem;align-items:center}
+#probe-all.probing{opacity:.7;cursor:progress}
+.last-deploy{font-size:.8rem;color:#94a3b8;margin:.4rem 0}
+.config-section{margin-top:.8rem;border-top:1px solid #1f2937;padding-top:.8rem}
+.config-section label{display:block;font-size:.8rem;font-weight:600;color:#cbd5e1;margin-bottom:.3rem}
+.config-section textarea,.config-section input{width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;padding:.4rem .5rem;border:1px solid #334155;border-radius:4px;resize:vertical;background:#020617;color:#e5e7eb}
+.config-section textarea{min-height:60px}
+.deploy-output{margin-top:.5rem;background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
+.deploy-output.show{display:block}
+.log-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:.5rem}
+.log-table th{text-align:left;border-bottom:2px solid #1f2937;padding:.4rem .5rem;color:#94a3b8;font-size:.78rem;text-transform:uppercase;letter-spacing:.02em}
+.log-table td{border-bottom:1px solid #1f2937;padding:.4rem .5rem}
+.log-table .ok{color:#6ee7b7}.log-table .fail{color:#fca5a5}
+.badge{display:inline-block;padding:.15rem .5rem;border-radius:99px;font-size:.75rem;font-weight:600}
+.badge.ok{background:rgba(16,185,129,.12);border:1px solid #065f46;color:#6ee7b7}.badge.fail{background:rgba(239,68,68,.12);border:1px solid #991b1b;color:#fca5a5}
+.no-config{color:#94a3b8;font-style:italic;font-size:.85rem}
+.muted{color:#94a3b8;font-size:.85rem}
+.local-version{font-size:.9rem;margin-bottom:.8rem;color:#cbd5e1}
+.local-version .version.source{background:#1e3a8a;border-color:#3b82f6;color:#93c5fd}
+a{color:#93c5fd}
+.deploy-tabs{display:flex;gap:0;border-bottom:2px solid #1f2937;margin-bottom:1rem}
+.deploy-tab{background:transparent;border:none;color:#94a3b8;padding:.5rem 1.2rem;font:inherit;font-size:.9rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s}
+.deploy-tab:hover{color:#e5e7eb}
+.deploy-tab.active{color:#93c5fd;border-bottom-color:#3b82f6;font-weight:600}
+@media(max-width:760px){.targets{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
+`;
+
+const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
+const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;let password='';if(!window.__pwHasDeployPassword){password=prompt('Enter your domain password for deployment:');if(password===null)return}btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});const j=await r.json();output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
+
+const deployScript = `<script>
+(function(){
+ function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]))}
+ document.querySelectorAll('.save-config').forEach(btn=>{
+  btn.onclick=async()=>{
+   const card=btn.closest('.target-card');
+   const project=card.dataset.project;
+   const target=card.dataset.target;
+   const script=card.querySelector('.deploy-script').value;
+   const versionCmd=card.querySelector('.version-cmd').value;
+   btn.disabled=true;btn.textContent='Saving…';
+   try{
+    const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.error);
+    btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save';btn.disabled=false},1500);
+   }catch(e){alert(e.message);btn.textContent='Save';btn.disabled=false}
+  };
+ });
+ document.querySelectorAll('.deploy-btn').forEach(btn=>{
+  btn.onclick=async()=>{
+   const card=btn.closest('.target-card');
+   const project=card.dataset.project;
+   const target=card.dataset.target;
+   const output=card.querySelector('.deploy-output');
+   const isProd=target==='prod';
+   const opt=(card.querySelector('.deploy-option')||{}).value||'';
+   if((isProd||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;
+   let password='';
+   if(!window.__pwHasDeployPassword){
+    password=prompt('Enter your domain password for deployment (or store it in Settings > Users):');
+    if(password===null)return;
+   }
+   btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   try{
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});
+    const j=await r.json();
+    if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');throw new Error(j.error||'deploy failed')}
+    output.textContent='✅ SUCCESS ('+j.duration+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
+    const vEl=card.querySelector('.current-version');
+    if(vEl&&j.version)vEl.textContent=j.version;
+    const ldEl=card.querySelector('.last-deploy-info');
+    if(ldEl)ldEl.textContent='Just now by '+j.user;
+   }catch(e){output.textContent=output.textContent||e.message}finally{btn.textContent='Deploy';btn.disabled=false}
+  };
+ });
+ document.querySelectorAll('.toggle-log').forEach(btn=>{
+  btn.onclick=async()=>{
+   const card=btn.closest('.project-card');
+   const logDiv=card.querySelector('.deploy-log');
+   if(logDiv.style.display==='block'){logDiv.style.display='none';btn.textContent='Show history';return}
+   const project=card.dataset.project;
+   try{
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log');
+    const j=await r.json();if(!j.ok)throw new Error(j.error);
+    if(!j.log.length){logDiv.innerHTML='<p class="muted">No deployments yet.</p>'}
+    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td></tr>').join('')+'</tbody></table>'}
+    logDiv.style.display='block';btn.textContent='Hide history';
+   }catch(e){logDiv.innerHTML='<p class="muted">Error: '+esc(e.message)+'</p>';logDiv.style.display='block'}
+  };
+ });
+ function srcCmp(src,dep){var re=/^V1\\.\\d{2}\\.\\d{4}\\.\\d{4}$/;return !!src&&!!dep&&re.test(src)&&re.test(dep)&&src>dep;}
+ function markSrcNewer(card,dep){
+  var pc=card.closest('.project-card');var se=pc&&pc.querySelector('.version.source');
+  var src=se?se.textContent.trim():'';var line=card.querySelector('.version-line');if(!line)return;
+  var badge=line.querySelector('.src-newer');
+  if(srcCmp(src,dep)){
+   if(!badge){badge=document.createElement('span');badge.className='src-newer';badge.title='Working copy is newer than the deployed build — deploy to update';badge.textContent='⬆ source newer';badge.style.cssText='display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap';line.appendChild(badge);}
+  }else if(badge){badge.remove();}
+ }
+ async function probeTarget(card){
+  if(!card || card.dataset.probeable!=='1') return;
+  const project=card.dataset.project, target=card.dataset.target;
+  const vEl=card.querySelector('.current-version');
+  const btn=card.querySelector('.probe-btn');
+  if(vEl){vEl.textContent='…';vEl.title='';}
+  if(btn)btn.disabled=true;
+  try{
+   const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target+'/version');
+   const j=await r.json();
+   if(!j.ok)throw new Error(j.error||'probe failed');
+   if(vEl)vEl.textContent=j.version||'—';
+   markSrcNewer(card, j.version||'');
+  }catch(e){ if(vEl){vEl.textContent='⚠';vEl.title=e.message;} markSrcNewer(card,''); }
+  finally{ if(btn)btn.disabled=false; }
+ }
+ document.querySelectorAll('.probe-btn').forEach(btn=>{ btn.onclick=()=>probeTarget(btn.closest('.target-card')); });
+ const probeAllBtn=document.getElementById('probe-all');
+ async function probeAll(){
+  const cards=[...document.querySelectorAll('.target-card[data-probeable="1"]')];
+  if(!cards.length)return;
+  if(probeAllBtn){probeAllBtn.disabled=true;probeAllBtn.classList.add('probing');probeAllBtn.textContent='Probing…';}
+  let i=0; const POOL=5;
+  const worker=async()=>{ while(i<cards.length){ await probeTarget(cards[i++]); } };
+  await Promise.all(Array.from({length:Math.min(POOL,cards.length)},worker));
+  if(probeAllBtn){probeAllBtn.disabled=false;probeAllBtn.classList.remove('probing');probeAllBtn.textContent='↻ Probe all';}
+ }
+ if(probeAllBtn)probeAllBtn.onclick=probeAll;
+ probeAll();
+})();
+</script>`;
+
 const cockpitCss = `html,body{margin:0;width:100%;height:100%;overflow:hidden;background:var(--bg);color:var(--text);font-family:var(--font)}
 #shell{display:flex;width:100%;height:100%}
 #stage{flex:1 1 auto;min-width:0;display:flex;flex-direction:column;position:relative;background:#1f1f1f}
@@ -964,20 +1540,23 @@ body.rail-mobile-open #railScrim{opacity:1;pointer-events:auto}
 #tray{grid-template-columns:1fr;grid-template-areas:"header" "dropzone" "list" "status"}
 }`;
 
-function railHtml(projects, currentName, user){
+function railHtml(projects, currentName, user, deployConfigured=false){
  const isAdmin = user.role === 'admin';
  const keys = projects.map((p,i)=>{
   const cur = p.name === currentName;
-  return `<a class="pkey${cur?' current':''}" href="/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-pin" role="button" tabindex="-1" title="Pin">📌</span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a>`;
+  return `<a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-pin" role="button" tabindex="-1" title="Pin">📌</span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a>`;
  }).join('');
  const adminActs = isAdmin
-  ? `<a class="railAct" id="manageEntry" href="/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
+  ? `<a class="railAct" id="manageEntry" href="${BASE}/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="${BASE}/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
+  : '';
+ const deployAct = DEPLOY_CENTRE && deployConfigured
+  ? `<a class="railAct" id="deployEntry" href="${BASE}/deploy?project=${encodeURIComponent(currentName)}" data-deploy="${esc(currentName)}" title="Deploy this project"><span class="railActIco">🚀</span><span class="railActLabel">Deploy</span></a>`
   : '';
  const who = user.implicit
   ? `<span class="railWho" title="PW_AUTH_ENFORCE off — anonymous admin"><span class="railWhoDot"></span><span class="railWhoName">anonymous</span></span>`
   : `<span class="railWho" title="${esc(user.username)} · ${esc(user.role)}"><span class="railWhoDot"></span><span class="railWhoName">${esc(user.username)} · ${esc(user.role)}</span></span><button id="railLogout" class="railAct" type="button" title="Sign out"><span class="railActIco">↪</span><span class="railActLabel">Sign out</span></button>`;
  const autoPinBtn = `<button id="autoPinBtn" class="railAct" type="button" role="switch" aria-pressed="true" title="Auto-pin projects when a session finishes"><span class="railActIco autoPinIco">📌</span><span class="railActLabel">Auto-pin on done · <b id="autoPinState">on</b></span></button>`;
- return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div><nav id="railKeys" class="railKeys">${keys}</nav><div class="railFoot">${autoPinBtn}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
+ return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div><nav id="railKeys" class="railKeys">${keys}</nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
 }
 
 const railScript = `<script>(function(){
@@ -997,7 +1576,7 @@ if(railBtn)railBtn.onclick=()=>setMobileOpen(!document.body.classList.contains('
 if(scrim)scrim.onclick=()=>setMobileOpen(false);
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.classList.contains('rail-mobile-open'))setMobileOpen(false)});
 const logout=document.getElementById('railLogout');
-if(logout)logout.onclick=async()=>{try{await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='/login'};
+if(logout)logout.onclick=async()=>{try{await fetch('${BASE}/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='${BASE}/login'};
 let pinned=new Set();try{pinned=new Set(JSON.parse(localStorage.getItem('pwPinned')||'[]'))}catch{}
 let autoPin=true;try{autoPin=(localStorage.getItem('pwAutoPin')||'1')==='1'}catch{}
 function savePins(){try{localStorage.setItem('pwPinned',JSON.stringify([...pinned]))}catch{}}
@@ -1011,7 +1590,7 @@ const baseTitle=(CUR?CUR+' — ':'')+'Workbench';
 document.title=baseTitle;
 let first=true;
 async function refreshRail(){try{
-const r=await fetch('/api/projects/status',{cache:'no-store'});if(r.status===401){if(window.pwAuthLost)window.pwAuthLost();return}const j=await r.json();if(!j||!j.ok)return;
+const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});if(r.status===401){if(window.pwAuthLost)window.pwAuthLost();return}const j=await r.json();if(!j||!j.ok)return;
 let anyLit=false;
 for(const p of (j.projects||[])){
 const key=KEYS.querySelector('[data-project="'+p.name+'"]');if(!key)continue;
@@ -1071,11 +1650,12 @@ const manageModalHtml = `<style>
 .pmPane.active{display:flex}
 .pmField{display:flex;flex-direction:column;gap:5px}
 .pmField>span{font-size:11.5px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--faint)}
-.pmField input,.pmField textarea{background:#070d19;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font:13px var(--font);box-sizing:border-box;width:100%;transition:border-color .15s}
+.pmField input,.pmField textarea,.pmField select{background:#070d19;color:var(--text);border:1px solid var(--line);border-radius:9px;padding:9px 11px;font:13px var(--font);box-sizing:border-box;width:100%;transition:border-color .15s}
 .pmField textarea{font:12px/1.5 var(--mono);resize:vertical}
-.pmField input:focus,.pmField textarea:focus{outline:none;border-color:var(--cyan)}
+.pmField input:focus,.pmField textarea:focus,.pmField select:focus{outline:none;border-color:var(--cyan)}
 .pmField .pmHelp{font-size:11.5px;color:var(--faint);line-height:1.5;text-transform:none;letter-spacing:0;font-weight:400}
 .pmField .pmHelp code{font-family:var(--mono);color:#9fd3ff;font-size:11px}
+.pmField input[type=checkbox]{width:auto;padding:0;accent-color:var(--cyan)}
 .pmRow2{display:grid;grid-template-columns:2fr 1fr;gap:12px}
 .pmCallout{border:1px solid #4a3a10;background:#1a1404;color:#fde68a;border-radius:10px;padding:10px 12px;font-size:12px;line-height:1.5}
 .pmCallout.red{border-color:#5b1a1a;background:#180808;color:#fecaca}
@@ -1108,7 +1688,7 @@ const manageModalHtml = `<style>
 @media(max-width:760px){.pmBody{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}.pmListWrap{border-right:0;border-bottom:1px solid var(--line);max-height:200px}.modal-box.pm{height:94vh}}
 </style>
 <div id="pmBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Manage projects"><div class="modal-box pm"><header><h2>Projects<span class="pmHint">drag to reorder — the rail follows this order</span></h2><button class="modal-close" id="pmClose" aria-label="Close" type="button">×</button></header><div class="body"><div class="pmBody"><div class="pmListWrap"><button class="pmAdd" id="pmAddBtn" type="button">+ New project</button><div class="pmItems" id="pmItems"></div></div><div class="pmDetail" id="pmDetail"><div class="pmTabs" id="pmTabs" role="tablist"><button type="button" data-t="general" class="active">General</button><button type="button" data-t="preview">Preview</button><button type="button" data-t="tabs">Terminal tabs</button><button type="button" data-t="danger" class="dangerTab">Danger</button></div><div class="pmPanes">
-<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
+<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmField"><span>Git identity <em style="text-transform:none;font-style:normal;font-weight:400">(for private repos)</em></span><select id="pmPrimaryUser"></select><span class="pmHelp">Choose which user's GitHub token authenticates this workspace's git. Blank leaves git unauthenticated.</span></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><label class="pmField"><span>Admin only</span><span class="pmHelp"><input type="checkbox" id="pmAdminOnly"> Admin only — hidden from non-admins</span></label><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
 <section class="pmPane" data-p="preview"><div class="pmField"><span>Preview command</span><textarea id="pmPrevCmd" rows="3" placeholder="empty = preview disabled"></textarea><span class="pmHelp">Runs inside the workspace. Use <code>\${PORT}</code> and <code>\${BASEPATH}</code>; the app must bind <code>127.0.0.1:\${PORT}</code>.</span></div><details class="pmExamples"><summary>Examples — click one to use it</summary><div><code>npm run dev -- --host 127.0.0.1 --port \${PORT}</code><code>dotnet watch run --project Foo/Foo.csproj --urls http://127.0.0.1:\${PORT} --non-interactive</code><code>hugo server --bind 127.0.0.1 --port \${PORT} --baseURL http://127.0.0.1:\${PORT}\${BASEPATH}/ --appendPort=false</code><code>python3 -m http.server \${PORT} --bind 127.0.0.1</code></div></details><div class="pmRow2"><div class="pmField"><span>Preview port</span><input id="pmPrevPort" type="number" min="1024" max="65535" placeholder="auto"></div><div></div></div><div class="pmField"><span>Environment</span><textarea id="pmPrevEnv" rows="4" placeholder="# one KEY=VALUE per line&#10;# ASPNETCORE_ENVIRONMENT=Development"></textarea><span class="pmHelp">Exported before the command runs. <code>PORT</code> and <code>BASEPATH</code> are reserved.</span></div></section>
 <section class="pmPane" data-p="tabs"><div class="pmField"><span>Tab templates</span><span class="pmHelp">Named tabs offered in the terminal's <b>+</b> menu. <b>auto-start</b> spawns the tab when the project's tmux session is first created. Empty command = plain bash.</span></div><div class="pmTabRows" id="pmTabRows"></div><button class="pmAddTab" id="pmAddTabBtn" type="button">+ Add tab template</button></section>
 <section class="pmPane" data-p="danger"><div class="pmCallout red"><b>Delete project</b> — stops its terminal service, kills its tmux session, removes it from the registry <b>and deletes the workspace folder</b> shown in General. Repos without a remote copy are gone for good.</div><div class="pmDelArm"><input id="pmDelName" type="text" placeholder="type the project name to arm" autocomplete="off"><button class="pmDelBtn" id="pmDelBtn" type="button" disabled>Delete project</button></div></section>
@@ -1117,7 +1697,7 @@ const manageModalHtml = `<style>
 const manageModalScript = `<script>(function(){
 const backdrop=document.getElementById('pmBackdrop');if(!backdrop)return;
 const items=document.getElementById('pmItems'),addBtn=document.getElementById('pmAddBtn'),tabsBar=document.getElementById('pmTabs'),panes=[...document.querySelectorAll('.pmPane')],saveBtn=document.getElementById('pmSave'),statusEl=document.getElementById('pmStatus'),closeBtn=document.getElementById('pmClose');
-const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
+const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fAdminOnly=document.getElementById('pmAdminOnly'),fPrimaryUser=document.getElementById('pmPrimaryUser'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
 const CUR=(typeof project!=='undefined')?project:null;
 let cfg=null,sel=null,mode='edit',formDirty=false,reloadOnClose=false,navTarget=null,busy=false,curNow=CUR;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -1125,7 +1705,8 @@ function hue(name){let h=5381;const s=String(name);for(let i=0;i<s.length;i++)h=
 function mono(name){const p=String(name).replace(/[_\\-.]+/g,' ').replace(/([a-z0-9])([A-Z])/g,'$1 $2').split(/\\s+/).filter(Boolean);if(p.length>=2)return(p[0][0]+p[1][0]).toUpperCase();return(p[0]||'?').slice(0,2).toUpperCase()}
 function setStatus(t,err){statusEl.textContent=t||'';statusEl.classList.toggle('err',!!err)}
 function markDirty(){formDirty=true}
-[fName,fRepo,fPort,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
+[fName,fRepo,fPort,fPrimaryUser,fAdminOnly,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
+fAdminOnly.addEventListener('change',markDirty);fPrimaryUser.addEventListener('change',markDirty);
 function activatePane(id){tabsBar.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.t===id));panes.forEach(p=>p.classList.toggle('active',p.dataset.p===id))}
 tabsBar.addEventListener('click',e=>{const b=e.target.closest('button[data-t]');if(b&&mode==='edit')activatePane(b.dataset.t)});
 function renderList(){items.innerHTML='';for(const p of cfg.projects){const row=document.createElement('div');row.className='pmItem'+(mode==='edit'&&p.name===sel?' sel':'');row.dataset.name=p.name;row.draggable=true;row.style.setProperty('--h',hue(p.name));row.innerHTML='<span class="pmDrag" title="Drag to reorder">⠿</span><span class="pmMono">'+esc(mono(p.name))+'</span><span class="pmIname">'+esc(p.name)+'</span><span class="pmPort">:'+esc(p.port)+'</span>';row.onclick=()=>select(p.name);items.appendChild(row)}addBtn.classList.toggle('sel',mode==='add')}
@@ -1135,23 +1716,24 @@ tabRows.addEventListener('input',markDirty);
 addTabBtn.onclick=()=>{tabRows.insertAdjacentHTML('beforeend',tabRowHtml({autoStart:true}));tabRows.lastElementChild.querySelector('.tt-name').focus();markDirty()};
 document.querySelectorAll('.pmExamples code').forEach(c=>c.addEventListener('click',()=>{fPrevCmd.value=c.textContent;markDirty()}));
 function envText(env){return Object.entries(env||{}).map(([k,v])=>k+'='+v).join('\\n')}
-function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
+function primaryOptions(selected){return '<option value="">— none —</option>'+((cfg&&cfg.users)||[]).map(u=>'<option value="'+esc(u.username)+'"'+(selected===u.username?' selected':'')+'>'+esc(u.username)+(u.hasToken?' ✓':'')+'</option>').join('')}
+function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fPrimaryUser.innerHTML=primaryOptions(p?p.primaryUser:'');fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fAdminOnly.checked=!!(p&&p.adminOnly);fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
 function select(name){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='edit';sel=name;const p=cfg.projects.find(x=>x.name===name);fillForm(p);restartNote.textContent=(name===CUR?'You are looking at this project\\u2019s terminal right now — saving restarts it and kills this very session\\u2019s processes.':'Saving restarts this project\\u2019s terminal service — running processes in its tabs are killed.');tabsBar.style.display='';saveBtn.textContent='Save changes';activatePane('general');renderList();setStatus('')}
 function startAdd(){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='add';sel=null;fillForm(null);tabsBar.style.display='none';activatePane('general');saveBtn.textContent='Create project';renderList();setStatus('Preview, tab templates and more are configurable after the project exists.');setTimeout(()=>fName.focus(),40)}
 addBtn.onclick=startAdd;
 delName.addEventListener('input',()=>{delBtn.disabled=delName.value.trim()!==sel});
 async function api(url,params){const r=await fetch(url,{method:'POST',headers:{'Accept':'application/json'},body:params});let j=null;try{j=await r.json()}catch{}if(!j)throw new Error('Unexpected response ('+r.status+')');if(!j.ok)throw new Error(j.error||('Request failed ('+r.status+')'));return j}
-async function refreshCfg(){const r=await fetch('/api/projects/config',{cache:'no-store'});cfg=await r.json();if(!cfg.ok)throw new Error(cfg.error||'config load failed')}
+async function refreshCfg(){const r=await fetch('${BASE}/api/projects/config',{cache:'no-store'});cfg=await r.json();if(!cfg.ok)throw new Error(cfg.error||'config load failed')}
 function collectTabs(){const arr=[];tabRows.querySelectorAll('.pmTabRow').forEach(row=>{const n=row.querySelector('.tt-name').value.trim();if(!n)return;arr.push({name:n,cmd:row.querySelector('.tt-cmd').value,autoStart:row.querySelector('.tt-auto').checked})});return arr}
 saveBtn.onclick=async()=>{if(busy)return;busy=true;saveBtn.disabled=true;try{
-if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),port:fPort.value||''});await api('/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
-else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),port:fPort.value||'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
+if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':''});await api('${BASE}/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
+else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('${BASE}/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'${BASE}/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
 }catch(e){setStatus(e.message||String(e),true)}finally{busy=false;saveBtn.disabled=false}};
-delBtn.onclick=async()=>{if(busy||delBtn.disabled)return;if(!confirm('Really delete "'+sel+'" AND its workspace folder? This cannot be undone.'))return;busy=true;delBtn.disabled=true;try{setStatus('Deleting '+sel+'…');await api('/manage/delete/'+encodeURIComponent(sel),new URLSearchParams({confirm:'yes'}));reloadOnClose=true;if(sel===curNow)navTarget='/';await refreshCfg();busy=false;sel=null;formDirty=false;if(cfg.projects.length){select(cfg.projects[0].name);setStatus('Deleted.')}else{navTarget=navTarget||'/';closeModal()}}catch(e){setStatus(e.message||String(e),true)}finally{busy=false}};
+delBtn.onclick=async()=>{if(busy||delBtn.disabled)return;if(!confirm('Really delete "'+sel+'" AND its workspace folder? This cannot be undone.'))return;busy=true;delBtn.disabled=true;try{setStatus('Deleting '+sel+'…');await api('${BASE}/manage/delete/'+encodeURIComponent(sel),new URLSearchParams({confirm:'yes'}));reloadOnClose=true;if(sel===curNow)navTarget='${BASE}/';await refreshCfg();busy=false;sel=null;formDirty=false;if(cfg.projects.length){select(cfg.projects[0].name);setStatus('Deleted.')}else{navTarget=navTarget||'${BASE}/';closeModal()}}catch(e){setStatus(e.message||String(e),true)}finally{busy=false}};
 let dragSrc=null;
 items.addEventListener('dragstart',e=>{const row=e.target.closest('.pmItem');if(!row)return;dragSrc=row;row.classList.add('dragging');e.dataTransfer.effectAllowed='move';try{e.dataTransfer.setData('text/plain',row.dataset.name)}catch{}});
 items.addEventListener('dragover',e=>{if(!dragSrc)return;const t=e.target.closest('.pmItem');if(!t||t===dragSrc)return;e.preventDefault();const r=t.getBoundingClientRect();if((e.clientY-r.top)>r.height/2)t.parentNode.insertBefore(dragSrc,t.nextSibling);else t.parentNode.insertBefore(dragSrc,t)});
-items.addEventListener('dragend',async()=>{if(!dragSrc)return;dragSrc.classList.remove('dragging');dragSrc=null;const order=[...items.querySelectorAll('.pmItem')].map(r=>r.dataset.name);try{const rr=await fetch('/api/projects/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})});const jj=await rr.json().catch(()=>null);if(!jj||!jj.ok)throw new Error((jj&&jj.error)||('HTTP '+rr.status));reloadOnClose=true;cfg.projects.sort((a,b)=>order.indexOf(a.name)-order.indexOf(b.name));setStatus('Order saved — the rail follows it.')}catch(e){setStatus('Reorder failed: '+(e.message||e),true)}});
+items.addEventListener('dragend',async()=>{if(!dragSrc)return;dragSrc.classList.remove('dragging');dragSrc=null;const order=[...items.querySelectorAll('.pmItem')].map(r=>r.dataset.name);try{const rr=await fetch('${BASE}/api/projects/reorder',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({order})});const jj=await rr.json().catch(()=>null);if(!jj||!jj.ok)throw new Error((jj&&jj.error)||('HTTP '+rr.status));reloadOnClose=true;cfg.projects.sort((a,b)=>order.indexOf(a.name)-order.indexOf(b.name));setStatus('Order saved — the rail follows it.')}catch(e){setStatus('Reorder failed: '+(e.message||e),true)}});
 async function openModal(){backdrop.classList.remove('hidden');setStatus('Loading…');try{await refreshCfg();setStatus('');if(cfg.projects.length){select(sel&&cfg.projects.some(p=>p.name===sel)?sel:(cfg.projects.some(p=>p.name===CUR)?CUR:cfg.projects[0].name))}else startAdd()}catch(e){setStatus(e.message||String(e),true)}}
 function closeModal(){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;backdrop.classList.add('hidden');if(navTarget){location.href=navTarget}else if(reloadOnClose){location.reload()}}
 closeBtn.onclick=closeModal;
@@ -1164,7 +1746,7 @@ try{const qs=new URLSearchParams(location.search);if(qs.get('manage')==='1'){qs.
 })();</script>`;
 
 
-app.get('/', requireAuth, async (req,res)=>{
+app.get(BASE + '/', requireAuth, async (req,res)=>{
  const allProjects = await loadProjects();
  const projects = filterProjectsForUser(allProjects, req.user);
  const isAdmin = req.user.role === 'admin';
@@ -1179,7 +1761,7 @@ app.get('/', requireAuth, async (req,res)=>{
  if(canOpenTerminal && projects.length){
   const lastName = getCookie(req, 'pw_last');
   const target = projects.find(p => p.name === lastName) || projects[0];
-  return res.redirect(`/term/${encodeURIComponent(target.name)}/${req.query.manage === '1' ? '?manage=1' : ''}`);
+  return res.redirect(BASE + '/term/' + encodeURIComponent(target.name) + '/' + (req.query.manage === '1' ? '?manage=1' : ''));
  }
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
@@ -1191,7 +1773,7 @@ app.get('/', requireAuth, async (req,res)=>{
  } else {
   const cards = projects.map((p,i)=>{
    const acts = [
-    canUpload ? `<a class="lBtn primary" href="/files/${encodeURIComponent(p.name)}/">Drop files</a>` : '',
+    canUpload ? `<a class="lBtn primary" href="${BASE}/files/${encodeURIComponent(p.name)}/">Drop files</a>` : '',
     hasPreview(p) ? `<button class="lBtn" type="button" data-preview="${esc(p.name)}">Preview</button>` : ''
    ].join('');
    return `<article class="lCard lProj" style="--h:${projHue(p.name)};--i:${i}"><div class="lProjHead"><span class="pk-mono">${esc(projMonogram(p.name))}</span><h3>${esc(p.name)}</h3></div><code class="lPath">${esc(p.path)}</code><div class="lActs">${acts || '<span class="lNone">read-only access</span>'}</div></article>`;
@@ -1201,30 +1783,30 @@ app.get('/', requireAuth, async (req,res)=>{
  const userChip = req.user.implicit
   ? `<span class="badge" title="PW_AUTH_ENFORCE is OFF; all requests treated as admin">anonymous · enforce off</span>`
   : `<span class="badge"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span><button id="logoutBtn" class="lBtn" type="button">Sign out</button>`;
- const adminCta = isAdmin ? `<a class="lBtn" href="/settings">Settings</a>` : '';
+ const adminCta = isAdmin ? `<a class="lBtn" href="${BASE}/settings">Settings</a>` : '';
  const adminModals = isAdmin ? wizardModalHtml + manageModalHtml : '';
  const adminScripts = isAdmin ? wizardScript + manageModalScript + `<script>document.getElementById('openWizardBtn')?.addEventListener('click',()=>document.getElementById('setupBackdrop')?.classList.remove('hidden'));document.getElementById('openManageBtn')?.addEventListener('click',()=>window.pwManage&&window.pwManage.open());</script>` : '';
  const firstRunScript = isAdmin
-  ? `<script>(async()=>{try{const k='pw_firstrun_dismissed';if(sessionStorage.getItem(k))return;const r=await fetch('/api/system/firstrun',{cache:'no-store'});const j=await r.json();if(j?.firstRunNeeded){document.getElementById('setupBackdrop')?.classList.remove('hidden');sessionStorage.setItem(k,'1')}}catch{}})();</script>`
+  ? `<script>(async()=>{try{const k='pw_firstrun_dismissed';if(sessionStorage.getItem(k))return;const r=await fetch('${BASE}/api/system/firstrun',{cache:'no-store'});const j=await r.json();if(j?.firstRunNeeded){document.getElementById('setupBackdrop')?.classList.remove('hidden');sessionStorage.setItem(k,'1')}}catch{}})();</script>`
   : '';
- const logoutScript = req.user.implicit ? '' : `<script>document.getElementById('logoutBtn')?.addEventListener('click',async()=>{try{await fetch('/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='/login'});</script>`;
+ const logoutScript = req.user.implicit ? '' : `<script>document.getElementById('logoutBtn')?.addEventListener('click',async()=>{try{await fetch('${BASE}/api/auth/logout',{method:'POST',headers:{'Content-Type':'application/json'}})}catch{}location.href='${BASE}/login'});</script>`;
  const previewBits = !canOpenTerminal && projects.some(hasPreview) ? previewModalHtml + previewScript : '';
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Project Workbench</title><style>${designTokensCss}${landingCss}${statusBarCss}${modalBaseCss}${wizardCss}${previewCss}</style></head><body class="landing"><header class="lHero"><div class="lBrand"><span class="brandGlyph">&gt;_</span><div><h1>Project Workbench</h1><p>Terminal cockpits for every project, with Claude Code on tap.</p></div></div><div class="lActions">${userChip}${adminCta}</div></header><main class="lMain">${content}</main>${adminModals}${previewBits}${adminScripts}${firstRunScript}${logoutScript}${footer}</body></html>`);
 });
 
-app.get('/manage', requireAdmin, async (req,res)=>{
+app.get(BASE + '/manage', requireAdmin, async (req,res)=>{
  // The old server-rendered manage page is retired: project management now
  // lives in the cockpit's Manage modal. Deep-link by redirecting into the
  // last-visited (or first) project's cockpit with ?manage=1.
  const projects = filterProjectsForUser(await loadProjects(), req.user);
- if(projects.length === 0) return res.redirect('/?manage=1');
+ if(projects.length === 0) return res.redirect(BASE + '/?manage=1');
  const lastName = getCookie(req, 'pw_last');
  const target = projects.find(p => p.name === lastName) || projects[0];
- res.redirect(`/term/${encodeURIComponent(target.name)}/?manage=1`);
+ res.redirect(BASE + '/term/' + encodeURIComponent(target.name) + '/?manage=1');
 });
 
-app.post('/manage/add', requireAdmin, async (req,res,next)=>{ try {
+app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
  if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  await withProjectsLock(async () => {
@@ -1234,18 +1816,29 @@ app.post('/manage/add', requireAdmin, async (req,res,next)=>{ try {
   if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
   if(allUsedPorts(projects).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
   const p = repo ? { name, repo, path: workspacePath(name), port } : { name, path: workspacePath(name), port };
-  await cloneWorkspace(p); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
+  if(req.body.adminOnly === 'yes') p.adminOnly = true;
+  const primaryUser = String(req.body.primaryUser || '').trim();
+  if(primaryUser) p.primaryUser = primaryUser;
+  const users = await loadUsers();
+  // Default the project's git identity to the adding admin when they have a token
+  // and none was chosen, so the clone (and later pull/push) can authenticate.
+  if(!p.primaryUser && users.find(u=>u.username===req.user?.username)?.ghToken) p.primaryUser = req.user.username;
+  const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
+  let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
+  await cloneWorkspace(p, cloneToken); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
+  if(p.primaryUser){ await syncProjectCredentials(p, users); }
  });
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
  if(wantsJson(req)) return res.json({ok:true,name});
- res.redirect('/manage');
+ res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }});
 
-app.post('/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
+app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
  const oldName = req.params.oldName; const newName = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); const port = Number(req.body.port);
  const previewCmd = String(req.body.previewCmd || '').trim();
  const previewPortRaw = String(req.body.previewPort || '').trim();
  const previewEnvRaw = String(req.body.previewEnv || '');
+ const primaryUser = String(req.body.primaryUser || '').trim();
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
  await withProjectsLock(async () => {
@@ -1290,17 +1883,21 @@ app.post('/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
   }
  }
  await stopProject(oldName); const oldPath = p.path; p.name = newName; if(repo) p.repo = repo; else delete p.repo; p.port = port; p.path = workspacePath(newName);
+ if(req.body.adminOnly === 'yes') p.adminOnly = true; else delete p.adminOnly;
+ if(primaryUser) p.primaryUser = primaryUser; else delete p.primaryUser;
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
+ const users = await loadUsers();
  await saveProjects(projects); await applyRouting(projects); await startProject(p);
+ await syncProjectCredentials(p, users);
  });
  await audit('project_update', { oldName, newName, port }, req);
  if(wantsJson(req)) return res.json({ok:true,name:newName});
- res.redirect('/manage');
+ res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }});
 
-app.post('/manage/delete/:name', requireAdmin, async (req,res,next)=>{ try {
+app.post(BASE + '/manage/delete/:name', requireAdmin, async (req,res,next)=>{ try {
  if(req.body.confirm !== 'yes') throw new Error('Delete confirmation required'); const name = req.params.name;
  await withProjectsLock(async () => {
   const projects = await loadProjects(); const idx = projects.findIndex(p=>p.name===name); if(idx<0) throw new Error('Project not found'); const [p] = projects.splice(idx,1);
@@ -1308,10 +1905,10 @@ app.post('/manage/delete/:name', requireAdmin, async (req,res,next)=>{ try {
  });
  await audit('project_delete', { project: name }, req);
  if(wantsJson(req)) return res.json({ok:true});
- res.redirect('/manage');
+ res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }});
 
-app.get('/api/projects/status', requireAuth, async (req,res)=>{ try {
+app.get(BASE + '/api/projects/status', requireAuth, async (req,res)=>{ try {
  const all = await loadProjects();
  const projects = filterProjectsForUser(all, req.user);
  const out = await Promise.all(projects.map(async p => {
@@ -1334,12 +1931,12 @@ app.get('/api/projects/status', requireAuth, async (req,res)=>{ try {
  res.json({ ok:true, projects: out });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/projects/:name/clear-pending', requireAuth, requireProjectAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/projects/:name/clear-pending', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.name); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  await clearPending(p); res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/projects/reorder', requireAdmin, async (req,res)=>{ try {
+app.post(BASE + '/api/projects/reorder', requireAdmin, async (req,res)=>{ try {
  const order = req.body?.order;
  if(!Array.isArray(order)) return res.status(400).json({ok:false,error:'order must be an array of names'});
  await withProjectsLock(async () => {
@@ -1354,7 +1951,7 @@ app.post('/api/projects/reorder', requireAdmin, async (req,res)=>{ try {
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 
-app.post('/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
+app.post(BASE + '/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
  const auth = String(req.get('authorization') || '');
  const token = auth.toLowerCase().startsWith('bearer ') ? auth.slice(7).trim() : String(req.get('x-pw-handoff-token') || '').trim();
  if(!internalHandoffToken || token !== internalHandoffToken) return res.status(403).json({ok:false,error:'forbidden'});
@@ -1367,34 +1964,35 @@ app.post('/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
  res.json({ok:true,project:p.name,...injected});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/projects/config', requireAdmin, async (_req,res)=>{ try {
- const projects = await loadProjects();
+app.get(BASE + '/api/projects/config', requireAdmin, async (_req,res)=>{ try {
+ const [projects, users] = await Promise.all([loadProjects(), loadUsers()]);
  res.json({ ok:true,
-  projects: projects.map(p => ({ name:p.name, repo:p.repo||'', port:p.port, path:p.path,
+  projects: projects.map(p => ({ name:p.name, repo:p.repo||'', port:p.port, path:p.path, adminOnly: !!p.adminOnly, primaryUser:p.primaryUser||'',
    preview: p.preview ? { cmd:p.preview.cmd||'', port:p.preview.port||'', env:p.preview.env||{} } : null,
    tabs: Array.isArray(p.tabs) ? p.tabs : [] })),
+  users: users.map(u => ({ username:u.username, hasToken: !!u.ghToken })),
   suggestedPort: nextPort(projects), suggestedPreviewPort: nextPreviewPort(projects) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/term/:project/windows', requireTerminalAccess, async (req,res)=>{ try {
+app.get(BASE + '/api/term/:project/windows', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  const windows = await listTmuxWindows(p.name);
  res.json({ok:true,windows});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/term/:project/windows', requireTerminalAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/term/:project/windows', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  await newTmuxWindow(p, req.body?.name || 'new task', req.body?.cmd || '');
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/term/:project/windows/:index/select', requireTerminalAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/term/:project/windows/:index/select', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  await tmux(['select-window','-t',`${tmuxSession(p.name)}:${Number(req.params.index)}`]);
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/term/:project/windows/:index/rename', requireTerminalAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/term/:project/windows/:index/rename', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  const name = String(req.body?.name || '').replace(/[\r\n\t]/g,' ').trim().slice(0,80);
  if(!name) return res.status(400).json({ok:false,error:'Window name required'});
@@ -1402,7 +2000,7 @@ app.post('/api/term/:project/windows/:index/rename', requireTerminalAccess, asyn
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.delete('/api/term/:project/windows/:index', requireTerminalAccess, async (req,res)=>{ try {
+app.delete(BASE + '/api/term/:project/windows/:index', requireTerminalAccess, async (req,res)=>{ try {
  const p = await requireProject(req,res); if(!p) return;
  const windows = await listTmuxWindows(p.name);
  if(windows.length <= 1) return res.status(400).json({ok:false,error:'Cannot close the last session'});
@@ -1410,7 +2008,7 @@ app.delete('/api/term/:project/windows/:index', requireTerminalAccess, async (re
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/term/:project/', requireTerminalAccess, async (req,res)=>{ await audit('terminal_open', { project: req.params.project }, req);
+app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ await audit('terminal_open', { project: req.params.project }, req);
  const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); const projectJson = JSON.stringify(p.name).replace(/</g,'\\u003c');
  const railProjects = filterProjectsForUser(await loadProjects(), req.user);
  res.append('Set-Cookie', `pw_last=${encodeURIComponent(p.name)}; Path=/; Max-Age=31536000; SameSite=Lax`);
@@ -1419,90 +2017,131 @@ app.get('/term/:project/', requireTerminalAccess, async (req,res)=>{ await audit
  const _ws = await loadWorkbenchSettings();
  const cliTabsJson = JSON.stringify((_ws.enabledClis||[]).filter(k=>k in SUPPORTED_CLIS).map(k=>({label:SUPPORTED_CLIS[k].label,bin:SUPPORTED_CLIS[k].bin}))).replace(/</g,'\\u003c');
  await clearPending(p);
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Workbench</title><style>${designTokensCss}${cockpitCss}${modalBaseCss}${previewCss}</style></head><body><div id="shell"><main id="stage"><div id="topBar"><span class="projChip" title="Current project: ${esc(p.name)}"><span class="pcMono" style="--h:${projHue(p.name)}">${esc(projMonogram(p.name))}</span><span class="pcName">${esc(p.name)}</span></span><div id="tabScroller" class="tabScroller"><button id="tabArrowL" class="tabArrow" type="button" aria-label="Scroll tabs left" tabindex="-1">‹</button><div id="tabStrip" class="tabStrip"></div><button id="tabArrowR" class="tabArrow" type="button" aria-label="Scroll tabs right" tabindex="-1">›</button></div><div class="tbActions"><button class="previewBtn" type="button" data-preview="${esc(p.name)}" title="Open live preview window"><span class="pbDot"></span>Preview</button><button id="fileBtn" type="button" title="Files — paste or drop into project"><span class="fileInfo">Files</span></button><button id="railBtn" class="railBtn" type="button" aria-label="Toggle project rail">☰</button></div></div><div id="tray"><div id="drop" tabindex="0"><div>Paste/drop/select files here</div><div class="dropHint">PDF, txt, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status">Saved files go to <code>${esc(p.path)}/_inbox</code>. The path will be inserted into the terminal.</div><div id="preview"></div><div id="inboxHeader" class="inboxHeader"></div><div id="inboxList" class="inboxList"></div><button class="close" id="close">Close</button></div><div id="trayShield" aria-hidden="true"></div><iframe id="term" src="/pty/${encodeURIComponent(p.name)}/"></iframe></main>${railHtml(railProjects, p.name, req.user)}</div><script>const project=${projectJson};const tabPresets=${tabPresetsJson};let pwAuthRedirecting=false;window.pwAuthLost=function(){if(pwAuthRedirecting)return true;pwAuthRedirecting=true;location.href='/login?next='+encodeURIComponent(location.pathname);return true};const cliTabs=${cliTabsJson};const tray=document.getElementById('tray'),drop=document.getElementById('drop'),file=document.getElementById('file'),status=document.getElementById('status'),preview=document.getElementById('preview'),inboxHeader=document.getElementById('inboxHeader'),inboxList=document.getElementById('inboxList'),frame=document.getElementById('term');let previewTimer=null;const hoverPanel=Object.assign(document.createElement('div'),{id:'pwHoverPreview'});document.body.appendChild(hoverPanel);function setStatus(t,bad=false){status.textContent=t;status.style.color=bad?'#fca5a5':'#bbf7d0'}function clearPreview(){preview.innerHTML='';document.body.classList.remove('has-preview');setStatus('');if(previewTimer){clearTimeout(previewTimer);previewTimer=null}}function showPreview(url,name,isImage){if(!url&&!name)return clearPreview();if(previewTimer){clearTimeout(previewTimer);previewTimer=null}document.body.classList.add('has-preview');const safeName=escHtml(name||'file');if(isImage&&url){preview.innerHTML='<div class="previewItem"><a href="'+url+'" target="_blank" rel="noopener"><img src="'+url+'" alt="'+safeName+'"></a><button class="previewClear" type="button" title="Clear preview">×</button></div>'}else{preview.innerHTML='<div class="previewItem"><div style="padding:18px;border:1px solid #334155;border-radius:8px;color:#cbd5e1;text-align:center;display:flex;align-items:center;justify-content:center;min-height:130px;word-break:break-all;background:#111827">'+safeName+'</div><button class="previewClear" type="button" title="Clear preview">×</button></div>'}preview.querySelector('.previewClear').onclick=clearPreview;previewTimer=setTimeout(closeTray,15000)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function refreshInbox(){try{const r=await fetch('/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const out=await r.json();if(!out?.ok){inboxHeader.innerHTML='';inboxList.innerHTML='';return}const files=out.files||[];if(files.length===0){inboxHeader.innerHTML='<span>No saved files yet.</span>';inboxList.innerHTML='';return}inboxHeader.innerHTML='<span>'+files.length+' saved file'+(files.length===1?'':'s')+' — click a row to insert its path</span><button class="clear" type="button">Clear all</button>';inboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s inbox?'))return;await fetch('/api/inbox/'+encodeURIComponent(project),{method:'DELETE'});refreshInbox()};inboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';row.title='Click to insert path: '+f.path;const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);row.innerHTML='<div class="thumb">'+(isImg?'<img src="'+f.url+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+'</div></div><button class="del" type="button" title="Delete">×</button>';row.onclick=ev=>{if(ev.target.closest('.del'))return;if(insertPath(f.path)){setStatus('Inserted:\\n'+f.path)}else{setStatus('Could not insert (no terminal focus)',true)}};row.onmouseenter=()=>{hoverPanel.innerHTML=isImg?'<img src="'+f.url+'">':'<div class="card">'+escHtml(f.name)+'<div class="meta">'+fmtSize(f.size)+'</div></div>';hoverPanel.style.display='block';const rct=row.getBoundingClientRect(),pw=hoverPanel.offsetWidth,ph=hoverPanel.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;let lf=rct.right+10;if(lf+pw>vw-8)lf=Math.max(8,rct.left-pw-10);let tp=rct.top-4;if(tp+ph>vh-8)tp=Math.max(8,vh-ph-8);if(tp<8)tp=8;hoverPanel.style.left=lf+'px';hoverPanel.style.top=tp+'px'};row.onmouseleave=()=>{hoverPanel.style.display='none'};row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();hoverPanel.style.display='none';await fetch('/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(f.name),{method:'DELETE'});refreshInbox()};inboxList.appendChild(row)}}catch{}}function openTray(msg){document.body.classList.add('shade-open');setTimeout(()=>drop.focus(),50);if(msg)setStatus(msg);refreshInbox()}function closeTray(){document.body.classList.remove('shade-open');clearPreview();focusTerminal()}function focusTerminal(){try{const ta=frame.contentDocument?.querySelector('textarea.xterm-helper-textarea');if(ta){ta.focus();return}}catch{}try{frame.contentWindow?.focus()}catch{}}function toggleTray(){document.body.classList.contains('shade-open')?closeTray():openTray()}document.getElementById('fileBtn').onclick=toggleTray;document.getElementById('close').onclick=closeTray;document.getElementById('trayShield').onclick=closeTray;document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.classList.contains('shade-open'))closeTray()});function insertPath(path){try{if(frame.contentWindow.__pwSendToTerminal?.(path))return true}catch{}try{const ta=frame.contentDocument.querySelector('textarea.xterm-helper-textarea')||frame.contentDocument.querySelector('textarea');if(!ta)return false;ta.focus();const dt=new DataTransfer();dt.setData('text/plain',path);ta.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));return true}catch{return false}}async function upload(blob,name='clipboard-file'){if(!blob)return setStatus('No file received.',true);setStatus('Saving file...');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const res=await fetch('/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name,mime:blob.type||'application/octet-stream',data})});const out=await res.json().catch(()=>null);if(!res.ok||!out?.ok)throw new Error(out?.error||'Upload failed');const ok=insertPath(out.path);try{await navigator.clipboard.writeText(out.path)}catch{}showPreview(out.url,name||'file',(blob.type||'').startsWith('image/'));setStatus('Saved and '+(ok?'inserted':'copied')+':\\n'+out.path);refreshInbox()}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name).catch(e=>setStatus(e.message||String(e),true));drop.addEventListener('dragover',e=>{e.preventDefault();drop.style.borderColor='#60a5fa'});drop.addEventListener('dragleave',()=>drop.style.borderColor='#64748b');/* drop handler removed — the window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads because e.preventDefault() stops the browser default but not other listeners. */window.addEventListener('paste',e=>{const items=[...(e.clipboardData?.items||[])];const item=items.find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();openTray('Saving pasted file...');upload(f,f?.name||'clipboard-file').catch(err=>setStatus(err.message||String(err),true))},true);let dragDepth=0;window.addEventListener('dragenter',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();dragDepth++;openTray('Drop files here to save them into _inbox.')}},true);window.addEventListener('dragover',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.style.borderColor='#60a5fa'}},true);window.addEventListener('dragleave',e=>{if(e.dataTransfer?.types?.includes('Files')){dragDepth=Math.max(0,dragDepth-1);if(dragDepth===0)drop.style.borderColor='#64748b'}},true);window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();dragDepth=0;drop.style.borderColor='#64748b';openTray();upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))}},true);window.addEventListener('message',e=>{const d=e.data;if(!d||typeof d!=='object')return;if(d.type==='pw-open-image-tray'){openTray(d.message||'Paste the file here.')}else if(d.type==='pw-paste-saved'){openTray();const base=(d.path||'').split('/').pop()||'file';showPreview(d.url,base,/\\.(png|jpe?g|webp|gif|bmp)$/i.test(base));setStatus('Saved and inserted:\\n'+d.path);refreshInbox()}else if(d.type==='pw-paste-error'){openTray();setStatus('Paste failed: '+d.error,true)}});const TAB_DEBUG=/[?&]tabdebug\b/.test(location.search)||localStorage.getItem('pwTabDebug')==='1';console.info('[pw-tabs] tab-attention diagnostics: window.__pwTabs = latest tmux window state; set localStorage.pwTabDebug=1 (or add ?tabdebug) then reload to trace bell flags every poll.'+(TAB_DEBUG?' [tracing ON]':''));const tabStrip=document.getElementById('tabStrip');const tabScroller=document.getElementById('tabScroller');const tabArrowL=document.getElementById('tabArrowL');const tabArrowR=document.getElementById('tabArrowR');function updateTabArrows(){const of=tabStrip.scrollWidth-tabStrip.clientWidth>1;tabScroller.classList.toggle('overflow',of);if(of){const mx=tabStrip.scrollWidth-tabStrip.clientWidth;tabArrowL.disabled=tabStrip.scrollLeft<=1;tabArrowR.disabled=tabStrip.scrollLeft>=mx-1}}function scrollTabs(dir){tabStrip.scrollBy({left:dir*Math.max(120,Math.round(tabStrip.clientWidth*0.6)),behavior:'smooth'})}tabArrowL.onclick=()=>scrollTabs(-1);tabArrowR.onclick=()=>scrollTabs(1);tabStrip.addEventListener('scroll',updateTabArrows,{passive:true});window.addEventListener('resize',updateTabArrows);const tabsBase='/api/term/'+encodeURIComponent(project)+'/windows';let lastTabsKey='';let editingIdx=null;let editAfterRender=false;function startEdit(label,w){editingIdx=w.index;const original=label.textContent;label.contentEditable='true';label.classList.add('editing');label.focus();const sel=window.getSelection();const range=document.createRange();range.selectNodeContents(label);sel.removeAllRanges();sel.addRange(range);let done=false;const finish=async save=>{if(done)return;done=true;label.contentEditable='false';label.classList.remove('editing');label.removeEventListener('keydown',onKey);label.removeEventListener('blur',onBlur);const next=label.textContent.trim();editingIdx=null;if(save&&next&&next!==w.name){try{await fetch(tabsBase+'/'+w.index+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:next})})}catch{}lastTabsKey='';refreshTabs()}else if(!save){label.textContent=original}};const onKey=ev=>{if(ev.key==='Enter'){ev.preventDefault();finish(true)}else if(ev.key==='Escape'){ev.preventDefault();finish(false)}};const onBlur=()=>finish(true);label.addEventListener('keydown',onKey);label.addEventListener('blur',onBlur)}function closeTabMenu(){document.querySelector('.tabMenu')?.remove();document.removeEventListener('click',closeTabMenu,true);document.removeEventListener('keydown',tabMenuKey,true)}function tabMenuKey(e){if(e.key==='Escape')closeTabMenu()}async function spawnTab(name,cmd){editAfterRender=!name;await fetch(tabsBase,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name||'new task',cmd:cmd||''})});lastTabsKey='';refreshTabs()}function openTabMenu(anchor,windows){closeTabMenu();const menu=document.createElement('div');menu.className='tabMenu';menu.addEventListener('click',e=>e.stopPropagation());const existing=new Set((windows||[]).map(w=>w.name));const usable=(tabPresets||[]).filter(t=>t&&t.name&&!existing.has(t.name));for(const t of usable){const item=document.createElement('button');item.type='button';item.className='tabMenuItem';item.innerHTML='<span class="ti-name">'+escHtml(t.name)+'</span>'+(t.cmd?'<span class="ti-cmd">'+escHtml(t.cmd)+'</span>':'');item.onclick=()=>{spawnTab(t.name,t.cmd||'');closeTabMenu()};menu.appendChild(item)}if(usable.length===0&&(tabPresets||[]).length>0){const note=document.createElement('div');note.className='tabMenuItem empty';note.textContent='All tab templates are already open';menu.appendChild(note)}const cliUsable=(cliTabs||[]).filter(c=>!existing.has(c.label));const hasAbove=(tabPresets||[]).length>0;for(let i=0;i<cliUsable.length;i++){const c=cliUsable[i];const item=document.createElement('button');item.type='button';item.className='tabMenuItem'+(i===0&&hasAbove?' blank':'');item.innerHTML='<span class="ti-name">'+escHtml(c.label)+'</span><span class="ti-cmd">'+escHtml(c.bin)+'</span>';item.onclick=()=>{spawnTab(c.label,c.bin);closeTabMenu()};menu.appendChild(item)}const blank=document.createElement('button');blank.type='button';blank.className='tabMenuItem blank';blank.innerHTML='<span class="ti-name">+ Blank tab</span><span class="ti-cmd">plain bash, name it after creation</span>';blank.onclick=()=>{spawnTab('','');closeTabMenu()};menu.appendChild(blank);document.body.appendChild(menu);const r=anchor.getBoundingClientRect();const mw=menu.offsetWidth||220;let lf=r.left;if(lf+mw>window.innerWidth-8)lf=Math.max(8,window.innerWidth-mw-8);menu.style.left=lf+'px';menu.style.top=(r.bottom+4)+'px';setTimeout(()=>{document.addEventListener('click',closeTabMenu,true);document.addEventListener('keydown',tabMenuKey,true)},0)}async function refreshTabs(){if(editingIdx!=null)return;try{const r=await fetch(tabsBase,{cache:'no-store'});if(r.status===401)return void window.pwAuthLost();const out=await r.json();if(!out?.ok){tabStrip.innerHTML='';lastTabsKey='';return}window.__pwTabs=out.windows;if(TAB_DEBUG)console.debug('[pw-tabs]',new Date().toLocaleTimeString(),(out.windows||[]).map(w=>'#'+w.index+' '+(w.name||'')+' active='+(w.active?1:0)+' bell='+(w.bell?1:0)).join('  |  '));const key=JSON.stringify(out.windows);if(key===lastTabsKey)return;lastTabsKey=key;renderTabs(out.windows)}catch{}}function renderTabs(windows){tabStrip.innerHTML='';for(const w of windows){const tab=document.createElement('div');const needsAttention=w.bell&&!w.active;if(needsAttention&&TAB_DEBUG)console.log('[pw-tabs] ATTENTION \u2192 #'+w.index+' '+(w.name||''));tab.className='tab'+(w.active?' active':'')+(needsAttention?' attention':'');tab.title=w.active?'Click name to rename':(needsAttention?'Finished — click to view':'Window '+w.index+': '+(w.name||''));if(w.working){const lv=document.createElement('span');lv.className='live';lv.title='Working…';tab.appendChild(lv)}const label=document.createElement('span');label.className='name';label.textContent=w.name||('#'+w.index);label.onclick=ev=>{if(!w.active)return;ev.stopPropagation();startEdit(label,w)};tab.appendChild(label);if(windows.length>1){const x=document.createElement('span');x.className='x';x.textContent='×';x.title='Close window';x.onclick=async ev=>{ev.stopPropagation();if(!confirm('Close window "'+(w.name||w.index)+'"? Any running process in it will be killed.'))return;await fetch(tabsBase+'/'+w.index,{method:'DELETE'});lastTabsKey='';refreshTabs()};tab.appendChild(x)}tab.onclick=async()=>{if(w.active)return;await fetch(tabsBase+'/'+w.index+'/select',{method:'POST'});lastTabsKey='';refreshTabs()};tabStrip.appendChild(tab)}const plus=document.createElement('button');plus.className='newTab';plus.textContent='+';plus.title='New tab';plus.onclick=ev=>{ev.stopPropagation();openTabMenu(plus,windows)};tabStrip.appendChild(plus);const _act=tabStrip.querySelector('.tab.active');if(_act)try{_act.scrollIntoView({inline:'nearest',block:'nearest'})}catch{}requestAnimationFrame(updateTabArrows);if(editAfterRender){editAfterRender=false;const ai=windows.find(w=>w.active);if(ai){const tabs=tabStrip.querySelectorAll('.tab');const i=windows.indexOf(ai);const lbl=tabs[i]?.querySelector('.name');if(lbl)startEdit(lbl,ai)}}}refreshTabs();setInterval(()=>{if(!document.hidden)refreshTabs()},2000);async function pwHeartbeat(){if(document.hidden)return;try{await fetch('/api/projects/'+encodeURIComponent(project)+'/clear-pending',{method:'POST'})}catch{}}pwHeartbeat();setInterval(pwHeartbeat,10000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwHeartbeat()});</script>${railScript}${adminManage}${previewModalHtml}${previewScript}</body></html>`);
+ let deployConfigured = false;
+ let hasDeployPw = false;
+ if(DEPLOY_CENTRE){
+  const [dCfg, users] = await Promise.all([loadDeployConfig(), loadUsers()]);
+  deployConfigured = hasDeployConfigFor(p.name, dCfg);
+  const currentUser = users.find(u => u.username === req.user?.username);
+  hasDeployPw = !!currentUser?.deployPassword;
+ }
+ const deployBits = DEPLOY_CENTRE && deployConfigured ? `<script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script>${deployModalHtml}${deployModalScript}` : '';
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Workbench</title><style>${designTokensCss}${DEPLOY_CENTRE && deployConfigured ? deployCss : ''}${cockpitCss}${modalBaseCss}${previewCss}</style></head><body><div id="shell"><main id="stage"><div id="topBar"><span class="projChip" title="Current project: ${esc(p.name)}"><span class="pcMono" style="--h:${projHue(p.name)}">${esc(projMonogram(p.name))}</span><span class="pcName">${esc(p.name)}</span></span><div id="tabScroller" class="tabScroller"><button id="tabArrowL" class="tabArrow" type="button" aria-label="Scroll tabs left" tabindex="-1">‹</button><div id="tabStrip" class="tabStrip"></div><button id="tabArrowR" class="tabArrow" type="button" aria-label="Scroll tabs right" tabindex="-1">›</button></div><div class="tbActions"><button class="previewBtn" type="button" data-preview="${esc(p.name)}" title="Open live preview window"><span class="pbDot"></span>Preview</button><button id="fileBtn" type="button" title="Files — paste or drop into project"><span class="fileInfo">Files</span></button><button id="railBtn" class="railBtn" type="button" aria-label="Toggle project rail">☰</button></div></div><div id="tray"><div id="drop" tabindex="0"><div>Paste/drop/select files here</div><div class="dropHint">PDF, txt, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status">Saved files go to <code>${esc(p.path)}/_inbox</code>. The path will be inserted into the terminal.</div><div id="preview"></div><div id="inboxHeader" class="inboxHeader"></div><div id="inboxList" class="inboxList"></div><button class="close" id="close">Close</button></div><div id="trayShield" aria-hidden="true"></div><iframe id="term" src="${BASE}/pty/${encodeURIComponent(p.name)}/"></iframe></main>${railHtml(railProjects, p.name, req.user, deployConfigured)}</div><script>const project=${projectJson};const tabPresets=${tabPresetsJson};let pwAuthRedirecting=false;window.pwAuthLost=function(){if(pwAuthRedirecting)return true;pwAuthRedirecting=true;location.href='${BASE}/login?next='+encodeURIComponent(location.pathname);return true};const cliTabs=${cliTabsJson};const tray=document.getElementById('tray'),drop=document.getElementById('drop'),file=document.getElementById('file'),status=document.getElementById('status'),preview=document.getElementById('preview'),inboxHeader=document.getElementById('inboxHeader'),inboxList=document.getElementById('inboxList'),frame=document.getElementById('term');let previewTimer=null;const hoverPanel=Object.assign(document.createElement('div'),{id:'pwHoverPreview'});document.body.appendChild(hoverPanel);function setStatus(t,bad=false){status.textContent=t;status.style.color=bad?'#fca5a5':'#bbf7d0'}function clearPreview(){preview.innerHTML='';document.body.classList.remove('has-preview');setStatus('');if(previewTimer){clearTimeout(previewTimer);previewTimer=null}}function showPreview(url,name,isImage){if(!url&&!name)return clearPreview();if(previewTimer){clearTimeout(previewTimer);previewTimer=null}document.body.classList.add('has-preview');const safeName=escHtml(name||'file');if(isImage&&url){preview.innerHTML='<div class="previewItem"><a href="'+url+'" target="_blank" rel="noopener"><img src="'+url+'" alt="'+safeName+'"></a><button class="previewClear" type="button" title="Clear preview">×</button></div>'}else{preview.innerHTML='<div class="previewItem"><div style="padding:18px;border:1px solid #334155;border-radius:8px;color:#cbd5e1;text-align:center;display:flex;align-items:center;justify-content:center;min-height:130px;word-break:break-all;background:#111827">'+safeName+'</div><button class="previewClear" type="button" title="Clear preview">×</button></div>'}preview.querySelector('.previewClear').onclick=clearPreview;previewTimer=setTimeout(closeTray,15000)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function refreshInbox(){try{const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const out=await r.json();if(!out?.ok){inboxHeader.innerHTML='';inboxList.innerHTML='';return}const files=out.files||[];if(files.length===0){inboxHeader.innerHTML='<span>No saved files yet.</span>';inboxList.innerHTML='';return}inboxHeader.innerHTML='<span>'+files.length+' saved file'+(files.length===1?'':'s')+' — click a row to insert its path</span><button class="clear" type="button">Clear all</button>';inboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s inbox?'))return;await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{method:'DELETE'});refreshInbox()};inboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';row.title='Click to insert path: '+f.path;const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);row.innerHTML='<div class="thumb">'+(isImg?'<img src="'+f.url+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+'</div></div><button class="del" type="button" title="Delete">×</button>';row.onclick=ev=>{if(ev.target.closest('.del'))return;if(insertPath(f.path)){setStatus('Inserted:\\n'+f.path)}else{setStatus('Could not insert (no terminal focus)',true)}};row.onmouseenter=()=>{hoverPanel.innerHTML=isImg?'<img src="'+f.url+'">':'<div class="card">'+escHtml(f.name)+'<div class="meta">'+fmtSize(f.size)+'</div></div>';hoverPanel.style.display='block';const rct=row.getBoundingClientRect(),pw=hoverPanel.offsetWidth,ph=hoverPanel.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;let lf=rct.right+10;if(lf+pw>vw-8)lf=Math.max(8,rct.left-pw-10);let tp=rct.top-4;if(tp+ph>vh-8)tp=Math.max(8,vh-ph-8);if(tp<8)tp=8;hoverPanel.style.left=lf+'px';hoverPanel.style.top=tp+'px'};row.onmouseleave=()=>{hoverPanel.style.display='none'};row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();hoverPanel.style.display='none';await fetch('${BASE}/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(f.name),{method:'DELETE'});refreshInbox()};inboxList.appendChild(row)}}catch{}}function openTray(msg){document.body.classList.add('shade-open');setTimeout(()=>drop.focus(),50);if(msg)setStatus(msg);refreshInbox()}function closeTray(){document.body.classList.remove('shade-open');clearPreview();focusTerminal()}function focusTerminal(){try{const ta=frame.contentDocument?.querySelector('textarea.xterm-helper-textarea');if(ta){ta.focus();return}}catch{}try{frame.contentWindow?.focus()}catch{}}function toggleTray(){document.body.classList.contains('shade-open')?closeTray():openTray()}document.getElementById('fileBtn').onclick=toggleTray;document.getElementById('close').onclick=closeTray;document.getElementById('trayShield').onclick=closeTray;document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.classList.contains('shade-open'))closeTray()});function insertPath(path){try{if(frame.contentWindow.__pwSendToTerminal?.(path))return true}catch{}try{const ta=frame.contentDocument.querySelector('textarea.xterm-helper-textarea')||frame.contentDocument.querySelector('textarea');if(!ta)return false;ta.focus();const dt=new DataTransfer();dt.setData('text/plain',path);ta.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));return true}catch{return false}}async function upload(blob,name='clipboard-file'){if(!blob)return setStatus('No file received.',true);setStatus('Saving file...');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const res=await fetch('${BASE}/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name,mime:blob.type||'application/octet-stream',data})});const out=await res.json().catch(()=>null);if(!res.ok||!out?.ok)throw new Error(out?.error||'Upload failed');const ok=insertPath(out.path);try{await navigator.clipboard.writeText(out.path)}catch{}showPreview(out.url,name||'file',(blob.type||'').startsWith('image/'));setStatus('Saved and '+(ok?'inserted':'copied')+':\\n'+out.path);refreshInbox()}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name).catch(e=>setStatus(e.message||String(e),true));drop.addEventListener('dragover',e=>{e.preventDefault();drop.style.borderColor='#60a5fa'});drop.addEventListener('dragleave',()=>drop.style.borderColor='#64748b');/* drop handler removed — the window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads because e.preventDefault() stops the browser default but not other listeners. */window.addEventListener('paste',e=>{const items=[...(e.clipboardData?.items||[])];const item=items.find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();openTray('Saving pasted file...');upload(f,f?.name||'clipboard-file').catch(err=>setStatus(err.message||String(err),true))},true);let dragDepth=0;window.addEventListener('dragenter',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();dragDepth++;openTray('Drop files here to save them into _inbox.')}},true);window.addEventListener('dragover',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.style.borderColor='#60a5fa'}},true);window.addEventListener('dragleave',e=>{if(e.dataTransfer?.types?.includes('Files')){dragDepth=Math.max(0,dragDepth-1);if(dragDepth===0)drop.style.borderColor='#64748b'}},true);window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();dragDepth=0;drop.style.borderColor='#64748b';openTray();upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))}},true);window.addEventListener('message',e=>{const d=e.data;if(!d||typeof d!=='object')return;if(d.type==='pw-open-image-tray'){openTray(d.message||'Paste the file here.')}else if(d.type==='pw-paste-saved'){openTray();const base=(d.path||'').split('/').pop()||'file';showPreview(d.url,base,/\\.(png|jpe?g|webp|gif|bmp)$/i.test(base));setStatus('Saved and inserted:\\n'+d.path);refreshInbox()}else if(d.type==='pw-paste-error'){openTray();setStatus('Paste failed: '+d.error,true)}});const TAB_DEBUG=/[?&]tabdebug\b/.test(location.search)||localStorage.getItem('pwTabDebug')==='1';console.info('[pw-tabs] tab-attention diagnostics: window.__pwTabs = latest tmux window state; set localStorage.pwTabDebug=1 (or add ?tabdebug) then reload to trace bell flags every poll.'+(TAB_DEBUG?' [tracing ON]':''));const tabStrip=document.getElementById('tabStrip');const tabScroller=document.getElementById('tabScroller');const tabArrowL=document.getElementById('tabArrowL');const tabArrowR=document.getElementById('tabArrowR');function updateTabArrows(){const of=tabStrip.scrollWidth-tabStrip.clientWidth>1;tabScroller.classList.toggle('overflow',of);if(of){const mx=tabStrip.scrollWidth-tabStrip.clientWidth;tabArrowL.disabled=tabStrip.scrollLeft<=1;tabArrowR.disabled=tabStrip.scrollLeft>=mx-1}}function scrollTabs(dir){tabStrip.scrollBy({left:dir*Math.max(120,Math.round(tabStrip.clientWidth*0.6)),behavior:'smooth'})}tabArrowL.onclick=()=>scrollTabs(-1);tabArrowR.onclick=()=>scrollTabs(1);tabStrip.addEventListener('scroll',updateTabArrows,{passive:true});window.addEventListener('resize',updateTabArrows);const tabsBase='${BASE}/api/term/'+encodeURIComponent(project)+'/windows';let lastTabsKey='';let editingIdx=null;let editAfterRender=false;function startEdit(label,w){editingIdx=w.index;const original=label.textContent;label.contentEditable='true';label.classList.add('editing');label.focus();const sel=window.getSelection();const range=document.createRange();range.selectNodeContents(label);sel.removeAllRanges();sel.addRange(range);let done=false;const finish=async save=>{if(done)return;done=true;label.contentEditable='false';label.classList.remove('editing');label.removeEventListener('keydown',onKey);label.removeEventListener('blur',onBlur);const next=label.textContent.trim();editingIdx=null;if(save&&next&&next!==w.name){try{await fetch(tabsBase+'/'+w.index+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:next})})}catch{}lastTabsKey='';refreshTabs()}else if(!save){label.textContent=original}};const onKey=ev=>{if(ev.key==='Enter'){ev.preventDefault();finish(true)}else if(ev.key==='Escape'){ev.preventDefault();finish(false)}};const onBlur=()=>finish(true);label.addEventListener('keydown',onKey);label.addEventListener('blur',onBlur)}function closeTabMenu(){document.querySelector('.tabMenu')?.remove();document.removeEventListener('click',closeTabMenu,true);document.removeEventListener('keydown',tabMenuKey,true)}function tabMenuKey(e){if(e.key==='Escape')closeTabMenu()}async function spawnTab(name,cmd){editAfterRender=!name;await fetch(tabsBase,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name||'new task',cmd:cmd||''})});lastTabsKey='';refreshTabs()}function openTabMenu(anchor,windows){closeTabMenu();const menu=document.createElement('div');menu.className='tabMenu';menu.addEventListener('click',e=>e.stopPropagation());const existing=new Set((windows||[]).map(w=>w.name));const usable=(tabPresets||[]).filter(t=>t&&t.name&&!existing.has(t.name));for(const t of usable){const item=document.createElement('button');item.type='button';item.className='tabMenuItem';item.innerHTML='<span class="ti-name">'+escHtml(t.name)+'</span>'+(t.cmd?'<span class="ti-cmd">'+escHtml(t.cmd)+'</span>':'');item.onclick=()=>{spawnTab(t.name,t.cmd||'');closeTabMenu()};menu.appendChild(item)}if(usable.length===0&&(tabPresets||[]).length>0){const note=document.createElement('div');note.className='tabMenuItem empty';note.textContent='All tab templates are already open';menu.appendChild(note)}const cliUsable=(cliTabs||[]).filter(c=>!existing.has(c.label));const hasAbove=(tabPresets||[]).length>0;for(let i=0;i<cliUsable.length;i++){const c=cliUsable[i];const item=document.createElement('button');item.type='button';item.className='tabMenuItem'+(i===0&&hasAbove?' blank':'');item.innerHTML='<span class="ti-name">'+escHtml(c.label)+'</span><span class="ti-cmd">'+escHtml(c.bin)+'</span>';item.onclick=()=>{spawnTab(c.label,c.bin);closeTabMenu()};menu.appendChild(item)}const blank=document.createElement('button');blank.type='button';blank.className='tabMenuItem blank';blank.innerHTML='<span class="ti-name">+ Blank tab</span><span class="ti-cmd">plain bash, name it after creation</span>';blank.onclick=()=>{spawnTab('','');closeTabMenu()};menu.appendChild(blank);document.body.appendChild(menu);const r=anchor.getBoundingClientRect();const mw=menu.offsetWidth||220;let lf=r.left;if(lf+mw>window.innerWidth-8)lf=Math.max(8,window.innerWidth-mw-8);menu.style.left=lf+'px';menu.style.top=(r.bottom+4)+'px';setTimeout(()=>{document.addEventListener('click',closeTabMenu,true);document.addEventListener('keydown',tabMenuKey,true)},0)}async function refreshTabs(){if(editingIdx!=null)return;try{const r=await fetch(tabsBase,{cache:'no-store'});if(r.status===401)return void window.pwAuthLost();const out=await r.json();if(!out?.ok){tabStrip.innerHTML='';lastTabsKey='';return}window.__pwTabs=out.windows;if(TAB_DEBUG)console.debug('[pw-tabs]',new Date().toLocaleTimeString(),(out.windows||[]).map(w=>'#'+w.index+' '+(w.name||'')+' active='+(w.active?1:0)+' bell='+(w.bell?1:0)).join('  |  '));const key=JSON.stringify(out.windows);if(key===lastTabsKey)return;lastTabsKey=key;renderTabs(out.windows)}catch{}}function renderTabs(windows){tabStrip.innerHTML='';for(const w of windows){const tab=document.createElement('div');const needsAttention=w.bell&&!w.active;if(needsAttention&&TAB_DEBUG)console.log('[pw-tabs] ATTENTION \u2192 #'+w.index+' '+(w.name||''));tab.className='tab'+(w.active?' active':'')+(needsAttention?' attention':'');tab.title=w.active?'Click name to rename':(needsAttention?'Finished — click to view':'Window '+w.index+': '+(w.name||''));if(w.working){const lv=document.createElement('span');lv.className='live';lv.title='Working…';tab.appendChild(lv)}const label=document.createElement('span');label.className='name';label.textContent=w.name||('#'+w.index);label.onclick=ev=>{if(!w.active)return;ev.stopPropagation();startEdit(label,w)};tab.appendChild(label);if(windows.length>1){const x=document.createElement('span');x.className='x';x.textContent='×';x.title='Close window';x.onclick=async ev=>{ev.stopPropagation();if(!confirm('Close window "'+(w.name||w.index)+'"? Any running process in it will be killed.'))return;await fetch(tabsBase+'/'+w.index,{method:'DELETE'});lastTabsKey='';refreshTabs()};tab.appendChild(x)}tab.onclick=async()=>{if(w.active)return;await fetch(tabsBase+'/'+w.index+'/select',{method:'POST'});lastTabsKey='';refreshTabs()};tabStrip.appendChild(tab)}const plus=document.createElement('button');plus.className='newTab';plus.textContent='+';plus.title='New tab';plus.onclick=ev=>{ev.stopPropagation();openTabMenu(plus,windows)};tabStrip.appendChild(plus);const _act=tabStrip.querySelector('.tab.active');if(_act)try{_act.scrollIntoView({inline:'nearest',block:'nearest'})}catch{}requestAnimationFrame(updateTabArrows);if(editAfterRender){editAfterRender=false;const ai=windows.find(w=>w.active);if(ai){const tabs=tabStrip.querySelectorAll('.tab');const i=windows.indexOf(ai);const lbl=tabs[i]?.querySelector('.name');if(lbl)startEdit(lbl,ai)}}}refreshTabs();setInterval(()=>{if(!document.hidden)refreshTabs()},2000);async function pwHeartbeat(){if(document.hidden)return;try{await fetch('${BASE}/api/projects/'+encodeURIComponent(project)+'/clear-pending',{method:'POST'})}catch{}}pwHeartbeat();setInterval(pwHeartbeat,10000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwHeartbeat()});</script>${railScript}${adminManage}${previewModalHtml}${previewScript}${deployBits}</body></html>`);
 });
 
 // Lightweight /files/<name>/ page: drop tray + inbox list, no terminal iframe.
 // Lets content_editor (and other inbox-write roles) drop files into a project's
 // _inbox without granting raw shell. Hand-off path for the planned PVIKPBot
 // content workflow.
-app.get('/files/:project/', requireInboxWrite, async (req,res)=>{
+app.get(BASE + '/files/:project/', requireInboxWrite, async (req,res)=>{
  const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project');
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
  const projectJson = JSON.stringify(p.name).replace(/</g,'\\u003c');
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Files</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;background:#0f172a;color:#e5e7eb}.f-header{display:flex;align-items:center;gap:1rem;padding:.95rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.f-header h1{margin:0;font-size:1.15rem}.f-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.f-header .back:hover{background:#1e293b;color:#fff}.f-header .grow{flex:1}.f-header .who{font-size:.85rem;color:#cbd5e1}.f-main{max-width:920px;margin:1.5rem auto;padding:0 1.5rem 3rem}.f-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.f-card h2{margin:0 0 .25rem;font-size:1.1rem;color:#bfdbfe}.f-card .muted{color:#94a3b8;font-size:.85rem;margin:.15rem 0 0}#drop{border:2px dashed #64748b;border-radius:14px;padding:42px 18px;text-align:center;background:#0b1220;cursor:pointer;color:#cbd5e1;font-size:.95rem;margin-top:.75rem}#drop:hover{background:#152033;border-color:#94a3b8}#drop.over{border-color:#60a5fa;background:#152033}#drop .hint{color:#94a3b8;font-size:.82rem;margin-top:.4rem}#status{margin-top:.65rem;font-size:.85rem;color:#bbf7d0;white-space:pre-wrap;min-height:1.3em}#status.err{color:#fca5a5}.ilist{display:flex;flex-direction:column;gap:.35rem;margin-top:.5rem}.irow{display:flex;align-items:center;gap:.65rem;padding:.5rem .65rem;background:#0b1220;border:1px solid #1f2937;border-radius:8px}.irow .thumb{width:36px;height:36px;background:#1f2937;border-radius:4px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:11px;font-weight:600;overflow:hidden}.irow .thumb img{width:100%;height:100%;object-fit:cover}.irow .nameCol{flex:1 1 auto;min-width:0;overflow:hidden}.irow .nameCol .name{color:#e5e7eb;font-size:.88rem;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.irow .nameCol .meta{color:#94a3b8;font-size:.75rem}.irow .copyBtn,.irow .del,.irow a{background:transparent;border:1px solid #334155;color:#cbd5e1;border-radius:6px;padding:3px 9px;font-size:.78rem;cursor:pointer;text-decoration:none}.irow .copyBtn:hover,.irow a:hover{background:#1e293b;color:#fff}.irow .del{color:#fca5a5;border-color:#7f1d1d}.irow .del:hover{background:#7f1d1d;color:#fff}.empty{color:#94a3b8;font-style:italic;font-size:.85rem;padding:.75rem 0}${statusBarCss}</style></head><body><header class="f-header"><a class="back" href="/">← Dashboard</a><h1>Files — ${esc(p.name)}</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><main class="f-main"><div class="f-card"><h2>Drop or paste files</h2><p class="muted">Saved files go to <code>${esc(p.path)}/_inbox</code>. Click <b>Copy path</b> to grab the absolute path and hand it to whatever consumes the inbox (Claude conversation, PVIKPBot, etc.).</p><div id="drop" tabindex="0">Drop files here, paste from clipboard, or click to pick<div class="hint">PDF, text, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status"></div></div><div class="f-card"><h2>Inbox</h2><div class="ilist" id="ilist"><div class="empty">Loading…</div></div></div></main>${footer}<script>const project=${projectJson};const drop=document.getElementById('drop');const file=document.getElementById('file');const status=document.getElementById('status');const ilist=document.getElementById('ilist');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(t,err){status.textContent=t||'';status.classList.toggle('err',!!err)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}async function refreshInbox(){try{const r=await fetch('/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){ilist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){ilist.innerHTML='<div class="empty">No saved files yet.</div>';return}ilist.innerHTML=files.map(f=>{const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);return '<div class="irow" data-n="'+esc(f.name)+'" data-p="'+esc(f.path)+'"><div class="thumb">'+(isImg?'<img src="'+esc(f.url)+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'" target="_blank" rel="noopener">Open</a><button class="copyBtn" type="button">Copy path</button><button class="del" type="button">Delete</button></div>'}).join('')}catch(e){ilist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}ilist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshInbox()}else if(e.target.classList.contains('copyBtn')){try{await navigator.clipboard.writeText(row.dataset.p);setStatus('Copied path: '+row.dataset.p)}catch(err){setStatus('Could not copy: '+err.message,true)}}});async function upload(blob,name){if(!blob){setStatus('No file received.',true);return}setStatus('Saving '+(name||'file')+'…');try{const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const r=await fetch('/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name||'clipboard-file',mime:blob.type||'application/octet-stream',data})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Upload failed');try{await navigator.clipboard.writeText(j.path)}catch{}setStatus('Saved and path copied to clipboard:\\n'+j.path);refreshInbox()}catch(e){setStatus(e.message||String(e),true)}}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name);['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));['dragleave','dragend'].forEach(ev=>drop.addEventListener(ev,()=>drop.classList.remove('over')));/* drop handler removed — window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads. */window.addEventListener('paste',e=>{const item=[...(e.clipboardData?.items||[])].find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();upload(f,f?.name||'clipboard-file')},true);['dragenter','dragover'].forEach(ev=>window.addEventListener(ev,e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.classList.add('over')}},true));window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();drop.classList.remove('over');upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name)}},true);refreshInbox();</script></body></html>`);
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Files</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;background:#0f172a;color:#e5e7eb}.f-header{display:flex;align-items:center;gap:1rem;padding:.95rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.f-header h1{margin:0;font-size:1.15rem}.f-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.f-header .back:hover{background:#1e293b;color:#fff}.f-header .grow{flex:1}.f-header .who{font-size:.85rem;color:#cbd5e1}.f-main{max-width:920px;margin:1.5rem auto;padding:0 1.5rem 3rem}.f-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.f-card h2{margin:0 0 .25rem;font-size:1.1rem;color:#bfdbfe}.f-card .muted{color:#94a3b8;font-size:.85rem;margin:.15rem 0 0}#drop{border:2px dashed #64748b;border-radius:14px;padding:42px 18px;text-align:center;background:#0b1220;cursor:pointer;color:#cbd5e1;font-size:.95rem;margin-top:.75rem}#drop:hover{background:#152033;border-color:#94a3b8}#drop.over{border-color:#60a5fa;background:#152033}#drop .hint{color:#94a3b8;font-size:.82rem;margin-top:.4rem}#status{margin-top:.65rem;font-size:.85rem;color:#bbf7d0;white-space:pre-wrap;min-height:1.3em}#status.err{color:#fca5a5}.ilist{display:flex;flex-direction:column;gap:.35rem;margin-top:.5rem}.irow{display:flex;align-items:center;gap:.65rem;padding:.5rem .65rem;background:#0b1220;border:1px solid #1f2937;border-radius:8px}.irow .thumb{width:36px;height:36px;background:#1f2937;border-radius:4px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:11px;font-weight:600;overflow:hidden}.irow .thumb img{width:100%;height:100%;object-fit:cover}.irow .nameCol{flex:1 1 auto;min-width:0;overflow:hidden}.irow .nameCol .name{color:#e5e7eb;font-size:.88rem;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.irow .nameCol .meta{color:#94a3b8;font-size:.75rem}.irow .copyBtn,.irow .del,.irow a{background:transparent;border:1px solid #334155;color:#cbd5e1;border-radius:6px;padding:3px 9px;font-size:.78rem;cursor:pointer;text-decoration:none}.irow .copyBtn:hover,.irow a:hover{background:#1e293b;color:#fff}.irow .del{color:#fca5a5;border-color:#7f1d1d}.irow .del:hover{background:#7f1d1d;color:#fff}.empty{color:#94a3b8;font-style:italic;font-size:.85rem;padding:.75rem 0}${statusBarCss}</style></head><body><header class="f-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Files — ${esc(p.name)}</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><main class="f-main"><div class="f-card"><h2>Drop or paste files</h2><p class="muted">Saved files go to <code>${esc(p.path)}/_inbox</code>. Click <b>Copy path</b> to grab the absolute path and hand it to whatever consumes the inbox (Claude conversation, PVIKPBot, etc.).</p><div id="drop" tabindex="0">Drop files here, paste from clipboard, or click to pick<div class="hint">PDF, text, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status"></div></div><div class="f-card"><h2>Inbox</h2><div class="ilist" id="ilist"><div class="empty">Loading…</div></div></div><div class="f-card"><h2>Outbox <span class="muted" style="font-weight:400">— files the agent left for you</span></h2><div class="ilist" id="olist"><div class="empty">Loading…</div></div></div></main>${footer}<script>const project=${projectJson};const drop=document.getElementById('drop');const file=document.getElementById('file');const status=document.getElementById('status');const ilist=document.getElementById('ilist');const olist=document.getElementById('olist');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(t,err){status.textContent=t||'';status.classList.toggle('err',!!err)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}async function refreshInbox(){try{const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){ilist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){ilist.innerHTML='<div class="empty">No saved files yet.</div>';return}ilist.innerHTML=files.map(f=>{const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);return '<div class="irow" data-n="'+esc(f.name)+'" data-p="'+esc(f.path)+'"><div class="thumb">'+(isImg?'<img src="'+esc(f.url)+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'" target="_blank" rel="noopener">Open</a><button class="copyBtn" type="button">Copy path</button><button class="del" type="button">Delete</button></div>'}).join('')}catch(e){ilist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}ilist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshInbox()}else if(e.target.classList.contains('copyBtn')){try{await navigator.clipboard.writeText(row.dataset.p);setStatus('Copied path: '+row.dataset.p)}catch(err){setStatus('Could not copy: '+err.message,true)}}});async function upload(blob,name){if(!blob){setStatus('No file received.',true);return}setStatus('Saving '+(name||'file')+'…');try{const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const r=await fetch('${BASE}/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name||'clipboard-file',mime:blob.type||'application/octet-stream',data})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Upload failed');try{await navigator.clipboard.writeText(j.path)}catch{}setStatus('Saved and path copied to clipboard:\\n'+j.path);refreshInbox()}catch(e){setStatus(e.message||String(e),true)}}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name);['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));['dragleave','dragend'].forEach(ev=>drop.addEventListener(ev,()=>drop.classList.remove('over')));/* drop handler removed — window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads. */window.addEventListener('paste',e=>{const item=[...(e.clipboardData?.items||[])].find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();upload(f,f?.name||'clipboard-file')},true);['dragenter','dragover'].forEach(ev=>window.addEventListener(ev,e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.classList.add('over')}},true));window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();drop.classList.remove('over');upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name)}},true);async function refreshOutbox(){try{const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){olist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){olist.innerHTML='<div class="empty">No files from the agent yet.</div>';return}olist.innerHTML=files.map(f=>'<div class="irow" data-n="'+esc(f.name)+'"><div class="thumb"><span>FILE</span></div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'">Download</a><button class="del" type="button">Delete</button></div>').join('')}catch(e){olist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}olist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project)+'/file/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshOutbox()}});refreshOutbox();refreshInbox();</script></body></html>`);
 });
 
-app.post('/api/upload/:project', requireInboxWrite, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); await audit('upload', { project: p.name, filename: path.basename(full), bytes: Buffer.byteLength(data, 'base64') }, req); return res.json({ok:true,path:full,url:`/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
-app.get('/file/:project/:file', requireAuth, requireProjectAccess, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
+app.post(BASE + '/api/upload/:project', requireInboxWrite, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); await audit('upload', { project: p.name, filename: path.basename(full), bytes: Buffer.byteLength(data, 'base64') }, req); return res.json({ok:true,path:full,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
+app.get(BASE + '/file/:project/:file', requireAuth, requireProjectAccess, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
 
-app.get('/api/inbox/:project', requireAuth, requireProjectAccess, async (req,res)=>{ try {
+app.get(BASE + '/api/inbox/:project', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const inbox = path.join(p.path, '_inbox');
  let entries; try { entries = await fs.readdir(inbox, {withFileTypes:true}); } catch { return res.json({ok:true,files:[]}); }
  const files = await Promise.all(entries.filter(e=>e.isFile()).map(async e => {
   const full = path.join(inbox, e.name); const st = await fs.stat(full);
-  return { name: e.name, size: st.size, mtime: st.mtime.toISOString(), path: full, url: `/file/${encodeURIComponent(p.name)}/${encodeURIComponent(e.name)}` };
+  return { name: e.name, size: st.size, mtime: st.mtime.toISOString(), path: full, url: `${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(e.name)}` };
  }));
  files.sort((a,b)=>b.mtime.localeCompare(a.mtime));
  res.json({ok:true,files});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.delete('/api/inbox/:project/:file', requireInboxWrite, async (req,res)=>{ try {
+app.delete(BASE + '/api/inbox/:project/:file', requireInboxWrite, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const name = path.basename(req.params.file); if(!name || name==='.' || name==='..') return res.status(400).json({ok:false,error:'Invalid file'});
  await fs.rm(path.join(p.path,'_inbox',name), {force:true});
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.delete('/api/inbox/:project', requireTerminalAccess, async (req,res)=>{ try {
+app.delete(BASE + '/api/inbox/:project', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const inbox = path.join(p.path, '_inbox');
  try { const entries = await fs.readdir(inbox); await Promise.all(entries.map(n => fs.rm(path.join(inbox,n),{force:true,recursive:true}))); } catch {}
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-app.get('/api/preview/:project/status', requireAuth, requireProjectAccess, async (req,res)=>{ try {
+// _outbox: files an agent WRITES for the user to download (mirror of _inbox).
+// Listing/downloading needs project access; mutations need terminal access.
+app.get(BASE + '/api/outbox/:project', requireAuth, requireProjectAccess, async (req,res)=>{ try {
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+ const outbox = path.join(p.path, '_outbox');
+ let entries; try { entries = await fs.readdir(outbox, {withFileTypes:true}); } catch { return res.json({ok:true,files:[]}); }
+ const files = await Promise.all(entries.filter(e=>e.isFile()).map(async e => {
+  const full = path.join(outbox, e.name); const st = await fs.stat(full);
+  return { name: e.name, size: st.size, mtime: st.mtime.toISOString(), path: full, url: `${BASE}/api/outbox/${encodeURIComponent(p.name)}/file/${encodeURIComponent(e.name)}` };
+ }));
+ files.sort((a,b)=>b.mtime.localeCompare(a.mtime));
+ res.json({ok:true,files});
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+// Download one outbox file (served as an attachment under /api/ so nginx always routes it).
+app.get(BASE + '/api/outbox/:project/file/:name', requireAuth, requireProjectAccess, async (req,res)=>{
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project');
+ const name = path.basename(req.params.name); if(!name || name==='.' || name==='..') return res.status(400).send('Invalid file');
+ res.download(path.join(p.path, '_outbox', name), name, (err)=>{ if(err && !res.headersSent) res.status(404).send('Not found'); });
+});
+app.delete(BASE + '/api/outbox/:project/file/:name', requireTerminalAccess, async (req,res)=>{ try {
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+ const name = path.basename(req.params.name); if(!name || name==='.' || name==='..') return res.status(400).json({ok:false,error:'Invalid file'});
+ await fs.rm(path.join(p.path,'_outbox',name), {force:true});
+ res.json({ok:true});
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+app.delete(BASE + '/api/outbox/:project', requireTerminalAccess, async (req,res)=>{ try {
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+ const outbox = path.join(p.path, '_outbox');
+ try { const entries = await fs.readdir(outbox); await Promise.all(entries.map(n => fs.rm(path.join(outbox,n),{force:true,recursive:true}))); } catch {}
+ res.json({ok:true});
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+app.get(BASE + '/api/preview/:project/status', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const status = await previewStatus(p);
  res.json({ ok:true, project:p.name, cmd:p.preview?.cmd || '', ...status });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/preview/:project/start', requireTerminalAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/preview/:project/start', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  if(!hasPreview(p)) return res.status(400).json({ok:false,error:'Preview is not configured for this project. Edit it on the Manage page.'});
  await startPreviewUnit(p);
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/preview/:project/stop', requireTerminalAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/preview/:project/stop', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- await sh('systemctl',['stop',previewUnit(p.name)]).catch(()=>{});
+ if(DEPLOY_MODE === 'container') await stopPreviewUnit(p.name);
+ else await sh('systemctl',['stop',previewUnit(p.name)]).catch(()=>{});
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/preview/:project/restart', requireTerminalAccess, async (req,res)=>{ try {
+app.post(BASE + '/api/preview/:project/restart', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  if(!hasPreview(p)) return res.status(400).json({ok:false,error:'Preview is not configured for this project.'});
  await startPreviewUnit(p);
  res.json({ ok:true, ...(await previewStatus(p)) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/preview/:project/logs', requireAuth, requireProjectAccess, async (req,res)=>{ try {
+app.get(BASE + '/api/preview/:project/logs', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const lines = Math.min(2000, Math.max(20, Number(req.query.lines) || 200));
  const log = await previewLogs(p.name, lines);
  res.json({ ok:true, log });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/api/setup/state', requireAdmin, async (_req,res)=>{ try {
+app.get(BASE + '/api/setup/state', requireAdmin, async (_req,res)=>{ try {
  const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatuses()]);
  const updateStamp = await getClaudeUpdateStamp();
  res.json({ ok:true, settings, clis, updateStamp });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/state', requireAdmin, async (req,res)=>{ try {
+app.post(BASE + '/api/setup/state', requireAdmin, async (req,res)=>{ try {
  const s = await loadWorkbenchSettings();
  const body = req.body || {};
  if(typeof body.permissionMode === 'string') s.permissionMode = normalizePermissionMode(body.permissionMode);
@@ -1514,13 +2153,13 @@ app.post('/api/setup/state', requireAdmin, async (req,res)=>{ try {
  res.json({ ok:true, settings:s });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/heal/nginx', requireAdminOrLocal, async (_req,res)=>{ try {
+app.post(BASE + '/api/setup/heal/nginx', requireAdminOrLocal, async (_req,res)=>{ try {
  const projects = await loadProjects();
  await applyRouting(projects);
  res.json({ ok:true, message:`Regenerated nginx config from projects.json (${projects.length} project route${projects.length===1?'':'s'} + /pty/_setup/) and reloaded nginx.` });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{ try {
+app.post(BASE + '/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{ try {
  const steps = [];
  for(const d of [pendingDir,'/etc/project-workbench','/opt/project-workbench/workspaces','/opt/project-workbench/memory']){
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
@@ -1537,7 +2176,7 @@ app.post('/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{ try {
  res.json({ ok:true, message: steps.join('\n') });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
+app.post(BASE + '/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
  const cli = String(req.body?.cli || '');
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
  const { stdout, stderr } = await sh('npm',['install','-g',`${cfg.pkg}@latest`],{timeout:300000});
@@ -1545,7 +2184,7 @@ app.post('/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
  res.json({ ok:true, version: version || 'not installed', log:(stdout+stderr).slice(-1500) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.post('/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
+app.post(BASE + '/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
  const cli = String(req.body?.cli || '');
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
  const ready = await ensureSetupTerminal();
@@ -1554,14 +2193,14 @@ app.post('/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
  res.json({ ok:true, command: cfg.authCmd });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get('/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
-app.get('/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
-app.get('/healthz', (_req,res)=>res.json({ok:true}));
+app.get(BASE + '/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
+app.get(BASE + '/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
+app.get(BASE + '/healthz', (_req,res)=>res.json({ok:true}));
 // Public-readable agent guide. Lives in the repo at AGENTS.md and is the
 // canonical place for an external AI agent to learn how to discover sessions,
 // inject prompts, hand off files, etc. on this PW instance. No auth so a
 // remote agent can curl it without first negotiating credentials.
-app.get('/agents.md', async (_req,res) => {
+app.get(BASE + '/agents.md', async (_req,res) => {
  try {
   // Prefer the live-deployed source-tree copy; fall back to the dashboard's
   // installed copy if the source tree isn't present (e.g. tarball install).
@@ -1595,39 +2234,41 @@ const settingsScript = `<script>(function(){const tabs=document.querySelectorAll
 // --- Users tab ---
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
-let pwProjects=[];async function loadProjectList(){try{const r=await fetch('/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="5" class="muted">loading…</td></tr>';try{const r=await fetch('/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="5" class="muted">'+esc(e.message)+'</td></tr>'}}
+let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="5" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Projects</th><th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td><td>'+projectsCellHtml(u.projects)+'</td><td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
-uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
+function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
+function tokenCellHtml(u){return u.hasToken?'<td><span class="role-pill" style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)">✓ token</span></td>':'<td><span class="role-pill">none</span></td>'}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
 // --- User modal (used for both Add and Edit) ---
-const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
+const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
 function renderProjList(selected){if(!pwProjects.length){umProjList.innerHTML='<span class="empty">No projects in <code>projects.json</code> yet — add one from the dashboard\\'s Manage page first.</span>';return}const sel=new Set(Array.isArray(selected)?selected:[]);umProjList.innerHTML=pwProjects.map(p=>'<label><input type="checkbox" value="'+esc(p)+'"'+(sel.has(p)?' checked':'')+'>'+esc(p)+'</label>').join('')}
 function syncStarDisabled(){umProjList.classList.toggle('disabled',umProjStar.checked)}
 umProjStar.addEventListener('change',syncStarDisabled);
-function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
+function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';umGhToken.value='';umGhToken.placeholder=user?.hasToken?'(stored — leave blank to keep)':'ghp_… (optional)';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
 function umCloseFn(){umBackdrop.classList.add('hidden')}
 umCancel.addEventListener('click',umCloseFn);umClose.addEventListener('click',umCloseFn);umBackdrop.addEventListener('click',e=>{if(e.target===umBackdrop)umCloseFn()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!umBackdrop.classList.contains('hidden'))umCloseFn()});
 uAddBtn.addEventListener('click',()=>{if(!pwProjects.length){loadProjectList().then(()=>umOpen('add',null))}else{umOpen('add',null)}});
-umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects};if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={};if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;r=await fetch('/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
+umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects};const ghToken=umGhToken.value.trim();if(ghToken)body.ghToken=ghToken;${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();" : ''}if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={};if(ghToken)patchBody.ghToken=ghToken;if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
 loadProjectList();loadUsers();
 // --- CLIs + Environment + System tabs (reuse existing /api/setup/* endpoints) ---
-const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('/pty/_setup/')<0)authFrame.src='/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('/api/setup/heal/dirs',healDirs);loadState();loadSystem();
+const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('${BASE}/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);loadState();loadSystem();
 // --- First Run tab: launch wizard modal ---
 document.getElementById('rerunWizardBtn')?.addEventListener('click',()=>{document.getElementById('setupBackdrop')?.classList.remove('hidden')});})();</script>`;
 
-app.get('/settings', requireAdmin, async (req,res) => {
+app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
 <section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed.</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
 <section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead">Install or update each assistant, then sign in. Tokens land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Sign-in terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
 <section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
-<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
+<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
 ${wizardModalHtml}${wizardScript}${settingsScript}${footer}</body></html>`);
 });
 
@@ -1635,34 +2276,35 @@ ${wizardModalHtml}${wizardScript}${settingsScript}${footer}</body></html>`);
 // Auth routes (Phase 1)
 // ============================================================================
 const loginCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;background:#0f172a;color:#e5e7eb}.card{background:#111827;border:1px solid #334155;border-radius:14px;padding:2rem 1.75rem;max-width:380px;width:calc(100% - 2rem);box-shadow:0 30px 80px rgba(0,0,0,.6)}h1{margin:0 0 .35rem;font-size:1.45rem}.sub{margin:0 0 1.5rem;color:#94a3b8;font-size:.9rem}label{display:block;margin:.75rem 0 .3rem;font-size:.85rem;color:#cbd5e1}input{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.6rem;width:100%;box-sizing:border-box;font:inherit}.button{display:inline-block;background:#2563eb;color:white;padding:.65rem 1rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit;width:100%;margin-top:1rem}.button:hover{background:#1d4ed8}.err{margin-top:.85rem;color:#fca5a5;font-size:.85rem;min-height:1.2em}.foot{margin-top:1.25rem;color:#64748b;font-size:.75rem;text-align:center}`;
-app.get('/login', (req,res) => {
- if(req.user && !req.user.implicit){ return res.redirect(req.query.next ? String(req.query.next) : '/'); }
- const next = req.query.next ? String(req.query.next) : '/';
+app.get(BASE + '/login', (req,res) => {
+ if(req.user && !req.user.implicit){ return res.redirect(req.query.next ? String(req.query.next) : BASE + '/'); }
+ const next = req.query.next ? String(req.query.next) : BASE + '/';
  const msg = req.query.msg ? String(req.query.msg) : '';
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Project Workbench</title><style>${loginCss}</style></head><body><div class="card"><h1>Project Workbench</h1><p class="sub">Sign in to continue.</p><form id="loginForm"><label>Username<input id="u" name="username" autocomplete="username" autofocus required></label><label>Password<input id="p" name="password" type="password" autocomplete="current-password" required></label><button class="button" type="submit">Sign in</button><div class="err" id="err">${esc(msg)}</div></form></div><script>const next=${JSON.stringify(next)};document.getElementById('loginForm').addEventListener('submit',async e=>{e.preventDefault();const u=document.getElementById('u').value;const p=document.getElementById('p').value;const err=document.getElementById('err');err.textContent='Signing in…';try{const r=await fetch('/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});const j=await r.json();if(!j.ok){err.textContent=j.error||'Login failed';return}location.href=next}catch(e){err.textContent=e.message||String(e)}});</script></body></html>`);
+ const sub = AUTH_MODE === 'ldap' ? `Sign in with ${esc(LOGIN_ORG || 'your directory account')}.` : 'Sign in to continue.';
+ const uph = AUTH_MODE === 'ldap' ? 'firstname.lastname' : 'username';
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Sign in — Project Workbench</title><style>${loginCss}</style></head><body><div class="card"><h1>Project Workbench</h1><p class="sub">${sub}</p><form id="loginForm"><label>Username<input id="u" name="username" autocomplete="username" placeholder="${uph}" autofocus required></label><label>Password<input id="p" name="password" type="password" autocomplete="current-password" required></label><button class="button" type="submit">Sign in</button><div class="err" id="err">${esc(msg)}</div></form></div><script>const next=${JSON.stringify(next)};document.getElementById('loginForm').addEventListener('submit',async e=>{e.preventDefault();const u=document.getElementById('u').value;const p=document.getElementById('p').value;const err=document.getElementById('err');err.textContent='Signing in…';try{const r=await fetch('${BASE}/api/auth/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:u,password:p})});const j=await r.json();if(!j.ok){err.textContent=j.error||'Login failed';return}location.href=next}catch(e){err.textContent=e.message||String(e)}});</script></body></html>`);
 });
 
-app.post('/api/auth/login', async (req,res) => {
+app.post(BASE + '/api/auth/login', async (req,res) => {
  try {
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
   if(!username || !password){ await audit('login_fail', { reason:'missing-fields', username }, req); return res.status(400).json({ ok:false, error:'Username and password required' }); }
-  const users = await loadUsers();
-  const u = users.find(x => x.username === username);
-  if(!u){ await audit('login_fail', { reason:'unknown-user', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  const ok = await verifyPassword(password, u.passwordHash);
-  if(!ok){ await audit('login_fail', { reason:'bad-password', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
+  let u = null;
+  try { u = await authenticate(username, password); }
+  catch(e){ await audit('login_fail', { reason:'ldap-bind', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
+  if(!u){ await audit('login_fail', { reason:'invalid', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
   const sid = await createSession(u.id);
   setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
-  // Record lastLoginAt opportunistically (best-effort, don't fail the login if it can't write).
-  try { u.lastLoginAt = new Date().toISOString(); await saveUsers(users); } catch {}
+  // Record lastLoginAt opportunistically (best-effort; re-load so we mutate the persisted record).
+  try { const list = await loadUsers(); const rec = list.find(x => x.id === u.id); if(rec){ rec.lastLoginAt = new Date().toISOString(); await saveUsers(list); } } catch {}
   req.user = u;
   await audit('login_ok', { username }, req);
   res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
-app.post('/api/auth/logout', async (req,res) => {
+app.post(BASE + '/api/auth/logout', async (req,res) => {
  try {
   const sid = getCookie(req, SESSION_COOKIE);
   if(sid) await revokeSession(sid);
@@ -1672,7 +2314,7 @@ app.post('/api/auth/logout', async (req,res) => {
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
-app.get('/api/auth/me', (req,res) => {
+app.get(BASE + '/api/auth/me', (req,res) => {
  if(!req.user){ return res.status(401).json({ ok:false, authenticated:false, enforce: AUTH_ENFORCE }); }
  res.json({ ok:true, authenticated: !req.user.implicit, enforce: AUTH_ENFORCE, user: { username:req.user.username, role:req.user.role, projects:req.user.projects, implicit: !!req.user.implicit } });
 });
@@ -1681,14 +2323,26 @@ app.get('/api/auth/me', (req,res) => {
 // ?project=<name>; 401/403 otherwise. nginx then allows or blocks the parent.
 // ?admin=1 forces an admin-only check regardless of project (used for the
 // shared setup terminal at /pty/_setup/).
-app.get('/api/auth/check', async (req,res) => {
+app.get(BASE + '/api/auth/check', async (req,res) => {
  try {
-  const project = String(req.query.project || '');
-  const adminOnly = String(req.query.admin || '') === '1';
+  // nginx's auth_request does NOT forward the parent request's query string, so
+  // derive the project/setup scope from the ORIGINAL request path (X-Original-URI)
+  // when the query params are absent. Without this, the raw ttyd pty and live
+  // preview would be reachable regardless of per-project grants or adminOnly.
+  const orig = String(req.headers['x-original-uri'] || '');
+  let project = String(req.query.project || '');
+  let adminOnly = String(req.query.admin || '') === '1';
+  if(!project && !adminOnly && orig){
+   if(/\/pty\/_setup\//.test(orig)) adminOnly = true;
+   else { const m = orig.match(/\/(?:pty|preview)\/([^\/?]+)/); if(m){ try { project = decodeURIComponent(m[1]); } catch { project = m[1]; } } }
+  }
   if(!req.user){
    if(!AUTH_ENFORCE) return res.status(200).end(); // soft mode: allow.
    return res.status(401).end();
   }
+  // Optional sibling-app SSO: propagate the authenticated username so an
+  // nginx auth_request can forward it to sister apps (opt-in via PW_SSO_USER_HEADER).
+  if(SSO_USER_HEADER && !req.user.implicit) res.set(SSO_USER_HEADER, req.user.username);
   if(adminOnly){
    return res.status(req.user.role === 'admin' ? 200 : 403).end();
   }
@@ -1696,6 +2350,9 @@ app.get('/api/auth/check', async (req,res) => {
   if(project){
    if(!TERMINAL_ROLES.has(req.user.role)) return res.status(403).end();
    if(!userHasProjectAccess(req.user, project)) return res.status(403).end();
+   const projects = await loadProjects();
+   const proj = projects.find(x => x.name === project);
+   if(proj?.adminOnly) return res.status(403).end();
   }
   return res.status(200).end();
  } catch { res.status(500).end(); }
@@ -1706,7 +2363,9 @@ app.get('/api/auth/check', async (req,res) => {
 // Last-admin guard prevents accidental lockout.
 // ============================================================================
 function safeUserShape(u){
- return { username: u.username, role: u.role, projects: u.projects, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+ const out = { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+ if(DEPLOY_CENTRE) out.hasDeployPassword = !!u.deployPassword;
+ return out;
 }
 function isAdmin(u){ return u && u.role === 'admin'; }
 function countAdmins(users){ return users.filter(isAdmin).length; }
@@ -1720,34 +2379,40 @@ function normalizeProjects(value){
  return out;
 }
 
-app.get('/api/users', requireAdmin, async (_req,res) => {
+app.get(BASE + '/api/users', requireAdmin, async (_req,res) => {
  try { const users = await loadUsers(); res.json({ ok:true, users: users.map(safeUserShape) }); }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
-app.post('/api/users', requireAdmin, async (req,res) => {
+app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
  try {
   const username = String(req.body?.username || '').trim();
   const role = String(req.body?.role || '');
   const password = String(req.body?.password || '');
+  const ghToken = typeof req.body?.ghToken === 'string' ? req.body.ghToken.trim() : '';
+  const deployPassword = DEPLOY_CENTRE && typeof req.body?.deployPassword === 'string' ? req.body.deployPassword.trim() : '';
   if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
   if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
-  if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
+  if(AUTH_MODE !== 'ldap' && password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   let projects;
   try { projects = normalizeProjects(req.body?.projects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
   const users = await loadUsers();
   if(users.some(u => u.username === username)) return res.status(409).json({ ok:false, error:`User "${username}" already exists` });
-  const passwordHash = await hashPassword(password);
+  const passwordHash = AUTH_MODE === 'ldap' ? undefined : await hashPassword(password);
   const now = new Date().toISOString();
   const id = 'u-' + crypto.randomBytes(6).toString('base64url');
-  users.push({ id, username, passwordHash, role, projects, createdAt: now, lastLoginAt: null });
+  const rec = { id, username, role, projects, createdAt: now, lastLoginAt: null };
+  if(passwordHash) rec.passwordHash = passwordHash;
+  if(ghToken) rec.ghToken = encrypt(ghToken);
+  if(deployPassword) rec.deployPassword = encrypt(deployPassword);
+  users.push(rec);
   await saveUsers(users);
-  await audit('user_create', { username, role, projects }, req);
-  res.json({ ok:true, user: safeUserShape({ username, role, projects, createdAt: now, lastLoginAt: null }) });
+  await audit('user_create', { username, role, projects, hasToken: !!ghToken }, req);
+  res.json({ ok:true, user: safeUserShape(rec) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
-app.patch('/api/users/:username', requireAdmin, async (req,res) => {
+app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
   const users = await loadUsers();
@@ -1756,6 +2421,8 @@ app.patch('/api/users/:username', requireAdmin, async (req,res) => {
   const newUsername = req.body?.username !== undefined ? String(req.body.username).trim() : undefined;
   const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
   const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
+  const newToken = req.body?.ghToken !== undefined ? String(req.body.ghToken || '').trim() : undefined;
+  const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
   if(newUsername !== undefined){
    if(!validNewUsername(newUsername)) return res.status(400).json({ ok:false, error:'Invalid username' });
    if(newUsername !== u.username && users.some(x => x.username === newUsername)) return res.status(409).json({ ok:false, error:`Username "${newUsername}" already exists` });
@@ -1772,14 +2439,23 @@ app.patch('/api/users/:username', requireAdmin, async (req,res) => {
   if(newUsername !== undefined) u.username = newUsername;
   if(newRole !== undefined) u.role = newRole;
   if(newProjects !== undefined) u.projects = projectsResolved;
+  if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
+  if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
   await saveUsers(users);
-  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects } }, req);
+  if(newToken !== undefined){
+   const projects = await loadProjects();
+   for(const p of projects){
+    if(p.primaryUser === u.username) await syncProjectCredentials(p, users);
+   }
+  }
+  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken } }, req);
   res.json({ ok:true, user: safeUserShape(u) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
-app.post('/api/users/:username/password', requireAdmin, async (req,res) => {
+app.post(BASE + '/api/users/:username/password', requireAdmin, async (req,res) => {
  try {
+  if(AUTH_MODE === 'ldap') return res.status(400).json({ ok:false, error:'Passwords are managed by the directory (ldap mode)' });
   const target = req.params.username;
   const password = String(req.body?.password || '');
   if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
@@ -1793,7 +2469,7 @@ app.post('/api/users/:username/password', requireAdmin, async (req,res) => {
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
-app.delete('/api/users/:username', requireAdmin, async (req,res) => {
+app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
   const users = await loadUsers();
@@ -1804,6 +2480,19 @@ app.delete('/api/users/:username', requireAdmin, async (req,res) => {
   }
   const [removed] = users.splice(i, 1);
   await saveUsers(users);
+  // Revoke any on-disk git credentials this user seeded: for every project that
+  // named them primaryUser, drop the reference and re-sync (the user is already
+  // gone from `users`, so syncProjectCredentials takes the clear path — removes
+  // the 0600 cred file and unsets the local helper). Otherwise the deleted
+  // account's token would keep authenticating git in those workspaces.
+  try {
+   const projects = await loadProjects();
+   let changed = false;
+   for(const p of projects){
+    if(p.primaryUser === target){ delete p.primaryUser; await syncProjectCredentials(p, users); changed = true; }
+   }
+   if(changed) await saveProjects(projects);
+  } catch {}
   try {
    const sessions = await loadSessions();
    const remaining = sessions.filter(s => s.userId !== removed.id);
@@ -1818,7 +2507,7 @@ app.delete('/api/users/:username', requireAdmin, async (req,res) => {
 // System status / readiness (admin-only). Used by Settings → System tab and
 // by the first-run wizard auto-trigger to decide whether to prompt.
 // ============================================================================
-app.get('/api/system/status', requireAdmin, async (_req,res) => {
+app.get(BASE + '/api/system/status', requireAdmin, async (_req,res) => {
  try {
   const [claudeVersion, updateStamp, users, settings] = await Promise.all([
    getClaudeVersion(), getClaudeUpdateStamp(), loadUsers(), loadWorkbenchSettings(),
@@ -1838,7 +2527,7 @@ app.get('/api/system/status', requireAdmin, async (_req,res) => {
 
 // Returns minimal first-run hint to any authenticated/implicit user so the
 // dashboard knows whether to auto-prompt the wizard.
-app.get('/api/system/firstrun', async (_req,res) => {
+app.get(BASE + '/api/system/firstrun', async (_req,res) => {
  try {
   const [claudeVersion, users, claudeAuth] = await Promise.all([getClaudeVersion(), loadUsers(), getCliAuth('claude')]);
   const needed = claudeVersion === 'unavailable' || !claudeAuth || users.length === 0;
@@ -1846,5 +2535,242 @@ app.get('/api/system/firstrun', async (_req,res) => {
  } catch { res.json({ ok:true, firstRunNeeded: false }); }
 });
 
-app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="/manage">Back to Manage</a></p>`); });
-app.listen(3000,'127.0.0.1',()=>{ console.log('dashboard listening on 127.0.0.1:3000'); sweepOrphanTmuxSessions(); });
+if(DEPLOY_CENTRE){
+ const fmtDeployLog = (entry) => entry ? `${entry.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')} by ${entry.user}` : 'Never deployed';
+
+ async function deployPageCard(p, cfg, isAdmin){
+  const devCfg = cfg[p.name]?.dev || {};
+  const prodCfg = cfg[p.name]?.prod || {};
+  const devSlot = deploySlot(p,'dev'); const prodSlot = deploySlot(p,'prod');
+  const devOptSel = deployOptionSelect(devSlot); const prodOptSel = deployOptionSelect(prodSlot);
+  const localVersion = await getLocalVersion(p.path || workspacePath(p.name));
+  const log = await readDeployLog(p.name);
+  const devLog = log.filter(e=>e.target==='dev').slice(-1)[0];
+  const prodLog = log.filter(e=>e.target==='prod').slice(-1)[0];
+  return `<div class="project-card" data-project="${esc(p.name)}">
+   <h2>${esc(p.name)}</h2>
+   <div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>
+   <div class="targets">
+    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}">
+     <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
+     <div class="version-line">Version: <span class="version current-version">—</span>${devCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
+     <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
+     ${devCfg.script ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : (isAdmin ? `<span class="no-config">Configure script below</span>` : `<span class="no-config">Not configured</span>`)}
+     <div class="deploy-output"></div>
+     ${isAdmin ? `<div class="config-section">
+      <label>Deploy script (bash)</label>
+      <textarea class="deploy-script" placeholder="#!/bin/bash&#10;ssh devserver 'cd /app && git pull && npm install && pm2 restart all'">${esc(devCfg.script||'')}</textarea>
+      <label>Version check command</label>
+      <input class="version-cmd" placeholder="ssh devserver 'cat /app/package.json | jq -r .version'" value="${esc(devCfg.versionCmd||'')}">
+      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+     </div>` : ''}
+    </div>
+    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}">
+     <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
+     <div class="version-line">Version: <span class="version current-version">—</span>${prodCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
+     <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
+     ${prodCfg.script ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : (isAdmin ? `<span class="no-config">Configure script below</span>` : `<span class="no-config">Not configured</span>`)}
+     <div class="deploy-output"></div>
+     ${isAdmin ? `<div class="config-section">
+      <label>Deploy script (bash)</label>
+      <textarea class="deploy-script" placeholder="#!/bin/bash&#10;ssh prodserver 'cd /app && git pull origin main && npm ci --production && pm2 restart all'">${esc(prodCfg.script||'')}</textarea>
+      <label>Version check command</label>
+      <input class="version-cmd" placeholder="ssh prodserver 'cat /app/package.json | jq -r .version'" value="${esc(prodCfg.versionCmd||'')}">
+      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+     </div>` : ''}
+    </div>
+   </div>
+   <button class="button secondary small toggle-log" type="button" style="margin-top:.8rem">Show history</button>
+   <div class="deploy-log" style="display:none"></div>
+  </div>`;
+ }
+
+ async function deployModalCard(p, cfg, isAdmin, deployEnv){
+  const devCfg = cfg[p.name]?.dev || {};
+  const prodCfg = cfg[p.name]?.prod || {};
+  const devSlot = deploySlot(p,'dev'); const prodSlot = deploySlot(p,'prod');
+  const devOptSel = deployOptionSelect(devSlot); const prodOptSel = deployOptionSelect(prodSlot);
+  const [devVersion, prodVersion, localVersion, allLog] = await Promise.all([
+   getDeployedVersion(p.name,'dev',cfg,deployEnv),
+   getDeployedVersion(p.name,'prod',cfg,deployEnv),
+   getLocalVersion(p.path || workspacePath(p.name)),
+   readDeployLog(p.name)
+  ]);
+  const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
+  const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
+  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td class="${e.status==='success'||e.ok?'ok':'fail'}">${e.status==='success'||e.ok?'✅ OK':'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
+  return `<div class="deploy-tabs"><button class="deploy-tab active" data-tab="deploy-panel">Deploy</button><button class="deploy-tab" data-tab="history-panel">History</button></div>
+   <div id="deploy-panel" class="deploy-tab-panel">
+   <div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>
+   <div class="targets">
+    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}">
+     <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
+     <div>Version: <span class="version current-version">${esc(devVersion||'—')}</span>${sourceNewer(localVersion?.version, devVersion)?`<span style="display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap" title="Working copy is newer than the deployed build — deploy to update">⬆ source newer</span>`:''}</div>
+     <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
+     ${devCfg.script ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
+     <div class="deploy-output"></div>
+     ${isAdmin ? `<div class="config-section">
+      <label>Deploy script (bash)</label>
+      <textarea class="deploy-script">${esc(devCfg.script||'')}</textarea>
+      <label>Version check command</label>
+      <input class="version-cmd" value="${esc(devCfg.versionCmd||'')}">
+      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+     </div>` : ''}
+    </div>
+    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}">
+     <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
+     <div>Version: <span class="version current-version">${esc(prodVersion||'—')}</span>${sourceNewer(localVersion?.version, prodVersion)?`<span style="display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap" title="Working copy is newer than the deployed build — deploy to update">⬆ source newer</span>`:''}</div>
+     <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
+     ${prodCfg.script ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
+     <div class="deploy-output"></div>
+     ${isAdmin ? `<div class="config-section">
+      <label>Deploy script (bash)</label>
+      <textarea class="deploy-script">${esc(prodCfg.script||'')}</textarea>
+      <label>Version check command</label>
+      <input class="version-cmd" value="${esc(prodCfg.versionCmd||'')}">
+      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+     </div>` : ''}
+    </div>
+   </div>
+   </div>
+   <div id="history-panel" class="deploy-tab-panel" style="display:none">
+    ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th></tr></thead><tbody>${historyRows}</tbody></table>` : `<p class="muted">No deployment history yet.</p>`}
+   </div>`;
+ }
+
+ app.get(BASE + '/deploy', requireAuth, async (req,res)=>{
+  const isAdmin = req.user?.role === 'admin';
+  const projects = await loadProjects();
+  const cfg = await loadDeployConfig();
+  const users = await loadUsers();
+  const currentUser = users.find(u => u.username === req.user?.username);
+  const visibleProjects = filterProjectsForUser(projects, req.user);
+  const cards = await Promise.all(visibleProjects.map(p => deployPageCard(p, cfg, isAdmin)));
+  const noProjects = visibleProjects.length === 0 ? `<p class="muted">No projects configured. <a href="${BASE}/manage">Add a project</a> first.</p>` : '';
+  const hasDeployPw = !!currentUser?.deployPassword;
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body><script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
+ });
+
+ app.post(BASE + '/api/deploy/config', requireAdmin, async (req,res)=>{
+  try {
+   const { project, target, script, versionCmd } = req.body || {};
+   if(!project || !validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+   if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
+   if(project === '__proto__' || project === 'constructor' || project === 'prototype') return res.status(400).json({ok:false,error:'Invalid project name'});
+   const cfg = await loadDeployConfig();
+   if(!cfg[project]) cfg[project] = {};
+   cfg[project][target] = { script: String(script||'').trim(), versionCmd: String(versionCmd||'').trim() };
+   await saveDeployConfig(cfg);
+   await audit('deploy_config_update', { project, target }, req);
+   res.json({ok:true});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ app.get(BASE + '/api/deploy/status', requireAuth, async (req,res)=>{
+  try {
+   const projects = filterProjectsForUser(await loadProjects(), req.user);
+   const cfg = await loadDeployConfig();
+   const users = await loadUsers();
+   const currentUser = users.find(u => u.username === req.user?.username);
+   const deployEnv = getDeployEnv(users, currentUser);
+   const status = await Promise.all(projects.map(async p => ({
+    name: p.name,
+    dev: { version: await getDeployedVersion(p.name,'dev',cfg,deployEnv), configured: !!(cfg[p.name]?.dev?.script) },
+    prod: { version: await getDeployedVersion(p.name,'prod',cfg,deployEnv), configured: !!(cfg[p.name]?.prod?.script) },
+   })));
+   res.json({ok:true, projects: status});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ app.post(BASE + '/api/deploy/:project/:target', requireAuth, requireProjectAccess, async (req,res)=>{
+  const { project, target } = req.params;
+  if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+  if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
+  const p = await projectByName(project);
+  if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+  const cfg = await loadDeployConfig();
+  const tc = cfg[project]?.[target];
+  if(!tc || !tc.script) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
+  const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
+  let option = String(req.body?.option || '').trim();
+  if(allowedOpts.length){ if(!option) option = allowedOpts[0]; if(!allowedOpts.includes(option)) return res.status(400).json({ok:false,error:'Invalid option for this slot'}); }
+  else option = '';
+  const users = await loadUsers();
+  const currentUser = users.find(u => u.username === req.user?.username);
+  const deployPassword = req.body?.password || (currentUser?.deployPassword ? decrypt(currentUser.deployPassword) : '');
+  const deployUser = currentUser?.deployUser || currentUser?.username || req.user?.username || '';
+  const start = Date.now();
+  let output = '', status = 'success', version = null;
+  try {
+   const result = await execFileAsync('bash',['-c',tc.script,'pw-deploy',option],{timeout:300000, env:{...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}});
+   output = (result.stdout || '') + (result.stderr || '');
+  } catch(e) {
+   status = 'failed';
+   output = (e.stdout || '') + (e.stderr || '') + '\n' + (e.message || '');
+  }
+  const duration = ((Date.now()-start)/1000).toFixed(1);
+  if(tc.versionCmd){
+   try { const { stdout } = await execFileAsync('bash',['-c',tc.versionCmd],{timeout:30000, env:{...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}}); version = stdout.trim()||null; } catch {}
+  }
+  const logEntry = { ts: new Date().toISOString(), project, target, option: option||undefined, version, user: req.user?.username||'unknown', status, duration, outputSnippet: output.slice(0,500) };
+  await appendDeployLog(logEntry);
+  await audit('deploy_execute', { project, target, option: option||undefined, status, version, duration }, req);
+  res.json({ ok: status==='success', status, output: output.slice(0,5000), version, duration, user: req.user?.username });
+ });
+
+ app.get(BASE + '/api/deploy/:project/log', requireAuth, requireProjectAccess, async (req,res)=>{
+  try { res.json({ok:true, log: await readDeployLog(req.params.project)}); }
+  catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ app.get(BASE + '/api/deploy/:project/:target/version', requireAuth, requireProjectAccess, async (req,res)=>{
+  try {
+   const { project, target } = req.params;
+   if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+   if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
+   const cfg = await loadDeployConfig();
+   const tc = cfg[project]?.[target];
+   if(!tc?.versionCmd) return res.json({ok:true, version:null, configured:false});
+   const users = await loadUsers();
+   const currentUser = users.find(u => u.username === req.user?.username);
+   const deployEnv = getDeployEnv(users, currentUser);
+   const version = await getDeployedVersion(project, target, cfg, deployEnv);
+   res.json({ok:true, version, configured:true});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ app.get(BASE + '/api/deploy/:project/card', requireAuth, requireProjectAccess, async (req,res)=>{
+  try {
+   const projectName = req.params.project;
+   const p = await projectByName(projectName);
+   if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+   const isAdmin = req.user?.role === 'admin';
+   const cfg = await loadDeployConfig();
+   const users = await loadUsers();
+   const currentUser = users.find(u => u.username === req.user?.username);
+   const deployEnv = getDeployEnv(users, currentUser);
+   res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, deployEnv)});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+}
+
+app.use((err,_req,res,_next)=>{ console.error(err); res.status(500).type('html').send(`<h1>Workbench error</h1><pre>${esc(err.message || err)}</pre><p><a href="${BASE}/manage">Back to Manage</a></p>`); });
+const PORT = parseInt(process.env.PORT || '3000', 10);
+app.listen(PORT,'127.0.0.1',()=>{
+ console.log(`dashboard listening on 127.0.0.1:${PORT}`);
+ console.log(`[deploy-mode] ${DEPLOY_MODE}`);
+ if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
+ if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
+ sweepOrphanTmuxSessions();
+ setTimeout(async ()=>{
+  try {
+   const projects = await loadProjects();
+   for(const p of projects){
+    try { await startProject(p); console.log(`[boot] started terminal for ${p.name} on port ${p.port}`); }
+    catch(e){ console.error(`[boot] failed to start ${p.name}:`, e.message); }
+   }
+   await applyRouting(projects);
+   console.log(`[boot] auto-start complete (${projects.length} project${projects.length===1?'':'s'})`);
+  } catch(e){ console.error('[boot] auto-start error:', e.message); }
+ }, 2000);
+});

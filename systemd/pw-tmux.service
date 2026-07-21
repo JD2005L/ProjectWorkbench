@@ -1,0 +1,39 @@
+[Unit]
+Description=Project Workbench persistent tmux server (terminal sessions)
+Documentation=https://github.com/GovAlta-EMU/ProjWB
+After=network-online.target
+Wants=network-online.target
+
+# The main app container (project-workbench.service) is ordered After= and
+# Requires= this unit so the shared tmux server is up before the app attaches.
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=5
+ExecStartPre=-/usr/bin/podman rm -f pw-tmux
+# Same image + same mounts as the app container so shells/agents in the panes see
+# identical workspaces, agent homes, npm-global CLIs and CA trust. The extra
+# -v .../run/tmux mount is the shared tmux socket dir; TMUX_TMPDIR points at it.
+ExecStart=/usr/bin/podman run --name pw-tmux \
+  --network=host --pid=host --privileged \
+  -e TMUX_TMPDIR=/opt/project-workbench/run/tmux \
+  -e NPM_CONFIG_PREFIX=/opt/npm-global \
+  -e PATH=/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  -e "NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection" \
+  -v /etc/server-docs:/etc/server-docs:ro \
+  -v /opt/project-workbench/source/app:/opt/project-workbench/app \
+  -v /opt/project-workbench/source/scripts:/opt/project-workbench/scripts \
+  -v /opt/project-workbench/workspaces:/opt/project-workbench/workspaces \
+  -v /opt/project-workbench/memory:/opt/project-workbench/memory \
+  -v /etc/project-workbench:/etc/project-workbench \
+  -v /etc/nginx/conf.d:/etc/nginx/conf.d \
+  -v /opt/project-workbench/persistent/npm-global:/opt/npm-global \
+  -v /opt/project-workbench/persistent/root-home:/root \
+  -v /opt/project-workbench/persistent/admin-home:/home/admin \
+  -v /opt/project-workbench/run/tmux:/opt/project-workbench/run/tmux \
+  project-workbench:latest \
+  /opt/project-workbench/scripts/pw-tmux-keepalive.sh
+ExecStop=/usr/bin/podman stop -t 10 pw-tmux
+
+[Install]
+WantedBy=multi-user.target
