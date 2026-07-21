@@ -1544,7 +1544,7 @@ function railHtml(projects, currentName, user, deployConfigured=false){
  const isAdmin = user.role === 'admin';
  const keys = projects.map((p,i)=>{
   const cur = p.name === currentName;
-  return `<a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-dot" aria-hidden="true"></span><span class="pk-pin" role="button" tabindex="-1" title="Pin">📌</span><span class="pk-live" aria-hidden="true"></span></a>`;
+  return `<a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-pin" role="button" tabindex="-1" title="Pin">📌</span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a>`;
  }).join('');
  const adminActs = isAdmin
   ? `<a class="railAct" id="manageEntry" href="${BASE}/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="${BASE}/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
@@ -2164,6 +2164,8 @@ app.post(BASE + '/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{
  for(const d of [pendingDir,'/etc/project-workbench','/opt/project-workbench/workspaces','/opt/project-workbench/memory']){
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
  }
+ // The Stop hook runs as admin and must be able to drop markers in pendingDir.
+ await sh('chown',['admin:admin',pendingDir]).catch(()=>{}); steps.push(`ok owner admin: ${pendingDir}`);
  try { await fs.access(emptyMcpPath); steps.push(`ok file: ${emptyMcpPath}`); }
  catch { await fs.writeFile(emptyMcpPath,'{}\n'); steps.push(`created: ${emptyMcpPath}`); }
  await syncWrapperEnv(await loadWorkbenchSettings()); steps.push(`refreshed: ${wrapperEnvPath}`);

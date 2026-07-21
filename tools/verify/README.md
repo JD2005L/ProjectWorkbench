@@ -22,6 +22,8 @@ Suites:
 - worktest2.mjs  — working detector: idle-view false-positive + steady output.
 - worktest3.mjs  — working detector: pause continuity, refresh continuity,
                    bell-less stop decay (≤25s by design; bells end instantly).
+- authloss.mjs   — session revoked mid-view → auto-redirect to /login?next=…
+                   within one tab-poll (~2s); re-login returns to the cockpit.
 - crud.mjs       — Manage modal end-to-end with a throwaway project.
 - shots.mjs      — ad-hoc screenshot/console-error harness (PW_VIEW, PW_CLICK,
                    PW_HOVER, PW_ACTIONS env knobs).
