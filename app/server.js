@@ -200,8 +200,22 @@ async function verifyPassword(plain, stored){
  } catch { return false; }
 }
 
+// Backward-compat: legacy user records (GOA / pre-role fork) used `isAdmin: boolean`
+// with no `role`/`projects`/`id`. Canonical authorizes on `role`+`projects` and
+// resolves sessions by `id`, so map legacy records forward. Guarded so canonical-
+// native records (which already set `role`) are left untouched; the mapping mirrors
+// what the pre-consolidation code derived inline (isAdmin?admin:developer, projects:'*').
+function normalizeUserRecord(u){
+ if(!u || typeof u !== 'object') return u;
+ if(('isAdmin' in u) && u.role == null){
+  u.role = u.isAdmin === true ? 'admin' : 'developer';
+  if(u.projects === undefined) u.projects = '*';
+ }
+ if(u.id == null) u.id = u.username;
+ return u;
+}
 async function loadUsers(){
- try { const raw = await fs.readFile(usersPath,'utf8'); const data = JSON.parse(raw); return Array.isArray(data?.users) ? data.users : []; }
+ try { const raw = await fs.readFile(usersPath,'utf8'); const data = JSON.parse(raw); return (Array.isArray(data?.users) ? data.users : []).map(normalizeUserRecord); }
  catch(e){ if(e.code === 'ENOENT') return []; throw e; }
 }
 async function saveUsers(users){
