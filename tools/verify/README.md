@@ -16,6 +16,7 @@ Setup (once per box):
    (pass files live at tools/*.pw — gitignored)
 
 Suites:
+- version-footer.mjs — release format/source + shared footer/cockpit wiring.
 - pw-verify.mjs  — full 31-check acceptance sweep (rail, bells, latch, roles,
                    a11y, force-motion, mobile hooks). Run before every ship.
 - pintest.mjs    — pinning: manual/auto/toggle/persistence + amber-over-pin.
