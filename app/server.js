@@ -28,7 +28,7 @@ const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/proje
 // catch-all `location /`; nginx -t validates it and applyRouting rolls back on
 // error. Default: file absent → nothing injected (byte-identical output).
 const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/extra-nginx.conf';
-const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath !== CANONICAL_REGISTRY;
+const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath.startsWith('/tmp/');
 const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
 const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
 const nginxTestCmd = process.env.PW_NGINX_TEST_CMD || '';
