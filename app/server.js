@@ -28,6 +28,9 @@ const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/proje
 // catch-all `location /`; nginx -t validates it and applyRouting rolls back on
 // error. Default: file absent → nothing injected (byte-identical output).
 const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/extra-nginx.conf';
+const TLS_CERT = '/etc/nginx/conf.d/ssl/pw-fullchain.crt';
+const TLS_KEY = '/etc/nginx/conf.d/ssl/pw-server.key';
+const HTTPS_ENABLED = (() => { try { return fsSync.existsSync(TLS_CERT) && fsSync.existsSync(TLS_KEY); } catch { return false; } })();
 const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath.startsWith('/tmp/');
 const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
 const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
@@ -980,7 +983,12 @@ function nginxConfig(projects){
  // unbuffered so multi-GB zips stream straight to the app (auth is enforced by
  // express on the endpoint itself, same as the JSON upload route).
  const uploadRoute = `    location ${BASE}/api/upload-stream/ {\n        client_max_body_size 0;\n        proxy_request_buffering off;\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout 3600s;\n        proxy_send_timeout 3600s;\n    }\n`;
- return `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}server {\n    listen 80 default_server;\n    server_name _;\n    client_max_body_size 100m;\n${extraLocations}${deployRoute}${uploadRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}}\n`;
+ const _pwPrelude = `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}`;
+ const _pwBody = `    client_max_body_size 100m;\n${extraLocations}${deployRoute}${uploadRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}`;
+ if(HTTPS_ENABLED){
+  return `${_pwPrelude}server {\n    listen 80 default_server;\n    server_name _;\n    return 301 https://$host$request_uri;\n}\nserver {\n    listen 443 ssl default_server;\n    server_name _;\n    ssl_certificate ${TLS_CERT};\n    ssl_certificate_key ${TLS_KEY};\n    ssl_protocols TLSv1.2 TLSv1.3;\n    ssl_ciphers HIGH:!aNULL:!MD5;\n    ssl_session_cache shared:SSL:10m;\n    ssl_session_timeout 1d;\n${_pwBody}}\n`;
+ }
+ return `${_pwPrelude}server {\n    listen 80 default_server;\n    server_name _;\n${_pwBody}}\n`;
 }
 function splitCommandLine(cmd){
  const out = [];
