@@ -2,6 +2,7 @@ import express from 'express';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
@@ -214,18 +215,25 @@ async function saveUsers(users){
 // against the system CA bundle (LDAPTLS_CACERT).
 function ldapBindOnce(bindDn, password){
  return new Promise((resolve, reject) => {
-  // Feed the bind password via stdin (-y /dev/stdin), NOT `-w <pw>`, so it never
-  // appears in argv / world-readable /proc/<pid>/cmdline (this host also grants
-  // interactive shells to terminal roles). Written without a trailing newline so
-  // `-y` reads the password verbatim regardless of its newline handling.
-  const child = spawn('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-y', '/dev/stdin'],
+  // Feed the bind password to ldapwhoami via `-y <file>` using a private 0600
+  // temp file that is unlinked as soon as the bind returns — NOT `-w <pw>` (which
+  // would expose it in argv / world-readable /proc/<pid>/cmdline; this host also
+  // grants interactive shells to terminal roles) and NOT `-y /dev/stdin` (a
+  // Node-spawned pipe cannot be re-opened as /dev/stdin — ldapwhoami fails with
+  // ENXIO "No such device or address", which breaks every bind).
+  let dir, pwFile;
+  try {
+   dir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'pw-ldap-'));
+   pwFile = path.join(dir, 'pw');
+   fsSync.writeFileSync(pwFile, String(password), { mode: 0o600 });
+  } catch(e){ return reject(new Error('LDAP credential staging failed: ' + (e.message || e))); }
+  const cleanup = () => { try { fsSync.rmSync(dir, { recursive: true, force: true }); } catch {} };
+  const child = spawn('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-y', pwFile],
    { timeout: 10000, env: { ...process.env, LDAPTLS_CACERT: LDAP_CACERT, LDAPTLS_REQCERT: 'demand' } });
   let stderr = '';
   child.stderr.on('data', d => { stderr += d; });
-  child.on('error', e => reject(new Error(e.message || 'LDAP bind failed')));
-  child.on('close', code => { if(code === 0) resolve(true); else reject(new Error((stderr.trim() || `ldapwhoami exited ${code}`))); });
-  child.stdin.on('error', () => {});   // ignore EPIPE if the child exits before reading
-  child.stdin.end(String(password));
+  child.on('error', e => { cleanup(); reject(new Error(e.message || 'LDAP bind failed')); });
+  child.on('close', code => { cleanup(); if(code === 0) resolve(true); else reject(new Error((stderr.trim() || `ldapwhoami exited ${code}`))); });
  });
 }
 // True only for connection/TLS-level failures (retryable across a DC round-robin);
