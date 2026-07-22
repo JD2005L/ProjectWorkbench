@@ -167,16 +167,19 @@
   }
   const oscDecoder = new TextDecoder();
   const oscRe = /\x1b\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\x07|\x1b\\)/g;
+  let oscBuf = '';
   function handleClipboardOSC(text) {
-    if (!text || text.indexOf('\x1b]52;') === -1) return;
+    text = oscBuf + text; oscBuf = '';
+    if (text.indexOf('\x1b]52;') === -1) return;
     oscRe.lastIndex = 0;
-    let m;
+    let m, lastEnd = 0;
     while ((m = oscRe.exec(text)) !== null) {
-      try {
-        const data = atob(m[1]);
-        if (data) writeClipboard(data);
-      } catch {}
+      lastEnd = oscRe.lastIndex;
+      try { const data = atob(m[1]); if (data) writeClipboard(data); } catch (e) {}
     }
+    const rest = text.slice(lastEnd);
+    const si = rest.indexOf('\x1b]52;');
+    if (si !== -1) { oscBuf = rest.slice(si); if (oscBuf.length > 4000000) oscBuf = ''; }
   }
   function sniffFrame(d) {
     try {
