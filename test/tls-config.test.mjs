@@ -58,6 +58,54 @@ test('happy path: enabled config resolved, default_server off unless opted in', 
   assert.equal(resolveTlsConfig({ ...env, PW_TLS_DEFAULT_SERVER: '1' }, bothFiles).defaultServer, true);
 });
 
+// Config values are interpolated verbatim into the generated nginx file, so
+// their shapes must be too strict to smuggle nginx syntax.
+test('server name must be a concrete safe hostname/IPv4 (nginx + redirect safe)', () => {
+  const env = (name) => ({ PW_TLS_ENABLED: '1', PW_TLS_CERT: CERT, PW_TLS_KEY: KEY, PW_TLS_SERVER_NAME: name });
+  for (const good of ['pw.example.com', 'goa-pw01.goa.internal', '10.62.5.20', 'localhost', 'PW.Example.Com']) {
+    assert.equal(resolveTlsConfig(env(good), bothFiles).serverName, good, `should accept ${good}`);
+  }
+  for (const bad of [
+    'pw.example.com;}',            // nginx directive injection
+    'pw.example.com{',             // block injection
+    'a b.example.com',             // whitespace
+    'pw.example.com\nreturn 301',  // newline / control char
+    'pw.example.com\x07',          // control char
+    'evil$host',                   // nginx variable
+    '*.example.com',               // wildcard — not a concrete redirect target
+    '*',                           // universal wildcard
+    'host/path',                   // slash — not a hostname
+    'host:443',                    // port does not belong in server_name here
+    '-leadinghyphen.example.com',  // invalid label
+    'trailingdot.example.com.',    // trailing dot form rejected for redirect use
+    '..',
+  ]) {
+    assert.throws(() => resolveTlsConfig(env(bad), bothFiles), /PW_TLS_SERVER_NAME/, `should reject ${JSON.stringify(bad)}`);
+  }
+});
+
+test('cert/key paths must be plain absolute paths (no nginx metacharacters)', () => {
+  const env = (cert, key = KEY) => ({ PW_TLS_ENABLED: '1', PW_TLS_CERT: cert, PW_TLS_KEY: key, PW_TLS_SERVER_NAME: 'pw.example.com' });
+  for (const good of ['/etc/nginx/conf.d/ssl/pw-fullchain.crt', '/etc/ssl/pw/c.crt', '/opt/pw-certs/2026/server_cert.pem']) {
+    const fsAll = fakeFs({ [good]: true, [KEY]: true });
+    assert.equal(resolveTlsConfig(env(good), fsAll).cert, good, `should accept ${good}`);
+  }
+  for (const bad of [
+    '/etc/ssl/pw.crt;include /etc/evil.conf',  // directive injection
+    '/etc/ssl/pw.crt\nssl_password_file /x',   // newline injection
+    '/etc/ssl/{pw}.crt',                        // braces
+    '/etc/ssl/pw cert.crt',                     // whitespace
+    '/etc/ssl/$host.crt',                       // nginx variable
+    'relative/path.crt',                        // not absolute
+    '/etc/ssl/pw\x1b.crt',                      // control char
+  ]) {
+    const fsAll = fakeFs({ [bad]: true, [KEY]: true });
+    assert.throws(() => resolveTlsConfig(env(bad), fsAll), /PW_TLS_CERT/, `should reject ${JSON.stringify(bad)}`);
+    const fsKey = fakeFs({ [CERT]: true, [bad]: true });
+    assert.throws(() => resolveTlsConfig(env(CERT, bad), fsKey), /PW_TLS_KEY/, `should reject key ${JSON.stringify(bad)}`);
+  }
+});
+
 test('TLS off: rendered config is byte-identical to the canonical HTTP-only output', () => {
   const out = renderNginxServers('PRELUDE\n', 'BODY\n', { enabled: false });
   assert.equal(out, 'PRELUDE\nserver {\n    listen 80 default_server;\n    server_name _;\nBODY\n}\n');

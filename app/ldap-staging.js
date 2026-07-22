@@ -25,8 +25,16 @@ export function ldapBindOnce(bindDn, password, { url, cacert, timeoutMs = 10000,
   let staged;
   try { staged = stageLdapSecret(password, baseDir); }
   catch (e) { return reject(new Error('LDAP credential staging failed: ' + (e.message || e))); }
-  const child = spawnFn('ldapwhoami', ['-x', '-H', url, '-D', bindDn, '-y', staged.file],
-   { timeout: timeoutMs, env: { ...env, LDAPTLS_CACERT: cacert, LDAPTLS_REQCERT: 'demand' } });
+  // spawn can also throw synchronously (EAGAIN/EMFILE, bad options); the
+  // staged secret must not outlive that either.
+  let child;
+  try {
+   child = spawnFn('ldapwhoami', ['-x', '-H', url, '-D', bindDn, '-y', staged.file],
+    { timeout: timeoutMs, env: { ...env, LDAPTLS_CACERT: cacert, LDAPTLS_REQCERT: 'demand' } });
+  } catch (e) {
+   staged.cleanup();
+   return reject(new Error(e.message || 'LDAP bind failed'));
+  }
   let stderr = '';
   child.stderr.on('data', d => { stderr += d; });
   child.on('error', e => { staged.cleanup(); reject(new Error(e.message || 'LDAP bind failed')); });

@@ -103,6 +103,20 @@ test('ldapBindOnce spawn error: rejects, staging removed', async () => {
   }
 });
 
+test('ldapBindOnce synchronous spawn throw: rejects AND staging removed immediately', async () => {
+  const base = newBase();
+  try {
+    const spawnFn = () => { throw new Error('posix_spawn EAGAIN'); };
+    await assert.rejects(
+      ldapBindOnce('CN=user', 'pw', { url: 'ldaps://dc:636', cacert: '/ca.crt', spawnFn, baseDir: base }),
+      /EAGAIN/,
+    );
+    assert.deepEqual(entries(base), [], 'staging dir must be removed when spawn throws synchronously — not left for startup scavenging');
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
 test('scavenge removes only stale pw-ldap-* dirs owned by us; everything else untouched', () => {
   const base = newBase();
   try {

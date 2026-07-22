@@ -9,6 +9,17 @@ import fsSync from 'node:fs';
 
 const truthy = (v) => ['1', 'true', 'yes'].includes(String(v ?? '').toLowerCase());
 
+// These values are interpolated verbatim into the generated nginx config, so
+// their shapes are kept too strict to smuggle nginx syntax (or an open
+// redirect) through them:
+// - server name: a concrete RFC-1123 hostname or IPv4 address — no wildcards,
+//   variables, ports, paths, whitespace, or control characters. It doubles as
+//   the redirect target, so it must be a literal.
+// - cert/key: plain absolute file paths from a conservative character set —
+//   no whitespace, `;`, braces, `$`, or control characters.
+const SERVER_NAME_RE = /^(?=.{1,253}$)[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$/i;
+const NGINX_PATH_RE = /^\/[A-Za-z0-9._@+,=-]+(\/[A-Za-z0-9._@+,=-]+)*$/;
+
 export function resolveTlsConfig(env = process.env, fsImpl = fsSync) {
  if (!truthy(env.PW_TLS_ENABLED)) return { enabled: false };
  const cert = env.PW_TLS_CERT || '';
@@ -17,6 +28,10 @@ export function resolveTlsConfig(env = process.env, fsImpl = fsSync) {
  if (!cert) throw new Error('PW_TLS_ENABLED is set but PW_TLS_CERT is not configured');
  if (!key) throw new Error('PW_TLS_ENABLED is set but PW_TLS_KEY is not configured');
  if (!serverName) throw new Error('PW_TLS_ENABLED is set but PW_TLS_SERVER_NAME is not configured (needed for server_name and the HTTPS redirect target)');
+ if (!SERVER_NAME_RE.test(serverName)) throw new Error(`PW_TLS_SERVER_NAME must be a concrete hostname or IPv4 address (it is embedded in nginx server_name and the HTTPS redirect): ${JSON.stringify(serverName)}`);
+ for (const [label, p] of [['PW_TLS_CERT', cert], ['PW_TLS_KEY', key]]) {
+  if (!NGINX_PATH_RE.test(p)) throw new Error(`${label} must be a plain absolute file path safe to embed in nginx config: ${JSON.stringify(p)}`);
+ }
  for (const [label, p] of [['PW_TLS_CERT', cert], ['PW_TLS_KEY', key]]) {
   let ok = false;
   try {
