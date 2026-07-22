@@ -10,7 +10,9 @@
     (document.head || document.documentElement).appendChild(_pwFill);
   } catch {}
 
-  const project = decodeURIComponent((location.pathname.match(/^\/pty\/([^/]+)/) || [])[1] || '');
+  const ptyMatch = location.pathname.match(/(.*?)\/pty\/([^/]+)/);
+  const base = ptyMatch ? ptyMatch[1] : '';
+  const project = decodeURIComponent((ptyMatch || [])[2] || '');
   if (!project) return;
 
   // Suppress ttyd's "Leave site?" beforeunload prompt. This terminal is a
@@ -62,7 +64,7 @@
       r.onload = () => resolve(String(r.result).split(',')[1]);
       r.readAsDataURL(blob);
     });
-    const res = await fetch('/api/upload/' + encodeURIComponent(project), {
+    const res = await fetch(base + '/api/upload/' + encodeURIComponent(project), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename, mime: blob.type || 'application/octet-stream', data })
