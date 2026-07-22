@@ -2,6 +2,20 @@
   if (window.__projectWorkbenchPreloadInstalled) return;
   window.__projectWorkbenchPreloadInstalled = true;
 
+  // Force-hide xterm's helper <textarea> even when it's been orphaned outside a
+  // `.xterm` container. ttyd re-inits/reconnects can leave stale helper textareas
+  // behind; once detached from `.xterm` they lose xterm's scoped hiding rule and
+  // render as visible ~20x20 boxes near the cursor. This unscoped rule (xterm's
+  // own intended hidden style, forced) covers current and future orphans too.
+  try {
+    const _pwHideTa = document.createElement('style');
+    _pwHideTa.textContent =
+      'textarea.xterm-helper-textarea{position:absolute!important;width:0!important;height:0!important;padding:0!important;margin:0!important;border:0!important;opacity:0!important;left:-9999em!important;top:0!important;z-index:-5!important;overflow:hidden!important}' +
+      // ttyd's own #terminal-container .terminal uses height:calc(100% - 10px)+padding:5px, leaving a gap at the bottom; make the terminal fill its container.
+      '#terminal-container .terminal{height:100%!important;padding:0!important}';
+    (document.head || document.documentElement).appendChild(_pwHideTa);
+  } catch {}
+
   const project = decodeURIComponent((location.pathname.match(/^\/pty\/([^/]+)/) || [])[1] || '');
   if (!project) return;
 
