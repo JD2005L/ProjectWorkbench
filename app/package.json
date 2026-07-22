@@ -1,1 +1,1 @@
-{"name":"project-workbench-dashboard","private":true,"type":"module","scripts":{"start":"node server.js"},"dependencies":{"express":"^4.18.3"}}
+{"name":"project-workbench-dashboard","private":true,"type":"module","scripts":{"start":"node server.js","test":"node --test ../test/*.test.mjs"},"dependencies":{"express":"^4.18.3"}}

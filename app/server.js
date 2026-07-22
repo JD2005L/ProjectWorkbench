@@ -2,11 +2,15 @@ import express from 'express';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import path from 'path';
-import os from 'os';
 import crypto from 'crypto';
 import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 import { RELEASE_VERSION } from './version.js';
+import { resolveIsolation } from './isolation.js';
+import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
+import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
+import { normalizeUserRecord } from './users-compat.js';
+import { deployCss } from './deploy-css.js';
 
 const app = express();
 const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
@@ -14,9 +18,10 @@ const execFileAsync = promisify(execFile);
 const DEPLOY_CENTRE = ['true','1'].includes(String(process.env.PW_DEPLOY_CENTRE || '').toLowerCase());
 // Data/host paths are env-overridable so an isolated test/verify instance never
 // mutates the shared host. ISOLATED = an explicit PW_ISOLATED=1, or a registry
-// path pointed away from the canonical location (e.g. a throwaway test registry).
-const CANONICAL_REGISTRY = '/opt/project-workbench/projects.json';
-const registryPath = process.env.PW_REGISTRY_PATH || CANONICAL_REGISTRY;
+// path other than the canonical one (see app/isolation.js — deployments that
+// intentionally keep the real registry elsewhere, like GOA under /etc, opt into
+// host mode by setting PW_CANONICAL_REGISTRY to that path).
+const { registryPath, isolated: ISOLATED } = resolveIsolation(process.env);
 const deployConfigPath = process.env.PW_DEPLOY_CONFIG || '/etc/project-workbench/deploy-config.json';
 const deployLogPath = process.env.PW_DEPLOY_LOG || '/etc/project-workbench/deploy-log.jsonl';
 const SECRET_KEY_PATH = process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key';
@@ -29,10 +34,10 @@ const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/proje
 // catch-all `location /`; nginx -t validates it and applyRouting rolls back on
 // error. Default: file absent → nothing injected (byte-identical output).
 const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/extra-nginx.conf';
-const TLS_CERT = '/etc/nginx/conf.d/ssl/pw-fullchain.crt';
-const TLS_KEY = '/etc/nginx/conf.d/ssl/pw-server.key';
-const HTTPS_ENABLED = (() => { try { return fsSync.existsSync(TLS_CERT) && fsSync.existsSync(TLS_KEY); } catch { return false; } })();
-const ISOLATED = process.env.PW_ISOLATED === '1' || registryPath.startsWith('/tmp/');
+// TLS for the generated nginx config is explicit opt-in (PW_TLS_ENABLED plus
+// PW_TLS_CERT/PW_TLS_KEY/PW_TLS_SERVER_NAME, see app/tls-config.js and
+// DEPLOY.md); resolveTlsConfig throws at startup when enabled but unusable.
+const TLS = resolveTlsConfig(process.env);
 const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
 const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
 const nginxTestCmd = process.env.PW_NGINX_TEST_CMD || '';
@@ -200,20 +205,8 @@ async function verifyPassword(plain, stored){
  } catch { return false; }
 }
 
-// Backward-compat: legacy user records (GOA / pre-role fork) used `isAdmin: boolean`
-// with no `role`/`projects`/`id`. Canonical authorizes on `role`+`projects` and
-// resolves sessions by `id`, so map legacy records forward. Guarded so canonical-
-// native records (which already set `role`) are left untouched; the mapping mirrors
-// what the pre-consolidation code derived inline (isAdmin?admin:developer, projects:'*').
-function normalizeUserRecord(u){
- if(!u || typeof u !== 'object') return u;
- if(('isAdmin' in u) && u.role == null){
-  u.role = u.isAdmin === true ? 'admin' : 'developer';
-  if(u.projects === undefined) u.projects = '*';
- }
- if(u.id == null) u.id = u.username;
- return u;
-}
+// Legacy GOA `isAdmin` records are mapped to canonical role/projects/id shape
+// (and the obsolete flag dropped) by normalizeUserRecord — see app/users-compat.js.
 async function loadUsers(){
  try { const raw = await fs.readFile(usersPath,'utf8'); const data = JSON.parse(raw); return (Array.isArray(data?.users) ? data.users : []).map(normalizeUserRecord); }
  catch(e){ if(e.code === 'ENOENT') return []; throw e; }
@@ -227,29 +220,18 @@ async function saveUsers(users){
 // ---- LDAP (ldap mode) --------------------------------------------------------
 // Simple bind over TLS via ldapwhoami (no native deps). The DC cert is validated
 // against the system CA bundle (LDAPTLS_CACERT).
+// Bind password travels via a private 0600 temp file (never argv, never
+// /dev/stdin) and the staging dir is removed as soon as the bind returns —
+// see app/ldap-staging.js for the full rationale.
 function ldapBindOnce(bindDn, password){
- return new Promise((resolve, reject) => {
-  // Feed the bind password to ldapwhoami via `-y <file>` using a private 0600
-  // temp file that is unlinked as soon as the bind returns — NOT `-w <pw>` (which
-  // would expose it in argv / world-readable /proc/<pid>/cmdline; this host also
-  // grants interactive shells to terminal roles) and NOT `-y /dev/stdin` (a
-  // Node-spawned pipe cannot be re-opened as /dev/stdin — ldapwhoami fails with
-  // ENXIO "No such device or address", which breaks every bind).
-  let dir, pwFile;
-  try {
-   dir = fsSync.mkdtempSync(path.join(os.tmpdir(), 'pw-ldap-'));
-   pwFile = path.join(dir, 'pw');
-   fsSync.writeFileSync(pwFile, String(password), { mode: 0o600 });
-  } catch(e){ return reject(new Error('LDAP credential staging failed: ' + (e.message || e))); }
-  const cleanup = () => { try { fsSync.rmSync(dir, { recursive: true, force: true }); } catch {} };
-  const child = spawn('ldapwhoami', ['-x', '-H', LDAP_URL, '-D', bindDn, '-y', pwFile],
-   { timeout: 10000, env: { ...process.env, LDAPTLS_CACERT: LDAP_CACERT, LDAPTLS_REQCERT: 'demand' } });
-  let stderr = '';
-  child.stderr.on('data', d => { stderr += d; });
-  child.on('error', e => { cleanup(); reject(new Error(e.message || 'LDAP bind failed')); });
-  child.on('close', code => { cleanup(); if(code === 0) resolve(true); else reject(new Error((stderr.trim() || `ldapwhoami exited ${code}`))); });
- });
+ return ldapBindOnceStaged(bindDn, password, { url: LDAP_URL, cacert: LDAP_CACERT });
 }
+// A process killed mid-bind can still strand a staging dir; sweep stale ones
+// (pattern/uid/age-guarded, bounded) once at startup.
+try {
+ const swept = scavengeLdapStaging();
+ if(swept.length) console.log(`[ldap] scavenged ${swept.length} stale credential staging dir(s)`);
+} catch {}
 // True only for connection/TLS-level failures (retryable across a DC round-robin);
 // a real bind result (bad password, signing-required, success) is never retried.
 function isRetryableLdapError(msg){
@@ -1007,10 +989,11 @@ function nginxConfig(projects){
  const uploadRoute = `    location ${BASE}/api/upload-stream/ {\n        client_max_body_size 0;\n        proxy_request_buffering off;\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout 3600s;\n        proxy_send_timeout 3600s;\n    }\n`;
  const _pwPrelude = `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}`;
  const _pwBody = `    client_max_body_size 100m;\n${extraLocations}${deployRoute}${uploadRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}`;
- if(HTTPS_ENABLED){
-  return `${_pwPrelude}server {\n    listen 80 default_server;\n    server_name _;\n    return 301 https://$host$request_uri;\n}\nserver {\n    listen 443 ssl default_server;\n    server_name _;\n    ssl_certificate ${TLS_CERT};\n    ssl_certificate_key ${TLS_KEY};\n    ssl_protocols TLSv1.2 TLSv1.3;\n    ssl_ciphers HIGH:!aNULL:!MD5;\n    ssl_session_cache shared:SSL:10m;\n    ssl_session_timeout 1d;\n${_pwBody}}\n`;
- }
- return `${_pwPrelude}server {\n    listen 80 default_server;\n    server_name _;\n${_pwBody}}\n`;
+ // TLS off → byte-identical canonical HTTP-only server. TLS on → :80 redirects
+ // to the configured server name (never the client-controlled $host) and the
+ // full body — auth_request, /pty, previews, uploads, deploy, extra-nginx —
+ // moves unchanged into the :443 ssl server. See app/tls-config.js.
+ return renderNginxServers(_pwPrelude, _pwBody, TLS);
 }
 function splitCommandLine(cmd){
  const out = [];
@@ -1256,53 +1239,7 @@ function projMonogram(name){
 const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--panel2:#101a2e;--line:#1b2740;--line2:#2b3d61;--text:#e7eef9;--dim:#8ea3c0;--faint:#5b6d89;--cyan:#38bdf8;--blue:#2563eb;--amber:#fbbf24;--amber2:#f59e0b;--ok:#34d399;--err:#f87171;--topbar-h:42px;--rail-w:64px;--rail-wo:246px;--font:ui-sans-serif,system-ui,-apple-system,'Segoe UI',Roboto,sans-serif;--mono:ui-monospace,'Cascadia Code','SF Mono',Menlo,Consolas,monospace}
 @view-transition{navigation:auto}
 ::view-transition-old(root),::view-transition-new(root){animation-duration:.16s}\n@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}`;
-const deployCss = `
-body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:1.5rem 2rem;background:#0f172a;color:#e5e7eb}
-.deploy-page h1{margin:0 0 .2rem}
-.top{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem}
-.subtitle{color:#94a3b8;margin:0}
-.button{display:inline-block;padding:.5rem 1rem;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;text-decoration:none;font-size:.9rem}
-.button:hover{filter:brightness(1.1)}
-.button.secondary{background:#374151;color:#e5e7eb}.button.secondary:hover{background:#4b5563}
-.button.danger{background:#991b1b}.button.danger:hover{background:#b91c1c}
-.button.small{padding:.3rem .7rem;font-size:.8rem}
-.button:disabled{opacity:.5;cursor:not-allowed}
-.project-card{background:#111827;border:1px solid #374151;border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1.2rem}
-.project-card h2{margin:0 0 .8rem;font-size:1.2rem;color:#f8fafc}
-.targets{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
-.target-card{border:1px solid #334155;border-radius:8px;padding:1rem;background:#0b1220}
-.target-card h3{margin:0 0 .5rem;font-size:.95rem;text-transform:uppercase;letter-spacing:.05em}
-.target-card.dev h3{color:#6ee7b7}
-.target-card.prod h3{color:#fca5a5}
-.version{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85rem;background:#020617;border:1px solid #334155;padding:.2rem .5rem;border-radius:4px;display:inline-block;margin:.3rem 0;color:#bbf7d0}
-.version-line{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
-.probe-btn{padding:.15rem .45rem;line-height:1;font-size:.85rem}
-.top-actions{display:flex;gap:.6rem;align-items:center}
-#probe-all.probing{opacity:.7;cursor:progress}
-.last-deploy{font-size:.8rem;color:#94a3b8;margin:.4rem 0}
-.config-section{margin-top:.8rem;border-top:1px solid #1f2937;padding-top:.8rem}
-.config-section label{display:block;font-size:.8rem;font-weight:600;color:#cbd5e1;margin-bottom:.3rem}
-.config-section textarea,.config-section input{width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;padding:.4rem .5rem;border:1px solid #334155;border-radius:4px;resize:vertical;background:#020617;color:#e5e7eb}
-.config-section textarea{min-height:60px}
-.deploy-output{margin-top:.5rem;background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
-.deploy-output.show{display:block}
-.log-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:.5rem}
-.log-table th{text-align:left;border-bottom:2px solid #1f2937;padding:.4rem .5rem;color:#94a3b8;font-size:.78rem;text-transform:uppercase;letter-spacing:.02em}
-.log-table td{border-bottom:1px solid #1f2937;padding:.4rem .5rem}
-.log-table .ok{color:#6ee7b7}.log-table .fail{color:#fca5a5}
-.badge{display:inline-block;padding:.15rem .5rem;border-radius:99px;font-size:.75rem;font-weight:600}
-.badge.ok{background:rgba(16,185,129,.12);border:1px solid #065f46;color:#6ee7b7}.badge.fail{background:rgba(239,68,68,.12);border:1px solid #991b1b;color:#fca5a5}
-.no-config{color:#94a3b8;font-style:italic;font-size:.85rem}
-.muted{color:#94a3b8;font-size:.85rem}
-.local-version{font-size:.9rem;margin-bottom:.8rem;color:#cbd5e1}
-.local-version .version.source{background:#1e3a8a;border-color:#3b82f6;color:#93c5fd}
-a{color:#93c5fd}
-.deploy-tabs{display:flex;gap:0;border-bottom:2px solid #1f2937;margin-bottom:1rem}
-.deploy-tab{background:transparent;border:none;color:#94a3b8;padding:.5rem 1.2rem;font:inherit;font-size:.9rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s}
-.deploy-tab:hover{color:#e5e7eb}
-.deploy-tab.active{color:#93c5fd;border-bottom-color:#3b82f6;font-weight:600}
-@media(max-width:760px){.targets{grid-template-columns:1fr}.top{align-items:flex-start;flex-direction:column}}
-`;
+// deployCss (fully scoped) is imported from app/deploy-css.js.
 
 const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
 const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;let password='';if(!window.__pwHasDeployPassword){password=prompt('Enter your domain password for deployment:');if(password===null)return}btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});const j=await r.json();output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
