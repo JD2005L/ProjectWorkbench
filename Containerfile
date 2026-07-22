@@ -43,8 +43,12 @@ ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
     -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd
 
-# admin user for host-parity; container terminals run as root on the shared tmux.
-RUN useradd -m -s /bin/bash admin && echo "admin ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
+# admin user for host-parity. Container terminals/agents run as this NON-root
+# user (the app drops to it via `sudo -u admin`). We intentionally grant NO
+# passwordless-root sudo here: nothing in PW needs admin-initiated sudo, and in a
+# --privileged deployment admin->root would become host root (via nsenter).
+# GOA hosts also enforce this at container start via pw-harden-sudoers.sh.
+RUN useradd -m -s /bin/bash admin
 
 # This container is a single-tenant sandbox: the AI CLI runs with skip-permissions,
 # which Claude Code only allows under root when IS_SANDBOX=1. Inherited by
