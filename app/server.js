@@ -1257,8 +1257,8 @@ const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--pane
 @view-transition{navigation:auto}
 ::view-transition-old(root),::view-transition-new(root){animation-duration:.16s}\n@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}`;
 const deployCss = `
-body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:1.5rem 2rem;background:#0f172a;color:#e5e7eb}
-h1{margin:0 0 .2rem}
+body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;padding:1.5rem 2rem;background:#0f172a;color:#e5e7eb}
+.deploy-page h1{margin:0 0 .2rem}
 .top{display:flex;justify-content:space-between;align-items:center;margin-bottom:1.5rem}
 .subtitle{color:#94a3b8;margin:0}
 .button{display:inline-block;padding:.5rem 1rem;background:#2563eb;color:#fff;border:none;border-radius:8px;cursor:pointer;text-decoration:none;font-size:.9rem}
@@ -2715,7 +2715,7 @@ if(DEPLOY_CENTRE){
   const cards = await Promise.all(visibleProjects.map(p => deployPageCard(p, cfg, isAdmin)));
   const noProjects = visibleProjects.length === 0 ? `<p class="muted">No projects configured. <a href="${BASE}/manage">Add a project</a> first.</p>` : '';
   const hasDeployPw = !!currentUser?.deployPassword;
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body><script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
  });
 
  app.post(BASE + '/api/deploy/config', requireAdmin, async (req,res)=>{
