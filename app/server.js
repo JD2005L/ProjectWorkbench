@@ -745,11 +745,34 @@ async function tmuxWindowDetails(project){
 }
 function shellQuote(s){ return JSON.stringify(String(s)); }
 const projectTerminals = new Map();
+// --- GOA opt-in: run terminal/agent panes as a non-root uid via setpriv ---
+// When PW_TERMINAL_UID is set, every interactive shell tmux/ttyd spawns gets
+// wrapped with `setpriv --reuid <uid> --regid <gid> --init-groups /usr/bin/env`
+// so agents (claude/copilot/bash) run as that account instead of the app root
+// uid. Unset (default) => byte-identical to upstream (root panes).
+const TERMINAL_UID = process.env.PW_TERMINAL_UID || '';
+const TERMINAL_GID = process.env.PW_TERMINAL_GID || TERMINAL_UID;
+const TERMINAL_HOME = process.env.PW_TERMINAL_HOME || (TERMINAL_UID ? '/home/admin' : '');
+const TERMINAL_USER = process.env.PW_TERMINAL_USER || (TERMINAL_UID ? 'admin' : '');
+const TERMINAL_EXTRA_PATH = process.env.PW_TERMINAL_EXTRA_PATH || '';
+function agentEnvTokens(canonicalTokens){
+ if(!TERMINAL_UID) return canonicalTokens;
+ const kv = canonicalTokens.slice(1).map(tok=>{
+  if(tok.startsWith('HOME=')) return `HOME=${TERMINAL_HOME}`;
+  if(tok.startsWith('PATH=') && TERMINAL_EXTRA_PATH) return `${tok}:${TERMINAL_EXTRA_PATH}`;
+  return tok;
+ });
+ if(!kv.some(t=>t.startsWith('USER='))) kv.splice(1,0,`USER=${TERMINAL_USER}`,`LOGNAME=${TERMINAL_USER}`);
+ if(!kv.some(t=>t.startsWith('IS_SANDBOX='))) kv.push('IS_SANDBOX=1');
+ if(!kv.some(t=>t.startsWith('COPILOT_AUTO_UPDATE='))) kv.push('COPILOT_AUTO_UPDATE=false');
+ return ['/usr/bin/setpriv','--reuid',String(TERMINAL_UID),'--regid',String(TERMINAL_GID),'--init-groups','/usr/bin/env',...kv];
+}
+const agentLoginDropArgv = TERMINAL_UID ? ['/usr/bin/setpriv','--reuid',String(TERMINAL_UID),'--regid',String(TERMINAL_GID),'--init-groups','/usr/bin/env',`HOME=${TERMINAL_HOME}`,`USER=${TERMINAL_USER}`,`LOGNAME=${TERMINAL_USER}`] : [];
 async function ensureTmuxSession(p){
  const sess = tmuxSession(p.name);
  try { await tmux(['has-session','-t',sess]); return; } catch {}
  const cwd = p.path || workspacePath(p.name);
- const env = ['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin'];
+ const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']);
  const tabs = Array.isArray(p.tabs) ? p.tabs : [];
  const firstName = tabs[0]?.name || 'Base';
  await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash','--noprofile','--norc']);
@@ -763,7 +786,7 @@ async function ensureTmuxSession(p){
 }
 async function ensureProjectTmuxSession(p){
  try { await tmux(['has-session','-t',tmuxSession(p.name)]); return; } catch {}
- const cmd = `env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc`;
+ const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']).join(' ') + ' bash --noprofile --norc';
  await tmux(['new-session','-d','-s',tmuxSession(p.name),'-c',p.path,cmd]);
  await tmux(['send-keys','-t',tmuxSession(p.name),`printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' ${shellQuote(p.path)} ${shellQuote('/usr/local/bin/claude')} ${shellQuote(tmuxSession(p.name))}`,'C-m']);
 }
@@ -831,7 +854,7 @@ async function injectPvikpbotPrompt(p,prompt){
 }
 async function newTmuxWindow(p,name='new task',cmd=''){
  const safeName = String(name || 'new task').replace(/[\r\n\t]/g,' ').trim().slice(0,80) || 'new task';
- await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,'env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin','bash','--noprofile','--norc']);
+ await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']),'bash','--noprofile','--norc']);
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
   await new Promise(r=>setTimeout(r,80));
@@ -933,7 +956,7 @@ async function ensureSetupTerminal(){
  if(DEPLOY_MODE === 'container'){
   if(ISOLATED) return true;
   if(setupTtydProc && setupTtydProc.exitCode === null) return true;
-  setupTtydProc = spawn('ttyd',['--interface','127.0.0.1','--port',String(setupTtydPort),'--base-path',`${BASE}/pty/_setup/`,'--writable','bash','--login'],{
+  setupTtydProc = spawn('ttyd',['--interface','127.0.0.1','--port',String(setupTtydPort),'--base-path',`${BASE}/pty/_setup/`,'--writable',...agentLoginDropArgv,'bash','--login'],{
    stdio:'ignore', detached:true, env:{...process.env, HOME:'/root'}
   });
   setupTtydProc.unref();
