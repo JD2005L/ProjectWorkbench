@@ -48,6 +48,14 @@ const nginxReloadCmd = process.env.PW_NGINX_RELOAD_CMD || '';
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
 const emptyMcpPath = '/etc/project-workbench/empty-mcp.json';
+// Per-user CLI credentials: when ON, a project's terminal runs on its assigned
+// owner's (primaryUser's) own Claude login + GitHub token instead of the shared
+// box login. Opt-in (default OFF = today's single shared login, upstream-generic).
+const PER_USER_CLAUDE = String(process.env.PW_PER_USER_CLAUDE || '').toLowerCase() === 'true';
+const USER_CRED_BASE = process.env.PW_USER_CRED_BASE || '/home/admin/pw-users';
+// The shared/default Claude config (source for seeding managed MCP servers into
+// each per-user config dir so team MCP — teamkb/pulse/skillhub — still loads).
+const sharedClaudeJson = path.join(process.env.HOME || '/home/admin', '.claude.json');
 const setupTtydPort = 7680;
 const setupTmuxSession = 'pw_setup';
 const internalHandoffToken = process.env.PW_INTERNAL_HANDOFF_TOKEN || '';
@@ -144,6 +152,64 @@ async function syncProjectCredentials(project, users){
   await fs.unlink(credFile).catch(()=>{});
   await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
  }
+}
+
+// ── Per-user CLI credentials (opt-in via PW_PER_USER_CLAUDE) ────────────────
+// A project is "owned" by its primaryUser. When per-user creds are enabled, the
+// project's terminal launches with CLAUDE_CONFIG_DIR pointed at that owner's
+// private config dir, so Claude runs on the owner's OWN login/seat. The first
+// `claude` run in the project triggers the owner's OAuth login into that dir;
+// it then persists. Copilot rides on the owner's GitHub token (GH_TOKEN).
+// NOTE: all sessions still run as one OS user (uid 1001) — this gives per-user
+// accountability/seat-usage, NOT hard OS isolation between users on the box.
+function safeUserName(u){ return String(u || '').replace(/[^A-Za-z0-9._-]/g, '_'); }
+function userClaudeConfigDir(username){ return path.join(USER_CRED_BASE, safeUserName(username), 'claude'); }
+async function userClaudeSignedIn(username){
+ try { const st = await fs.stat(path.join(userClaudeConfigDir(username), '.credentials.json')); return st.isFile() && st.size > 0; }
+ catch { return false; }
+}
+// The dashboard process runs as root, but agent panes may be dropped to
+// PW_TERMINAL_UID (see terminal-priv.js). A root-owned 0700 config dir would be
+// unreadable by that pane, so every per-user credential path we create is handed
+// to the terminal uid when the drop is active. No-op when it is not, which keeps
+// the shared-root deployment byte-identical to before.
+async function chownForTerminal(target){
+ if(!TERMINAL_PRIV?.enabled) return;
+ const uid = Number(TERMINAL_PRIV.uid), gid = Number(TERMINAL_PRIV.gid);
+ if(!Number.isInteger(uid) || !Number.isInteger(gid)) return;
+ await fs.chown(target, uid, gid).catch(()=>{});
+}
+// Create (if needed) a user's Claude config dir and seed it with the managed MCP
+// servers taken from the shared config, so per-user Claude still gets team MCP.
+async function ensureUserClaudeDir(username){
+ const dir = userClaudeConfigDir(username);
+ await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+ // mkdir -p may have created the base and the per-user parent too; the pane needs
+ // to traverse both to reach its config dir, so hand over every level we own.
+ await chownForTerminal(USER_CRED_BASE);
+ await chownForTerminal(path.dirname(dir));
+ await chownForTerminal(dir);
+ const cfgFile = path.join(dir, '.claude.json');
+ try { await fs.access(cfgFile); }
+ catch {
+  let mcpServers = {};
+  try { const shared = JSON.parse(await fs.readFile(sharedClaudeJson, 'utf8')); if(shared && typeof shared.mcpServers === 'object' && shared.mcpServers) mcpServers = shared.mcpServers; } catch {}
+  await fs.writeFile(cfgFile, JSON.stringify({ mcpServers }, null, 2) + '\n', { mode: 0o600 });
+  await chownForTerminal(cfgFile);
+ }
+ return dir;
+}
+// Extra `env` KEY=VALUE entries to prepend into a project's tmux session so it
+// uses the owner's credentials. Empty array = fall back to the shared login.
+async function credentialSessionEnv(project){
+ const extra = [];
+ if(!PER_USER_CLAUDE || !project?.primaryUser) return extra;
+ let users = []; try { users = await loadUsers(); } catch {}
+ const u = users.find(x => x.username === project.primaryUser);
+ if(!u) return extra;
+ try { const dir = await ensureUserClaudeDir(u.username); extra.push('CLAUDE_CONFIG_DIR=' + dir); } catch {}
+ if(u.ghToken){ try { const t = decrypt(u.ghToken); if(t) extra.push('GH_TOKEN=' + t); } catch {} }
+ return extra;
 }
 
 // Serialize every projects.json read-modify-write transaction. Concurrent POSTs
@@ -778,7 +844,10 @@ const agentLoginDropArgv = agentLoginDrop(TERMINAL_PRIV);async function ensureTm
  const sess = tmuxSession(p.name);
  try { await tmux(['has-session','-t',sess]); return; } catch {}
  const cwd = p.path || workspacePath(p.name);
- const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']);
+ // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
+ // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
+ // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
+ const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...(await credentialSessionEnv(p))]);
  const tabs = Array.isArray(p.tabs) ? p.tabs : [];
  const firstName = tabs[0]?.name || 'Base';
  await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash','--noprofile','--norc']);
@@ -860,7 +929,8 @@ async function injectPvikpbotPrompt(p,prompt){
 }
 async function newTmuxWindow(p,name='new task',cmd=''){
  const safeName = String(name || 'new task').replace(/[\r\n\t]/g,' ').trim().slice(0,80) || 'new task';
- await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']),'bash','--noprofile','--norc']);
+ const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...(await credentialSessionEnv(p))]);
+ await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...winEnv,'bash','--noprofile','--norc']);
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
   await new Promise(r=>setTimeout(r,80));
@@ -2297,11 +2367,11 @@ const settingsScript = `<script>(function(){const tabs=document.querySelectorAll
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
 let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">'+esc(e.message)+'</td></tr>'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '8' : '7'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '8' : '7'}" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
 function tokenCellHtml(u){return u.hasToken?'<td><span class="role-pill" style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)">✓ token</span></td>':'<td><span class="role-pill">none</span></td>'}
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '8' : '7'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Claude</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+(u.claudeSignedIn===true?'<span class="signed-in" title="This user completed their own Claude login">✓ signed in</span>':(u.claudeSignedIn===false?'<span class="muted" title="Owner has not completed their Claude login yet — they run claude once in a project they own">not yet</span>':'<span class="muted" title="Per-user Claude login is off (PW_PER_USER_CLAUDE)">·</span>'))+'</td>'+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
 uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
 // --- User modal (used for both Add and Edit) ---
 const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
@@ -2324,7 +2394,7 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
-<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed.</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
+<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed. When per-user Claude is enabled (<code>PW_PER_USER_CLAUDE</code>), the <b>Claude</b> column shows whether a user has completed their own Claude login — used automatically for the projects they own (their <code>primaryUser</code> assignment).</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
 <section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead">Install or update each assistant, then sign in. Tokens land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Sign-in terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
 <section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
@@ -2442,7 +2512,11 @@ function normalizeProjects(value){
 }
 
 app.get(BASE + '/api/users', requireAdmin, async (_req,res) => {
- try { const users = await loadUsers(); res.json({ ok:true, users: users.map(safeUserShape) }); }
+ try {
+  const users = await loadUsers();
+  const out = await Promise.all(users.map(async u => ({ ...safeUserShape(u), claudeSignedIn: PER_USER_CLAUDE ? await userClaudeSignedIn(u.username) : null })));
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, users: out });
+ }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
