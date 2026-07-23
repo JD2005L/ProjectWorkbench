@@ -1242,7 +1242,7 @@ const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--pane
 // deployCss (fully scoped) is imported from app/deploy-css.js.
 
 const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
-const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;let password='';if(!window.__pwHasDeployPassword){password=prompt('Enter your domain password for deployment:');if(password===null)return}btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});const j=await r.json();output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
+const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;let password='';if((typeof card!=='undefined'&&card&&card.dataset&&card.dataset.reauth==='1')||!window.__pwHasDeployPassword){password=prompt('Enter your domain password for deployment:');if(password===null)return}btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});const j=await r.json();output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
 
 const deployScript = `<script>
 (function(){
@@ -1273,7 +1273,7 @@ const deployScript = `<script>
    const opt=(card.querySelector('.deploy-option')||{}).value||'';
    if((isProd||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;
    let password='';
-   if(!window.__pwHasDeployPassword){
+   if((typeof card!=='undefined'&&card&&card.dataset&&card.dataset.reauth==='1')||!window.__pwHasDeployPassword){
     password=prompt('Enter your domain password for deployment (or store it in Settings > Users):');
     if(password===null)return;
    }
@@ -2571,7 +2571,7 @@ if(DEPLOY_CENTRE){
    <h2>${esc(p.name)}</h2>
    <div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>
    <div class="targets">
-    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}">
+    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
      <div class="version-line">Version: <span class="version current-version">—</span>${devCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
@@ -2585,7 +2585,7 @@ if(DEPLOY_CENTRE){
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
     </div>
-    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}">
+    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
      <div class="version-line">Version: <span class="version current-version">—</span>${prodCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
@@ -2623,7 +2623,7 @@ if(DEPLOY_CENTRE){
    <div id="deploy-panel" class="deploy-tab-panel">
    <div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>
    <div class="targets">
-    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}">
+    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
      <div>Version: <span class="version current-version">${esc(devVersion||'—')}</span>${sourceNewer(localVersion?.version, devVersion)?`<span style="display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap" title="Working copy is newer than the deployed build — deploy to update">⬆ source newer</span>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
@@ -2637,7 +2637,7 @@ if(DEPLOY_CENTRE){
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
     </div>
-    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}">
+    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
      <div>Version: <span class="version current-version">${esc(prodVersion||'—')}</span>${sourceNewer(localVersion?.version, prodVersion)?`<span style="display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap" title="Working copy is newer than the deployed build — deploy to update">⬆ source newer</span>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
@@ -2679,7 +2679,7 @@ if(DEPLOY_CENTRE){
    if(project === '__proto__' || project === 'constructor' || project === 'prototype') return res.status(400).json({ok:false,error:'Invalid project name'});
    const cfg = await loadDeployConfig();
    if(!cfg[project]) cfg[project] = {};
-   cfg[project][target] = { script: String(script||'').trim(), versionCmd: String(versionCmd||'').trim() };
+   cfg[project][target] = { ...(cfg[project][target]||{}), script: String(script||'').trim(), versionCmd: String(versionCmd||'').trim() };
    await saveDeployConfig(cfg);
    await audit('deploy_config_update', { project, target }, req);
    res.json({ok:true});
@@ -2711,6 +2711,12 @@ if(DEPLOY_CENTRE){
   const cfg = await loadDeployConfig();
   const tc = cfg[project]?.[target];
   if(!tc || !tc.script) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
+  if(tc.reauth){
+   const submitted = req.body?.password || '';
+   let reauthOk = false;
+   try { reauthOk = !!(await authenticate(req.user?.username, submitted)); } catch { reauthOk = false; }
+   if(!reauthOk){ await audit('deploy_reauth_failed', { project, target }, req); return res.status(401).json({ok:false,error:'Re-authentication failed: your password did not verify.'}); }
+  }
   const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
   let option = String(req.body?.option || '').trim();
   if(allowedOpts.length){ if(!option) option = allowedOpts[0]; if(!allowedOpts.includes(option)) return res.status(400).json({ok:false,error:'Invalid option for this slot'}); }
