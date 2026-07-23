@@ -2,7 +2,17 @@
   if (window.__projectWorkbenchPreloadInstalled) return;
   window.__projectWorkbenchPreloadInstalled = true;
 
-  const project = decodeURIComponent((location.pathname.match(/^\/pty\/([^/]+)/) || [])[1] || '');
+  // ttyd's own #terminal-container .terminal uses height:calc(100% - 10px)+padding:5px, which
+  // leaves a gap at the bottom; override it so the terminal fills its container.
+  try {
+    const _pwFill = document.createElement('style');
+    _pwFill.textContent = '#terminal-container .terminal{height:100%!important;padding:0!important}';
+    (document.head || document.documentElement).appendChild(_pwFill);
+  } catch {}
+
+  const ptyMatch = location.pathname.match(/(.*?)\/pty\/([^/]+)/);
+  const base = ptyMatch ? ptyMatch[1] : '';
+  const project = decodeURIComponent((ptyMatch || [])[2] || '');
   if (!project) return;
 
   // Suppress ttyd's "Leave site?" beforeunload prompt. This terminal is a
@@ -54,7 +64,7 @@
       r.onload = () => resolve(String(r.result).split(',')[1]);
       r.readAsDataURL(blob);
     });
-    const res = await fetch('/api/upload/' + encodeURIComponent(project), {
+    const res = await fetch(base + '/api/upload/' + encodeURIComponent(project), {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ filename, mime: blob.type || 'application/octet-stream', data })
@@ -156,18 +166,59 @@
     }
   }
   const oscDecoder = new TextDecoder();
-  const oscRe = /\x1b\]52;[^;]*;([A-Za-z0-9+/=]+)(?:\x07|\x1b\\)/g;
-  function handleClipboardOSC(text) {
-    if (!text || text.indexOf('\x1b]52;') === -1) return;
-    oscRe.lastIndex = 0;
-    let m;
-    while ((m = oscRe.exec(text)) !== null) {
-      try {
-        const data = atob(m[1]);
-        if (data) writeClipboard(data);
-      } catch {}
+  // OSC 52 sniffer, safe under ARBITRARY WebSocket fragmentation: the
+  // ESC ] 5 2 ; prefix, the payload, and the BEL / ESC-backslash terminator can
+  // each be split at any byte boundary, and one frame can carry several
+  // sequences. A trailing incomplete sequence — or a tail that could still
+  // grow into the prefix — is buffered (bounded by maxBuf) until the next
+  // frame; a terminated-but-malformed sequence is skipped so it can never
+  // stall the buffer.
+  function createOscSniffer(onCopy, maxBuf = 4000000) {
+    const PREFIX = '\x1b]52;';
+    const re = /\x1b\]52;[^;]*;([A-Za-z0-9+/=]*)(?:\x07|\x1b\\)/g;
+    let buf = '';
+    function terminatorEnd(s, from) {
+      // End index (exclusive) of the earliest BEL / ESC-backslash at or after `from`, else -1.
+      for (let i = from; i < s.length; i++) {
+        const c = s.charCodeAt(i);
+        if (c === 0x07) return i + 1;
+        if (c === 0x1b && s.charCodeAt(i + 1) === 0x5c) return i + 2;
+      }
+      return -1;
     }
+    function prefixTail(s) {
+      // Longest suffix of s that is a proper prefix of PREFIX ('\x1b', '\x1b]', ...).
+      const max = Math.min(PREFIX.length - 1, s.length);
+      for (let len = max; len > 0; len--) {
+        if (s.endsWith(PREFIX.slice(0, len))) return s.slice(s.length - len);
+      }
+      return '';
+    }
+    return function push(chunk) {
+      let text = buf + chunk;
+      buf = '';
+      re.lastIndex = 0;
+      let m, lastEnd = 0;
+      while ((m = re.exec(text)) !== null) {
+        lastEnd = re.lastIndex;
+        try { const data = atob(m[1]); if (data) onCopy(data); } catch (e) {}
+      }
+      // Everything after the last complete sequence: keep an incomplete
+      // trailing sequence (or possible-prefix tail) for the next frame; drop
+      // terminated-but-malformed ones.
+      let rest = text.slice(lastEnd);
+      for (;;) {
+        const si = rest.indexOf(PREFIX);
+        if (si === -1) { buf = prefixTail(rest); break; }
+        const cand = rest.slice(si);
+        const te = terminatorEnd(cand, PREFIX.length);
+        if (te === -1) { buf = cand; break; }
+        rest = cand.slice(te);
+      }
+      if (buf.length > maxBuf) buf = '';
+    };
   }
+  const handleClipboardOSC = createOscSniffer(writeClipboard);
   function sniffFrame(d) {
     try {
       if (typeof d === 'string') {
