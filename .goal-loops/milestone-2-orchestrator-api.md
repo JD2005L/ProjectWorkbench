@@ -420,6 +420,50 @@ from a fresh clone with `npm ci`. Plus 20 publication-idempotency repetitions wi
 contract fixture + cross-contract validation, HTTP/MCP smoke, and leak checks showing zero temp
 directories, sockets, listeners or stray processes.
 
+### 2026-07-27 (round 6) — explicit conformance to orchestrator ea9c7f8
+
+The drift gate did its job: independent verification against `ea9c7f8` failed three tests and named
+the pinned files, instead of presenting as flakiness. This is the conformance round it asked for.
+
+**Read the diff `703d765..ea9c7f8` read-only.** The orchestrator closed the bypass that survived one
+layer in: identity had moved to the envelope, but `binary_path`/`binary_version`/
+`capability_fingerprint` had not, so a peer declaring both fields `runtime_reported` still skipped
+the entire binary-identity check — and the administrator's `may_attest_launch` decision with it — by
+claiming *more*, not less. It also made `normalization` per-field, added `RUNTIME_REPORTABLE`, and
+dropped the `verification_nonce` default.
+
+**Conformed:**
+
+* binary identity moved to `AttestationEnvelope`, so it describes every claim whatever its
+  provenance; `buildAttestationEnvelope` now refuses by name without a usable fingerprint rather
+  than crashing on a property access;
+* `RUNTIME_REPORTABLE` mirrored here, and a label is permitted only where the orchestrator records
+  the backend emits that field from the source key named. For `claude-code` that is `model_alias`
+  from `init.model` and nothing else, so **effort stays `launch_enforced`** even if a build starts
+  printing one. The two-step order is documented: the orchestrator records the capability first;
+* a printed effort that *contradicts* the launched value still refutes and blocks — an observation
+  cannot raise the label, but it can refute it;
+* `verification_nonce` required with no default, on the wire and at the API;
+* `advertised_values` keys bounded and slug-filtered, so a misconfigured option drops rather than
+  producing a payload refused outright.
+
+**Two defects the schema check could never have found.** The new test runs the orchestrator's own
+`validate_attestation` over real payloads, not just its Pydantic shapes:
+
+1. `argv_builder_id` was a locally chosen name and the orchestrator *allowlists* it. Every
+   `launch_enforced` attestation would have been refused in production while every shape-level test
+   passed.
+2. `validate()` threw a bare `Error` carrying a `code`, so `sendError` fell through to its 500
+   branch — every route validating a body answered a malformed payload with `internal_error`, no
+   field errors, and the explanation swallowed as potentially sensitive. The one code path
+   `validation_failed` exists for could not produce it.
+
+**Gate:** 332/332 × 5 consecutive runs on each of Node 20.19.0, 20.20.0 and 22 — 15 green suites from
+a fresh clone with `npm ci` — plus 20 publication-idempotency repetitions with no git identity,
+fixture + drift pin + cross-contract, HTTP/MCP smoke, and zero temp dirs, sockets, listeners or
+stray processes. Pin re-recorded at `ea9c7f8`; guard re-verified three ways. Orchestrator repository
+unmodified.
+
 ### Status
 
 All P0 and P1 findings from all three review rounds are resolved with regression tests. The PR stays
