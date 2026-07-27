@@ -295,6 +295,118 @@ Fingerprints are cached on the binary's own identity (realpath, device, inode, s
 ~1 s hash of a 275 MB binary happens once and **any** change to the file misses the cache rather than
 being trusted. A failed probe is never cached: it may be a partially written upgrade.
 
+### Registering an instance: the capability-fingerprint bootstrap
+
+The orchestrator refuses every attestation from an instance it holds no `known_fingerprint` for, and
+refuses again when the value it holds does not match. Both refusals are right, and together they
+form a circle: the instance cannot produce the value by attesting, because the attestation is
+refused for want of the value.
+
+The way out is that the value is published, out of band, by the same function that computes it for
+the envelope — so what an administrator pins is byte-identical to what verification will present,
+not a second implementation of "the same thing".
+
+#### 4.1 Read it on the ProjectWorkbench host
+
+```
+node scripts/pw-orch-fingerprint.mjs            # human-readable
+node scripts/pw-orch-fingerprint.mjs --json     # for transfer
+```
+
+It takes **no credential**, contacts nothing, and writes only to stdout — which is what makes it
+usable on a host that has not been registered yet. Configuration comes from the environment, exactly
+as the service reads it: `PW_ORCHESTRATOR_INSTANCE_ID`, `PW_ORCHESTRATOR_CLI` (the *real* binary,
+never the `/usr/local/bin/claude` wrapper), and optionally `PW_ORCHESTRATOR_CLI_SHA256`.
+
+Live output from CT2115:
+
+```
+instance_id            pvi2-ct2115
+attestation contract   1.1
+binary                 /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe
+version                2.1.220 (Claude Code)
+sha256                 674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863
+advertised options     --model --effort
+--effort values        low, medium, high, xhigh, max
+
+capability_fingerprint a641b5b927c05a760723694869aa22b743200425282c43f9a2271ffa98202c9e
+```
+
+Exit status is load-bearing, so an install script can gate on it: **0** a fingerprint was produced,
+**1** the CLI could not be fingerprinted or declares no enforceable `--effort`, **2** the invocation
+was wrong. A report nobody can pin is a failure whatever it printed — half a report is worse than
+none, because a value taken from a probe that did not complete can never match.
+
+#### 4.2 Or read it over the API
+
+```
+GET /api/orchestrator/v1/instance/attestation-fingerprint
+```
+
+Authenticated (`jobs:read`), read-only, and the same report from the same function. Use it when the
+administrator is not on the PW host; use the script when the instance has no credential yet, which
+is the usual case at registration time. There is no `POST`: pinning is the orchestrator's decision,
+never something this side pushes.
+
+Neither carries a secret. The report is assembled from a fixed allowlist of fields rather than by
+stripping what looks sensitive — a denylist is a list someone forgets to extend — and every field in
+it is a property of an admin-owned binary that an operator could read for themselves.
+
+#### 4.3 How CT2122 pins it, independently
+
+The transfer is deliberately manual and one-directional. ProjectWorkbench never writes to the
+orchestrator's registry; if it could, the pin would be a value the attested party chose.
+
+1. **Obtain** the report, over a channel the administrator already trusts for CT2115 — an SSH
+   session to the host, or the authenticated endpoint above. Do not accept it from the instance
+   over an unauthenticated path.
+2. **Verify it independently**, which is why every input to the digest is published alongside it.
+   On the PW host: `sha256sum /usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe`
+   against `binary.sha256`, `/bin/claude --version` against `binary.version`, and
+   `/bin/claude --help` against the advertised option surface. An administrator who pins an opaque
+   hash cannot tell whether it describes the binary they think it does.
+3. **Record** `capability_fingerprint` against that instance id in the orchestrator's registry,
+   together with `may_attest_launch`. The two are separate decisions: the fingerprint says *which
+   program*, `may_attest_launch` says *whether this instance's word about a launch is accepted*.
+4. **Confirm** by running one verification. It should be accepted; the summary names both provenance
+   labels. If it is refused with `no capability fingerprint is on record`, the pin did not land
+   against the id the instance actually answers with.
+
+#### 4.4 Rotation, after a deliberate CLI upgrade
+
+The fingerprint covers the binary's realpath, self-reported version, content hash **and advertised
+option surface** — so any upgrade moves it. That is the intent: from the orchestrator's side, an
+upgrade nobody authorised is indistinguishable from a substituted binary, because it is one.
+
+1. Upgrade the CLI on the PW host as usual.
+2. Re-run `scripts/pw-orch-fingerprint.mjs` and re-verify the components by hand, as at 4.2.
+3. Record the new value against the instance.
+
+Between steps 1 and 3 the instance is **refused**, not degraded: every attestation it makes carries
+the new fingerprint against the old pin. Jobs block with `the binary capability fingerprint has
+changed`. Sequence the upgrade accordingly — this is a maintenance window, not a rolling change.
+If `PW_ORCHESTRATOR_CLI_SHA256` is pinned locally as well, update it in the same window, or the
+instance refuses to fingerprint at all and blocks one step earlier with `pinned_mismatch`.
+
+#### 4.5 What fails closed, and how it reads
+
+| Situation | Refused by | The operator sees |
+|---|---|---|
+| No pin recorded for the instance | orchestrator | `no capability fingerprint is on record for <id>; an unknown binary is not a matching one` |
+| Binary upgraded, substituted, or rebuilt | orchestrator | `the binary capability fingerprint has changed; the binary that reported this is not the binary on record` |
+| Instance revoked (`may_attest_launch` withdrawn) | orchestrator | `instance <id> is not authorised to make a launch_enforced claim` — and since effort rests on the launch record, the job blocks rather than downgrading |
+| Local content pin mismatched | ProjectWorkbench | `pinned_mismatch`, before any claim is made |
+| Configured path is a wrapper or not a loadable binary | ProjectWorkbench | `wrapper` / `not_a_binary`, and no attestation of any provenance |
+
+Note the third row. Revocation is not a downgrade to a weaker claim: because Claude Code cannot
+report effort, withdrawing `may_attest_launch` leaves effort unattestable, and an unattestable
+setting blocks the job. Revoking authority stops work, which is what revoking authority should do.
+
+Note the last row too. The wrapper check is not only about shebangs: `execvp` hands a file the
+kernel refuses to `/bin/sh`, so a non-script that is not a *loadable* executable is still
+interpreted and can still rewrite argv. The ELF header is parsed far enough to answer that
+question rather than trusting the magic bytes.
+
 ## 5. The contract fixture
 
 [`contract/pw-contract-1.0.json`](../contract/pw-contract-1.0.json) is a machine-readable description

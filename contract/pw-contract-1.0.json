@@ -19,6 +19,12 @@
     },
     {
       "method": "GET",
+      "path": "/instance/attestation-fingerprint",
+      "purpose": "the capability fingerprint an administrator must pin for this instance, so a registration can be made before the instance can attest anything; additive to the contract",
+      "contract": "additive"
+    },
+    {
+      "method": "GET",
       "path": "/projects",
       "purpose": "projects this instance owns",
       "contract": "1.0"

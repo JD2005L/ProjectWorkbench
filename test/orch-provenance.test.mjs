@@ -37,6 +37,25 @@ const REAL_HELP = [
   '  --model <model>                       Model for the current session',
 ].join('\n');
 
+/**
+ * A minimal *loadable* ELF header, followed by whatever body a test wants.
+ *
+ * The magic alone is not enough any more, and that is the point: a file carrying `\x7fELF` and
+ * nothing else valid is exactly what `execve` refuses with ENOEXEC, which makes `execvp` hand it to
+ * /bin/sh. These fixtures stand in for a real binary, so they carry a header a kernel would accept:
+ * 64-bit, little-endian, version 1, ET_EXEC.
+ */
+const elfBinary = (body) => {
+  const header = Buffer.alloc(64);
+  header.write('\x7fELF', 0, 'latin1');
+  header[4] = 2;  // EI_CLASS  = ELFCLASS64
+  header[5] = 1;  // EI_DATA   = little-endian
+  header[6] = 1;  // EI_VERSION
+  header.writeUInt16LE(2, 16);  // e_type = ET_EXEC
+  header.writeUInt16LE(0x3e, 18); // e_machine = x86-64
+  return Buffer.concat([header, Buffer.from(body, 'latin1')]);
+};
+
 /** A fingerprint of the real binary, as the prober would return it. */
 const GOOD_FINGERPRINT = Object.freeze({
   ok: true,
@@ -453,6 +472,33 @@ test('fingerprint: EVERY interpreted script is refused, not just shell ones', as
   }
 });
 
+test('fingerprint: a file with no shebang that a shell will still run is refused', async () => {
+  // Found while writing the bootstrap test, and it is the same hole the shebang check closes,
+  // reached from the other side. `execvp` falls back to running a file through /bin/sh when the
+  // kernel refuses it with ENOEXEC — so a text file with NO shebang is still interpreted, still
+  // sees the full argv, and can still rewrite it. Verified against the real syscall:
+  //
+  //   printf '\x7fELF not a real elf\necho "REWROTE-ARGV $*"\n' > fake.exe
+  //   execFile('fake.exe', ['--version'])  ->  stdout "REWROTE-ARGV --version"
+  //
+  // …while stderr reads `ELF: not found` from the shell that ran it. It even carries the ELF magic,
+  // so a header check alone is not the answer either: what matters is that the kernel would load
+  // it, and the only honest way to require that is to refuse anything we cannot recognise.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-enoexec-'));
+  try {
+    const impostor = path.join(dir, 'claude.exe');
+    fs.writeFileSync(impostor, '\x7fELF not a real elf\necho "REWROTE-ARGV $*"\n');
+    fs.chmodSync(impostor, 0o755);
+
+    const result = await probeBinaryFingerprint({ executable: impostor, options: ['--effort'] });
+    assert.equal(result.ok, false, 'a file a shell would run must never be fingerprinted as trusted');
+    assert.equal(result.failure, FingerprintFailure.NOT_A_BINARY);
+    assert.match(result.detail, /loadable/i);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('fingerprint: an option prefix does not borrow another option’s declared values', () => {
   // `\b` sits between `t` and `-`, so a search for --effort matched --effort-cap and adopted its
   // value list — enough to "enforce" a value the binary never accepts.
@@ -504,7 +550,7 @@ test('fingerprint: a pinned hash that does not match is refused', async () => {
   try {
     // Not a script: every shebang is now refused, because any interpreter can rewrite argv.
     const binary = path.join(dir, 'fake-cli');
-    fs.writeFileSync(binary, Buffer.from('\x7fELF fake binary contents', 'latin1'), { mode: 0o755 });
+    fs.writeFileSync(binary, elfBinary('fake binary contents'), { mode: 0o755 });
     const result = await probeBinaryFingerprint({
       executable: binary, options: ['--effort'], expectedSha256: 'a'.repeat(64),
     });
@@ -519,7 +565,7 @@ test('fingerprint: the cache is keyed on binary identity and invalidated by any 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
   try {
     const binary = path.join(dir, 'cli');
-    const write = (body) => fs.writeFileSync(binary, Buffer.from(`\x7fELF ${body}`, 'latin1'), { mode: 0o755 });
+    const write = (body) => fs.writeFileSync(binary, elfBinary(body), { mode: 0o755 });
     write('v1');
 
     let probes = 0;

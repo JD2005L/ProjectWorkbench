@@ -50,6 +50,34 @@ export class FakeCodingBackend {
     this._sessionCounter = 0;
     /** Every invocation, in order, so a test can assert what was *not* run and with which flags. */
     this.invocations = [];
+
+    /**
+     * A deterministic stand-in for the real binary's fingerprint.
+     *
+     * The fake models what the installed CLI does, and fingerprinting is part of that: without it
+     * the bootstrap path — the one an administrator uses to register an instance — could only be
+     * exercised against the live binary, which is exactly what this backend exists to avoid.
+     */
+    this.binaryFingerprint = {
+      ok: true,
+      realpath: '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+      sha256: '674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863',
+      version: '2.1.220 (Claude Code)',
+      capabilities: {
+        '--effort': { declared: true, values: ['low', 'medium', 'high', 'xhigh', 'max'] },
+        '--model': { declared: true, values: null },
+      },
+      identity: { dev: 47, inode: 1253244, size: 275012592, mtimeMs: 1785144521000 },
+      probed_at: this.clock().toISOString(),
+    };
+  }
+
+  /** The configured CLI's identity and advertised surface. `unavailable` reports the failure. */
+  async fingerprint() {
+    if (this.unavailable) {
+      return { ok: false, failure: 'unresolvable', detail: 'the configured coding CLI does not resolve to a file' };
+    }
+    return this.binaryFingerprint;
   }
 
   /** Backend authentication health. There is no API-key path to report. */

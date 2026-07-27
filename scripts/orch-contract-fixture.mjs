@@ -39,6 +39,7 @@ const sorted = (values) => [...values].sort();
 const ENDPOINTS = [
   { method: 'GET', path: '/health', purpose: 'instance health and coding-backend authentication health', contract: '1.0' },
   { method: 'GET', path: '/readiness', purpose: 'component readiness; additive to the contract', contract: 'additive' },
+  { method: 'GET', path: '/instance/attestation-fingerprint', purpose: 'the capability fingerprint an administrator must pin for this instance, so a registration can be made before the instance can attest anything; additive to the contract', contract: 'additive' },
   { method: 'GET', path: '/projects', purpose: 'projects this instance owns', contract: '1.0' },
   { method: 'GET', path: '/projects/{project}/capabilities', purpose: "what the project's lane can do", contract: '1.0' },
   { method: 'POST', path: '/projects/{project}/session/ensure', purpose: 'create or adopt the named orchestrator lane', contract: '1.0' },

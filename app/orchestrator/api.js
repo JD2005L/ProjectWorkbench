@@ -23,6 +23,7 @@ import {
   ProjectConfigStore, resolveProject, projectPayload, capabilitiesPayload, listGrantedProjects,
 } from './projects.js';
 import { validate } from './validate.js';
+import { buildFingerprintReport } from './bootstrap.js';
 import {
   ENSURE_SESSION_SCHEMA, MODEL_SETTINGS_SCHEMA, ARTIFACT_EXCERPT_SCHEMA, PUBLICATION_REQUEST_SCHEMA,
 } from './schemas.js';
@@ -228,6 +229,33 @@ export function createOrchestratorRouter({
       schema_versions_supported: ['1.0'],
       attestation,
     });
+  }));
+
+  /**
+   * The capability fingerprint an administrator must pin for this instance.
+   *
+   * Read-only, and the counterpart to `scripts/pw-orch-fingerprint.mjs` — same report, same
+   * function, so the two cannot disagree about the value being pinned. The endpoint exists for the
+   * case where the administrator is not on this host; the script exists for the case where the
+   * instance has no credential yet, which is the usual one at registration time.
+   *
+   * It publishes no secret: the report is assembled from a fixed allowlist in `bootstrap.js`, and
+   * everything in it is a property of an admin-owned binary an operator could read themselves.
+   */
+  router.get('/instance/attestation-fingerprint', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    if (typeof backend.fingerprint !== 'function') {
+      throw new ApiError(ErrorCode.WORKBENCH_UNAVAILABLE, 'this backend does not fingerprint its coding CLI');
+    }
+    const report = buildFingerprintReport({
+      instanceId: config.instanceId,
+      fingerprint: await backend.fingerprint(),
+    });
+    auditEvent(req, 'orchestrator.instance.fingerprint', {
+      attestable: report.attestable,
+      capability_fingerprint: report.capability_fingerprint,
+    });
+    res.json(report);
   }));
 
   // §4 declares the response model as `list[Project]`, so this is a bare array rather than an

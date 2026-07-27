@@ -43,11 +43,58 @@ const execFileAsync = promisify(execFile);
  */
 const SHEBANG = /^#!/;
 
+/**
+ * The executable formats a kernel will load directly.
+ *
+ * Refusing the shebang is not sufficient, and the gap is not theoretical. `execvp` falls back to
+ * running a file through `/bin/sh` when the kernel refuses it with `ENOEXEC`, so a text file with
+ * **no** shebang is still interpreted, still sees the full argv, and can still rewrite it:
+ *
+ *     printf '\x7fELF not a real elf\necho "REWROTE-ARGV $*"\n' > fake.exe
+ *     execFile('fake.exe', ['--version'])   ->   stdout: "REWROTE-ARGV --version"
+ *
+ * Note that the impostor above carries the ELF *magic* — which is why a magic check is not enough
+ * either. The question is whether the kernel would load it, so on Linux the header is parsed far
+ * enough to answer that: a bad `EI_CLASS`, `EI_DATA`, `EI_VERSION` or `e_type` is exactly what makes
+ * `execve` return ENOEXEC and hand the file to a shell. Other platforms' formats are recognised by
+ * magic only, which is a weaker statement and said so here rather than implied.
+ */
+const ELF_MAGIC = Buffer.from([0x7f, 0x45, 0x4c, 0x46]);
+const OTHER_EXECUTABLE_MAGICS = Object.freeze([
+  Buffer.from([0xcf, 0xfa, 0xed, 0xfe]),               // Mach-O 64, little-endian
+  Buffer.from([0xce, 0xfa, 0xed, 0xfe]),               // Mach-O 32, little-endian
+  Buffer.from([0xfe, 0xed, 0xfa, 0xcf]),               // Mach-O 64, big-endian
+  Buffer.from([0xfe, 0xed, 0xfa, 0xce]),               // Mach-O 32, big-endian
+  Buffer.from([0xca, 0xfe, 0xba, 0xbe]),               // Mach-O universal
+  Buffer.from([0x4d, 0x5a]),                           // PE/COFF ("MZ")
+]);
+
+/** ET_EXEC and ET_DYN — a position-independent executable is the latter. */
+const LOADABLE_ELF_TYPES = new Set([2, 3]);
+
+function isLoadableElf(head) {
+  if (head.length < 18 || !head.subarray(0, 4).equals(ELF_MAGIC)) return false;
+  const eiClass = head[4];   // 1 = 32-bit, 2 = 64-bit
+  const eiData = head[5];    // 1 = little-endian, 2 = big-endian
+  const eiVersion = head[6]; // always 1
+  if (eiClass !== 1 && eiClass !== 2) return false;
+  if (eiData !== 1 && eiData !== 2) return false;
+  if (eiVersion !== 1) return false;
+  const eType = eiData === 1 ? head.readUInt16LE(16) : head.readUInt16BE(16);
+  return LOADABLE_ELF_TYPES.has(eType);
+}
+
+function isLoadableExecutable(head) {
+  if (head.subarray(0, 4).equals(ELF_MAGIC)) return isLoadableElf(head);
+  return OTHER_EXECUTABLE_MAGICS.some((magic) => head.subarray(0, magic.length).equals(magic));
+}
+
 /** How a fingerprint failed. Each maps to a distinct, actionable operator message. */
 export const FingerprintFailure = Object.freeze({
   NOT_ABSOLUTE: 'not_absolute',
   UNRESOLVABLE: 'unresolvable',
   WRAPPER: 'wrapper',
+  NOT_A_BINARY: 'not_a_binary',
   UNREADABLE: 'unreadable',
   VERSION_UNAVAILABLE: 'version_unavailable',
   HELP_UNAVAILABLE: 'help_unavailable',
@@ -141,6 +188,16 @@ export async function probeBinaryFingerprint({
       ok: false,
       failure: FingerprintFailure.WRAPPER,
       detail: 'the configured coding CLI is an interpreted script, which can rewrite argv, so a launch through it cannot be enforced',
+    };
+  }
+  if (!isLoadableExecutable(head)) {
+    // No shebang is not the same as "a binary". A file the kernel refuses is handed to /bin/sh by
+    // execvp's ENOEXEC fallback, which puts an interpreter between us and the program with the
+    // whole argv in its hands — exactly what the check above exists to prevent.
+    return {
+      ok: false,
+      failure: FingerprintFailure.NOT_A_BINARY,
+      detail: 'the configured coding CLI is not a loadable executable, so a shell would run it and could rewrite argv',
     };
   }
 

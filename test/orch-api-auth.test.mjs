@@ -187,6 +187,35 @@ test('api: a token lacking the operation scope is refused with forbidden_scope',
   });
 });
 
+test('api: the fingerprint endpoint is authenticated, read-only, and carries no secret', async () => {
+  // The counterpart to `scripts/pw-orch-fingerprint.mjs`, for an administrator who is not on this
+  // host. Authenticated because it names an internal binary path and the instance's own identity;
+  // read-only because pinning is the orchestrator's decision, never something this side pushes.
+  const { FINGERPRINT_REPORT_FIELDS } = await import('../app/orchestrator/bootstrap.js');
+
+  await withApi(async ({ call }) => {
+    const anonymous = await call('GET', '/instance/attestation-fingerprint', { token: 'wrong-secret' });
+    assert.equal(anonymous.status, 401, 'the report must not be readable without a credential');
+
+    const res = await call('GET', '/instance/attestation-fingerprint');
+    assert.equal(res.status, 200, JSON.stringify(res.json));
+    assert.deepEqual(Object.keys(res.json).sort(), [...FINGERPRINT_REPORT_FIELDS].sort());
+
+    // Nothing that should not travel. The report is pasted into tickets and stored in another
+    // host's registry, so this asserts the absence directly rather than trusting the allowlist.
+    const serialised = JSON.stringify(res.json);
+    for (const secret of ['sk-ant', 'Bearer', 'access_token', 'refresh_token', SECRET]) {
+      assert.ok(!serialised.includes(secret), `the report leaked ${secret}`);
+    }
+
+    // Writing is not offered: pinning is the orchestrator's decision.
+    const write = await call('POST', '/instance/attestation-fingerprint', {
+      body: {}, headers: { 'Idempotency-Key': 'fp-1' },
+    });
+    assert.equal(write.status, 404);
+  });
+});
+
 test('api: a body that fails schema validation is a typed refusal, not an internal error', async () => {
   // Found by the nonce requirement below, and much wider than it: `validate()` throws its own
   // `ValidationError`, which `sendError` did not recognise — so EVERY route that validates a body
