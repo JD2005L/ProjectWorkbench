@@ -1,0 +1,24 @@
+{
+  "_comment": [
+    "Scoped service tokens for the orchestration API. Copy to the path named by",
+    "PW_ORCHESTRATOR_TOKENS_PATH (default /etc/project-workbench/orchestrator-tokens.json) and",
+    "chmod 0600. Only the SHA-256 DIGEST of each token is stored, never the token itself:",
+    "generate one with `openssl rand -hex 32`, hand that value to the orchestrator, and record",
+    "`printf %s '<token>' | sha256sum` here.",
+    "",
+    "Rotation needs no outage. Add the incoming token alongside the outgoing one, move the",
+    "orchestrator across, then set `disabled: true` on the old entry rather than deleting it, so",
+    "the audit trail survives the rotation. The file is re-read when it changes on disk."
+  ],
+  "schema_version": "1.0",
+  "tokens": [
+    {
+      "token_id": "primary",
+      "orchestrator_instance_id": "REPLACE-WITH-ORCHESTRATOR-INSTANCE-ID",
+      "secret_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+      "projects": ["REPLACE-WITH-PROJECT-NAME"],
+      "scopes": ["jobs:read", "jobs:write", "session:manage", "publish"],
+      "disabled": false
+    }
+  ]
+}

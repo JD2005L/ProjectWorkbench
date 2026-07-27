@@ -10,3 +10,13 @@ tools/*.pw
 tools/verify/*.png
 **/node_modules
 app/node_modules
+
+# Orchestration subsystem runtime state — durable job journal, snapshot, lock, evidence
+# artifacts, and the service-token file. None of these belong in the repository.
+orchestrator.journal
+orchestrator.snapshot.json
+orchestrator.snapshot.json.tmp
+orchestrator.lock
+orchestrator-tokens.json
+orchestrator-projects.json
+orchestrator-audit.log

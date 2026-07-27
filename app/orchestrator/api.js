@@ -152,6 +152,45 @@ export function createOrchestratorRouter({
     });
   }));
 
+  /**
+   * Component readiness.
+   *
+   * Additive to the contract: `InstanceHealth` forbids extra fields, so component detail cannot be
+   * folded into /health without breaking validation on the other side. Degraded — not down — when
+   * the backend is signed out, because every mutation will then fail closed and an operator needs
+   * to know that before submitting work rather than after.
+   */
+  router.get('/readiness', handle(async (req, res) => {
+    const auth = await backend.probeAuth();
+    const components = [
+      {
+        component: 'store',
+        // A store that cannot be written to is the one failure that loses evidence.
+        state: store && !store._closed ? 'ok' : 'down',
+        detail: store && !store._closed ? null : 'the durable store is not open',
+      },
+      {
+        component: 'queue',
+        state: 'ok',
+        detail: engine ? `${engine._running.size} job(s) in flight` : 'the engine is not mounted',
+      },
+      { component: 'runner', state: auth.state, detail: auth.detail ?? null },
+    ];
+    const worst = components.some((c) => c.state === 'down')
+      ? 'down'
+      : (components.some((c) => c.state === 'degraded') ? 'degraded' : 'ok');
+    res.json({
+      schema_version: SCHEMA_VERSION,
+      state: worst,
+      instance_id: config.instanceId,
+      contract_version: '1.0',
+      checked_at: new Date().toISOString(),
+      // No secret, no account address, no org id, no token — probeAuth already strips those.
+      components,
+      schema_versions_supported: ['1.0'],
+    });
+  }));
+
   router.get('/projects', handle(async (req, res) => {
     requireScope(req.token, SCOPES.JOBS_READ);
     res.json({

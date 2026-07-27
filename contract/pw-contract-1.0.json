@@ -1,0 +1,1448 @@
+{
+  "schema_version": "1.0",
+  "contract_version": "1.0",
+  "generated_by": "scripts/orch-contract-fixture.mjs",
+  "description": "Machine-readable description of the ProjectWorkbench orchestration surface. Generated from the implementation's own vocabularies so it cannot drift. The orchestrator repository can diff this file to detect an incompatible change without importing JavaScript.",
+  "base_path": "/api/orchestrator/v1",
+  "endpoints": [
+    {
+      "method": "GET",
+      "path": "/health",
+      "purpose": "instance health and coding-backend authentication health",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/readiness",
+      "purpose": "component readiness; additive to the contract",
+      "contract": "additive"
+    },
+    {
+      "method": "GET",
+      "path": "/projects",
+      "purpose": "projects this instance owns",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/projects/{project}/capabilities",
+      "purpose": "what the project's lane can do",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/projects/{project}/session/ensure",
+      "purpose": "create or adopt the named orchestrator lane",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/projects/{project}/session/verify",
+      "purpose": "report the effective model and effort",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs",
+      "purpose": "submit a task contract",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs",
+      "purpose": "list jobs; additive to the contract",
+      "contract": "additive"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}",
+      "purpose": "job snapshot",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/events",
+      "purpose": "ordered, sequenced events after a cursor",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/events/stream",
+      "purpose": "the same as Server-Sent Events",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/reply",
+      "purpose": "answer a question",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/approve",
+      "purpose": "relay a recorded human decision",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/revise",
+      "purpose": "request one bounded correction",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/review",
+      "purpose": "request an independent review",
+      "contract": "1.0"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/cancel",
+      "purpose": "cancel, preserving the working tree",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/result",
+      "purpose": "the final evidence-backed result",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/artifacts/{id}/metadata",
+      "purpose": "artifact metadata",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/artifacts/{id}/excerpt",
+      "purpose": "a bounded, redacted window into an artifact",
+      "contract": "1.0"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/questions",
+      "purpose": "typed questions (§9.1)",
+      "contract": "1.0+m2"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/approvals",
+      "purpose": "typed approvals (§9.2)",
+      "contract": "1.0+m2"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/checks",
+      "purpose": "Check records (§9.3)",
+      "contract": "1.0+m2"
+    },
+    {
+      "method": "GET",
+      "path": "/jobs/{id}/reviews",
+      "purpose": "Review records (§9.3)",
+      "contract": "1.0+m2"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/publish",
+      "purpose": "PublicationRequest → PublicationRecord (§9.4)",
+      "contract": "1.0+m2"
+    },
+    {
+      "method": "POST",
+      "path": "/jobs/{id}/heartbeat",
+      "purpose": "lease heartbeat (§9.5)",
+      "contract": "1.0+m2"
+    }
+  ],
+  "mcp": {
+    "tools": [
+      "pw_approve_stage",
+      "pw_cancel_job",
+      "pw_ensure_orchestrator_session",
+      "pw_get_approvals",
+      "pw_get_artifact_excerpt",
+      "pw_get_artifact_metadata",
+      "pw_get_checks",
+      "pw_get_events",
+      "pw_get_job",
+      "pw_get_project_capabilities",
+      "pw_get_questions",
+      "pw_get_result",
+      "pw_get_reviews",
+      "pw_health",
+      "pw_list_projects",
+      "pw_publish",
+      "pw_reply_to_question",
+      "pw_request_review",
+      "pw_request_revision",
+      "pw_stream_events",
+      "pw_submit_job",
+      "pw_verify_session_configuration"
+    ],
+    "forbidden_name_fragments": [
+      "checkout",
+      "clone",
+      "command",
+      "credential",
+      "env",
+      "eval",
+      "exec",
+      "list_dir",
+      "path",
+      "read_file",
+      "run_",
+      "script",
+      "secret",
+      "shell",
+      "write_file"
+    ],
+    "sampling_enabled": false,
+    "resources_offered": false,
+    "prompts_offered": false,
+    "tool_input_schemas": {
+      "pw_approve_stage": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "approval_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "stage": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "approved": {
+            "type": "boolean"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "decided_by": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id",
+          "approval_id",
+          "stage",
+          "approved"
+        ],
+        "additionalProperties": false
+      },
+      "pw_cancel_job": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "reason": {
+            "type": "string",
+            "maxLength": 200
+          }
+        },
+        "required": [
+          "workbench_job_id",
+          "reason"
+        ],
+        "additionalProperties": false
+      },
+      "pw_ensure_orchestrator_session": {
+        "type": "object",
+        "properties": {
+          "orchestrator_instance_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "project_id": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "role": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "reserved_tmux_window": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "cli_backend": {
+            "type": "string",
+            "enum": [
+              "claude-code",
+              "codex-cli"
+            ]
+          },
+          "force_replace": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "orchestrator_instance_id",
+          "project_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_approvals": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_artifact_excerpt": {
+        "type": "object",
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "byte_offset": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "max_bytes": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 65536
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_artifact_metadata": {
+        "type": "object",
+        "properties": {
+          "artifact_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "artifact_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_checks": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_events": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "after_sequence": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_job": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_project_capabilities": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          }
+        },
+        "required": [
+          "project_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_questions": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_result": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_get_reviews": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_health": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "pw_list_projects": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "pw_publish": {
+        "type": "object",
+        "properties": {
+          "job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "branch": {
+            "type": "string",
+            "maxLength": 200,
+            "pattern": "^[A-Za-z0-9._/-]+$"
+          },
+          "commit_message": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "intended_files": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 200,
+            "items": {
+              "type": "string",
+              "maxLength": 512
+            }
+          },
+          "open_pull_request": {
+            "type": "boolean"
+          },
+          "approval_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          }
+        },
+        "required": [
+          "job_id",
+          "branch",
+          "commit_message",
+          "intended_files"
+        ],
+        "additionalProperties": false
+      },
+      "pw_reply_to_question": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "question_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "answer": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "selected_option_index": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "workbench_job_id",
+          "question_id",
+          "answer"
+        ],
+        "additionalProperties": false
+      },
+      "pw_request_review": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "require_fresh_session": {
+            "type": "boolean"
+          },
+          "requested": {
+            "type": "object",
+            "properties": {
+              "model_alias": {
+                "type": "string",
+                "maxLength": 120,
+                "pattern": "^[A-Za-z0-9._-]+$"
+              },
+              "effort": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ]
+              }
+            },
+            "required": [
+              "model_alias",
+              "effort"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "workbench_job_id",
+          "requested"
+        ],
+        "additionalProperties": false
+      },
+      "pw_request_revision": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "instructions": {
+            "type": "string",
+            "maxLength": 2000
+          },
+          "blocking_finding_ids": {
+            "type": "array",
+            "maxItems": 50,
+            "items": {
+              "type": "string",
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9:._-]+$"
+            }
+          }
+        },
+        "required": [
+          "workbench_job_id",
+          "instructions"
+        ],
+        "additionalProperties": false
+      },
+      "pw_stream_events": {
+        "type": "object",
+        "properties": {
+          "workbench_job_id": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "after_sequence": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "limit": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 200
+          }
+        },
+        "required": [
+          "workbench_job_id"
+        ],
+        "additionalProperties": false
+      },
+      "pw_submit_job": {
+        "type": "object",
+        "additionalProperties": true
+      },
+      "pw_verify_session_configuration": {
+        "type": "object",
+        "properties": {
+          "project_id": {
+            "type": "string",
+            "maxLength": 100,
+            "pattern": "^[A-Za-z0-9._-]+$"
+          },
+          "session_key": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9:._-]+$"
+          },
+          "phase_class": {
+            "type": "string",
+            "enum": [
+              "discovery",
+              "planning",
+              "implementation",
+              "mechanical_correction",
+              "high_risk_design",
+              "routine_review",
+              "high_risk_review"
+            ]
+          },
+          "requested": {
+            "type": "object",
+            "properties": {
+              "model_alias": {
+                "type": "string",
+                "maxLength": 120,
+                "pattern": "^[A-Za-z0-9._-]+$"
+              },
+              "effort": {
+                "type": "string",
+                "enum": [
+                  "low",
+                  "medium",
+                  "high",
+                  "max"
+                ]
+              }
+            },
+            "required": [
+              "model_alias",
+              "effort"
+            ],
+            "additionalProperties": false
+          }
+        },
+        "required": [
+          "project_id",
+          "session_key",
+          "phase_class",
+          "requested"
+        ],
+        "additionalProperties": false
+      }
+    }
+  },
+  "enums": {
+    "JobStatus": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_review",
+      "blocked_usage_limit",
+      "blocked_verification",
+      "cancelled",
+      "completed",
+      "discovering",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "implementing",
+      "planning",
+      "publishing",
+      "queued",
+      "received",
+      "reviewing",
+      "revision_required",
+      "superseded",
+      "validating",
+      "verifying_backend",
+      "verifying_full",
+      "verifying_targeted",
+      "waiting_for_approval",
+      "waiting_for_input",
+      "waiting_for_plan_approval",
+      "waiting_for_publication_approval"
+    ],
+    "EventType": [
+      "approval_decided",
+      "approval_requested",
+      "artifact_recorded",
+      "blocked",
+      "cancelled",
+      "check_completed",
+      "completed",
+      "deployment_recorded",
+      "diff_observed",
+      "failed",
+      "heartbeat",
+      "job_submitted",
+      "model_mismatch",
+      "model_verified",
+      "phase_completed",
+      "phase_started",
+      "publication_recorded",
+      "question_answered",
+      "question_raised",
+      "review_completed",
+      "session_ready",
+      "state_changed"
+    ],
+    "Effort": [
+      "high",
+      "low",
+      "max",
+      "medium"
+    ],
+    "RiskClass": [
+      "critical",
+      "high",
+      "low",
+      "normal"
+    ],
+    "PlanPolicy": [
+      "auto",
+      "required",
+      "skip"
+    ],
+    "ApprovalPolicy": [
+      "allowed",
+      "approval_required",
+      "not_requested"
+    ],
+    "PhaseClass": [
+      "discovery",
+      "high_risk_design",
+      "high_risk_review",
+      "implementation",
+      "mechanical_correction",
+      "planning",
+      "routine_review"
+    ],
+    "ModelVerificationOutcome": [
+      "mismatch",
+      "unverifiable",
+      "verified"
+    ],
+    "CodingBackend": [
+      "claude-code",
+      "codex-cli"
+    ],
+    "OrchestratorSessionStatus": [
+      "failed",
+      "missing",
+      "ready",
+      "stale",
+      "unknown"
+    ],
+    "CapabilityFlag": [
+      "build",
+      "deployment",
+      "full_test_suite",
+      "implementation",
+      "independent_review",
+      "lint",
+      "planning",
+      "publication",
+      "targeted_tests",
+      "type_check"
+    ],
+    "ArtifactKind": [
+      "diff",
+      "log",
+      "other",
+      "plan",
+      "review_report",
+      "screenshot",
+      "test_report"
+    ],
+    "CheckKind": [
+      "build",
+      "canonical_verification",
+      "contract_check",
+      "diff_check",
+      "format",
+      "full_test_suite",
+      "lint",
+      "secret_scan",
+      "targeted_test",
+      "type_check",
+      "ui_verification"
+    ],
+    "CheckOutcome": [
+      "errored",
+      "failed",
+      "not_run",
+      "passed"
+    ],
+    "ReviewVerdict": [
+      "approved",
+      "changes_requested",
+      "inconclusive",
+      "rejected"
+    ],
+    "DecisionScope": [
+      "architecture",
+      "clarification",
+      "deployment",
+      "destructive",
+      "product",
+      "security"
+    ],
+    "QuestionStatus": [
+      "answered",
+      "open",
+      "voided"
+    ],
+    "TimeoutAction": [
+      "cancel",
+      "fail",
+      "remain_blocked"
+    ],
+    "ApprovalType": [
+      "architecture_decision",
+      "deployment",
+      "destructive_action",
+      "merge",
+      "plan",
+      "publication",
+      "scope_expansion",
+      "security_decision"
+    ],
+    "ApprovalStatus": [
+      "approved",
+      "pending",
+      "rejected",
+      "voided"
+    ],
+    "ActorKind": [
+      "agent",
+      "human",
+      "orchestrator",
+      "system",
+      "workbench"
+    ],
+    "CiState": [
+      "failed",
+      "not_configured",
+      "not_started",
+      "passed",
+      "running"
+    ],
+    "DeploymentStatus": [
+      "failed",
+      "not_requested",
+      "pending_approval",
+      "rolled_back",
+      "running",
+      "succeeded"
+    ],
+    "HealthState": [
+      "degraded",
+      "down",
+      "ok"
+    ],
+    "AuthMethod": [
+      "subscription_oauth",
+      "unknown"
+    ],
+    "ErrorCode": [
+      "conflict",
+      "direct_coding_forbidden",
+      "forbidden_scope",
+      "idempotency_key_reused",
+      "internal_error",
+      "invalid_transition",
+      "lease_lost",
+      "model_policy_violation",
+      "not_found",
+      "payload_too_large",
+      "project_not_authorized",
+      "rate_limited",
+      "unauthenticated",
+      "unsafe_path",
+      "unsupported_schema_version",
+      "validation_failed",
+      "workbench_unavailable"
+    ]
+  },
+  "state_families": {
+    "progress": [
+      "discovering",
+      "ensuring_project_session",
+      "implementing",
+      "planning",
+      "publishing",
+      "queued",
+      "received",
+      "reviewing",
+      "revision_required",
+      "validating",
+      "verifying_backend",
+      "verifying_full",
+      "verifying_targeted"
+    ],
+    "blocked": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_review",
+      "blocked_usage_limit",
+      "blocked_verification",
+      "waiting_for_approval",
+      "waiting_for_input",
+      "waiting_for_plan_approval",
+      "waiting_for_publication_approval"
+    ],
+    "terminal": [
+      "cancelled",
+      "completed",
+      "expired",
+      "failed",
+      "superseded"
+    ],
+    "workspace_active": [
+      "discovering",
+      "ensuring_project_session",
+      "implementing",
+      "planning",
+      "publishing",
+      "reviewing",
+      "verifying_backend",
+      "verifying_full",
+      "verifying_targeted"
+    ]
+  },
+  "transitions": {
+    "blocked_authentication": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "verifying_backend"
+    ],
+    "blocked_configuration": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "verifying_backend"
+    ],
+    "blocked_connectivity": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "verifying_backend"
+    ],
+    "blocked_project_state": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "verifying_backend"
+    ],
+    "blocked_rate_limit": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "verifying_backend"
+    ],
+    "blocked_review": [
+      "cancelled",
+      "expired",
+      "failed",
+      "reviewing",
+      "revision_required",
+      "superseded"
+    ],
+    "blocked_usage_limit": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "verifying_backend"
+    ],
+    "blocked_verification": [
+      "cancelled",
+      "expired",
+      "failed",
+      "queued",
+      "revision_required",
+      "superseded"
+    ],
+    "cancelled": [],
+    "completed": [],
+    "discovering": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "expired",
+      "failed",
+      "implementing",
+      "planning",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "ensuring_project_session": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "expired",
+      "failed",
+      "superseded",
+      "verifying_backend",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "expired": [],
+    "failed": [],
+    "implementing": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "expired",
+      "failed",
+      "superseded",
+      "verifying_targeted",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "planning": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "expired",
+      "failed",
+      "implementing",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input",
+      "waiting_for_plan_approval"
+    ],
+    "publishing": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "completed",
+      "expired",
+      "failed",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "queued": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "received": [
+      "cancelled",
+      "expired",
+      "failed",
+      "superseded",
+      "validating"
+    ],
+    "reviewing": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_review",
+      "blocked_usage_limit",
+      "cancelled",
+      "completed",
+      "expired",
+      "failed",
+      "publishing",
+      "revision_required",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input",
+      "waiting_for_publication_approval"
+    ],
+    "revision_required": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "expired",
+      "failed",
+      "implementing",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "superseded": [],
+    "validating": [
+      "blocked_configuration",
+      "blocked_project_state",
+      "cancelled",
+      "expired",
+      "failed",
+      "queued",
+      "superseded",
+      "waiting_for_input"
+    ],
+    "verifying_backend": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "cancelled",
+      "discovering",
+      "expired",
+      "failed",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "verifying_full": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "blocked_verification",
+      "cancelled",
+      "expired",
+      "failed",
+      "reviewing",
+      "revision_required",
+      "superseded",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "verifying_targeted": [
+      "blocked_authentication",
+      "blocked_configuration",
+      "blocked_connectivity",
+      "blocked_project_state",
+      "blocked_rate_limit",
+      "blocked_usage_limit",
+      "blocked_verification",
+      "cancelled",
+      "expired",
+      "failed",
+      "revision_required",
+      "superseded",
+      "verifying_full",
+      "waiting_for_approval",
+      "waiting_for_input"
+    ],
+    "waiting_for_approval": [
+      "cancelled",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "implementing",
+      "publishing",
+      "queued",
+      "reviewing",
+      "superseded",
+      "verifying_backend",
+      "verifying_full"
+    ],
+    "waiting_for_input": [
+      "cancelled",
+      "discovering",
+      "ensuring_project_session",
+      "expired",
+      "failed",
+      "implementing",
+      "planning",
+      "publishing",
+      "queued",
+      "reviewing",
+      "superseded",
+      "verifying_backend",
+      "verifying_full",
+      "verifying_targeted"
+    ],
+    "waiting_for_plan_approval": [
+      "cancelled",
+      "expired",
+      "failed",
+      "implementing",
+      "planning",
+      "queued",
+      "superseded"
+    ],
+    "waiting_for_publication_approval": [
+      "cancelled",
+      "completed",
+      "expired",
+      "failed",
+      "publishing",
+      "superseded"
+    ]
+  },
+  "event_rules": {
+    "evidence_required": [
+      "check_completed",
+      "deployment_recorded",
+      "diff_observed",
+      "publication_recorded",
+      "review_completed"
+    ],
+    "heartbeat_carries_no_evidence": true,
+    "state_changed_records_previous_status": true,
+    "sequences_are_per_job_gapless_from_one": true
+  },
+  "interaction_rules": {
+    "human_only_decision_scopes": [
+      "deployment",
+      "destructive",
+      "security"
+    ],
+    "approval_requires_human_actor": true,
+    "answer_matches_one_live_question_once": true
+  },
+  "errors": {
+    "conflict": 409,
+    "direct_coding_forbidden": 403,
+    "forbidden_scope": 403,
+    "idempotency_key_reused": 409,
+    "internal_error": 500,
+    "invalid_transition": 409,
+    "lease_lost": 409,
+    "model_policy_violation": 400,
+    "not_found": 404,
+    "payload_too_large": 413,
+    "project_not_authorized": 403,
+    "rate_limited": 429,
+    "unauthenticated": 401,
+    "unsafe_path": 400,
+    "unsupported_schema_version": 400,
+    "validation_failed": 400,
+    "workbench_unavailable": 503
+  },
+  "limits": {
+    "text": {
+      "shortText": 200,
+      "mediumText": 2000,
+      "longText": 20000,
+      "criterionText": 1000,
+      "slug": 100,
+      "identifier": 128,
+      "relativePath": 512,
+      "modelAlias": 120,
+      "branch": 200
+    },
+    "max_list_items": 50,
+    "max_artifact_bytes": 33554432,
+    "max_excerpt_bytes": 65536,
+    "max_events_per_page": 200,
+    "max_phase_turns": 60,
+    "max_revision_cycles": 3,
+    "max_intended_files": 200
+  },
+  "patterns": {
+    "slug": "^[A-Za-z0-9._-]+$",
+    "identifier": "^[A-Za-z0-9:._-]+$",
+    "modelAlias": "^[A-Za-z0-9._-]+$",
+    "gitSha": "^[a-f0-9]{40}$",
+    "branch": "^[A-Za-z0-9._/-]+$",
+    "mediaType": "^[\\w.+-]+\\/[\\w.+-]+$",
+    "schemaVersion": "^\\d+\\.\\d+$",
+    "idPrefix": "^[a-z][a-z0-9_]{0,15}$"
+  },
+  "safety": {
+    "allowed_check_names": [
+      "canonical_verification",
+      "contract_check",
+      "diff_check",
+      "full_test_suite",
+      "secret_scan",
+      "targeted_test"
+    ],
+    "allowed_git_subcommands": [
+      "add",
+      "branch",
+      "cat-file",
+      "check-ignore",
+      "commit",
+      "config",
+      "describe",
+      "diff",
+      "fetch",
+      "for-each-ref",
+      "hash-object",
+      "log",
+      "ls-files",
+      "ls-remote",
+      "push",
+      "remote",
+      "rev-list",
+      "rev-parse",
+      "show",
+      "status",
+      "symbolic-ref",
+      "var",
+      "worktree"
+    ],
+    "forbidden_git_subcommands": [
+      "am",
+      "apply",
+      "bisect",
+      "checkout",
+      "cherry-pick",
+      "clean",
+      "filter-branch",
+      "filter-repo",
+      "fsck",
+      "gc",
+      "merge",
+      "mv",
+      "notes",
+      "prune",
+      "rebase",
+      "reflog",
+      "repack",
+      "replace",
+      "reset",
+      "restore",
+      "revert",
+      "rm",
+      "stash",
+      "submodule",
+      "switch",
+      "symbolic-ref-d",
+      "update-index",
+      "update-ref"
+    ],
+    "cancellation_preserves_working_tree": true,
+    "api_key_authentication_representable": false,
+    "publication_requires_recorded_human_approval": true,
+    "remote_sha_verified_requires_full_sha_match": true
+  },
+  "known_gaps": [
+    {
+      "id": "effective-effort-unverifiable",
+      "summary": "Claude Code reports the active model in its stream-json init event but does not report the active effort, and silently ignores an unrecognised --effort value (stderr warning, exit 0, runs at the default). ProjectWorkbench therefore returns effective: null by default, which blocks the job, rather than reporting a guess.",
+      "workaround": "PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv makes the operator accept argv attestation; every such response is labelled argv-attested in `detail`.",
+      "needs_coordination": true
+    }
+  ]
+}

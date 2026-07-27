@@ -1,0 +1,35 @@
+{
+  "_comment": [
+    "Which projects this ProjectWorkbench instance offers to an orchestrator, and what each",
+    "project's lane may do. Copy to PW_ORCHESTRATOR_PROJECTS_PATH (default",
+    "/etc/project-workbench/orchestrator-projects.json).",
+    "",
+    "Kept separate from the dashboard's projects.json on purpose: enabling orchestration for one",
+    "project should not be an edit to the registry every human terminal depends on.",
+    "",
+    "An absent capability means NOT OFFERED. It never means 'assume yes'. An unrecognised",
+    "capability name is dropped rather than passed through.",
+    "",
+    "verification_commands are run by ProjectWorkbench with NO SHELL, so `a && b` and pipelines",
+    "will not work — point at a script instead. The first entry is the targeted check; the whole",
+    "list is the canonical verification."
+  ],
+  "schema_version": "1.0",
+  "projects": {
+    "REPLACE-WITH-PROJECT-NAME": {
+      "display_name": "Example project",
+      "capabilities": [
+        "planning",
+        "implementation",
+        "targeted_tests",
+        "full_test_suite",
+        "independent_review",
+        "publication"
+      ],
+      "verification_commands": ["npm test"],
+      "default_branch": "main",
+      "has_ci": true,
+      "publication_note": "PR requires approval"
+    }
+  }
+}
