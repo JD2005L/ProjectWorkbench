@@ -30,6 +30,14 @@ const execFileAsync = promisify(execFile);
 // name and does not occur in a filesystem path in practice.
 const FIELD_SEP = '<|pwsep|>';
 
+/**
+ * Pane commands that count as "an idle shell".
+ *
+ * Reclaiming an unmarked window is only safe when nothing is running in it. A window whose pane is
+ * running anything else belongs to whoever started it.
+ */
+const IDLE_SHELLS = Object.freeze(new Set(['bash', 'sh', 'zsh', 'dash', 'fish', 'ksh', '-bash', '-sh', '-zsh']));
+
 /** tmux user options carrying the lane's identity. Only this service ever writes them. */
 const MARKER = Object.freeze({
   ROLE: '@pw_role',
@@ -94,6 +102,7 @@ export class TmuxAdapter {
   async listWindows(session) {
     const format = [
       '#{window_id}', '#{window_index}', '#{window_name}', '#{pane_pid}', '#{pane_current_path}',
+      '#{pane_current_command}',
       `#{${MARKER.ROLE}}`, `#{${MARKER.PROJECT}}`, `#{${MARKER.SESSION_KEY}}`, `#{${MARKER.ORCHESTRATOR}}`,
     ].join(FIELD_SEP);
     let stdout;
@@ -103,13 +112,14 @@ export class TmuxAdapter {
       return [];
     }
     return stdout.split('\n').filter(Boolean).map((line) => {
-      const [id, index, name, panePid, paneCurrentPath, role, projectId, sessionKey, orchestrator] = line.split(FIELD_SEP);
+      const [id, index, name, panePid, paneCurrentPath, paneCommand, role, projectId, sessionKey, orchestrator] = line.split(FIELD_SEP);
       return {
         id,
         index: Number(index),
         name,
         panePid: Number(panePid),
         paneCurrentPath,
+        paneCommand: paneCommand || null,
         role: role || null,
         projectId: projectId || null,
         sessionKey: sessionKey || null,
@@ -274,7 +284,12 @@ export class OrchestratorSessionManager {
           && recorded.reserved_tmux_window === lane.reservedWindow
           && recorded.workspace_path === workspacePath
           && !existing.role && !existing.projectId && !existing.sessionKey && !existing.orchestrator
-          && existing.paneCurrentPath === workspacePath;
+          && existing.paneCurrentPath === workspacePath
+          // An idle shell, which is what pw-tmux-restore leaves behind. Anything actually running
+          // is somebody's work: the previous code claimed to check this and did not, so a human's
+          // window sitting in the workspace could be adopted — and, once its cwd moved, killed as
+          // a stale lane.
+          && IDLE_SHELLS.has(existing.paneCommand ?? '');
 
         if (!reclaimable) {
           throw new ApiError(

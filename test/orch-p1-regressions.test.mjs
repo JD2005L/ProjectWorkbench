@@ -291,7 +291,7 @@ gitTest("publish: a failed publication leaves the operator's index exactly as it
 });
 
 gitTest('publish: pathspec magic is refused before it reaches git add', async () => {
-  await withEngine(async ({ engine, repoDir }) => {
+  await withEngine(async ({ engine, repo, repoDir }) => {
     const { jobId, approval } = await driveToGate(engine);
     fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
     await engine.approveStage({
@@ -302,19 +302,22 @@ gitTest('publish: pathspec magic is refused before it reaches git add', async ()
 
     for (const magic of [':(glob)**', ':/', ':!README.md', '*', ':(exclude)a']) {
       // `--` stops git interpreting a leading dash as an option; it does NOT stop pathspec magic.
+      // The refusal is recorded rather than thrown: the job has already entered `publishing`, and
+      // an exception escaping would strand it there with no legal transition back.
       // eslint-disable-next-line no-await-in-loop
-      await assert.rejects(
-        engine.publish({
-          token: SUBMITTER, jobId,
-          request: {
-            job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: [magic],
-            open_pull_request: false, approval_id: approval.approval_id,
-          },
-          idempotencyKey: `p-${magic}`, correlationId: 'c',
-        }),
-        (err) => err instanceof ApiError,
-        `pathspec magic ${magic} must be refused`,
-      );
+      const record = await engine.publish({
+        token: SUBMITTER, jobId,
+        request: {
+          job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: [magic],
+          open_pull_request: false, approval_id: approval.approval_id,
+        },
+        idempotencyKey: `p-${magic}`, correlationId: 'c',
+      }).catch((err) => err);
+
+      const refused = record instanceof ApiError || (record.pushed === false && record.local_commit === null);
+      assert.ok(refused, `pathspec magic ${magic} must be refused`);
+      // And in every case the job must remain in a state it can move on from.
+      assert.notEqual(repo.getJob(jobId).status, JobStatus.PUBLISHING, `${magic} left the job stranded`);
     }
   }, { backendOptions: ATTESTING });
 });
@@ -653,10 +656,129 @@ tmuxTest('lane: an unmarked window is only adopted when this instance recorded t
   }
 });
 
+gitTest('cancel: the preservation check can actually fail — it is not a tautology', async () => {
+  // The check sampled the tree twice AFTER the worker had already stopped, so nothing could happen
+  // between the samples and `working_tree_preserved: true` was unconditional. A backend that
+  // discarded work during cancellation went undetected.
+  await withEngine(async ({ engine, repo, repoDir, backend }) => {
+    fs.writeFileSync(path.join(repoDir, 'operator-work.txt'), 'do not lose me\n');
+
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      request.signal?.addEventListener('abort', () => {
+        // A misbehaving backend that discards the operator's uncommitted work on the way out.
+        fs.rmSync(path.join(repoDir, 'operator-work.txt'), { force: true });
+        reject(Object.assign(new Error('aborted'), { kind: 'cancelled' }));
+      });
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await engine.cancelJob({
+      token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' },
+    });
+
+    assert.equal(
+      repo.getJob(jobId).working_tree_preserved, false,
+      'a discard during cancellation must be detected, not reported as preserved',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('cancel: further writes during cancellation are not mistaken for a discard', async () => {
+  // The opposite error: sampling before the abort and comparing whole-tree output would call an
+  // agent finishing a legitimate write a violation. Preservation means nothing was LOST.
+  await withEngine(async ({ engine, repo, repoDir, backend }) => {
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 41; // in progress\n');
+
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      request.signal?.addEventListener('abort', () => {
+        fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 41; // more work\n');
+        fs.writeFileSync(path.join(repoDir, 'new-file.txt'), 'added on the way out\n');
+        reject(Object.assign(new Error('aborted'), { kind: 'cancelled' }));
+      });
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await engine.cancelJob({
+      token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' },
+    });
+
+    assert.equal(repo.getJob(jobId).working_tree_preserved, true, 'continued writing is not a discard');
+    assert.ok(fs.existsSync(path.join(repoDir, 'new-file.txt')));
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('cancel: does not hold the caller open for the whole phase budget', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    // A child that is slow to notice the signal. It DOES finish eventually — the point is that the
+    // caller is not held open until it does. An unbounded await here meant a cancel request hung
+    // for the entire remaining phase budget, up to half an hour by default.
+    backend.runPhase = () => new Promise((resolve) => {
+      setTimeout(() => resolve({
+        ok: false, failure_kind: 'cancelled', session_id: 's', summary: '',
+        questions: [], turns_used: 0, max_turns_reached: false,
+      }), 4_000);
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const started = Date.now();
+    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+    const elapsed = Date.now() - started;
+
+    // Grace is 1s; the phase takes 4s. Returning in well under 4s is the whole assertion.
+    assert.ok(elapsed < 3_000, `cancel must be bounded by the grace period, took ${elapsed} ms`);
+    assert.equal(repo.getJob(jobId).status, JobStatus.CANCELLED);
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '1000' } });
+});
+
+gitTest('publish: a commit message beginning with a dash publishes, and never strands the job', async () => {
+  await withEngine(async ({ engine, repo, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+    // A perfectly ordinary message that the argv guard could not tell from a flag.
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/dash', commit_message: '- fix expiry handling',
+        intended_files: ['src.js'], open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+    assert.equal(record.pushed, true, record.failure_reason ?? 'a dash-leading message must publish');
+    assert.notEqual(repo.getJob(jobId).status, JobStatus.PUBLISHING);
+  }, { backendOptions: ATTESTING });
+});
+
 test('persistence: the tmux save manifest excludes orchestrator-owned lanes', () => {
   // The lane is ephemeral and ProjectWorkbench recreates it on demand. Restoring it by name as a
   // plain shell is what produced the unmarked squatter in the first place.
   const script = fs.readFileSync(new URL('../scripts/pw-tmux-save', import.meta.url), 'utf8');
   assert.match(script, /@pw_role/, 'the save script must be able to see the lane marker');
   assert.match(script, /skip|exclude/i);
+  // Two markers, not one: tmux resolves #{@option} through the window/session/global scope chain,
+  // so keying on @pw_role alone let a single stray global option exclude every window on the server.
+  assert.match(script, /@pw_session_key/, 'the skip must require a second window-scoped marker');
 });

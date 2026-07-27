@@ -1499,7 +1499,6 @@
       "rev-parse",
       "show",
       "status",
-      "symbolic-ref",
       "var",
       "worktree"
     ],
@@ -1529,7 +1528,7 @@
       "stash",
       "submodule",
       "switch",
-      "symbolic-ref-d",
+      "symbolic-ref",
       "update-index",
       "update-ref"
     ],

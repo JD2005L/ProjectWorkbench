@@ -31,7 +31,7 @@ import { KIND } from './store/repo.js';
 import { SCOPES } from './auth.js';
 import { attestModel } from './attestation.js';
 import { resolveWorkspacePath } from './projects.js';
-import { repositoryBaseline, workingTreeFingerprint } from './git.js';
+import { repositoryBaseline, workingTreeFingerprint, workingTreePreserved } from './git.js';
 import { diffStat, canonicaliseCheckName, CHECK_CATALOGUE } from './checks.js';
 import {
   SUBMIT_JOB_SCHEMA, REPLY_SCHEMA, APPROVE_SCHEMA, REVISE_SCHEMA, REVIEW_SCHEMA, CANCEL_SCHEMA,
@@ -722,6 +722,13 @@ export class OrchestrationEngine {
       });
       return;
     }
+    // The same renewal the main pipeline installs. Without it the lease (5 minutes by default)
+    // lapsed inside a revision phase (30 minutes) and a second job walked into the same checkout.
+    const renewal = setInterval(() => {
+      this._renewLease(jobId, project.project_id).catch(() => {});
+    }, Math.max(1_000, Math.floor(this.config.leaseTtlMs / 3)));
+    if (typeof renewal.unref === 'function') renewal.unref();
+
     try {
       const job = this.repo.getJob(jobId);
       await this._transition(jobId, JobStatus.IMPLEMENTING, {
@@ -770,6 +777,7 @@ export class OrchestrationEngine {
         detail: 'publication requires a recorded approval',
       });
     } finally {
+      clearInterval(renewal);
       await this._releaseLease(jobId);
     }
   }
@@ -1360,7 +1368,14 @@ export class OrchestrationEngine {
 
     const workspacePath = resolveWorkspacePath(this.config, project);
 
-    const record = await this.publisher.publish({ job, project, workspacePath, request });
+    let record;
+    try {
+      record = await this.publisher.publish({ job, project, workspacePath, request });
+    } catch (err) {
+      // The job has already been moved to `publishing`, so an exception escaping here would strand
+      // it there with no legal way back. Any refusal becomes a recorded failed publication instead.
+      record = this.publisher.refusedRecord(job, err instanceof ApiError ? err.message : 'the publication was refused');
+    }
 
     const artifact = await this.artifacts.write({
       jobId, kind: ArtifactKind.LOG, name: 'publication.log',
@@ -1428,20 +1443,29 @@ export class OrchestrationEngine {
     const project = this._resolveProjectOrThrow(job.project_id);
     const workspacePath = resolveWorkspacePath(this.config, project);
 
-    // Signal the running phase first. Waiting for it to finish on its own meant a cancel could take
-    // the whole phase budget while the agent carried on editing.
-    this._aborts.get(jobId)?.abort();
-
-    // Only once nothing is still writing are the two fingerprints comparable — otherwise a write
-    // that lands between them reads as "the tree changed", which is a false accusation on the
-    // contract's flagship guarantee rather than a detection of one.
-    const inFlight = this._running.get(jobId);
-    if (inFlight) await inFlight.promise.catch(() => {});
-
+    // BEFORE the abort. Sampling after the worker had already stopped made the comparison a
+    // tautology — the two samples were taken back to back with nothing able to happen between them,
+    // so a discard during cancellation was undetectable. The contract's flagship guarantee has to
+    // be checked across the window in which something could actually go wrong.
     const before = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
 
+    // Signal the running phase. Waiting for it to finish on its own meant a cancel could take the
+    // whole phase budget while the agent carried on editing.
+    this._aborts.get(jobId)?.abort();
+
+    // Bounded. An unbounded await here held the caller's request open for the entire remaining
+    // phase budget — up to half an hour — whenever a child ignored the signal. The job is recorded
+    // cancelled either way; a straggler finds `_cancelRequested` set and stops at its next boundary.
+    const inFlight = this._running.get(jobId);
+    if (inFlight) {
+      await Promise.race([
+        inFlight.promise.catch(() => {}),
+        new Promise((resolve) => { const t = setTimeout(resolve, this.config.cancelGraceMs); t.unref?.(); }),
+      ]);
+    }
+
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
-    const preserved = before.status === after.status && before.head === after.head && before.diff === after.diff;
+    const preserved = workingTreePreserved(before, after);
 
     await this._releaseLease(jobId);
     const current = this.repo.getJob(jobId);

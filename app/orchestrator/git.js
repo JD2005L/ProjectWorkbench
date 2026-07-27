@@ -28,7 +28,7 @@ const GIT_IDENTITY_VARS = Object.freeze([
  */
 export const ALLOWED_GIT_SUBCOMMANDS = Object.freeze(new Set([
   'rev-parse', 'status', 'diff', 'log', 'ls-files', 'show', 'cat-file', 'rev-list',
-  'symbolic-ref', 'for-each-ref', 'remote', 'config', 'branch', 'fetch', 'ls-remote',
+  'for-each-ref', 'remote', 'config', 'branch', 'fetch', 'ls-remote',
   'add', 'commit', 'push', 'worktree', 'check-ignore', 'var', 'describe', 'hash-object',
   // Seeds a scratch index from a commit. Writes ONLY the index — never the working tree, because
   // the options that would do that (-u, -m, --reset) are not in the option allowlist below, and
@@ -44,7 +44,10 @@ export const FORBIDDEN_GIT_SUBCOMMANDS = Object.freeze(new Set([
   'reset', 'checkout', 'restore', 'clean', 'stash', 'rm', 'mv', 'rebase', 'merge',
   'cherry-pick', 'revert', 'filter-branch', 'filter-repo', 'update-ref', 'reflog',
   'gc', 'prune', 'am', 'apply', 'switch', 'bisect', 'submodule', 'replace', 'notes',
-  'update-index', 'symbolic-ref-d', 'fsck', 'repack',
+  'update-index', 'fsck', 'repack',
+  // symbolic-ref with a second argument re-points HEAD at an arbitrary ref, after which a commit
+  // lands on that ref and abandons the operator's branch. Read-only uses are not worth the hole.
+  'symbolic-ref',
 ]));
 
 /**
@@ -66,7 +69,6 @@ const ALLOWED_OPTIONS = Object.freeze({
   show: new Set(['--numstat', '--stat', '--format=', '--name-only', '--no-color', '-z', '--no-renames']),
   'cat-file': new Set(['-t', '-p', '-e']),
   'rev-list': new Set(['--count', '--max-count', '-n']),
-  'symbolic-ref': new Set(['--short', '-q']),
   'for-each-ref': new Set(['--format', '--count']),
   remote: new Set([]),
   config: new Set(['--get', '--get-all', '--list']),
@@ -86,10 +88,20 @@ const ALLOWED_OPTIONS = Object.freeze({
   'read-tree': new Set([]),
 });
 
+/**
+ * Options whose next argv element is a value rather than another option.
+ *
+ * Listed explicitly, because "starts with a dash" cannot distinguish `-m` from the message it
+ * carries — and a commit message is free text that may legitimately begin with one.
+ */
+const VALUE_TAKING_OPTIONS = Object.freeze(new Set([
+  '-m', '--message', '-n', '--max-count', '--format', '--pretty', '-t', '-b', '-C',
+]));
+
 /** Verbs each multi-verb subcommand may use. */
 const ALLOWED_VERBS = Object.freeze({
   worktree: new Set(['list', 'add']),
-  remote: new Set(['get-url', 'show', '-v']),
+  remote: new Set(['get-url', 'show']),
 });
 
 function refuse(message) {
@@ -127,10 +139,16 @@ export function assertGitArgvAllowed(argv) {
 
   const allowedHere = ALLOWED_OPTIONS[subcommand] ?? new Set();
   let afterDoubleDash = false;
+  let skipNext = false;
   for (const arg of rest) {
     // Everything after `--` is a pathspec, not an option.
     if (afterDoubleDash) continue;
     if (arg === '--') { afterDoubleDash = true; continue; }
+    // The VALUE of a value-taking option is not itself an option, whatever it starts with. Without
+    // this a perfectly ordinary commit message beginning with a dash was refused as a flag — and
+    // the refusal threw from outside runGit's try, wedging the job in `publishing` forever.
+    if (skipNext) { skipNext = false; continue; }
+    if (VALUE_TAKING_OPTIONS.has(arg)) { skipNext = true; continue; }
     if (!arg.startsWith('-')) continue;
 
     // A short-option cluster is expanded by git: `-fu` is `-f -u`, and denylisting the literal
@@ -167,7 +185,9 @@ export function assertGitArgvAllowed(argv) {
     for (const arg of rest) {
       if (arg.startsWith('-')) continue;
       if (arg.startsWith(':')) throw refuse(`a deleting ${subcommand} refspec is not permitted`);
-      if (arg.startsWith('+')) throw refuse(`a forced ${subcommand} refspec is not permitted`);
+      // A `+` marks a forced update wherever it appears — `HEAD:+refs/heads/main` is not a leading
+      // plus, and real git creates a ref literally named `+refs/heads/main` from it.
+      if (arg.includes('+')) throw refuse(`a forced ${subcommand} refspec is not permitted`);
     }
   }
 
@@ -256,17 +276,41 @@ export async function repositoryBaseline({ cwd, gitExecutable = 'git', exec }) {
   };
 }
 
-/** A stable fingerprint of the working tree, used to prove cancellation changed nothing. */
+/**
+ * A fingerprint of the uncommitted work a cancellation must not destroy.
+ *
+ * Deliberately *not* a whole-tree snapshot. Comparing complete `status` and `diff` output either
+ * says nothing (if both samples are taken after everything has stopped) or cries wolf (if the agent
+ * legitimately writes between the two). What matters is narrower and checkable: which paths carried
+ * uncommitted work, and where HEAD was.
+ */
 export async function workingTreeFingerprint({ cwd, gitExecutable = 'git', exec }) {
   const opts = { cwd, gitExecutable, exec };
-  const [status, head, diff] = await Promise.all([
-    runGit(['status', '--porcelain=v1', '--untracked-files=all'], opts),
+  const [status, head] = await Promise.all([
+    runGit(['status', '--porcelain=v1', '--untracked-files=all', '-z'], opts),
     runGit(['rev-parse', 'HEAD'], opts),
-    runGit(['diff'], opts),
   ]);
-  return {
-    status: status.stdout,
-    head: head.stdout.trim(),
-    diff: diff.stdout,
-  };
+  // `-z` for the same reason publication uses it: git quotes non-ASCII paths otherwise.
+  const dirty = new Set();
+  for (const entry of status.stdout.split('\0').filter(Boolean)) {
+    const file = entry.slice(3);
+    if (file) dirty.add(file);
+  }
+  return { head: head.stdout.trim(), dirty };
+}
+
+/**
+ * Whether the second fingerprint still contains everything the first one did.
+ *
+ * "Preserved" means nothing was *lost*: HEAD did not move, and every path that carried uncommitted
+ * work still does. A path that gained further changes is fine — an agent finishing a write during
+ * cancellation is not a discard. A path that went from dirty to clean, or vanished, is.
+ */
+export function workingTreePreserved(before, after) {
+  if (!before || !after) return false;
+  if (before.head !== after.head) return false;
+  for (const file of before.dirty) {
+    if (!after.dirty.has(file)) return false;
+  }
+  return true;
 }

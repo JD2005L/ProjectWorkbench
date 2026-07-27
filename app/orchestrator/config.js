@@ -175,6 +175,9 @@ export function loadOrchestratorConfig(env = process.env) {
 
     // ---- leases ----
     leaseTtlMs: int(env.PW_ORCHESTRATOR_LEASE_TTL_MS, 300_000, { min: 5_000, max: 86_400_000 }),
+    // How long a cancel waits for the running phase to stop before returning anyway. The job is
+    // recorded cancelled regardless; this only bounds how long the caller's request is held open.
+    cancelGraceMs: int(env.PW_ORCHESTRATOR_CANCEL_GRACE_MS, 15_000, { min: 100, max: 600_000 }),
 
     // ---- publication ----
     gitExecutable: str(env.PW_ORCHESTRATOR_GIT_BIN, 'git'),

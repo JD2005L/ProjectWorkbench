@@ -287,6 +287,11 @@ export class Publisher {
     };
   }
 
+  /** A refusal that happened before any git ran, shaped like any other failed publication. */
+  refusedRecord(job, reason) {
+    return this._failed(job, reason, []);
+  }
+
   /** A publication that did not complete. Never partially claimed as success. */
   _failed(job, reason, steps) {
     return {
