@@ -49,76 +49,76 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 ### A. Wire contract
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| A1 | All contract endpoints + M2 additions served at exact paths | — | |
-| A2 | Responses validate against orchestrator Pydantic **and** committed fixture | — | |
-| A3 | `schema_version` 1.0; wrong major → `unsupported_schema_version`; unknown fields rejected | — | |
-| A4 | §10 error envelope + exact status/code table; no trace/env/credential/unredacted command | — | |
-| A5 | Bounded types, list caps, pagination ≤200, oversize → 413 | — | |
+| A1 | All contract endpoints + M2 additions served at exact paths | PASS | all 17 §3 paths + 6 M2 additions, verified by the wire reviewer |
+| A2 | Responses validate against orchestrator Pydantic **and** committed fixture | PASS | test/orch-wire.test.mjs validates every emitted payload against real Pydantic |
+| A3 | `schema_version` 1.0; wrong major → `unsupported_schema_version`; unknown fields rejected | PASS | orch-contract.test.mjs |
+| A4 | §10 error envelope + exact status/code table; no trace/env/credential/unredacted command | PASS | §10 table asserted both sides |
+| A5 | Bounded types, list caps, pagination ≤200, oversize → 413 | PASS | orch-api-auth.test.mjs |
 
 ### B. Durable engine
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| B1 | Crash mid-write reconciles on restart; no state without a record | — | |
-| B2 | Gapless per-job sequences from 1, durable, SSE-resumable across restart | — | |
-| B3 | Idempotent submit → `deduplicated: true`; different body → 409 `idempotency_key_reused` | — | |
-| B4 | Illegal transition → 409 `invalid_transition`; families match orchestrator `states.py` | — | |
-| B5 | Fencing tokens monotone; lower → 409 `lease_lost`; heartbeat renews; takeover raises | — | |
-| B6 | Evidence rules enforced at record time | — | |
+| B1 | Crash mid-write reconciles on restart; no state without a record | PASS | kill -9 test + mutation-tested |
+| B2 | Gapless per-job sequences from 1, durable, SSE-resumable across restart | PASS | gapless, durable, restart-verified |
+| B3 | Idempotent submit → `deduplicated: true`; different body → 409 `idempotency_key_reused` | PASS | races fixed; reserve-in-transaction |
+| B4 | Illegal transition → 409 `invalid_transition`; families match orchestrator `states.py` | PASS | table matches orchestrator edge for edge |
+| B5 | Fencing tokens monotone; lower → 409 `lease_lost`; heartbeat renews; takeover raises | PASS | fencing + renewal |
+| B6 | Evidence rules enforced at record time | PASS | enforced at write time |
 
 ### C. Ownership & isolation
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| C1 | Explicit configured resolution, no hostname inference; unowned → 403 | — | |
-| C2 | Lane naming exactly per §5; second ensure reuses | — | |
-| C3 | Human tmux window provably untouched across ensure and `force_replace` | — | |
-| C4 | Naming config-driven with contract defaults | — | |
-| C5 | No traversal/symlink escape/worktree collision; one write lease per project | — | |
-| C6 | Cancel leaves tree byte-identical; git argv allowlist forbids reset/stash/clean/checkout-- | — | |
+| C1 | Explicit configured resolution, no hostname inference; unowned → 403 | PASS | config-driven; no hostname inference |
+| C2 | Lane naming exactly per §5; second ensure reuses | PASS | orch-session.test.mjs |
+| C3 | Human tmux window provably untouched across ensure and `force_replace` | PASS | fingerprints unchanged; numeric-name P0 fixed |
+| C4 | Naming config-driven with contract defaults | PASS | laneNaming tests |
+| C5 | No traversal/symlink escape/worktree collision; one write lease per project | PASS | realpath containment + symlink test |
+| C6 | Cancel leaves tree byte-identical; git argv allowlist forbids reset/stash/clean/checkout-- | FAIL | git guard now sound, but cancel does not signal the child and the fingerprint is taken too late |
 
 ### D. Runner & verification
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| D1 | Exact claude argv, reapplied on every resume | — | |
-| D2 | Real effective settings; unqueryable → `effective: null` + `blocked_configuration` pre-read | — | |
-| D3 | No API-key path; only subscription OAuth representable | — | |
-| D4 | Auth/rate/malformed/death/timeout/cancel → distinct safe states preserving work | — | |
-| D5 | Checks allowlisted + canonicalized; real exit codes/counts + artifact | — | |
-| D6 | Review in a fresh session that provably didn't implement; fail-closed | — | |
+| D1 | Exact claude argv, reapplied on every resume | PASS | argv asserted incl. resume |
+| D2 | Real effective settings; unqueryable → `effective: null` + `blocked_configuration` pre-read | FAIL | model never compared; argv attestation is vacuous — see open findings |
+| D3 | No API-key path; only subscription OAuth representable | PASS | auth status + env stripping |
+| D4 | Auth/rate/malformed/death/timeout/cancel → distinct safe states preserving work | PASS | distinct blocked states |
+| D5 | Checks allowlisted + canonicalized; real exit codes/counts + artifact | PASS | allowlisted, real exit codes |
+| D6 | Review in a fresh session that provably didn't implement; fail-closed | PASS | session_isolated enforced |
 
 ### E. Interaction & publication
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| E1 | Real question ids/options/scope/expiry; stale/cross/double answers fail | — | |
-| E2 | Typed approvals; recorded decision required; chat text never approves | — | |
-| E3 | `pw_publish` intended-files-only, SHA parity, live PR, explicit no-CI; no merge/deploy/delete/rewrite path | — | |
-| E4 | Revisions bounded by `max_revision_cycles` and audited | — | |
+| E1 | Real question ids/options/scope/expiry; stale/cross/double answers fail | PASS | real ids; stale/cross/double refused |
+| E2 | Typed approvals; recorded decision required; chat text never approves | FAIL | typed and recorded, but one credential can still satisfy the gate |
+| E3 | `pw_publish` intended-files-only, SHA parity, live PR, explicit no-CI; no merge/deploy/delete/rewrite path | FAIL | SHA parity correct; staging comparison breaks on renames/unicode and leaves the index staged |
+| E4 | Revisions bounded by `max_revision_cycles` and audited | PASS | bounded and audited |
 
 ### F. Authorization
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| F1 | Scoped bearer; 401/403 table; instance mismatch refused; cross-instance job → 404 | — | |
-| F2 | Orchestrator routes separated from browser CSRF/session, both directions | — | |
-| F3 | MCP closed tool set, sampling disabled, no forbidden name fragments | — | |
-| F4 | Rate limits, replay, oversized/malformed, unsafe error reflection | — | |
-| F5 | Planted synthetic secrets redacted everywhere | — | |
+| F1 | Scoped bearer; 401/403 table; instance mismatch refused; cross-instance job → 404 | PASS | IDOR verified by the security reviewer |
+| F2 | Orchestrator routes separated from browser CSRF/session, both directions | PASS | both directions, in the smoke |
+| F3 | MCP closed tool set, sampling disabled, no forbidden name fragments | PASS | closed set, no sampling |
+| F4 | Rate limits, replay, oversized/malformed, unsafe error reflection | PASS | limits/replay/malformed covered |
+| F5 | Planted synthetic secrets redacted everywhere | PASS | redaction verified; detail gap closed |
 
 ### G. Portability
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| G1 | Config-driven; grep proves no CT2115/PVI2/live-path constants outside examples+docs | — | |
-| G2 | Node 20 clean; no native/experimental deps | — | |
-| G3 | `/health` reports db/queue/runner/auth + degraded, secret-free | — | |
-| G4 | Migrations + install/upgrade/rollback documented; no live-config mutation | — | |
-| G5 | All existing tests pass; existing features unchanged | — | |
+| G1 | Config-driven; grep proves no CT2115/PVI2/live-path constants outside examples+docs | PASS | grep clean |
+| G2 | Node 20 clean; no native/experimental deps | PASS | Node 20 clean clone, 236/236, verified by reviewer |
+| G3 | `/health` reports db/queue/runner/auth + degraded, secret-free | PASS | /readiness |
+| G4 | Migrations + install/upgrade/rollback documented; no live-config mutation | PASS | docs/orchestrator-api.md |
+| G5 | All existing tests pass; existing features unchanged | PASS | inertness verified by execution on a 17-request matrix |
 
 ### H. Verification discipline
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
-| H1 | Full lifecycle test on fake backend + temp repo/DB/tmux namespace | — | |
-| H2 | Restart/cancel/failure/cross-project-attack tests | — | |
-| H3 | Alternate-port HTTP+MCP smoke; teardown leaves nothing behind | — | |
-| H4 | `git diff --check` clean; secret scan clean; no runtime artefacts committed | — | |
-| H5 | Independent reviews (security+concurrency, lifecycle, wire, non-regression); P0/P1 resolved | — | |
+| H1 | Full lifecycle test on fake backend + temp repo/DB/tmux namespace | PASS | full lifecycle on fake backend + temp everything |
+| H2 | Restart/cancel/failure/cross-project-attack tests | PASS | restart/cancel/failure/cross-project |
+| H3 | Alternate-port HTTP+MCP smoke; teardown leaves nothing behind | PASS | orch-smoke.test.mjs; teardown verified |
+| H4 | `git diff --check` clean; secret scan clean; no runtime artefacts committed | PASS | diff --check + secret scan clean |
+| H5 | Independent reviews (security+concurrency, lifecycle, wire, non-regression); P0/P1 resolved | FAIL | four reviews obtained; P0s resolved, several P1/P2 open |
 
 ---
 
@@ -204,5 +204,58 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 - **Residual** no Node 20 runtime available locally to execute the suite against CI's pinned version; delegated to the non-regression reviewer.
 - **Criteria advanced** A2, G1, G3, G4, H3 (partial), H4.
 
-### Next
-Independent reviews (security+concurrency, session/worktree lifecycle, wire compatibility, non-regression) are running. Resolve findings, then open the PR.
+### 2026-07-27 — Independent reviews (four, fresh context, read-only)
+
+All four ran against the branch with real execution, not reading alone. **They found defects the
+246-test suite did not.** That is the single most important outcome of this run.
+
+| Reviewer | Verdict |
+|---|---|
+| Wire compatibility | **3 × P0** — every payload validated against real Pydantic. `Actor` given a `schema_version` it does not have (broke *every* event, so `EventBatch` and SSE were unusable wholesale); `Question` and `Approval` returned as raw stored records leaking internal fields. Plus P1 envelope/argument mismatches. |
+| Security + concurrency | **5 × P1** with working repros — idempotency read outside the transaction (two jobs, two commits from one key); `canTransition` same→same defeating every CAS; `_resume` starting a second worker; catastrophic regex backtracking (63 s on 200 k spaces, on the shared event loop); the approval gate self-certified by the machine credential. |
+| Session/worktree lifecycle | **2 × P0** — a numeric reserved-window name marks and then **kills a human's window**; every resumption drove the job to `failed` (terminal). Plus 15 proven `git` allowlist bypasses including `push -fu` and forced refspecs. |
+| Non-regression | **1 × P0** — `deploy-local.sh` hot-copies only `server.js`, so the live app could not start. Everything else verified clean by execution, including Node 20 (229/229 then 236/236 on a clean clone) and full inertness when disabled. |
+
+**Resolved in `0997b4f` and `36b07ec`** (all with regression tests; the git guard has 32 verified
+cases, the wire guard fails if either P0 is reintroduced): all 3 wire P0s, both lifecycle P0s, the
+deployment P0, the git bypasses, the ReDoS (63 s → 9 ms), the idempotency races, the same→same
+transition, the double worker and `drain()` race, question/approval compare-and-set, lease renewal,
+heartbeat fencing, `detail` redaction, base-path hijack, tmux socket/user inheritance,
+`ensureSession` mutual exclusion, and the bootstrap lock leak.
+
+### Open findings — NOT resolved
+
+**P1 · §6 verification is not a real check.** `engine.js` compares only `effort`, never the model;
+and with `PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv` the effective effort is *copied from the request*,
+so the comparison is `requested === requested` — always true. Worse, `init.model` returns the
+*resolved* id (`claude-sonnet-5`) while the request carries an alias (`sonnet`), so the two can never
+compare equal even if compared. The default (`effective: null`, job blocks) is honest; the only mode
+in which a job can actually run performs no verification. **This is the contract's central control
+and it does not currently hold.** Needs a resolution designed with the orchestrator side.
+
+**P1 · A reboot wedges the lane permanently.** `pw-tmux-save` does not persist tmux user options, so
+`pw-tmux-restore` recreates `orch_pvibot` as a plain *unmarked* window. `ensureSession` then refuses
+it forever — correctly, since it cannot prove ownership — including under `force_replace`. Needs
+either exclusion from the persistence manifest or a narrow, recorded recovery path.
+
+**P1 · The approval gate is still satisfiable by one credential.** Partly addressed: the decider must
+now be named, and the audit records decider and relayer separately. But `approveStage` still attributes
+`kind: human` on any caller's word, so `assertPublicationApproved`'s human check cannot fail. A separate
+scope (not granted alongside `publish` by default) is designed but not implemented.
+
+**P2 · Publication staging is a string comparison.** A rename (`R100 old → new`) or a non-ASCII
+filename makes the staged/intended comparison always fail — and the `git add` has already happened, so
+a failed publication leaves the operator's index staged with no way to unstage it (`reset`/`restore`
+are correctly forbidden). Needs `-z --no-renames` and an index-restoring failure path.
+Related: pathspec magic (`:(glob)**`) passes `validateRelativePath` and reaches `git add`.
+
+**P2 · `requestRevision` / `requestReview` strand the job** in `revision_required` / `reviewing` with
+no worker. **P2 · `publish()` takes no lease.** **P2 · Cancel does not signal the child process**, and
+the "before" tree fingerprint is taken while a phase may still be writing, so
+`working_tree_preserved: false` can be a false alarm. **P2 · Per-poll full-store event scan** and
+unbounded SSE stream lifetime. **P2 · Idempotency key is the header on HTTP but a body field on MCP,**
+never compared.
+
+### Status
+
+**Not ready to merge.** Pushed as a draft PR to preserve and surface the work.
