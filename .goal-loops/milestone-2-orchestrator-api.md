@@ -384,6 +384,42 @@ validated against the orchestrator's real Pydantic (`SettingsAttestation`, `Laun
 `effective` is refused; `AttestationProvenance` and `AuthMode` now cross-checked member-for-member;
 HTTP/MCP smoke green; no temp dirs, sockets or processes left; CT2115 undeployed.
 
+### 2026-07-27 (round 5) — the "intermittent" failure diagnosed
+
+**It was not flaky.** Captured on the *first* repeat, with full output written outside the
+repository: `wire: the attestation payloads validate against the orchestrator's policy contracts`,
+nine Pydantic errors — `envelope` required, the identity fields rejected as extra on
+`LaunchAttestation`, `normalization` no longer a list of strings.
+
+**Root cause: mutable shared state outside the repository under test.** The cross-contract tests
+validate against the orchestrator's *live working tree*, a sibling repository that changes
+independently. Commit `703d765` landed there at 12:03 restructuring `SettingsAttestation`, so two
+runs of the same ProjectWorkbench commit genuinely disagreed — the thing being compared against had
+changed underneath both. My earlier green runs validated against the pre-commit source. Not
+concurrency, not ports, not tmux, not timing.
+
+**Two pieces of work followed.**
+
+1. **Conformed** to the restructure. `AttestationEnvelope` now carries identity, authentication and
+   binding for *every* claim — the same asymmetry my own reviewer found, fixed structurally on their
+   side: with those fields inside the launch record, a peer declaring both fields `runtime_reported`
+   skipped the contract-version, identity, auth and binding checks and got the *stronger* provenance
+   for it. `normalization` is now `NormalizedField {field, source_key, raw_value, value}` — free text
+   was not evidence, since the validator could only ask whether the list was non-empty. And a
+   per-verification `verification_nonce` is plumbed end to end; the sentinel default, a short nonce
+   and a missing one are all treated as unbound.
+
+2. **Removed the nondeterminism.** `contract/orchestrator-revision.json` pins the contract sources
+   this repository is conformed to, and a guard compares the live tree against it. Pinning does not
+   stop the contract moving — it makes the move *say so*, name the changed files and both revisions,
+   and stop masquerading as flakiness. Verified three ways: fires on a simulated move (naming
+   `policy.py`), passes against the pinned tree, inert where the orchestrator is absent, as in CI.
+
+**Gate:** 325/325 × **5 consecutive runs on each of Node 20.19.0, 20.20.0 and 22** — 15 green suites
+from a fresh clone with `npm ci`. Plus 20 publication-idempotency repetitions with no git identity,
+contract fixture + cross-contract validation, HTTP/MCP smoke, and leak checks showing zero temp
+directories, sockets, listeners or stray processes.
+
 ### Status
 
 All P0 and P1 findings from all three review rounds are resolved with regression tests. The PR stays
