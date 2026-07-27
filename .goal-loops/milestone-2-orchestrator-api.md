@@ -501,6 +501,46 @@ publication repetitions; bootstrap + fixture + drift + cross-contract; HTTP/MCP 
 clean. Live cross-check: the digest the running backend would attest with equals the published
 report equals the operator command — `a641b5b9…` three ways.
 
+### 2026-07-27 (round 8) — conformance review against d022201
+
+The gate fired against `d02220126f3d`. Reviewed `ea9c7f8..d022201` read-only. Most of it is
+orchestrator-side — the operator registry, its CLI, durability, audit and hostile-path tests — but
+**three changes reach this side**, so this was not a pin-only round.
+
+1. **The nonce is an alphabet, not just a length.** The envelope now constrains it to
+   `^[A-Za-z0-9_-]+$`, because a non-ASCII value reaching `hmac.compare_digest` raises `TypeError`
+   and that exception escaped every handler, stranding the job mid-verification. PW *echoes* the
+   caller's nonce, so it must refuse what it cannot legally echo rather than become the source of
+   that failure. Enforced at the API and in `bindingIsUsable`.
+2. **A defect of my own, surfaced by it.** Two rounds back I wrote `minLength: 16, maxLength: 128`
+   on a `shortText`, and `validateText` accepted both keys and honoured neither — a two-character
+   nonce passed a schema that appeared to require sixteen. There is now a `verificationNonce` type
+   that enforces both, and `validateText` honours `minLength` for every caller.
+3. **`codex-cli` removed from the mirrored `RUNTIME_REPORTABLE`.** It asserted the same
+   `init.model` source as Claude Code with no fixture, no documentation and no measurement behind
+   it. A backend with no row cannot have observed anything, which is the correct answer until
+   someone measures it.
+
+`registry_version` needs nothing here: an orchestrator-side compare-and-set counter with a default,
+on a model PW does not emit.
+
+**The caveat from round 7 is closed.** The orchestrator's `docs/instance-registration.md` invokes
+`scripts/pw-orch-fingerprint.mjs` by name and pipes its JSON straight into `pin`, so the report's
+shape is load-bearing on both sides. A new wire test drives the **real registry CLI** over PW's own
+report — `pin`, `grant-launch-trust`, and a stale compare-and-set — against a throwaway database.
+Confirmed by hand first: `pinned a641b5b927c0… (2.1.220 (Claude Code))`, matching the digest PW
+attests with. The orchestrator repository stayed read-only throughout: nothing written inside it,
+its own database untouched, `git status` clean.
+
+`registry_admin.py` and `registry_cli.py` are now pinned as well. They are not a wire contract, but
+PW's report is an *input* to them, so a change there breaks this side just as a schema change does —
+and now fails by name rather than as a mystery.
+
+**Gate:** 345/345 from a fresh clone with `npm ci` — 3× Node 20.19.0, 2× Node 20.20.0, 3× Node 22 —
+plus 20 publication repetitions, all cross-contract/wire/fixture/drift/bootstrap/fingerprint suites
+(80/80), HTTP/MCP/auth (43/43), and leak checks clean. Guard re-verified: fires on a simulated move
+naming `registry_cli.py`, passes against the pinned tree, inert where the orchestrator is absent.
+
 ### Status
 
 All P0 and P1 findings from all three review rounds are resolved with regression tests. The PR stays
