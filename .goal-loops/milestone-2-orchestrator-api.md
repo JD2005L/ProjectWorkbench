@@ -464,6 +464,43 @@ fixture + drift pin + cross-contract, HTTP/MCP smoke, and zero temp dirs, socket
 stray processes. Pin re-recorded at `ea9c7f8`; guard re-verified three ways. Orchestrator repository
 unmodified.
 
+### 2026-07-27 (round 7) — the capability-fingerprint bootstrap
+
+Registration was a circle. The orchestrator refuses every attestation from an instance it holds no
+`known_fingerprint` for, and refuses again on a mismatch — both correct — but the value existed only
+inside `buildAttestationEnvelope`. PW could produce it by attesting, and the attestation was refused
+for want of it.
+
+**Published, by the same function that computes it for the envelope.** Byte-identical by
+construction, not by agreement: a second implementation of "the same thing" is a second thing, and
+it drifts the first time either side changes, stranding whoever pinned the value. Two readers:
+
+* `scripts/pw-orch-fingerprint.mjs` — no credential, contacts nothing, stdout only, exit status
+  load-bearing so an install script can gate on it. Verified from a fresh clone under `env -i`;
+* `GET /instance/attestation-fingerprint` — authenticated (`jobs:read`), read-only, no `POST`,
+  because pinning is the orchestrator's decision and never something this side pushes.
+
+No secret travels: the report is a fixed allowlist of fields rather than a denylist of things to
+strip, and every input to the digest is published alongside it so an administrator checks the value
+by hand instead of pinning an opaque hash.
+
+**Documented** (docs/orchestrator-api.md §4.1–4.5): how CT2122 obtains, independently verifies and
+records the value; rotation after a deliberate CLI upgrade — a maintenance window, since between
+upgrade and re-pin the instance is *refused*, not degraded; and a table of what each failure reads
+like. Revocation is not a downgrade: with effort unattestable without the launch record, withdrawing
+`may_attest_launch` stops work, which is what revoking authority should do.
+
+**A real hole, found by writing the bootstrap test.** Refusing shebangs was not enough. `execvp`
+hands a file the kernel refuses to `/bin/sh`, so a text file with *no* shebang is still interpreted,
+still sees the full argv, and can still rewrite it — confirmed against the real syscall, output
+`REWROTE-ARGV --version`. The impostor even carries the ELF magic, so a magic check is not the
+answer either; the header is now parsed far enough to say whether the kernel would load it.
+
+**Gate:** 341/341 × 5 on each of Node 20.19.0, 20.20.0 and 22 from a fresh clone with `npm ci`; 20
+publication repetitions; bootstrap + fixture + drift + cross-contract; HTTP/MCP smoke; leak checks
+clean. Live cross-check: the digest the running backend would attest with equals the published
+report equals the operator command — `a641b5b9…` three ways.
+
 ### Status
 
 All P0 and P1 findings from all three review rounds are resolved with regression tests. The PR stays
