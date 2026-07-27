@@ -28,6 +28,7 @@ import { redactText } from './redact.js';
 import { assertTransition, canTransition } from './statemachine.js';
 import { validate } from './validate.js';
 import { KIND } from './store/repo.js';
+import { SCOPES } from './auth.js';
 import { resolveWorkspacePath } from './projects.js';
 import { repositoryBaseline, workingTreeFingerprint } from './git.js';
 import { diffStat, canonicaliseCheckName, CHECK_CATALOGUE } from './checks.js';
@@ -64,8 +65,10 @@ export class OrchestrationEngine {
 
     /** In-flight job workers, so tests and shutdown can wait for quiescence. */
     this._running = new Map();
-    /** Jobs asked to stop. Checked between phases; a phase itself is never killed mid-write. */
+    /** Jobs asked to stop. Checked between phases, and used to abort the phase in flight. */
     this._cancelRequested = new Set();
+    /** One abort controller per running job, so a cancel reaches the child process. */
+    this._aborts = new Map();
   }
 
   now() { return this.clock().toISOString(); }
@@ -122,6 +125,15 @@ export class OrchestrationEngine {
    */
   async submitJob({ token, body, idempotencyKey, correlationId }) {
     const request = validate(SUBMIT_JOB_SCHEMA, body ?? {});
+
+    // The contract puts the key in the body (§7); HTTP also carries it as a header, and MCP has no
+    // header at all. Two sources that can disagree is one source too many — a retry with the same
+    // body but a fresh header would create a duplicate job.
+    if (idempotencyKey && request.idempotency_key !== idempotencyKey) {
+      throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the idempotency key in the body and the transport disagree', {
+        fieldErrors: [{ field: 'idempotency_key', message: 'must match the Idempotency-Key header' }],
+      });
+    }
 
     if (request.orchestrator_instance_id !== token.orchestrator_instance_id) {
       throw new ApiError(ErrorCode.FORBIDDEN_SCOPE, 'the payload claims a different orchestrator instance than this credential');
@@ -180,6 +192,8 @@ export class OrchestrationEngine {
         ended_at: null,
         correlation_id: correlationId,
         idempotency_key: idempotencyKey,
+        // Kept so an approval can be refused when it comes from the same credential.
+        submitted_by_token: token.token_id ?? null,
         lease_fencing_token: null,
         baseline: null,
         publication_id: null,
@@ -429,17 +443,21 @@ export class OrchestrationEngine {
    * returns while work is still in flight — which is what made the cancellation tree-preservation
    * comparison unsound.
    */
-  _startWorker(jobId, project) {
+  _startWorker(jobId, project, options = {}) {
     if (this._running.has(jobId)) return this._running.get(jobId);
 
+    this._aborts.set(jobId, new AbortController());
     const entry = {};
-    entry.promise = this._run(jobId, project)
+    entry.promise = this._run(jobId, project, options)
       .catch(async (err) => {
         // A worker must never die silently: an unexplained stall is worse than a recorded failure.
         await this._failSafely(jobId, `the job stopped unexpectedly (${err?.code ?? 'internal'})`);
       })
       .finally(() => {
-        if (this._running.get(jobId) === entry) this._running.delete(jobId);
+        if (this._running.get(jobId) === entry) {
+          this._running.delete(jobId);
+          this._aborts.delete(jobId);
+        }
       });
     this._running.set(jobId, entry);
     return entry.promise;
@@ -467,13 +485,18 @@ export class OrchestrationEngine {
 
   _cancelled(jobId) { return this._cancelRequested.has(jobId); }
 
-  async _run(jobId, project) {
+  async _run(jobId, project, options = {}) {
     const workspacePath = resolveWorkspacePath(this.config, project);
 
     // Intake runs once, on a freshly received job. A resumed job is already past it — re-entering
     // at `validating` is not a legal edge from `queued`, and treating that as a worker crash sent
     // every resumed job to `failed`, which is terminal. A blocked job is not a failed job.
     const entry = this.repo.getJob(jobId);
+    // A revision re-enters the pipeline directly: `revision_required -> implementing` is the only
+    // legal edge out of that state, so it cannot go back through the queue.
+    if (entry.status === JobStatus.REVISION_REQUIRED) {
+      return this._runRevision(jobId, project, workspacePath);
+    }
     if (entry.status === JobStatus.RECEIVED) {
       await this._transition(jobId, JobStatus.VALIDATING, { message: 'validating the task contract' });
       if (await this._stopIfCancelled(jobId, workspacePath)) return;
@@ -547,17 +570,26 @@ export class OrchestrationEngine {
         return;
       }
 
+      // The verdict is the attestation's, not this function's. An earlier version compared only
+      // effort here — and compared it against a value copied from the request, so the check always
+      // passed. Re-deriving a verdict at the call site is how that happened; it is not done again.
       if (!verification.effective) {
-        // The contract offers no way to say "probably correct". A job that cannot confirm its
-        // configuration blocks here, having read nothing.
-        await this._emit(jobId, { event_type: EventType.MODEL_MISMATCH, message: verification.detail ?? 'the effective configuration could not be determined' });
-        await this._blockWith(jobId, JobStatus.BLOCKED_CONFIGURATION, verification.detail ?? 'the effective model and effort could not be verified');
+        await this._emit(jobId, {
+          event_type: EventType.MODEL_MISMATCH,
+          message: verification.detail ?? 'the effective configuration could not be attested',
+        });
+        await this._blockWith(
+          jobId, JobStatus.BLOCKED_CONFIGURATION,
+          verification.detail ?? 'the effective model and effort could not be attested',
+        );
         return;
       }
-      const matches = verification.effective.effort === job.requested.effort;
-      if (!matches) {
-        await this._emit(jobId, { event_type: EventType.MODEL_MISMATCH, message: 'the effective configuration differs from the requested one' });
-        await this._blockWith(jobId, JobStatus.BLOCKED_CONFIGURATION, 'the effective model or effort differs from the requested one');
+      // Belt and braces: `effective` is only ever built from observations, but a future adapter
+      // returning something inconsistent must not be able to slip past.
+      if (verification.effective.model_alias !== job.requested.model_alias
+        || verification.effective.effort !== job.requested.effort) {
+        await this._emit(jobId, { event_type: EventType.MODEL_MISMATCH, message: 'the attested configuration differs from the requested one' });
+        await this._blockWith(jobId, JobStatus.BLOCKED_CONFIGURATION, 'the attested model or effort differs from the requested one');
         return;
       }
       await this._emit(jobId, { event_type: EventType.MODEL_VERIFIED, message: `verified ${verification.effective.model_alias} at ${verification.effective.effort} effort` });
@@ -666,6 +698,75 @@ export class OrchestrationEngine {
     }
   }
 
+  /**
+   * Work a bounded correction.
+   *
+   * Previously `requestRevision` moved the job to `revision_required` and stopped there — no worker,
+   * no phases, forever, and `revision_required -> queued` is not a legal edge so nothing could
+   * rescue it either.
+   */
+  async _runRevision(jobId, project, workspacePath) {
+    const lease = await this._acquireLease(jobId, project.project_id);
+    if (!lease) {
+      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
+        message: 'another job holds the write lease for this project',
+        detail: 'another job holds the write lease for this project',
+        eventType: EventType.BLOCKED,
+      });
+      return;
+    }
+    try {
+      const job = this.repo.getJob(jobId);
+      await this._transition(jobId, JobStatus.IMPLEMENTING, {
+        message: 'applying the requested revision', phase: 'implementation',
+      });
+      if (await this._stopIfCancelled(jobId, workspacePath)) return;
+
+      const outcome = await this._runPhase(jobId, {
+        project, workspacePath, phaseClass: PhaseClass.MECHANICAL_CORRECTION, session: null,
+        prompt: [
+          `Task: ${job.task.title}`,
+          `Apply exactly this correction, and nothing beyond it:`,
+          job.revision_instructions ?? 'address the review findings',
+          'Do not redesign, do not expand scope, and do not commit or push.',
+        ].join('\n'),
+      });
+      if (!outcome) return;
+      if (await this._handleQuestions(jobId, outcome, 'implementation')) return;
+
+      await this._transition(jobId, JobStatus.VERIFYING_TARGETED, { message: 'verifying the revision', phase: 'verification' });
+      const targeted = await this._runChecks(jobId, project, workspacePath, this._targetedChecks(job));
+      if (targeted.failed) {
+        await this._blockWith(jobId, JobStatus.BLOCKED_VERIFICATION, 'verification failed after the revision');
+        return;
+      }
+      await this._transition(jobId, JobStatus.VERIFYING_FULL, { message: 'running full verification', phase: 'verification' });
+      const full = await this._runChecks(jobId, project, workspacePath, this._fullChecks(job));
+      if (full.failed) {
+        await this._blockWith(jobId, JobStatus.BLOCKED_VERIFICATION, 'full verification failed after the revision');
+        return;
+      }
+      await this._transition(jobId, JobStatus.REVIEWING, { message: 're-reviewing after the revision', phase: 'review' });
+      const review = await this._runReview(jobId, { project, workspacePath, job: this.repo.getJob(jobId) });
+      if (!review) return;
+      if (review.verdict !== ReviewVerdict.APPROVED) {
+        await this._blockWith(jobId, JobStatus.BLOCKED_REVIEW, `review verdict after revision: ${review.verdict}`);
+        return;
+      }
+      await this._requestApproval(jobId, {
+        approvalType: ApprovalType.PUBLICATION,
+        requestedAction: `publish the revised change in ${project.project_id} as a pull request`,
+        evidenceSummary: `revision applied; review ${review.review_id} approved`,
+      });
+      await this._transition(jobId, JobStatus.WAITING_FOR_PUBLICATION_APPROVAL, {
+        message: 'waiting for a recorded human decision before publishing',
+        detail: 'publication requires a recorded approval',
+      });
+    } finally {
+      await this._releaseLease(jobId);
+    }
+  }
+
   /** Extend this job's lease while its worker is alive. Silent when the lease was already lost. */
   async _renewLease(jobId, projectId) {
     const job = this.repo.getJob(jobId);
@@ -692,8 +793,16 @@ export class OrchestrationEngine {
         phaseClass,
         cwd: workspacePath,
         resumeSessionId: job.cli_session_id ?? null,
+        // Cancelling must actually stop the agent. Without this the child kept editing while the
+        // caller waited out the phase budget — up to half an hour — and the "working tree
+        // preserved" comparison was taken around a still-running writer.
+        signal: this._aborts.get(jobId)?.signal ?? null,
       });
     } catch (err) {
+      if (err?.kind === 'cancelled' || err?.name === 'AbortError' || this._cancelled(jobId)) {
+        // The phase was stopped on purpose. Cancellation records the terminal state itself.
+        return null;
+      }
       await this._blockWith(jobId, JobStatus.BLOCKED_CONNECTIVITY, `the coding backend failed: ${err.message}`);
       return null;
     }
@@ -997,8 +1106,22 @@ export class OrchestrationEngine {
    * the other side even if it slipped past here.
    */
   async approveStage({ token, jobId, body, idempotencyKey }) {
-    this.requireJob(token, jobId);
+    const job = this.requireJob(token, jobId);
     const request = validate(APPROVE_SCHEMA, body ?? {});
+
+    // Recording a decision needs its own scope.
+    if (!token.scopes?.includes(SCOPES.APPROVE)) {
+      throw new ApiError(ErrorCode.FORBIDDEN_SCOPE, "recording a decision requires the 'approve' scope");
+    }
+    // And, by default, must not come from the credential that asked for the work. One token
+    // requesting, granting, and acting on its own authorisation is the failure mode the gate exists
+    // to prevent; without this the human check is satisfiable by the machine alone.
+    if (this.config.requireSeparateApprover && job.submitted_by_token === token.token_id) {
+      throw new ApiError(
+        ErrorCode.FORBIDDEN_SCOPE,
+        'the credential that submitted this job may not approve it',
+      );
+    }
     if (request.workbench_job_id !== jobId) {
       throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the path job and the payload job must agree');
     }
@@ -1051,9 +1174,11 @@ export class OrchestrationEngine {
       workbench_job_id: jobId,
       approval_id: request.approval_id,
       status: decided.status,
-      // Who decided, and through which credential — recorded separately and never conflated.
+      // Who decided, through which orchestrator, on which credential — three separate facts, never
+      // conflated. ProjectWorkbench cannot attest the first; it can and does record all three.
       decided_by: decided.decided_by.identifier,
       relayed_by: decided.decided_via,
+      relayed_by_token: token.token_id ?? null,
     });
 
     if (!request.approved) {
@@ -1087,6 +1212,8 @@ export class OrchestrationEngine {
     this._auditEvent('orchestrator.revision.requested', {
       workbench_job_id: jobId, cycle: job.revision_cycles_used + 1,
     });
+    // Start the worker that actually applies it.
+    this._startWorker(jobId, this._resolveProjectOrThrow(job.project_id));
     return this._jobState(this.repo.getJob(jobId));
   }
 
@@ -1251,13 +1378,18 @@ export class OrchestrationEngine {
     this._cancelRequested.add(jobId);
     const project = this._resolveProjectOrThrow(job.project_id);
     const workspacePath = resolveWorkspacePath(this.config, project);
-    const before = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
 
-    // Let the in-flight phase reach a boundary rather than killing it mid-write. The "before" and
-    // "after" fingerprints are only comparable once nothing is still writing, so this await is
-    // load-bearing for the tree-preservation claim.
+    // Signal the running phase first. Waiting for it to finish on its own meant a cancel could take
+    // the whole phase budget while the agent carried on editing.
+    this._aborts.get(jobId)?.abort();
+
+    // Only once nothing is still writing are the two fingerprints comparable — otherwise a write
+    // that lands between them reads as "the tree changed", which is a false accusation on the
+    // contract's flagship guarantee rather than a detection of one.
     const inFlight = this._running.get(jobId);
     if (inFlight) await inFlight.promise.catch(() => {});
+
+    const before = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
 
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
     const preserved = before.status === after.status && before.head === after.head && before.diff === after.diff;

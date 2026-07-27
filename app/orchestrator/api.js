@@ -389,7 +389,8 @@ export function createOrchestratorRouter({
   }));
 
   router.post('/jobs/:id/approve', handle(async (req, res) => {
-    requireScope(req.token, SCOPES.JOBS_WRITE);
+    // Not jobs:write — recording a human decision is a distinct authority.
+    requireScope(req.token, SCOPES.APPROVE);
     res.json(await requireEngine().approveStage({
       token: req.token, jobId: req.params.id, body: req.body ?? {}, idempotencyKey: req.idempotencyKey,
     }));

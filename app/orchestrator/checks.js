@@ -367,20 +367,34 @@ export class CheckRunner {
   }
 }
 
-/** Changed-file and diff statistics, taken from git rather than from a model's account. */
-export async function diffStat({ cwd, gitExecutable, exec, against = 'HEAD' }) {
-  const numstat = await runGit(['diff', against, '--numstat'], { cwd, gitExecutable, exec });
+/**
+ * Parse `--numstat -z` output.
+ *
+ * `-z` matters: without it git *quotes* any path containing non-ASCII bytes, so `café.txt` comes
+ * back as the literal `"caf\303\251.txt"` and every comparison against a real filename fails.
+ * With `--no-renames` each record is `added\tremoved\tpath`, NUL-terminated.
+ */
+export function parseNumstatZ(stdout) {
   let files = 0;
   let insertions = 0;
   let deletions = 0;
   const changedFiles = [];
-  for (const line of numstat.stdout.split('\n').filter(Boolean)) {
-    const [added, removed, file] = line.split('\t');
+  for (const record of String(stdout).split('\0').filter(Boolean)) {
+    const [added, removed, file] = record.split('\t');
+    if (file === undefined) continue;
     files += 1;
+    // A binary file reports `-` for both counts rather than a number.
     insertions += Number(added) || 0;
     deletions += Number(removed) || 0;
-    if (file) changedFiles.push(file);
+    changedFiles.push(file);
   }
+  return { files, insertions, deletions, changedFiles };
+}
+
+/** Changed-file and diff statistics, taken from git rather than from a model's account. */
+export async function diffStat({ cwd, gitExecutable, exec, against = 'HEAD' }) {
+  const numstat = await runGit(['diff', against, '--numstat', '-z', '--no-renames'], { cwd, gitExecutable, exec });
+  const { files, insertions, deletions, changedFiles } = parseNumstatZ(numstat.stdout);
   return {
     stat: { schema_version: SCHEMA_VERSION, files, insertions, deletions },
     changed_files: changedFiles,

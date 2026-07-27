@@ -27,6 +27,7 @@ import {
   SCHEMA_VERSION, PATTERNS, Effort, PhaseClass, CodingBackend, HealthState, AuthMethod,
 } from '../contract.js';
 import { redactText } from '../redact.js';
+import { buildAttestation } from '../attestation.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -268,51 +269,23 @@ export class ClaudeCodeBackend {
     }
 
     const { init } = this.parseStream(stdout);
-    // Retained even when `effective` must be null: knowing the session is running a *different*
-    // model than requested is a mismatch, which is a stronger and more actionable signal than
-    // "could not determine".
-    const observedModel = init?.model ?? null;
-    if (!init?.model) {
-      // No init event means nothing was observed. There is no partial credit here.
-      return {
-        effective: null,
-        observed_model: null,
-        backend: this.name,
-        checked_at: this.clock().toISOString(),
-        detail: 'the coding CLI did not report its effective configuration',
-        cli_session_id: null,
-      };
-    }
 
-    // The CLI ignores an unrecognised --effort with a stderr warning and runs at its default, so
-    // seeing that warning is positive evidence the requested effort was *not* applied.
-    const effortIgnored = /unknown --effort value/i.test(String(stderr));
-    const attesting = this.config.effortAttestation === 'argv' && !effortIgnored;
-
-    if (!attesting) {
-      return {
-        effective: null,
-        observed_model: observedModel,
-        backend: this.name,
-        checked_at: this.clock().toISOString(),
-        detail: effortIgnored
-          ? 'the coding CLI reported that it ignored the requested effort'
-          : 'the coding CLI reports the active model but not the active effort',
-        cli_session_id: init.session_id ?? null,
-      };
-    }
+    // Everything the caller learns comes from `buildAttestation`, which never copies a requested
+    // value into its answer. With a CLI that does not report effort this returns `effective: null`
+    // and `blocking: true`, and the job blocks at blocked_configuration having read nothing.
+    const attestation = buildAttestation({
+      requested, aliases: this.config.modelAliases, init: init ?? {}, stderr,
+    });
 
     return {
-      effective: {
-        schema_version: SCHEMA_VERSION,
-        model_alias: init.model,
-        effort: requested.effort,
-      },
-      observed_model: observedModel,
+      effective: attestation.effective,
+      observed_model: attestation.observed_model,
+      attestation,
       backend: this.name,
       checked_at: this.clock().toISOString(),
-      detail: 'model reported by the session; effort is argv-attested and not reported by the CLI',
-      cli_session_id: init.session_id ?? null,
+      detail: attestation.detail,
+      requirement: attestation.requirement,
+      cli_session_id: init?.session_id ?? null,
     };
   }
 

@@ -55,8 +55,15 @@ test('fixture: it describes the whole surface the orchestrator needs to check co
   for (const status of fixture.enums.JobStatus) {
     assert.ok(Object.hasOwn(fixture.transitions, status), `no transitions recorded for ${status}`);
   }
-  // The known gap must be declared rather than buried, so the other side can plan around it.
-  assert.ok(fixture.known_gaps.some((g) => g.id === 'effective-effort-unverifiable'));
+  // The known gaps must be declared rather than buried, so the other side can plan around them.
+  const gaps = fixture.known_gaps.map((g) => g.id);
+  assert.ok(gaps.includes('effective-effort-unattestable'));
+  assert.ok(gaps.includes('model-alias-namespace'));
+  // And the capability statement must be machine-readable: an orchestrator should be able to see
+  // that this instance cannot attest effort *before* it submits work that will only block.
+  assert.equal(fixture.safety.effort_attestation_available, false);
+  assert.equal(fixture.safety.approval_requires_separate_credential_by_default, true);
+  assert.ok(fixture.known_gaps.find((g) => g.id === 'effective-effort-unattestable').requirement.length > 40);
 });
 
 crossTest('cross-contract: the job state vocabulary matches the orchestrator member for member', () => {

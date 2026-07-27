@@ -11,13 +11,17 @@
 // deletion, and no history rewrite — not because none is called, but because git.js makes those
 // subcommands unreachable from this subsystem entirely.
 
+import fs from 'fs';
+import os from 'os';
 import path from 'path';
+import crypto from 'crypto';
 
 import {
   SCHEMA_VERSION, CiState, ApprovalStatus, ApprovalType, ErrorCode, newId,
 } from './contract.js';
 import { ApiError, notFound } from './errors.js';
 import { runGit } from './git.js';
+import { parseNumstatZ } from './checks.js';
 import { redactText } from './redact.js';
 
 const FULL_SHA = /^[a-f0-9]{40}$/;
@@ -35,8 +39,29 @@ export class Publisher {
     this.clock = clock;
   }
 
-  _git(argv, cwd) {
-    return runGit(argv, { cwd, gitExecutable: this.config.gitExecutable, exec: this.exec });
+  _git(argv, cwd, indexFile = null) {
+    return runGit(argv, { cwd, gitExecutable: this.config.gitExecutable, exec: this.exec, indexFile });
+  }
+
+  /**
+   * A private copy of the repository index.
+   *
+   * Staging into the real index would be irreversible from inside this subsystem: git.js forbids
+   * `reset` and `restore` precisely so nothing here can discard work, which also means nothing here
+   * could undo a partial stage. Working on a copy makes a failed publication a no-op on the
+   * operator's index rather than a mess they have to clean up by hand.
+   */
+  _privateIndex(workspacePath) {
+    const scratch = path.join(
+      os.tmpdir(), `pw-orch-index-${crypto.randomBytes(8).toString('hex')}`,
+    );
+    const real = path.join(workspacePath, '.git', 'index');
+    try {
+      if (fs.existsSync(real)) fs.copyFileSync(real, scratch);
+    } catch {
+      // A repository with no index yet: git will create one at the scratch path.
+    }
+    return scratch;
   }
 
   /**
@@ -49,6 +74,15 @@ export class Publisher {
   assertIntendedFilesSafe(intendedFiles, workspacePath) {
     const root = path.resolve(workspacePath);
     for (const file of intendedFiles) {
+      // `git add -- <pathspec>` stops git reading a leading dash as an *option*; it does not stop
+      // pathspec *magic*. `:(glob)**` and `:/` are not filenames, and `*` is not one either — each
+      // would stage files the caller never named.
+      if (/^:/.test(file) || /[*?[\]]/.test(file)) {
+        throw new ApiError(
+          ErrorCode.UNSAFE_PATH,
+          'an intended file must be a literal repository path, not a pathspec pattern',
+        );
+      }
       const resolved = path.resolve(root, file);
       if (resolved !== root && !resolved.startsWith(root + path.sep)) {
         throw new ApiError(ErrorCode.UNSAFE_PATH, 'an intended file resolves outside the project workspace');
@@ -64,21 +98,36 @@ export class Publisher {
       return result;
     };
 
+    const index = this._privateIndex(workspacePath);
+    try {
+      return await this._publishWithIndex({ job, project, workspacePath, request, steps, record, index });
+    } finally {
+      // Whatever happened, the scratch index goes away and the operator's index is as they left it.
+      try { fs.rmSync(index, { force: true }); } catch { /* already gone */ }
+    }
+  }
+
+  async _publishWithIndex({ job, project, workspacePath, request, steps, record, index }) {
     // -- stage only the intended files ------------------------------------
     // `--` separates paths from revisions, so a filename can never be read as a ref or an option.
-    const add = record('add', await this._git(['add', '--', ...request.intended_files], workspacePath));
+    const add = record('add', await this._git(['add', '--', ...request.intended_files], workspacePath, index));
     if (!add.ok) return this._failed(job, 'the intended files could not be staged', steps);
 
     // -- verify what is actually staged -----------------------------------
-    // Staging is not the same as having staged *only* what was asked for: a pre-existing index entry
-    // would ride along into the commit unnoticed.
-    const staged = await this._git(['diff', '--cached', '--name-only'], workspacePath);
-    const stagedFiles = staged.stdout.split('\n').map((s) => s.trim()).filter(Boolean).sort();
-    const intended = [...request.intended_files].sort();
-    if (JSON.stringify(stagedFiles) !== JSON.stringify(intended)) {
+    // `-z` because git quotes non-ASCII paths in its default output ("caf\303\251.txt"), and
+    // `--no-renames` because a rename otherwise reports only the destination — both made the
+    // comparison fail for changes that were entirely legitimate.
+    const staged = await this._git(['diff', '--cached', '--name-only', '-z', '--no-renames'], workspacePath, index);
+    const stagedFiles = staged.stdout.split('\0').filter(Boolean).sort();
+    const intended = [...new Set(request.intended_files)].sort();
+
+    // The staged set must be a subset of the intended set. Equality is too strong: intending both
+    // sides of a rename is correct even though only one side may show as changed.
+    const unintended = stagedFiles.filter((f) => !intended.includes(f));
+    if (unintended.length) {
       return this._failed(
         job,
-        `the staged set does not match the intended set (${stagedFiles.length} staged, ${intended.length} intended)`,
+        `${unintended.length} file(s) were staged that were not intended`,
         steps,
       );
     }
@@ -89,7 +138,7 @@ export class Publisher {
     // -- commit -----------------------------------------------------------
     // No -a: only the explicitly staged set is committed. An `-a` here would sweep up every other
     // dirty file in the operator's checkout.
-    const commit = record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath));
+    const commit = record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath, index));
     if (!commit.ok) return this._failed(job, 'the commit failed', steps);
 
     const localHead = await this._git(['rev-parse', 'HEAD'], workspacePath);
@@ -121,18 +170,12 @@ export class Publisher {
       pullRequest.ciState = CiState.NOT_CONFIGURED;
     }
 
-    const changed = await this._git(['show', '--numstat', '--format=', localCommit], workspacePath);
-    let files = 0;
-    let insertions = 0;
-    let deletions = 0;
-    const changedFiles = [];
-    for (const line of changed.stdout.split('\n').filter(Boolean)) {
-      const [added, removed, file] = line.split('\t');
-      files += 1;
-      insertions += Number(added) || 0;
-      deletions += Number(removed) || 0;
-      if (file) changedFiles.push(file);
-    }
+    // `-z` again: the published file list is compared against the intended one and shown to a
+    // human, so it must carry real filenames rather than git's quoted escapes.
+    const changed = await this._git(
+      ['show', '--numstat', '-z', '--no-renames', '--format=', localCommit], workspacePath,
+    );
+    const { files, insertions, deletions, changedFiles } = parseNumstatZ(changed.stdout);
 
     return {
       schema_version: SCHEMA_VERSION,

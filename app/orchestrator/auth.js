@@ -24,6 +24,12 @@ export const SCOPES = Object.freeze({
   JOBS_WRITE: 'jobs:write',
   SESSION_MANAGE: 'session:manage',
   PUBLISH: 'publish',
+  // Recording a human decision is its own authority, deliberately separate from jobs:write.
+  // ProjectWorkbench cannot verify that a human was involved — it sits at the far end of a
+  // machine-to-machine interface. What it can do is refuse to let one credential request work,
+  // approve it, and act on that approval. Granting `approve` alongside the others is then a
+  // deliberate, visible act rather than a default.
+  APPROVE: 'approve',
 });
 
 const KNOWN_SCOPES = new Set(Object.values(SCOPES));

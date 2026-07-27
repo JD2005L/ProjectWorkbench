@@ -57,6 +57,12 @@ Copy [`config/orchestrator-tokens.example.json`](../config/orchestrator-tokens.e
 `/etc/project-workbench/orchestrator-tokens.json`, `chmod 0600`, and paste the digest. Only the
 digest is stored — the token itself never touches the ProjectWorkbench filesystem.
 
+**Scopes are separable on purpose.** `jobs:read`, `jobs:write`, `session:manage`, `publish` and
+`approve`. Give the orchestrator's token everything except `approve`, and hold `approve` on a
+separate credential used by whatever records human decisions — otherwise one credential can request
+work, approve it, and publish it. The default configuration refuses that combination even when both
+scopes are present on one token, because the submitting credential may not approve its own job.
+
 **Rotation needs no outage.** Several live tokens are accepted at once: add the incoming token, move
 the orchestrator across, then set `"disabled": true` on the outgoing entry rather than deleting it,
 so the audit trail survives the rotation. The file is re-read whenever it changes on disk — no
@@ -93,7 +99,8 @@ defaults. A deployment with different conventions is *configured*, never patched
 | `PW_ORCHESTRATOR_LEASE_TTL_MS` | `300000` | Project write-lease lifetime |
 | `PW_ORCHESTRATOR_BACKEND_TIMEOUT_MS` | `1800000` | Per-phase ceiling |
 | `PW_ORCHESTRATOR_CHECK_TIMEOUT_MS` | `900000` | Per-check ceiling |
-| `PW_ORCHESTRATOR_EFFORT_ATTESTATION` | `none` | See [§4](#4-a-contract-gap-effective-effort-is-not-verifiable) |
+| `PW_ORCHESTRATOR_MODEL_ALIASES` | measured defaults | JSON `alias -> [model ids]`; a `*` suffix matches a dated release. Setting it REPLACES the defaults. See [§4](#4-a-contract-gap-effective-effort-cannot-be-attested) |
+| `PW_ORCHESTRATOR_REQUIRE_SEPARATE_APPROVER` | `true` | Refuse an approval from the credential that submitted the job |
 
 The subsystem reuses the dashboard's existing `PW_WORKSPACES` for the workspace root, so there is
 one source of truth for where project checkouts live.
@@ -122,6 +129,13 @@ scope:
   Resources and prompts are empty for the same reason.
 - **Review cannot write.** Planning, discovery and review phases run in the CLI's `plan` permission
   mode; `bypassPermissions` appears nowhere.
+- **One credential cannot request work and approve it.** Recording a decision needs its own
+  `approve` scope, and by default the credential that submitted a job may not approve it
+  (`PW_ORCHESTRATOR_REQUIRE_SEPARATE_APPROVER`). ProjectWorkbench cannot verify that a human was
+  involved — it sits at the far end of a machine-to-machine interface, and the decision is recorded
+  on the orchestrator side. What it can do is refuse to invent a decider, record decider and relayer
+  as separate facts in the audit, and make self-approval a deliberate configuration change rather
+  than the default.
 
 ---
 
@@ -143,7 +157,19 @@ intended set *before* committing, so a pre-existing index entry cannot ride alon
 never given `-a`.
 
 **A blocked job is not a failed job.** Work is preserved, the lease is released, and the job can be
-resumed once the condition clears.
+resumed once the condition clears — and resumption re-enters the readiness chain rather than jumping
+to where it stopped, because whatever blocked it may have changed the world in the meantime.
+
+**Publication never touches the operator's index.** Staging happens in a private copy of the index,
+so a failed publication is a no-op on whatever the operator had staged. That matters because
+`git.js` forbids `reset` and `restore` precisely so nothing here can discard work — which also means
+nothing here could undo a partial stage. Comparison uses `-z --no-renames`, so a rename or a
+non-ASCII filename (`café.txt`, which git otherwise quotes as `"caf\303\251.txt"`) publishes
+correctly instead of failing as a spurious mismatch.
+
+**Cancellation stops the work.** The running phase is signalled, not waited out, and the working-tree
+fingerprints are taken either side of that — so `working_tree_preserved` reflects what happened
+rather than racing a still-running writer.
 
 **Crash safety.** State lives in an append-only write-ahead journal with a CRC per transaction. A
 torn final record is discarded as a crash; a bad record with good records after it is corruption, and
@@ -158,41 +184,68 @@ contract exists to prevent.
 
 ---
 
-## 4. A contract gap: effective effort is not verifiable
+## 4. A contract gap: effective effort cannot be attested
 
 Contract §6 requires ProjectWorkbench to report what is *actually* active and to be able to say "I do
-not know", with no way to say "probably correct". Measuring Claude Code 2.1.220 found that the two
-halves of `ModelSettings` are not equally knowable:
+not know", with no way to say "probably correct". Probing the installed CLI directly (Claude Code
+2.1.220) shows the two halves of `ModelSettings` are not equally knowable.
 
-- **Model is positively verifiable.** `--output-format stream-json` emits a `system/init` event
-  carrying the live `model` and `permissionMode`. That is structured output from the running session,
-  not an echoed keystroke, and an unknown `--model` fails the run outright.
-- **Effort is not.** The init event carries no effort field, and an unrecognised `--effort` value is
-  *silently ignored* — a warning on stderr, exit 0, and the run proceeds at the default. There is no
-  read-back path at all.
+**Model is attestable — through an explicit mapping.** `--output-format stream-json` emits a
+`system/init` event carrying the live model. But it carries the *resolved id*, not the alias that was
+requested:
 
-ProjectWorkbench therefore returns **`effective: null` by default**, which moves the job to
-`blocked_configuration`. That blocks work, and it is the correct behaviour: the alternative is
-reporting a guess, and the entire control exists to prevent exactly that.
+| requested | reported |
+|---|---|
+| `--model sonnet` | `claude-sonnet-5` |
+| `--model opus` | `claude-opus-5` |
+| `--model haiku` | `claude-haiku-4-5-20251001` |
 
-An operator who accepts a weaker form of evidence can opt in:
+The two are in different namespaces and can never compare equal directly, so attestation goes through
+a configured `alias -> ids` mapping (`PW_ORCHESTRATOR_MODEL_ALIASES`, defaults measured from the
+installed CLI, `*` suffix for dated releases). An alias with no mapping is **unverifiable** and blocks.
+An alias is never compared to itself.
 
-```bash
-PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv
+**Effort is not attestable at all.** The full set of `system/init` keys is:
+
+```
+agents, analytics_disabled, apiKeySource, capabilities, claude_code_version, cwd,
+fast_mode_disabled_reason, fast_mode_state, mcp_servers, memory_paths, model, output_style,
+permissionMode, plugins, product_feedback_disabled, session_id, skills, slash_commands, subtype,
+tools, type, uuid
 ```
 
-ProjectWorkbench then reports the effort it passed, but only when the CLI did **not** warn that it
-ignored the flag, and every such response is labelled `argv-attested` in `detail` so the orchestrator
-can see what kind of evidence it is holding. The observed model is retained either way, so a genuine
-model mismatch stays distinguishable from "could not determine".
+There is no effort field, and an unrecognised `--effort` value is *silently ignored* — a warning on
+stderr, exit 0, and the run proceeds at the default. There is no read-back path of any kind.
 
-**This gap needs coordination.** It was not among the gaps Milestone 1 identified. Either the
-contract gains a way to express the *provenance* of an effective setting, or the coding CLI gains an
-effort read-back. It is recorded in
-[`contract/pw-contract-1.0.json`](../contract/pw-contract-1.0.json) under `known_gaps` so the
-orchestrator side can plan around it without reading this document.
+**Therefore ProjectWorkbench reports `effective: null` and moves the job to
+`blocked_configuration`.** Jobs will not run against a CLI that cannot report effort. That is the
+required behaviour, not a limitation to work around: an earlier build offered an
+`PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv` mode which reported the effort it had passed — making the
+comparison `requested === requested`, a check that could never fail. **That mode has been removed.**
+There is no configuration that relaxes this.
 
----
+### What a compatible CLI must provide
+
+> Effective effort can only be attested by a coding CLI that reports the effort actually in force for
+> the running session — as an `effort`, `effortLevel`, or `reasoning_effort` field on the stream-json
+> `system/init` event, or via an equivalent status command. Passing the flag is not attestation: it is
+> the assumption the contract exists to forbid.
+
+ProjectWorkbench probes for this per session, so a CLI that gains the field is picked up with **no
+configuration change** — `effective` starts being populated and jobs start running. The capability is
+also machine-readable in [`contract/pw-contract-1.0.json`](../contract/pw-contract-1.0.json) under
+`safety.effort_attestation_available` and `known_gaps`, so an orchestrator can see that an instance
+cannot attest effort *before* submitting work that would only block.
+
+**This needs coordination.** Either the contract gains a way to express the provenance of an
+effective setting, or the coding CLI gains an effort read-back. Until one of those happens, this
+instance blocks — which is the honest outcome.
+
+### One more thing the init event gives us
+
+`apiKeySource` is reported alongside the model. `"none"` is the subscription case; anything else means
+inference is billed to an API account, which the product forbids. A session reporting an API key
+source is refused outright however well it otherwise attests.
 
 ## 5. The contract fixture
 

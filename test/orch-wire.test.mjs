@@ -194,7 +194,7 @@ async function capturePayloads() {
   let decidedApproval = null;
   if (approval) {
     await engine.approveStage({
-      token: TOKEN, jobId,
+      token: { ...TOKEN, token_id: 'approver', scopes: ['jobs:read', 'approve'] }, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
       idempotencyKey: 'a1',
     });

@@ -1,0 +1,574 @@
+// Regression tests for the P1 findings of the second review round.
+//
+// Each test below corresponds to a defect an independent reviewer proved by execution, and each one
+// fails against the code as it was. They live together because their provenance is the same: things
+// the first 246 tests were happy with.
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+
+import { JournalStore } from '../app/orchestrator/store/journal.js';
+import { OrchestratorRepository } from '../app/orchestrator/store/repo.js';
+import { OrchestrationEngine } from '../app/orchestrator/engine.js';
+import { ArtifactStore, CheckRunner } from '../app/orchestrator/checks.js';
+import { ProjectConfigStore } from '../app/orchestrator/projects.js';
+import { FakeCodingBackend } from '../app/orchestrator/runner/fake.js';
+import { TmuxAdapter, OrchestratorSessionManager } from '../app/orchestrator/session.js';
+import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
+import { ApiError } from '../app/orchestrator/errors.js';
+import { JobStatus, ApprovalStatus } from '../app/orchestrator/contract.js';
+import { SCOPES } from '../app/orchestrator/auth.js';
+
+const execFileAsync = promisify(execFile);
+const HAVE_GIT = await execFileAsync('git', ['--version']).then(() => true).catch(() => false);
+const HAVE_TMUX = await execFileAsync('tmux', ['-V']).then(() => true).catch(() => false);
+const gitTest = (name, fn) => test(name, { skip: HAVE_GIT ? false : 'git is not installed' }, fn);
+const tmuxTest = (name, fn) => test(name, { skip: HAVE_TMUX ? false : 'tmux is not installed' }, fn);
+
+const ORCH = 'orch-test';
+const INSTANCE = 'wb-test-01';
+
+/** The submitting credential. Deliberately without the approve scope — see the separation test. */
+const SUBMITTER = Object.freeze({
+  token_id: 'submitter', orchestrator_instance_id: ORCH, projects: ['Demo'],
+  scopes: [SCOPES.JOBS_READ, SCOPES.JOBS_WRITE, SCOPES.SESSION_MANAGE, SCOPES.PUBLISH],
+});
+/** A separate credential held by whoever records human decisions. */
+const APPROVER = Object.freeze({
+  token_id: 'approver', orchestrator_instance_id: ORCH, projects: ['Demo'],
+  scopes: [SCOPES.JOBS_READ, SCOPES.APPROVE],
+});
+
+async function makeRepo(dir) {
+  const env = {
+    ...process.env,
+    GIT_AUTHOR_NAME: 'Test', GIT_AUTHOR_EMAIL: 't@example.invalid',
+    GIT_COMMITTER_NAME: 'Test', GIT_COMMITTER_EMAIL: 't@example.invalid',
+  };
+  const run = (args, cwd = dir) => execFileAsync('git', args, { cwd, env });
+  await run(['init', '-q', '-b', 'main']);
+  fs.writeFileSync(path.join(dir, 'README.md'), '# demo\n');
+  fs.writeFileSync(path.join(dir, 'src.js'), 'export const answer = 41;\n');
+  fs.writeFileSync(path.join(dir, 'café.txt'), 'accented\n');
+  await run(['add', '.']);
+  await run(['commit', '-qm', 'initial']);
+  const remote = `${dir}-remote.git`;
+  await execFileAsync('git', ['init', '-q', '--bare', remote]);
+  await run(['remote', 'add', 'origin', remote]);
+  return { run, remote };
+}
+
+async function withEngine(fn, { backendOptions, envOverrides } = {}) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-p1-'));
+  const workspaceRoot = path.join(dir, 'workspaces');
+  const repoDir = path.join(workspaceRoot, 'Demo');
+  fs.mkdirSync(repoDir, { recursive: true });
+  const { run: git, remote } = HAVE_GIT ? await makeRepo(repoDir) : { run: null, remote: null };
+
+  const projectsPath = path.join(dir, 'projects.json');
+  fs.writeFileSync(projectsPath, JSON.stringify({
+    schema_version: '1.0',
+    projects: {
+      Demo: {
+        display_name: 'Demo',
+        capabilities: ['implementation', 'targeted_tests', 'publication'],
+        verification_commands: ['true'], default_branch: 'main', has_ci: false,
+      },
+    },
+  }));
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: INSTANCE,
+    PW_ORCHESTRATOR_DATA_DIR: path.join(dir, 'data'),
+    PW_ORCHESTRATOR_PROJECTS_PATH: projectsPath,
+    PW_WORKSPACES: workspaceRoot,
+    ...envOverrides,
+  });
+  const store = await JournalStore.open({
+    journalPath: config.journalPath, snapshotPath: config.snapshotPath,
+    lockPath: config.lockPath, compactEveryRecords: 1_000,
+  });
+  const repo = new OrchestratorRepository(store);
+  const artifacts = new ArtifactStore({ config, repo, store });
+  const projectStore = new ProjectConfigStore(projectsPath);
+  const backend = new FakeCodingBackend(backendOptions);
+  const sessionManager = {
+    ensureSession: async () => ({ session_key: `${ORCH}:${INSTANCE}:Demo:pvi2-orchestrator` }),
+    verifySession: async ({ request }) => ({
+      session_key: request.session_key,
+      ...(await backend.verifyConfiguration({ requested: request.requested, phaseClass: request.phase_class })),
+    }),
+  };
+  const engine = new OrchestrationEngine({
+    config, store, repo, backend, sessionManager, artifacts, projectStore,
+    checkRunner: new CheckRunner({ config, repo, store, artifacts }),
+  });
+
+  try {
+    await fn({ engine, store, repo, config, backend, repoDir, git, remote, dir });
+  } finally {
+    await engine.drain().catch(() => {});
+    await store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+    if (remote) fs.rmSync(remote, { recursive: true, force: true });
+  }
+}
+
+const submit = (engine, overrides = {}, key = 'req-1', token = SUBMITTER) => engine.submitJob({
+  token,
+  body: {
+    idempotency_key: key, orchestrator_instance_id: ORCH, orchestrator_job_id: 'job_1',
+    project_id: 'Demo', session_key: `${ORCH}:${INSTANCE}:Demo:pvi2-orchestrator`,
+    task: {
+      title: 'Fix the expiry', goal: 'Tokens outlive their expiry.',
+      acceptance_criteria: ['An expired token is rejected.'],
+      constraints: [], out_of_scope: [], likely_paths: [], required_checks: [],
+    },
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    max_phase_turns: 10, max_revision_cycles: 1, fencing_token: 7,
+    ...overrides,
+  },
+  idempotencyKey: key, correlationId: 'corr-1',
+});
+
+/** The fake attests both halves, so jobs reach the publication gate. */
+const ATTESTING = { effective: { model_alias: 'sonnet', effort: 'high' } };
+
+async function driveToGate(engine) {
+  const handle = await submit(engine);
+  await engine.drain();
+  const jobId = handle.workbench_job_id;
+  const approval = engine.getApprovals(SUBMITTER, jobId).approvals[0];
+  return { jobId, approval };
+}
+
+// ---------------------------------------------------------------------------
+// separation of requester and approver authority
+// ---------------------------------------------------------------------------
+
+gitTest('approval: the credential that submitted a job may not approve it', async () => {
+  await withEngine(async ({ engine }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    const body = {
+      workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication',
+      approved: true, decided_by: 'james',
+    };
+
+    // The submitter holds jobs:write and publish, but not approve. Self-approval is the whole
+    // failure mode: one credential requesting, granting, and acting on its own authorisation.
+    await assert.rejects(
+      engine.approveStage({ token: SUBMITTER, jobId, body, idempotencyKey: 'a1' }),
+      (err) => err instanceof ApiError && err.code === 'forbidden_scope',
+    );
+
+    // A distinct credential carrying the approve scope succeeds.
+    const decided = await engine.approveStage({ token: APPROVER, jobId, body, idempotencyKey: 'a2' });
+    assert.equal(decided.status, ApprovalStatus.APPROVED);
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('approval: a decision must name the human who made it', async () => {
+  await withEngine(async ({ engine }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    await assert.rejects(
+      engine.approveStage({
+        token: APPROVER, jobId,
+        body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true },
+        idempotencyKey: 'a1',
+      }),
+      (err) => err instanceof ApiError && err.code === 'validation_failed',
+      'an approval that identifies nobody is not a recorded human decision',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('approval: the audit records the decider and the relaying credential separately', async () => {
+  const audited = [];
+  await withEngine(async ({ engine }) => {
+    engine.audit = (event, detail) => audited.push({ event, detail });
+    const { jobId, approval } = await driveToGate(engine);
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+    const entry = audited.find((a) => a.event === 'orchestrator.approval.decided');
+    assert.equal(entry.detail.decided_by, 'james');
+    assert.equal(entry.detail.relayed_by, ORCH);
+    assert.equal(entry.detail.relayed_by_token, 'approver');
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// publication: renames, non-ASCII names, and index rollback
+// ---------------------------------------------------------------------------
+
+gitTest('publish: a non-ASCII filename is staged and compared correctly', async () => {
+  await withEngine(async ({ engine, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'café.txt'), 'accented and edited\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // git quotes non-ASCII paths in its default output, so a name-only comparison saw
+    // "caf\303\251.txt" and never matched the intended set.
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/accents', commit_message: 'chore: accents',
+        intended_files: ['café.txt'], open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+    assert.equal(record.pushed, true, record.failure_reason ?? 'publication should have succeeded');
+    assert.equal(record.remote_sha_verified, true);
+    assert.deepEqual(record.changed_files, ['café.txt']);
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: a rename is published as the intended path, not rejected as a mismatch', async () => {
+  await withEngine(async ({ engine, repoDir, git }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    // A rename shows up as `R100 old -> new` in the default output, which never matched either.
+    fs.renameSync(path.join(repoDir, 'src.js'), path.join(repoDir, 'renamed.js'));
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/rename', commit_message: 'refactor: rename',
+        intended_files: ['src.js', 'renamed.js'], open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+    assert.equal(record.pushed, true, record.failure_reason ?? 'publication should have succeeded');
+    assert.deepEqual([...record.changed_files].sort(), ['renamed.js', 'src.js']);
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest("publish: a failed publication leaves the operator's index exactly as it was", async () => {
+  await withEngine(async ({ engine, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    fs.writeFileSync(path.join(repoDir, 'README.md'), '# demo\nunrelated\n');
+    // The operator has their own work staged.
+    await execFileAsync('git', ['add', 'README.md'], { cwd: repoDir });
+    const before = (await execFileAsync('git', ['diff', '--cached', '--name-only'], { cwd: repoDir })).stdout;
+
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // Intending a file that is not actually modified makes the publication fail after staging.
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['nonexistent.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+    assert.equal(record.pushed, false);
+
+    // git.js forbids reset and restore, so if publication dirties the real index there is nothing
+    // in this subsystem that could ever put it back. It must therefore not touch it at all.
+    const after = (await execFileAsync('git', ['diff', '--cached', '--name-only'], { cwd: repoDir })).stdout;
+    assert.equal(after, before, "the operator's staged set must be untouched by a failed publish");
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: pathspec magic is refused before it reaches git add', async () => {
+  await withEngine(async ({ engine, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    for (const magic of [':(glob)**', ':/', ':!README.md', '*', ':(exclude)a']) {
+      // `--` stops git interpreting a leading dash as an option; it does NOT stop pathspec magic.
+      // eslint-disable-next-line no-await-in-loop
+      await assert.rejects(
+        engine.publish({
+          token: SUBMITTER, jobId,
+          request: {
+            job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: [magic],
+            open_pull_request: false, approval_id: approval.approval_id,
+          },
+          idempotencyKey: `p-${magic}`, correlationId: 'c',
+        }),
+        (err) => err instanceof ApiError,
+        `pathspec magic ${magic} must be refused`,
+      );
+    }
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: publication holds the project write lease while it runs', async () => {
+  await withEngine(async ({ engine, store, repo, config }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // Another job holds the lease. Publication must not commit into a checkout someone else is
+    // actively editing.
+    const resource = `project-write:${INSTANCE}:Demo`;
+    await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'other-job', ttlMs: 600_000 }));
+
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    }).catch((err) => err);
+
+    const blocked = record instanceof ApiError || record.pushed === false;
+    assert.ok(blocked, 'publication must not proceed while another job holds the write lease');
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// revision and review must actually run
+// ---------------------------------------------------------------------------
+
+gitTest('revision: a requested revision runs, rather than stranding the job forever', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    // A non-isolated review parks the job in blocked_review, which is where a revision is requested.
+    backend.phaseResults = Array.from({ length: 6 }, () => ({
+      ok: true, session_id: 'same-session', summary: 'done', questions: [],
+      turns_used: 1, max_turns_reached: false,
+    }));
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_REVIEW);
+
+    backend.phaseResults = [];
+    await engine.requestRevision({
+      token: SUBMITTER, jobId,
+      body: { workbench_job_id: jobId, instructions: 'tighten the expiry check' },
+    });
+    await engine.drain();
+
+    const job = repo.getJob(jobId);
+    assert.notEqual(job.status, JobStatus.REVISION_REQUIRED,
+      'a revision must be worked, not left parked with no worker');
+    assert.equal(job.revision_cycles_used, 1);
+    const events = engine.getEvents(SUBMITTER, jobId, { limit: 200 }).events;
+    assert.ok(events.some((e) => e.phase === 'implementation' && e.event_type === 'phase_started'),
+      'the revision must re-enter implementation');
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// cancellation must actually stop the work
+// ---------------------------------------------------------------------------
+
+gitTest('cancel: an in-flight phase is signalled rather than waited out', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    // A phase that would run far longer than any reasonable cancel latency.
+    let aborted = false;
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => resolve({ ok: true, session_id: 's', summary: 'late', questions: [], turns_used: 1, max_turns_reached: false }), 60_000);
+      request.signal?.addEventListener('abort', () => {
+        aborted = true;
+        clearTimeout(timer);
+        reject(Object.assign(new Error('aborted'), { kind: 'cancelled' }));
+      });
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    // Wait until the job is genuinely inside a phase — cancelling before one starts would prove
+    // nothing about whether a running phase can be stopped.
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    assert.equal(repo.getJob(jobId).status, JobStatus.DISCOVERING, 'the job must be in a phase before cancelling');
+
+    const started = Date.now();
+    const state = await engine.cancelJob({
+      token: SUBMITTER, jobId,
+      body: { workbench_job_id: jobId, reason: 'director changed priority' },
+    });
+    const elapsed = Date.now() - started;
+
+    assert.equal(state.status, JobStatus.CANCELLED);
+    assert.ok(aborted, 'the running phase must have been signalled');
+    assert.ok(elapsed < 20_000, `cancel must not wait out the phase budget (took ${elapsed} ms)`);
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// idempotency key: one source of truth across both transports
+// ---------------------------------------------------------------------------
+
+gitTest('idempotency: a body key that disagrees with the transport key is refused', async () => {
+  await withEngine(async ({ engine }) => {
+    await assert.rejects(
+      engine.submitJob({
+        token: SUBMITTER,
+        body: {
+          idempotency_key: 'from-body', orchestrator_instance_id: ORCH, orchestrator_job_id: 'job_1',
+          project_id: 'Demo', session_key: `${ORCH}:${INSTANCE}:Demo:pvi2-orchestrator`,
+          task: {
+            title: 't', goal: 'g', acceptance_criteria: ['a'],
+            constraints: [], out_of_scope: [], likely_paths: [], required_checks: [],
+          },
+          requested: { model_alias: 'sonnet', effort: 'high' },
+          max_phase_turns: 10, max_revision_cycles: 1, fencing_token: 7,
+        },
+        idempotencyKey: 'from-header', correlationId: 'c',
+      }),
+      (err) => err instanceof ApiError && err.code === 'validation_failed',
+      'two disagreeing keys must not silently pick one',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// reboot-safe lane identity
+// ---------------------------------------------------------------------------
+
+tmuxTest('lane: a lane restored unmarked after a reboot is re-adopted, not wedged forever', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-reboot-'));
+  const socket = `pwreboot${process.pid}${Number(process.hrtime.bigint() % 100000n)}`;
+  const workspaceRoot = path.join(dir, 'workspaces');
+  fs.mkdirSync(path.join(workspaceRoot, 'Demo'), { recursive: true });
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: INSTANCE,
+    PW_ORCHESTRATOR_DATA_DIR: path.join(dir, 'data'),
+    PW_WORKSPACES: workspaceRoot, PW_ORCHESTRATOR_TMUX_SOCKET: socket,
+  });
+  const store = await JournalStore.open({
+    journalPath: config.journalPath, snapshotPath: config.snapshotPath,
+    lockPath: config.lockPath, compactEveryRecords: 500,
+  });
+  const repo = new OrchestratorRepository(store);
+  const tmux = new TmuxAdapter({ socket, executable: 'tmux' });
+  const manager = new OrchestratorSessionManager({ config, store, repo, tmux, backend: new FakeCodingBackend() });
+  const project = { project_id: 'Demo', workspace_subdir: 'Demo' };
+  const token = { token_id: 't', orchestrator_instance_id: ORCH, projects: ['Demo'], scopes: [] };
+  const request = {
+    orchestrator_instance_id: ORCH, project_id: 'Demo', role: null,
+    reserved_tmux_window: null, cli_backend: 'claude-code', force_replace: false,
+  };
+
+  try {
+    const first = await manager.ensureSession({ token, project, request, correlationId: 'c' });
+
+    // Simulate the reboot: pw-tmux-restore recreates every pw_* window BY NAME as a plain shell.
+    // tmux user options are not in the manifest, so the marker is gone.
+    await execFileAsync('tmux', ['-L', socket, 'kill-server']).catch(() => {});
+    // The old server does not disappear the instant kill-server returns, and starting a new one on
+    // a socket that is still being torn down fails with "server exited unexpectedly". A real reboot
+    // has no such race; this retry is the fixture catching up with it, not a product behaviour.
+    for (let i = 0; i < 40; i++) {
+      try {
+        await tmux.raw(['new-session', '-d', '-s', 'pw_Demo', '-c', path.join(workspaceRoot, 'Demo')]);
+        break;
+      } catch (err) {
+        if (i === 39) throw err;
+        fs.rmSync(path.join('/tmp', `tmux-${process.getuid?.() ?? 0}`, socket), { force: true });
+        await new Promise((r) => setTimeout(r, 50));
+      }
+    }
+    await tmux.raw(['new-window', '-d', '-t', '=pw_Demo', '-n', 'orch_pvibot',
+      '-c', path.join(workspaceRoot, 'Demo')]);
+    const restored = await tmux.findWindow('pw_Demo', 'orch_pvibot');
+    assert.equal(restored.role, null, 'the restored window must be unmarked, as after a real reboot');
+
+    // Before the fix this threw `conflict` forever, including under force_replace, so every job for
+    // the project blocked at "ensuring the orchestrator lane" until a human intervened.
+    const second = await manager.ensureSession({ token, project, request, correlationId: 'c' });
+    assert.equal(second.session_key, first.session_key);
+    const lane = await tmux.findWindow('pw_Demo', 'orch_pvibot');
+    assert.equal(lane.role, 'pvi2-orchestrator', 'the lane must have been re-marked');
+    assert.equal(lane.sessionKey, first.session_key);
+  } finally {
+    await execFileAsync('tmux', ['-L', socket, 'kill-server']).catch(() => {});
+    fs.rmSync(path.join('/tmp', `tmux-${process.getuid?.() ?? 0}`, socket), { force: true });
+    await store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+tmuxTest('lane: an unmarked window is only adopted when this instance recorded that lane', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-adopt-'));
+  const socket = `pwadopt${process.pid}${Number(process.hrtime.bigint() % 100000n)}`;
+  const workspaceRoot = path.join(dir, 'workspaces');
+  fs.mkdirSync(path.join(workspaceRoot, 'Demo'), { recursive: true });
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: INSTANCE,
+    PW_ORCHESTRATOR_DATA_DIR: path.join(dir, 'data'),
+    PW_WORKSPACES: workspaceRoot, PW_ORCHESTRATOR_TMUX_SOCKET: socket,
+  });
+  const store = await JournalStore.open({
+    journalPath: config.journalPath, snapshotPath: config.snapshotPath,
+    lockPath: config.lockPath, compactEveryRecords: 500,
+  });
+  const repo = new OrchestratorRepository(store);
+  const tmux = new TmuxAdapter({ socket, executable: 'tmux' });
+  const manager = new OrchestratorSessionManager({ config, store, repo, tmux, backend: new FakeCodingBackend() });
+
+  try {
+    // No durable record exists — this instance has never created a lane here. Something else is
+    // sitting on the reserved name, and adopting it would be taking a window we cannot prove is ours.
+    await tmux.raw(['new-session', '-d', '-s', 'pw_Demo', '-c', path.join(workspaceRoot, 'Demo')]);
+    await tmux.raw(['new-window', '-d', '-t', '=pw_Demo', '-n', 'orch_pvibot', 'sleep 600']);
+    const before = await tmux.findWindow('pw_Demo', 'orch_pvibot');
+
+    await assert.rejects(
+      manager.ensureSession({
+        token: { token_id: 't', orchestrator_instance_id: ORCH, projects: ['Demo'], scopes: [] },
+        project: { project_id: 'Demo', workspace_subdir: 'Demo' },
+        request: {
+          orchestrator_instance_id: ORCH, project_id: 'Demo', role: null,
+          reserved_tmux_window: null, cli_backend: 'claude-code', force_replace: false,
+        },
+        correlationId: 'c',
+      }),
+      (err) => err instanceof ApiError && err.code === 'conflict',
+    );
+    const after = await tmux.findWindow('pw_Demo', 'orch_pvibot');
+    assert.equal(after.id, before.id, 'an unowned window must be left completely alone');
+    assert.equal(after.role, null, 'and must not have been marked');
+  } finally {
+    await execFileAsync('tmux', ['-L', socket, 'kill-server']).catch(() => {});
+    fs.rmSync(path.join('/tmp', `tmux-${process.getuid?.() ?? 0}`, socket), { force: true });
+    await store.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('persistence: the tmux save manifest excludes orchestrator-owned lanes', () => {
+  // The lane is ephemeral and ProjectWorkbench recreates it on demand. Restoring it by name as a
+  // plain shell is what produced the unmarked squatter in the first place.
+  const script = fs.readFileSync(new URL('../scripts/pw-tmux-save', import.meta.url), 'utf8');
+  assert.match(script, /@pw_role/, 'the save script must be able to see the lane marker');
+  assert.match(script, /skip|exclude/i);
+});

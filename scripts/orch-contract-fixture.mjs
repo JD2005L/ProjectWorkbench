@@ -29,6 +29,8 @@ import { ALLOWED_TOOLS, TOOL_DEFINITIONS, FORBIDDEN_TOOL_FRAGMENTS } from '../ap
 import { statusForCode } from '../app/orchestrator/errors.js';
 import { ALLOWED_CHECK_NAMES } from '../app/orchestrator/checks.js';
 import { ALLOWED_GIT_SUBCOMMANDS, FORBIDDEN_GIT_SUBCOMMANDS } from '../app/orchestrator/git.js';
+import { EFFORT_ATTESTATION_REQUIREMENT } from '../app/orchestrator/attestation.js';
+import { SCOPES } from '../app/orchestrator/auth.js';
 
 const sorted = (values) => [...values].sort();
 
@@ -157,9 +159,15 @@ export function buildFixture() {
     safety: {
       // Named here so the orchestrator side can assert the guarantees it is relying on.
       allowed_check_names: sorted(ALLOWED_CHECK_NAMES),
+      scopes: sorted(Object.values(SCOPES)),
       allowed_git_subcommands: sorted(ALLOWED_GIT_SUBCOMMANDS),
       forbidden_git_subcommands: sorted(FORBIDDEN_GIT_SUBCOMMANDS),
       cancellation_preserves_working_tree: true,
+      cancellation_signals_the_running_phase: true,
+      publication_uses_a_private_index: true,
+      effort_attestation_available: false,
+      approval_requires_separate_scope: true,
+      approval_requires_separate_credential_by_default: true,
       api_key_authentication_representable: false,
       publication_requires_recorded_human_approval: true,
       remote_sha_verified_requires_full_sha_match: true,
@@ -167,16 +175,31 @@ export function buildFixture() {
 
     known_gaps: [
       {
-        id: 'effective-effort-unverifiable',
+        id: 'effective-effort-unattestable',
         summary:
-          'Claude Code reports the active model in its stream-json init event but does not report '
-          + 'the active effort, and silently ignores an unrecognised --effort value (stderr warning, '
-          + 'exit 0, runs at the default). ProjectWorkbench therefore returns effective: null by '
-          + 'default, which blocks the job, rather than reporting a guess.',
-        workaround:
-          'PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv makes the operator accept argv attestation; every '
-          + 'such response is labelled argv-attested in `detail`.',
+          'Measured against Claude Code 2.1.220: the stream-json system/init event carries model, '
+          + 'permissionMode and apiKeySource but NO effort field of any kind, and an unrecognised '
+          + '--effort value is silently ignored (stderr warning, exit 0, running at the default). '
+          + 'Effective effort therefore cannot be attested against this CLI at all.',
+        behaviour:
+          'ProjectWorkbench reports effective: null and moves the job to blocked_configuration. '
+          + 'There is no configuration that relaxes this — an earlier argv-attestation mode made '
+          + 'the check requested === requested and has been removed. Jobs will not run against a '
+          + 'CLI that cannot report effort.',
+        requirement: EFFORT_ATTESTATION_REQUIREMENT,
         needs_coordination: true,
+      },
+      {
+        id: 'model-alias-namespace',
+        summary:
+          'The orchestrator requests a model by alias (sonnet); the CLI reports the resolved id '
+          + '(claude-sonnet-5, or a dated id such as claude-haiku-4-5-20251001). The two are in '
+          + 'different namespaces and can never compare equal directly.',
+        behaviour:
+          'ProjectWorkbench attests the model through an explicit configured alias -> id mapping '
+          + '(PW_ORCHESTRATOR_MODEL_ALIASES, defaults measured from the installed CLI). An alias '
+          + 'with no mapping is unverifiable and blocks; an alias is never compared to itself.',
+        needs_coordination: false,
       },
       {
         id: 'tmux-session-name-normalisation',

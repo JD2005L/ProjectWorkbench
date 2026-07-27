@@ -221,49 +221,83 @@ test('runner: the effective model comes from the init event, not from an echoed 
   assert.equal(calls[0].args[calls[0].args.indexOf('--permission-mode') + 1], 'plan');
 });
 
-test('runner: effort is reported as unverifiable by default, because the CLI does not report it', async () => {
-  // Claude Code 2.1.220 emits no effort in its init event, and silently ignores an unknown
-  // --effort value with only a stderr warning. There is therefore no reliable way to *read back*
-  // the active effort, and the contract offers no way to say "probably correct".
+test('runner: a session reporting no effort blocks, and says what would unblock it', async () => {
+  // The installed CLI's real behaviour. There is no configuration that turns this into a pass —
+  // the previous `argv` opt-in made the check `requested === requested` and has been removed.
   const { backend } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
   });
-  assert.equal(outcome.effective, null, 'unverifiable effort must block, not be assumed');
-  assert.match(outcome.detail, /effort/i);
+  assert.equal(outcome.effective, null);
+  assert.equal(outcome.attestation.effort.outcome, 'unavailable');
+  // The model IS attested — the two halves are reported separately so a real model drift stays
+  // distinguishable from "the CLI cannot tell us about effort".
+  assert.equal(outcome.attestation.model.verified, true);
+  assert.equal(outcome.observed_model, 'claude-sonnet-5');
+  assert.ok(outcome.requirement?.includes('stream-json'), 'the operator must be told what would work');
 });
 
-test('runner: argv attestation is an explicit operator opt-in, and is labelled as such', async () => {
-  const config = loadOrchestratorConfig({
-    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
-    PW_ORCHESTRATOR_EFFORT_ATTESTATION: 'argv',
+test('runner: a session that DOES report effort attests, with no configuration change', async () => {
+  // Forward compatibility: the capability is probed per session, not configured.
+  const reporting = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5', effort: 'high',
+    apiKeySource: 'none', session_id: 's1', permissionMode: 'plan',
   });
-  const { backend } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` }, { config });
+  const { backend } = backendWith({ stdout: `${reporting}\n${RESULT_LINE}\n` });
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
   });
-  assert.equal(outcome.effective.model_alias, 'claude-sonnet-5');
-  assert.equal(outcome.effective.effort, 'high');
-  // The orchestrator must be able to see what kind of evidence this is.
-  assert.match(outcome.detail, /argv-attested/i);
+  assert.deepEqual(
+    { model_alias: outcome.effective.model_alias, effort: outcome.effective.effort },
+    { model_alias: 'sonnet', effort: 'high' },
+  );
 });
 
-test('runner: attestation still fails closed when the CLI says it ignored the effort flag', async () => {
-  const config = loadOrchestratorConfig({
-    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
-    PW_ORCHESTRATOR_EFFORT_ATTESTATION: 'argv',
+test('runner: a session running a different model than requested is a mismatch, not a pass', async () => {
+  const drifted = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-haiku-4-5-20251001', effort: 'high',
+    apiKeySource: 'none', session_id: 's1',
+  });
+  const { backend } = backendWith({ stdout: `${drifted}\n${RESULT_LINE}\n` });
+  const outcome = await backend.verifyConfiguration({
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(outcome.effective, null);
+  assert.equal(outcome.attestation.model.outcome, 'mismatch');
+});
+
+test('runner: an API-billed session is refused even when it attests perfectly', async () => {
+  const billed = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5', effort: 'high',
+    apiKeySource: 'ANTHROPIC_API_KEY', session_id: 's1',
+  });
+  const { backend } = backendWith({ stdout: `${billed}\n${RESULT_LINE}\n` });
+  const outcome = await backend.verifyConfiguration({
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(outcome.effective, null);
+  assert.match(outcome.detail, /subscription/i);
+});
+
+test('runner: a CLI warning that it ignored the effort flag is never attested as applied', async () => {
+  const reporting = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5', effort: 'high',
+    apiKeySource: 'none', session_id: 's1',
   });
   const { backend } = backendWith({
-    stdout: `${INIT_LINE}\n${RESULT_LINE}\n`,
+    stdout: `${reporting}\n${RESULT_LINE}\n`,
     stderr: "Warning: Unknown --effort value 'high' — ignoring it and using the default effort.",
-  }, { config });
+  });
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
   });
   assert.equal(outcome.effective, null, 'an ignored flag must never be attested as applied');
+  assert.equal(outcome.attestation.effort.outcome, 'ignored');
 });
 
 test('runner: output with no init event is unverifiable rather than optimistically parsed', async () => {

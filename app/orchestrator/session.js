@@ -248,6 +248,7 @@ export class OrchestratorSessionManager {
       .find((w) => w.name === lane.reservedWindow);
 
     let replaced = false;
+    let laneWindowId = null;
     if (existing) {
       const ownedByThisLane = existing.role === lane.role
         && existing.projectId === project.project_id
@@ -257,12 +258,51 @@ export class OrchestratorSessionManager {
       const markedByUs = Boolean(existing.role) && existing.role === lane.role;
 
       if (!markedByUs) {
-        // Somebody else's window is sitting on the reserved name. Refuse — including under
-        // force_replace. This service does not destroy windows it cannot prove it owns.
-        throw new ApiError(
-          ErrorCode.CONFLICT,
-          `the reserved window '${lane.reservedWindow}' is occupied by a window this instance does not own`,
-        );
+        // An unmarked window on the reserved name. Usually somebody else's — but there is one case
+        // where it is provably ours: a host reboot. `pw-tmux-save` records session, window name and
+        // cwd, not tmux user options, so `pw-tmux-restore` recreates the lane by name as a plain
+        // shell with the marker gone. Refusing forever meant every job for the project blocked at
+        // "ensuring the orchestrator lane" until a human killed the window by hand.
+        //
+        // The proof of ownership comes from this instance's own durable record — not from the
+        // window, which by definition has nothing left to say. All of it must line up: we recorded
+        // this lane, in this session, under this window name, and what is there now is an idle
+        // shell in the right directory carrying no other role marker.
+        const recorded = this.store.get('sessions', sessionKey);
+        const reclaimable = Boolean(recorded)
+          && recorded.project_tmux_session === lane.tmuxSession
+          && recorded.reserved_tmux_window === lane.reservedWindow
+          && recorded.workspace_path === workspacePath
+          && !existing.role && !existing.projectId && !existing.sessionKey && !existing.orchestrator
+          && existing.paneCurrentPath === workspacePath;
+
+        if (!reclaimable) {
+          throw new ApiError(
+            ErrorCode.CONFLICT,
+            `the reserved window '${lane.reservedWindow}' is occupied by a window this instance does not own`,
+          );
+        }
+
+        // Re-mark in place rather than killing and recreating: the window is ours, and replacing it
+        // would be a gratuitous change to what the operator is looking at.
+        await this.tmux.setWindowOptionById(existing.id, MARKER.ROLE, lane.role);
+        await this.tmux.setWindowOptionById(existing.id, MARKER.PROJECT, project.project_id);
+        await this.tmux.setWindowOptionById(existing.id, MARKER.SESSION_KEY, sessionKey);
+        await this.tmux.setWindowOptionById(existing.id, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
+
+        const reclaimed = {
+          ...recorded,
+          // A restored shell has verified nothing: whatever the pre-reboot session knew is gone.
+          effective: null,
+          last_verified_at: null,
+          cli_session_id: null,
+          status: OrchestratorSessionStatus.MISSING,
+          last_used_at: this.now(),
+          lane_window_id: existing.id,
+          reclaimed_at: this.now(),
+        };
+        await this.store.transact((tx) => { this.repo.putSession(tx, reclaimed); });
+        return this._publicSession(reclaimed);
       }
 
       if (markedByUs && existing.orchestrator && existing.orchestrator !== token.orchestrator_instance_id) {
@@ -279,11 +319,11 @@ export class OrchestratorSessionManager {
         // By id: the window was resolved from an exact-name match in listWindows, and killing by
         // name would reintroduce the index ambiguity this whole path exists to avoid.
         await this.tmux.killWindowById(existing.id);
-        await this._createLane(lane, workspacePath, project, sessionKey, token);
+        laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token);
         replaced = true;
       }
     } else {
-      await this._createLane(lane, workspacePath, project, sessionKey, token);
+      laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token);
     }
 
     const prior = this.store.get('sessions', sessionKey);
@@ -309,6 +349,7 @@ export class OrchestratorSessionManager {
       requested: replaced ? null : (prior?.requested ?? null),
       effective,
       status: effective && lastVerifiedAt ? OrchestratorSessionStatus.READY : OrchestratorSessionStatus.MISSING,
+      lane_window_id: laneWindowId ?? prior?.lane_window_id ?? null,
       last_verified_at: lastVerifiedAt,
       last_used_at: this.now(),
       created_at: createdAt,
@@ -408,7 +449,8 @@ export class OrchestratorSessionManager {
   /** The `OrchestratorSession` contract payload — internal bookkeeping fields are not exposed. */
   _publicSession(record) {
     const {
-      workspace_path: _workspacePath, correlation_id: _correlationId, ...rest
+      workspace_path: _workspacePath, correlation_id: _correlationId,
+      lane_window_id: _laneWindowId, reclaimed_at: _reclaimedAt, ...rest
     } = record;
     return rest;
   }

@@ -54,7 +54,7 @@ const ALLOWED_OPTIONS = Object.freeze({
   diff: new Set(['--check', '--cached', '--staged', '--name-only', '--numstat', '--stat', '--unified=0', '--no-renames', '-z', '--no-color']),
   log: new Set(['--oneline', '--format', '--pretty', '-n', '--max-count', '--no-color']),
   'ls-files': new Set(['--others', '--exclude-standard', '--cached', '-z']),
-  show: new Set(['--numstat', '--stat', '--format=', '--name-only', '--no-color']),
+  show: new Set(['--numstat', '--stat', '--format=', '--name-only', '--no-color', '-z', '--no-renames']),
   'cat-file': new Set(['-t', '-p', '-e']),
   'rev-list': new Set(['--count', '--max-count', '-n']),
   'symbolic-ref': new Set(['--short', '-q']),
@@ -165,12 +165,17 @@ export function assertGitArgvAllowed(argv) {
  * `-c` and every other configuration-injection option is refused above, and the environment is
  * pruned of the variables that would let git write somewhere else or prompt for credentials.
  */
-export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120_000, exec = execFileAsync } = {}) {
+export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120_000, exec = execFileAsync, indexFile = null } = {}) {
   assertGitArgvAllowed(argv);
   const env = { ...process.env };
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) {
     delete env[key];
   }
+  // An explicitly supplied private index — never inherited from the ambient environment, which is
+  // why the variable is stripped first. Publication stages into a throwaway copy of the index so a
+  // failure cannot leave the operator's staged work rearranged, and git.js deliberately offers no
+  // way to unstage.
+  if (indexFile) env.GIT_INDEX_FILE = indexFile;
   // A prompt would hang the phase rather than fail it.
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_ASKPASS = env.GIT_ASKPASS ?? '/bin/true';

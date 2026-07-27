@@ -38,6 +38,11 @@ const TOKEN = Object.freeze({
   token_id: 't', orchestrator_instance_id: ORCH, projects: ['Demo'],
   scopes: ['jobs:read', 'jobs:write', 'session:manage', 'publish'],
 });
+/** Recording a human decision is a separate authority from requesting the work. */
+const APPROVER = Object.freeze({
+  token_id: 'approver', orchestrator_instance_id: ORCH, projects: ['Demo'],
+  scopes: ['jobs:read', 'approve'],
+});
 
 /** A disposable repository with one commit, a remote, and a dirty file the job must not touch. */
 async function makeRepo(dir) {
@@ -150,7 +155,12 @@ const submission = (overrides = {}) => ({
 });
 
 const submit = (engine, overrides = {}, idempotencyKey = 'req-0001') => engine.submitJob({
-  token: TOKEN, body: submission(overrides), idempotencyKey, correlationId: 'corr-1',
+  token: TOKEN,
+  // The contract puts the key in the body; the transport also carries it. They must agree, so the
+  // helper keeps them in step rather than letting a test drift them apart.
+  body: submission({ idempotency_key: idempotencyKey, ...overrides }),
+  idempotencyKey,
+  correlationId: 'corr-1',
 });
 
 // ---------------------------------------------------------------------------
@@ -519,7 +529,7 @@ gitTest('engine: an expired question and an expired approval are both refused', 
     });
     await assert.rejects(
       engine.approveStage({
-        token: TOKEN, jobId,
+        token: APPROVER, jobId,
         body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
         idempotencyKey: 'a',
       }),
@@ -666,7 +676,7 @@ gitTest('engine: publication stages only the intended files and verifies the rea
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# demo\nunrelated edit\n');
 
     await engine.approveStage({
-      token: TOKEN, jobId,
+      token: APPROVER, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
       idempotencyKey: 'a1',
     });
@@ -707,7 +717,7 @@ gitTest('engine: a mismatch between intended and staged files aborts before comm
     await execFileAsync('git', ['add', 'README.md'], { cwd: repoDir });
 
     await engine.approveStage({
-      token: TOKEN, jobId,
+      token: APPROVER, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
       idempotencyKey: 'a1',
     });
@@ -732,7 +742,7 @@ gitTest('engine: a declined approval completes the job without publishing anythi
   await withEngine(async ({ engine, repo, repoDir, remote }) => {
     const { jobId, approval } = await readyToPublish(engine, repoDir);
     await engine.approveStage({
-      token: TOKEN, jobId,
+      token: APPROVER, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: false, reason: 'not now', decided_by: 'james' },
       idempotencyKey: 'a1',
     });
@@ -747,7 +757,7 @@ gitTest('engine: publication is idempotent — a retry does not produce a second
     const { jobId, approval } = await readyToPublish(engine, repoDir);
     fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
     await engine.approveStage({
-      token: TOKEN, jobId,
+      token: APPROVER, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
       idempotencyKey: 'a1',
     });
