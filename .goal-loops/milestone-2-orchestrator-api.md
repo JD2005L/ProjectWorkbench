@@ -302,11 +302,49 @@ the "before" tree fingerprint is taken while a phase may still be writing, so
 unbounded SSE stream lifetime. **P2 · Idempotency key is the header on HTTP but a body field on MCP,**
 never compared.
 
+### 2026-07-27 (round 3) — reported blocker diagnosed; every P1 closed
+
+**The reported intermittent failure had TWO independent causes, both product bugs.**
+
+1. **No ambient git identity.** Publication inherited whatever identity existed on the host. A
+   service account routinely has none — as do CI runners and fresh containers — so `git commit`
+   failed with "Please tell me who you are", publication reported a bare "the commit failed", and the
+   repository was left with one commit where two were expected. Reproduced deterministically with an
+   empty `HOME`. Publication now commits under a configured identity; the regression test pins it
+   with `GIT_CONFIG_GLOBAL=/dev/null`, verified RED without the fix.
+2. **A stale-stat private index.** The private index was *copied* from the repository's own, so it
+   carried git's cached stat data and `git add` trusted it: `git add` exited 0 having staged nothing
+   while `git status` still showed the file modified — "there is nothing to publish", ~1 in 20. Found
+   by capturing the publication *event* rather than the returned record, which strips the reason. The
+   index is now *seeded* with `read-tree HEAD`, so it has no stat data and git must hash the file.
+   **0 failures in 80 diagnostic iterations**, and committing from a private index no longer leaves
+   the real one stale relative to the new HEAD.
+
+**Round-3 independent reviews found a P0 I had introduced and four more P1s**, all fixed:
+
+- **P0** `working_tree_preserved` was a tautology — both fingerprints were taken after the worker had
+  stopped. A reviewer proved a backend deleting the operator's files during cancellation still
+  reported `preserved: true`. Now sampled before the abort, and defined as *nothing lost* rather than
+  *nothing changed*, with tests for both directions.
+- **P1** `_runRevision` never renewed the write lease → a second job reached `discovering` in the same
+  checkout. **P1** `cancelJob` awaited unboundedly → a request could hang for the whole phase budget.
+  **P1** a commit message beginning with `-` wedged the job in `publishing` forever. **P1** separation
+  of duty keyed on `token_id` was defeated by the token store's own rotation design; it now rests on
+  capability. **P1** the phases that do the work were never attested — only the probe session was.
+- Plus: base-path guard ignored `PW_BASE_PATH` (a `/workbench` install could be bricked);
+  `pw-tmux-save` keyed on an option tmux resolves through the global scope chain, so one stray
+  `set-option -g` silently excluded the entire manifest; `bin/` was documented but shipped by no
+  install path; `symbolic-ref` was an allowed write; a wildcard alias mapping verified any model.
+
+**Verification:** 287/287 on Node 20.19.0 and Node 22, three consecutive runs each, in a **fresh
+clone with `npm ci`**; 20 focused repetitions of the reported test with no git identity; contract
+fixture drift + cross-contract against real Pydantic; isolated HTTP/MCP smoke; zero temp dirs,
+sockets or processes left behind; live tmux (15 sessions) untouched; CT2115 undeployed.
+
 ### Status
 
-All P0 and P1 findings from both review rounds are resolved with regression tests. Round-2 independent
-reviews (attestation/authority, publication/lifecycle, non-regression) are running; the PR stays a
-draft until they report and anything they find is addressed.
+All P0 and P1 findings from all three review rounds are resolved with regression tests. The PR stays
+a draft: the residual below is a coordination decision, not a code change.
 
 **Residual, by design not omission:** with the installed CLI, effort cannot be attested, so jobs block
 at `blocked_configuration`. That is the required fail-closed behaviour and needs a coordinated
