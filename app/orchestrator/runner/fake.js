@@ -32,6 +32,8 @@ export class FakeCodingBackend {
 
     /** Scripted phase outcomes, consumed in order. */
     this.phaseResults = [];
+    /** Counter behind the synthetic session ids. Deterministic: no randomness, no clock. */
+    this._sessionCounter = 0;
     /** Every invocation, in order, so a test can assert what was *not* run and with which flags. */
     this.invocations = [];
   }
@@ -101,9 +103,16 @@ export class FakeCodingBackend {
     if (this.malformedOutput) throw Object.assign(new Error('the CLI produced unparseable output'), { kind: 'malformed_output' });
 
     const scripted = this.phaseResults.shift();
-    return scripted ?? {
+    if (scripted) return scripted;
+
+    // A resumed run keeps its session; a fresh one gets a new id. That is what the real CLI does,
+    // and modelling it matters: the engine's review-isolation check compares session ids, so a fake
+    // that returned one constant id would make an independent review look non-independent.
+    this._sessionCounter += 1;
+    const sessionId = request.resumeSessionId ?? `fake-session-${String(this._sessionCounter).padStart(4, '0')}`;
+    return {
       ok: true,
-      session_id: 'fake-session-0001',
+      session_id: sessionId,
       effective: this.effective ? { schema_version: SCHEMA_VERSION, ...this.effective } : null,
       summary: 'fake phase completed',
       questions: [],

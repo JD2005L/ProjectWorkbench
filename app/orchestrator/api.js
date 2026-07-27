@@ -21,6 +21,9 @@ import {
   ProjectConfigStore, resolveProject, projectPayload, capabilitiesPayload, listGrantedProjects,
 } from './projects.js';
 import { validate } from './validate.js';
+import {
+  ENSURE_SESSION_SCHEMA, MODEL_SETTINGS_SCHEMA, ARTIFACT_EXCERPT_SCHEMA, PUBLICATION_REQUEST_SCHEMA,
+} from './schemas.js';
 
 /** Requests that mutate must carry an idempotency key: the relay may retry, and a retry must not
  *  produce a second side effect. */
@@ -167,18 +170,6 @@ export function createOrchestratorRouter({
   // the named orchestrator lane
   // -------------------------------------------------------------------------
 
-  const ENSURE_SESSION_SCHEMA = {
-    name: 'EnsureSessionRequest',
-    fields: {
-      orchestrator_instance_id: { type: 'identifier', required: true },
-      project_id: { type: 'slug', required: true },
-      role: { type: 'slug', default: null, nullable: true },
-      reserved_tmux_window: { type: 'slug', default: null, nullable: true },
-      cli_backend: { type: 'enum', values: ['claude-code', 'codex-cli'], default: 'claude-code' },
-      force_replace: { type: 'bool', default: false },
-    },
-  };
-
   const VERIFY_SESSION_SCHEMA = {
     name: 'VerifySessionRequest',
     fields: {
@@ -188,17 +179,7 @@ export function createOrchestratorRouter({
         values: ['discovery', 'planning', 'implementation', 'mechanical_correction', 'high_risk_design', 'routine_review', 'high_risk_review'],
         required: true,
       },
-      requested: {
-        type: 'object',
-        required: true,
-        schema: {
-          name: 'ModelSettings',
-          fields: {
-            model_alias: { type: 'modelAlias', required: true },
-            effort: { type: 'enum', values: ['low', 'medium', 'high', 'max'], required: true },
-          },
-        },
-      },
+      requested: { type: 'object', schema: MODEL_SETTINGS_SCHEMA, required: true },
     },
   };
 
@@ -238,19 +219,184 @@ export function createOrchestratorRouter({
   }));
 
   // -------------------------------------------------------------------------
-  // jobs — wired in the engine increment
+  // jobs
   // -------------------------------------------------------------------------
 
   router.post('/jobs', handle(async (req, res) => {
     requireScope(req.token, SCOPES.JOBS_WRITE);
-    const handle_ = await requireEngine().submitJob({
+    const accepted = await requireEngine().submitJob({
       token: req.token, body: req.body ?? {}, idempotencyKey: req.idempotencyKey,
       correlationId: req.correlationId,
     });
     auditEvent(req, 'orchestrator.job.submit', {
-      workbench_job_id: handle_.workbench_job_id, deduplicated: handle_.deduplicated,
+      workbench_job_id: accepted.workbench_job_id, deduplicated: accepted.deduplicated,
     });
-    res.status(handle_.deduplicated ? 200 : 201).json(handle_);
+    // A deduplicated submission is 200: it returns the original outcome and created nothing.
+    res.status(accepted.deduplicated ? 200 : 201).json(accepted);
+  }));
+
+  router.get('/jobs', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().listJobs(req.token, {
+      projectId: req.query.project ? String(req.query.project) : null,
+      limit: Number(req.query.limit) || 50,
+      offset: Number(req.query.offset) || 0,
+    }));
+  }));
+
+  router.get('/jobs/:id', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getJob(req.token, req.params.id));
+  }));
+
+  router.get('/jobs/:id/events', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getEvents(req.token, req.params.id, {
+      afterSequence: Number(req.query.after_sequence) || 0,
+      limit: Number(req.query.limit) || 100,
+    }));
+  }));
+
+  /**
+   * The same timeline as Server-Sent Events.
+   *
+   * The cursor is the durable per-job sequence, so a dropped connection resumes exactly where it
+   * stopped rather than replaying or skipping.
+   */
+  router.get('/jobs/:id/events/stream', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    const engine_ = requireEngine();
+    let cursor = Number(req.query.after_sequence) || 0;
+    engine_.getJob(req.token, req.params.id); // authorises before any stream is opened
+
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache, no-transform',
+      Connection: 'keep-alive',
+      'X-Correlation-Id': req.correlationId,
+    });
+
+    const pump = () => {
+      let batch;
+      try {
+        batch = engine_.getEvents(req.token, req.params.id, { afterSequence: cursor, limit: 50 });
+      } catch {
+        res.end();
+        return;
+      }
+      for (const event of batch.events) {
+        cursor = event.sequence;
+        res.write(`id: ${event.sequence}\ndata: ${JSON.stringify(event)}\n\n`);
+      }
+    };
+    pump();
+    const timer = setInterval(pump, 1_000);
+    // A comment frame keeps intermediaries from closing an idle stream, and carries no data.
+    const keepAlive = setInterval(() => res.write(': keep-alive\n\n'), 15_000);
+    req.on('close', () => { clearInterval(timer); clearInterval(keepAlive); });
+  }));
+
+  router.get('/jobs/:id/result', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getResult(req.token, req.params.id));
+  }));
+
+  // -- the Milestone 2 record retrievals (contract §9.1-§9.3) ---------------
+
+  router.get('/jobs/:id/questions', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getQuestions(req.token, req.params.id));
+  }));
+
+  router.get('/jobs/:id/approvals', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getApprovals(req.token, req.params.id));
+  }));
+
+  router.get('/jobs/:id/checks', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getChecks(req.token, req.params.id));
+  }));
+
+  router.get('/jobs/:id/reviews', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(requireEngine().getReviews(req.token, req.params.id));
+  }));
+
+  // -- mutations ------------------------------------------------------------
+
+  router.post('/jobs/:id/reply', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_WRITE);
+    res.json(await requireEngine().replyToQuestion({
+      token: req.token, jobId: req.params.id, body: req.body ?? {}, idempotencyKey: req.idempotencyKey,
+    }));
+  }));
+
+  router.post('/jobs/:id/approve', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_WRITE);
+    res.json(await requireEngine().approveStage({
+      token: req.token, jobId: req.params.id, body: req.body ?? {}, idempotencyKey: req.idempotencyKey,
+    }));
+  }));
+
+  router.post('/jobs/:id/revise', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_WRITE);
+    res.json(await requireEngine().requestRevision({ token: req.token, jobId: req.params.id, body: req.body ?? {} }));
+  }));
+
+  router.post('/jobs/:id/review', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_WRITE);
+    res.json(await requireEngine().requestReview({ token: req.token, jobId: req.params.id, body: req.body ?? {} }));
+  }));
+
+  router.post('/jobs/:id/cancel', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_WRITE);
+    const state = await requireEngine().cancelJob({ token: req.token, jobId: req.params.id, body: req.body ?? {} });
+    auditEvent(req, 'orchestrator.job.cancel', { workbench_job_id: req.params.id });
+    res.json(state);
+  }));
+
+  /** Lease heartbeat (contract §9.5): liveness, carrying no evidence and claiming no progress. */
+  router.post('/jobs/:id/heartbeat', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_WRITE);
+    res.json(await requireEngine().heartbeat({ token: req.token, jobId: req.params.id, body: req.body ?? {} }));
+  }));
+
+  /** Publication (contract §9.4): separate from implementation, and approval-gated. */
+  router.post('/jobs/:id/publish', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.PUBLISH);
+    const body = validate(PUBLICATION_REQUEST_SCHEMA, req.body ?? {});
+    if (body.job_id !== req.params.id) {
+      throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the path job and the payload job must agree');
+    }
+    const record = await requireEngine().publish({
+      token: req.token, jobId: req.params.id, request: body, idempotencyKey: req.idempotencyKey,
+      correlationId: req.correlationId,
+    });
+    auditEvent(req, 'orchestrator.publication', {
+      workbench_job_id: req.params.id, publication_id: record.publication_id,
+      remote_sha_verified: record.remote_sha_verified,
+    });
+    res.json(record);
+  }));
+
+  // -------------------------------------------------------------------------
+  // artifacts
+  // -------------------------------------------------------------------------
+
+  router.get('/artifacts/:id/metadata', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    res.json(await requireEngine().getArtifactMetadata(req.token, req.params.id));
+  }));
+
+  router.get('/artifacts/:id/excerpt', handle(async (req, res) => {
+    requireScope(req.token, SCOPES.JOBS_READ);
+    const request = validate(ARTIFACT_EXCERPT_SCHEMA, {
+      artifact_id: req.params.id,
+      byte_offset: Number(req.query.byte_offset) || 0,
+      max_bytes: Number(req.query.max_bytes) || 8_192,
+    });
+    res.json(await requireEngine().getArtifactExcerpt(req.token, request));
   }));
 
   // -------------------------------------------------------------------------
