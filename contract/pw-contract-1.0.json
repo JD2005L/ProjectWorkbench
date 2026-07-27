@@ -1043,6 +1043,17 @@
       "subscription"
     ]
   },
+  "additive_fields": {
+    "AuthHealth.auth_mode": {
+      "values": [
+        "api_key",
+        "subscription"
+      ],
+      "nullable": true,
+      "emitted_on": "GET /health, GET /readiness",
+      "meaning": "how the coding backend is billed; null means this instance could not determine it, and is never to be read as subscription"
+    }
+  },
   "attestation": {
     "contract_version": "1.1",
     "argv_builder_id": "pw-fixed-argv-v1",

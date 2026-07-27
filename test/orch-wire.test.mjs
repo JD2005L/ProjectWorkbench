@@ -566,6 +566,231 @@ wireTest('wire: the orchestrator’s registry CLI accepts the report this reposi
   }
 });
 
+wireTest('wire: this instance passes the orchestrator’s real compatibility handshake', async () => {
+  // The handshake settles compatibility ONCE, before anything is mutated, and refuses to proceed
+  // until it is settled. It reads `/health` and requires a backend that is both `ok` AND reports
+  // `auth_mode: subscription` — "absence is not consent", so a backend that does not say is refused
+  // rather than assumed. Nothing in this repository proved we satisfy it; a peer that fails here
+  // never gets a lane, a worktree or a lease, so the failure would surface as every job blocking.
+  const { FakeCodingBackend } = await import('../app/orchestrator/runner/fake.js');
+  const backend = new FakeCodingBackend();
+  const health = {
+    schema_version: '1.0', instance_id: INSTANCE, contract_version: '1.0', reachable: true,
+    workbench_version: 'test', backends: [await backend.probeAuth()],
+    checked_at: new Date().toISOString(),
+  };
+
+  const script = `
+import json, sys
+from datetime import datetime, timezone
+from pvi_orchestrator.contracts.workbench import WorkbenchInstance
+from pvi_orchestrator.workbench.handshake import CompatibilityHandshake
+from pvi_orchestrator.workbench.protocol import InstanceHealth, WorkbenchError
+
+payload = json.load(sys.stdin)
+
+class Peer:
+    def health(self):
+        return InstanceHealth.model_validate(payload["health"])
+
+class Clock:
+    def now(self):
+        return datetime.now(timezone.utc)
+    def monotonic(self):
+        return 0.0
+
+instance = WorkbenchInstance(
+    instance_id=payload["instance_id"], display_name="wire test",
+    base_url="http://127.0.0.1:9999",
+)
+try:
+    record = CompatibilityHandshake(clock=Clock()).verify(Peer(), instance)
+    print(json.dumps({"ok": True, "instance_id": record.instance_id, "contract_version": record.contract_version}))
+except WorkbenchError as exc:
+    print(json.dumps({"ok": False, "error": f"{type(exc).__name__}: {exc}"}))
+`;
+  const result = JSON.parse(execFileSync(VENV_PYTHON, ['-c', script], {
+    cwd: ORCHESTRATOR_ROOT,
+    env: { ...process.env, PYTHONPATH: path.join(ORCHESTRATOR_ROOT, 'src') },
+    input: JSON.stringify({ health, instance_id: INSTANCE }),
+    encoding: 'utf8', timeout: 120_000,
+  }));
+
+  assert.equal(result.ok, true, `the orchestrator refused this instance: ${result.error}`);
+  assert.equal(result.contract_version, '1.0');
+
+  // And the field the handshake turns on is really there, rather than the check passing for some
+  // other reason: `auth_mode` is what distinguishes a subscription-backed backend from one that
+  // simply did not say. The real backend has always reported it; the deterministic fake did not,
+  // so this suite could not have caught a regression in the one field the gate depends on.
+  assert.equal(health.backends[0].auth_mode, 'subscription');
+});
+
+wireTest('wire: a signed-out or unstated backend is refused by the handshake', async () => {
+  // The negative half. If the handshake accepted a backend that never stated its billing, the
+  // assertion above would be worthless — it would pass whatever we sent.
+  const { FakeCodingBackend } = await import('../app/orchestrator/runner/fake.js');
+  const ok = await new FakeCodingBackend().probeAuth();
+
+  const script = `
+import json, sys
+from datetime import datetime, timezone
+from pvi_orchestrator.contracts.workbench import WorkbenchInstance
+from pvi_orchestrator.workbench.handshake import CompatibilityHandshake
+from pvi_orchestrator.workbench.protocol import InstanceHealth, WorkbenchError
+
+cases = json.load(sys.stdin)
+
+class Clock:
+    def now(self):
+        return datetime.now(timezone.utc)
+    def monotonic(self):
+        return 0.0
+
+out = {}
+for label, health in cases.items():
+    class Peer:
+        def health(self, _h=health):
+            return InstanceHealth.model_validate(_h)
+    instance = WorkbenchInstance(
+        instance_id=health["instance_id"], display_name="wire test",
+        base_url="http://127.0.0.1:9999",
+    )
+    try:
+        CompatibilityHandshake(clock=Clock()).verify(Peer(), instance)
+        out[label] = None
+    except WorkbenchError as exc:
+        out[label] = f"{type(exc).__name__}"
+print(json.dumps(out))
+`;
+  const healthWith = (backend) => ({
+    schema_version: '1.0', instance_id: INSTANCE, contract_version: '1.0', reachable: true,
+    workbench_version: 'test', backends: [backend], checked_at: new Date().toISOString(),
+  });
+
+  const results = JSON.parse(execFileSync(VENV_PYTHON, ['-c', script], {
+    cwd: ORCHESTRATOR_ROOT,
+    env: { ...process.env, PYTHONPATH: path.join(ORCHESTRATOR_ROOT, 'src') },
+    input: JSON.stringify({
+      unstated: healthWith({ ...ok, auth_mode: null }),
+      apiBilled: healthWith({ ...ok, auth_mode: 'api_key' }),
+      signedOut: healthWith({ ...ok, state: 'down', detail: 'signed out' }),
+    }),
+    encoding: 'utf8', timeout: 120_000,
+  }));
+
+  assert.ok(results.unstated, 'a backend that does not state its billing must be refused');
+  assert.ok(results.apiBilled, 'API billing is forbidden by the product and must be refused');
+  assert.ok(results.signedOut, 'a signed-out backend must be refused');
+});
+
+wireTest('wire: the requestable-check set is exactly what this instance can run', async () => {
+  // The orchestrator now closes `required_checks` to a set it transcribed from this repository's
+  // CHECK_CATALOGUE, so that a name it would refuse is refused before a job is persisted, queued
+  // and leased rather than after. A divergence in either direction strands work: a name it sends
+  // and we cannot run, or one we can run and it will not send.
+  const { CHECK_CATALOGUE, canonicaliseCheckName } = await import('../app/orchestrator/checks.js');
+
+  const theirs = JSON.parse(execFileSync(VENV_PYTHON, [
+    '-c', 'import json;from pvi_orchestrator.contracts.evidence import REQUESTABLE_CHECKS;print(json.dumps(sorted(REQUESTABLE_CHECKS)))',
+  ], {
+    cwd: ORCHESTRATOR_ROOT,
+    env: { ...process.env, PYTHONPATH: path.join(ORCHESTRATOR_ROOT, 'src') },
+    encoding: 'utf8', timeout: 60_000,
+  }));
+
+  assert.deepEqual(theirs, Object.keys(CHECK_CATALOGUE).sort(),
+    'the set the orchestrator will send and the set this instance can run must be identical');
+
+  // And the spellings it normalises must be spellings we normalise the same way — it transcribed
+  // `canonicaliseCheckName`, so parity is claimed in both directions, not just in the strict one.
+  for (const [raw, expected] of [
+    ['diff-check', 'diff_check'],
+    ['Full Test Suite', 'full_test_suite'],
+    ['  targeted_test  ', 'targeted_test'],
+    ['SECRET-SCAN', 'secret_scan'],
+  ]) {
+    assert.equal(canonicaliseCheckName(raw), expected, `this instance must accept ${JSON.stringify(raw)}`);
+  }
+});
+
+wireTest('wire: every path the orchestrator may send is one this instance accepts', async () => {
+  // `WorkspaceRelativePath` was transcribed from this repository's `validateRelativePath`, down to
+  // JavaScript's `\s` — which is NOT Python's. U+FEFF is whitespace to us and not to `str.isspace`,
+  // so a byte-order mark in a pasted path would have passed there and been refused here, after the
+  // job was persisted. This asserts the two agree on the awkward cases in both directions.
+  const { validate } = await import('../app/orchestrator/validate.js');
+  const schema = { name: 'Probe', fields: { p: { type: 'relativePath', required: true } } };
+  const accepts = (p) => {
+    try {
+      validate(schema, { p });
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  const cases = ['src/app.js', '.hidden/file.txt', 'a.b/c-d_e.f', 'deep/nested/path/to/file.mjs'];
+  const refused = ['/absolute/path', 'a\\b', '../escape', 'a/../b', 'a//b', './a', 'has space.js', 'bom﻿path.js'];
+
+  const theirs = JSON.parse(execFileSync(VENV_PYTHON, ['-c', `
+import json, sys
+from pydantic import TypeAdapter, ValidationError
+from pvi_orchestrator.contracts.common import WorkspaceRelativePath
+adapter = TypeAdapter(WorkspaceRelativePath)
+out = {}
+for path in json.load(sys.stdin):
+    try:
+        adapter.validate_python(path)
+        out[path] = True
+    except ValidationError:
+        out[path] = False
+print(json.dumps(out))
+`], {
+    cwd: ORCHESTRATOR_ROOT,
+    env: { ...process.env, PYTHONPATH: path.join(ORCHESTRATOR_ROOT, 'src') },
+    input: JSON.stringify([...cases, ...refused]),
+    encoding: 'utf8', timeout: 60_000,
+  }));
+
+  for (const path of cases) {
+    assert.equal(accepts(path), true, `this instance must accept ${JSON.stringify(path)}`);
+    assert.equal(theirs[path], true, `the orchestrator must be able to send ${JSON.stringify(path)}`);
+  }
+  for (const path of refused) {
+    assert.equal(accepts(path), false, `this instance must refuse ${JSON.stringify(path)}`);
+    assert.equal(theirs[path], false, `the orchestrator must refuse to send ${JSON.stringify(path)}`);
+  }
+});
+
+wireTest('wire: an approval that names nobody is refused at the door, as the contract now requires', async () => {
+  // `ApproveStageRequest.decided_by` became REQUIRED, with no placeholder: this is the record that
+  // authorises a push, and an audit trail reading "recorded-human-decision" identifies nobody. The
+  // engine already refused it; the declared schema said `nullable, default null`, so the two
+  // disagreed about the shape even though they agreed about the outcome.
+  const schemas = await import('../app/orchestrator/schemas.js');
+  const { validate } = await import('../app/orchestrator/validate.js');
+
+  let thrown = null;
+  try {
+    validate(schemas.APPROVE_SCHEMA, {
+      workbench_job_id: 'pwjob_1', approval_id: 'pwapr_1', stage: 'publication', approved: true,
+    });
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown, 'an approval naming nobody must be refused');
+  assert.equal(thrown.code, 'validation_failed');
+  assert.ok(thrown.fieldErrors?.some((f) => f.field === 'decided_by'),
+    `the refusal must name the field: ${JSON.stringify(thrown.fieldErrors)}`);
+
+  // And what the orchestrator now sends is accepted.
+  assert.doesNotThrow(() => validate(schemas.APPROVE_SCHEMA, {
+    workbench_job_id: 'pwjob_1', approval_id: 'pwapr_1', stage: 'publication',
+    approved: true, decided_by: 'james', reason: 'looks right',
+  }));
+});
+
 wireTest('wire: a verification response sends the attestation and never `effective`', async () => {
   // The contract derives `effective` from the attestation. A payload carrying `effective` is
   // refused rather than read as an observation, so sending it would be a hard incompatibility.
@@ -634,9 +859,11 @@ out = {
   "ReplyToQuestionRequest": protocol.ReplyToQuestionRequest(
       workbench_job_id="pwjob_1", question_id="pwq_1", answer="Preserve compatibility",
       selected_option_index=0).model_dump(mode="json"),
+  # decided_by is REQUIRED now, with no placeholder: this is the record that authorises a push,
+  # and an audit trail reading 'recorded-human-decision' identifies nobody.
   "ApproveStageRequest": protocol.ApproveStageRequest(
       workbench_job_id="pwjob_1", approval_id="pwapr_1", stage="publication",
-      approved=True, reason="looks right").model_dump(mode="json"),
+      approved=True, decided_by="james", reason="looks right").model_dump(mode="json"),
   "RequestRevisionRequest": protocol.RequestRevisionRequest(
       workbench_job_id="pwjob_1", instructions="tighten the expiry check").model_dump(mode="json"),
   "RequestReviewRequest": protocol.RequestReviewRequest(

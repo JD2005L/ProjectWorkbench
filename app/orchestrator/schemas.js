@@ -77,7 +77,12 @@ export const APPROVE_SCHEMA = {
     approved: { type: 'bool', required: true },
     reason: { type: 'mediumText', nullable: true, default: null },
     // Who actually decided. The orchestrator is the channel, not the decider.
-    decided_by: { type: 'identifier', nullable: true, default: null },
+    // Required, with no placeholder and no default. The engine already refused an approval that
+    // named nobody — this is the record that authorises a push — but the declared schema said
+    // "nullable, default null", so the shape and the behaviour disagreed. The contract settled it:
+    // `ApproveStageRequest.decided_by` is required, and the refusal belongs at the door where it
+    // can name the field.
+    decided_by: { type: 'identifier', required: true },
   },
 };
 

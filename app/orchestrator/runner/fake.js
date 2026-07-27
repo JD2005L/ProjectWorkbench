@@ -10,7 +10,7 @@
 // raised) instead of depending on a hidden heuristic.
 
 import {
-  CodingBackend, HealthState, AuthMethod, SCHEMA_VERSION, ATTESTATION_CONTRACT_VERSION,
+  CodingBackend, HealthState, AuthMethod, SCHEMA_VERSION, ATTESTATION_CONTRACT_VERSION, AuthMode,
 } from '../contract.js';
 import { DEFAULT_MODEL_ALIASES, speaksAttestationContract } from '../attestation.js';
 
@@ -89,6 +89,7 @@ export class FakeCodingBackend {
       return {
         schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.DOWN,
         method: AuthMethod.UNKNOWN, checked_at: checkedAt, detail: 'the coding CLI is not installed',
+        auth_mode: null,
       };
     }
     if (this.authExpired) {
@@ -96,18 +97,27 @@ export class FakeCodingBackend {
         schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.DOWN,
         method: AuthMethod.SUBSCRIPTION_OAUTH, checked_at: checkedAt,
         detail: 'the subscription session is signed out',
+        auth_mode: null,
       };
     }
     if (this.rateLimited) {
       return {
         schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.DEGRADED,
         method: AuthMethod.SUBSCRIPTION_OAUTH, retry_after_seconds: this.retryAfterSeconds ?? 60,
+        // Rate-limited is still subscription-backed; the billing question is separate from the
+        // throttle, and conflating them would refuse a healthy account for being busy.
+        auth_mode: AuthMode.SUBSCRIPTION,
         checked_at: checkedAt, detail: 'a subscription rate limit is in effect',
       };
     }
     return {
       schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.OK,
       method: AuthMethod.SUBSCRIPTION_OAUTH, account_label: 'Fake Subscription',
+      // The orchestrator's compatibility handshake requires a POSITIVE finding here — "absence is
+      // not consent", so a backend that does not say is refused. The real backend has always
+      // reported it; without it here, this suite could not catch a regression in the one field
+      // that gate turns on.
+      auth_mode: AuthMode.SUBSCRIPTION,
       cli_version: '0.0.0-fake', checked_at: checkedAt,
     };
   }
