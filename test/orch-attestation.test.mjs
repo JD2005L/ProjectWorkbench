@@ -31,6 +31,19 @@ import {
 } from '../app/orchestrator/attestation.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 
+/**
+ * A fingerprint is now a precondition for BOTH provenance labels, not just the enforced one — "the
+ * backend said so" is worth nothing until we know which backend. These unit tests supply one so
+ * they exercise the attestation logic rather than this host's filesystem.
+ */
+const FP = Object.freeze({
+  ok: true,
+  realpath: '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+  sha256: '674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863',
+  version: '2.1.220 (Claude Code)',
+  capabilities: { '--effort': { declared: true, values: ['low', 'medium', 'high', 'xhigh', 'max'] } },
+});
+
 // ---------------------------------------------------------------------------
 // model attestation — through an explicit mapping, never string equality
 // ---------------------------------------------------------------------------
@@ -122,6 +135,7 @@ test('attestation: a session that does not report its authentication source is r
   // Absence is not assent. A build that stopped emitting apiKeySource would otherwise let an
   // API-billed session attest — fail-open inside a module whose thesis is fail-closed on absence.
   const result = buildAttestation({
+    fingerprint: FP,
     requested: { model_alias: 'sonnet', effort: 'high' },
     aliases: DEFAULT_MODEL_ALIASES,
     init: { model: 'claude-sonnet-5', effort: 'high' },
@@ -194,6 +208,7 @@ test('attestation: effective is null unless BOTH model and effort are attested',
 
   // The installed CLI: model attested, effort unavailable -> effective null, and the job must block.
   const real = buildAttestation({
+    fingerprint: FP,
     requested, aliases,
     init: { model: 'claude-sonnet-5', apiKeySource: 'none', claude_code_version: '2.1.220' },
     stderr: '',
@@ -206,6 +221,7 @@ test('attestation: effective is null unless BOTH model and effort are attested',
 
   // A hypothetical CLI reporting both.
   const complete = buildAttestation({
+    fingerprint: FP,
     requested, aliases,
     init: { model: 'claude-sonnet-5', effort: 'high', apiKeySource: 'none' },
     stderr: '',
@@ -219,6 +235,7 @@ test('attestation: effective is null unless BOTH model and effort are attested',
 
   // Model drift blocks even when effort is reported.
   const drifted = buildAttestation({
+    fingerprint: FP,
     requested, aliases,
     init: { model: 'claude-haiku-4-5-20251001', effort: 'high', apiKeySource: 'none' },
     stderr: '',
@@ -233,6 +250,7 @@ test('attestation: an API-billed session is refused however well it attests', ()
   // means inference is being billed to an API account, which the product forbids outright.
   for (const source of ['ANTHROPIC_API_KEY', 'apiKeyHelper', 'bedrock', 'vertex']) {
     const result = buildAttestation({
+      fingerprint: FP,
       requested: { model_alias: 'sonnet', effort: 'high' },
       aliases: DEFAULT_MODEL_ALIASES,
       init: { model: 'claude-sonnet-5', effort: 'high', apiKeySource: source },
@@ -249,6 +267,7 @@ test('attestation: the requested effort is never copied into the result', () => 
   // from an observation — so with a non-reporting CLI there is no effective value at all.
   for (const effort of ['low', 'medium', 'high', 'max']) {
     const result = buildAttestation({
+      fingerprint: FP,
       requested: { model_alias: 'sonnet', effort },
       aliases: DEFAULT_MODEL_ALIASES,
       init: { model: 'claude-sonnet-5', apiKeySource: 'none' },

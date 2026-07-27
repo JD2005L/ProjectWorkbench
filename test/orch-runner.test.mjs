@@ -27,6 +27,10 @@ const INIT_LINE = JSON.stringify({
   session_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
   model: 'claude-sonnet-5',
   permissionMode: 'acceptEdits',
+  // The real event carries this, and absence is no longer read as assent: a build that stopped
+  // emitting it would otherwise let an API-billed session attest.
+  apiKeySource: 'none',
+  claude_code_version: '2.1.220',
   tools: ['Read', 'Edit', 'Bash'],
 });
 
@@ -39,16 +43,41 @@ const RESULT_LINE = JSON.stringify({
 });
 
 /** Build a backend whose process runner is a scripted stub, recording every invocation. */
-function backendWith(script, { config = CONFIG } = {}) {
+function backendWith(script, { config = CONFIG, fingerprint = FINGERPRINT } = {}) {
   const calls = [];
   const exec = async (file, args, options) => {
+    // Identity probes are answered separately from the scripted phase output: the runner now
+    // fingerprints the binary before every launch, and `auth status` is an independent check.
+    if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+    if (args[0] === '--help') return { stdout: REAL_HELP, stderr: '' };
     calls.push({ file, args, options });
     const outcome = typeof script === 'function' ? script({ file, args, options, calls }) : script;
     if (outcome instanceof Error) throw outcome;
     return { stdout: outcome?.stdout ?? '', stderr: outcome?.stderr ?? '' };
   };
-  return { backend: new ClaudeCodeBackend({ config, exec, clock: () => new Date('2026-07-27T12:00:00.000Z') }), calls };
+  const backend = new ClaudeCodeBackend({ config, exec, clock: () => new Date('2026-07-27T12:00:00.000Z') });
+  // A fingerprint the tests control, so they exercise attestation rather than this host's filesystem.
+  if (fingerprint !== null) backend.fingerprint = async () => fingerprint;
+  return { backend, calls };
 }
+
+/** The real --help block, so capability parsing is exercised against genuine output. */
+const REAL_HELP = [
+  '  --effort <level>                      Effort level for the current session',
+  '                                        (low, medium, high, xhigh, max)',
+  '  --model <model>                       Model for the current session',
+].join('\n');
+
+const FINGERPRINT = Object.freeze({
+  ok: true,
+  realpath: '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+  sha256: '674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863',
+  version: '2.1.220 (Claude Code)',
+  capabilities: {
+    '--effort': { declared: true, values: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    '--model': { declared: true, values: null },
+  },
+});
 
 // ---------------------------------------------------------------------------
 // argv construction
@@ -210,32 +239,38 @@ test('runner: the effective model comes from the init event, not from an echoed 
     phaseClass: PhaseClass.DISCOVERY,
     sessionKey: 'o:w:Demo:pvi2-orchestrator',
     cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
 
   // The observed model is retained even when `effective` must be null for want of a verifiable
   // effort: a session running a *different* model than requested is a mismatch, which is a stronger
   // and more actionable signal than "could not determine".
   assert.equal(outcome.observed_model, 'claude-sonnet-5');
-  assert.equal(calls[0].args[calls[0].args.indexOf('--model') + 1], 'sonnet');
+  // The phase invocation, not the independent `auth status` probe that now precedes it.
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal(phase.args[phase.args.indexOf('--model') + 1], 'sonnet');
   // Verification itself must never be able to write, whatever phase it is verifying for.
-  assert.equal(calls[0].args[calls[0].args.indexOf('--permission-mode') + 1], 'plan');
+  assert.equal(phase.args[phase.args.indexOf('--permission-mode') + 1], 'plan');
 });
 
-test('runner: a session reporting no effort blocks, and says what would unblock it', async () => {
-  // The installed CLI's real behaviour. There is no configuration that turns this into a pass —
-  // the previous `argv` opt-in made the check `requested === requested` and has been removed.
+test('runner: a session reporting no effort is launch-enforced, not blocked', async () => {
+  // The installed CLI's real behaviour: it declares --effort in --help but reports nothing about it
+  // at runtime, so the value is enforced at launch rather than observed.
   const { backend } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
-  assert.equal(outcome.effective, null);
-  assert.equal(outcome.attestation.effort.outcome, 'unavailable');
+  // Effort is not reported, so it is ENFORCED at launch rather than blocking — the whole point of
+  // the provenance contract. The model half remains an observation.
+  assert.equal(outcome.attestation.effort.provenance, 'launch_enforced');
+  assert.equal(outcome.attestation.model.provenance, 'runtime_reported');
   // The model IS attested — the two halves are reported separately so a real model drift stays
   // distinguishable from "the CLI cannot tell us about effort".
   assert.equal(outcome.attestation.model.verified, true);
   assert.equal(outcome.observed_model, 'claude-sonnet-5');
-  assert.ok(outcome.requirement?.includes('stream-json'), 'the operator must be told what would work');
+  assert.equal(outcome.effective.effort, 'high');
 });
 
 test('runner: a session that DOES report effort attests, with no configuration change', async () => {
@@ -248,6 +283,7 @@ test('runner: a session that DOES report effort attests, with no configuration c
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
   assert.deepEqual(
     { model_alias: outcome.effective.model_alias, effort: outcome.effective.effort },
@@ -264,6 +300,7 @@ test('runner: a session running a different model than requested is a mismatch, 
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
   assert.equal(outcome.effective, null);
   assert.equal(outcome.attestation.model.outcome, 'mismatch');
@@ -278,6 +315,7 @@ test('runner: an API-billed session is refused even when it attests perfectly', 
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
   assert.equal(outcome.effective, null);
   assert.match(outcome.detail, /subscription/i);
@@ -295,6 +333,7 @@ test('runner: a CLI warning that it ignored the effort flag is never attested as
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
   assert.equal(outcome.effective, null, 'an ignored flag must never be attested as applied');
   assert.equal(outcome.attestation.effort.outcome, 'ignored');
@@ -305,6 +344,7 @@ test('runner: output with no init event is unverifiable rather than optimistical
   const outcome = await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
   });
   assert.equal(outcome.effective, null);
 });

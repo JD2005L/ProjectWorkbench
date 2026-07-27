@@ -348,17 +348,38 @@ export function buildLaunchAttestation({
 export function buildAttestation({
   requested, aliases, init, stderr = '',
   fingerprint = null, argvOwnedByServer = false, binding = null,
-  instanceId = null, argv = [],
+  instanceId = null, argv = [], probedAuthMode = null,
 }) {
+  // A trustworthy fingerprint is a precondition for BOTH labels, not just the weaker one. Without
+  // this the apparatus was one-sided: seven checks fenced `launch_enforced`, while `runtime_reported`
+  // — the STRONGER label — cost a hostile or substituted backend one extra JSON field. "The backend
+  // said so" is only worth anything once we know which backend.
+  const identified = Boolean(fingerprint?.ok);
+
   const model = attestModel({
     requestedAlias: requested.model_alias, observedModel: init?.model, aliases,
   });
+  if (!identified) {
+    model.verified = false;
+    model.reason = model.reason
+      ?? `the coding CLI could not be fingerprinted (${fingerprint?.failure ?? 'unknown'}), so nothing it reports can be attributed`;
+  }
   model.provenance = model.verified ? Provenance.RUNTIME_REPORTED : Provenance.UNAVAILABLE;
 
   // Runtime observation first: it is strictly stronger, so a CLI that grows an effort field is
   // preferred automatically and the enforcement path simply stops being used.
   let effort = attestEffort({ requestedEffort: requested.effort, init, stderr });
-  if (!effort.verified && effort.outcome === 'unavailable') {
+  if (!identified) {
+    effort = {
+      ...effort,
+      verified: false,
+      provenance: Provenance.UNAVAILABLE,
+      reason: 'the coding CLI could not be fingerprinted, so nothing it reports can be attributed',
+    };
+  }
+  // `unverifiable` also falls through to enforcement: a backend printing a nonsense effort would
+  // otherwise suppress the fallback and block the job — a denial of service by malformed output.
+  if (!effort.verified && ['unavailable', 'unverifiable'].includes(effort.outcome)) {
     const enforced = attestLaunchEnforced({
       option: '--effort', value: requested.effort, fingerprint, stderr, argvOwnedByServer,
       binding: { ...binding, auth_mode: authModeOf(init) },
@@ -384,7 +405,12 @@ export function buildAttestation({
   // Absence is NOT assent. A build that stopped emitting the field would otherwise let an
   // API-billed session attest, which is fail-open inside the one module whose thesis is fail-closed
   // on absence.
-  const subscriptionBacked = apiKeySource === 'none';
+  // The init event's own word, cross-checked against an INDEPENDENT probe when one was taken. A
+  // backend that prints `apiKeySource: none` while running on an API key would otherwise authenticate
+  // itself by assertion.
+  const claimsSubscription = apiKeySource === 'none';
+  const subscriptionBacked = claimsSubscription
+    && (probedAuthMode === null || probedAuthMode === AuthMode.SUBSCRIPTION);
 
   const reasons = [];
   if (!subscriptionBacked) {

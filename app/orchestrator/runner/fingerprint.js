@@ -28,10 +28,20 @@ import { promisify } from 'util';
 
 const execFileAsync = promisify(execFile);
 
-/** Interpreters that mean "this is a script that will do something before the real program runs". */
-// Must scan the whole shebang line: ProjectWorkbench's own wrapper is `#!/usr/bin/env bash`, where
-// the interpreter is a separate word from the path — an `\S*` anchored form never reaches it.
-const WRAPPER_INTERPRETERS = /^#![^\n]*\b(bash|sh|zsh|dash|ksh|fish|python[0-9.]*|perl|ruby)\b/;
+/**
+ * Any shebang at all marks a script, and a script can always rewrite argv before the real program
+ * sees it.
+ *
+ * An earlier version listed shells, which was the wrong shape of check: the vendor ships
+ * `cli-wrapper.cjs` with `#!/usr/bin/env node` and calls it a fallback launcher, so a node shim at
+ * the configured path passed the list and was attested as enforced. Enumerating interpreters is a
+ * losing game — node, bun, deno, busybox ash, and whatever comes next. The real CLI is a compiled
+ * ELF, so refusing every script costs nothing and closes the class.
+ *
+ * A compiled binary that execs something else with extra argv remains undetectable from here; that
+ * is why the pinned content hash exists alongside this.
+ */
+const SHEBANG = /^#!/;
 
 /** How a fingerprint failed. Each maps to a distinct, actionable operator message. */
 export const FingerprintFailure = Object.freeze({
@@ -58,7 +68,11 @@ export const FingerprintFailure = Object.freeze({
  */
 export function parseOptionCapability(helpText, option) {
   const lines = String(helpText ?? '').split('\n');
-  const index = lines.findIndex((line) => new RegExp(`^\\s*${option}\\b`).test(line));
+  // The option must END here: `\b` sits between `t` and `-`, so `--effort` matched `--effort-cap`
+  // and borrowed its value list — which would let a value the binary never accepts be "enforced".
+  const escaped = option.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const boundary = new RegExp(`^\\s*${escaped}(?=[\\s=<[,]|$)`);
+  const index = lines.findIndex((line) => boundary.test(line));
   if (index === -1) return { declared: false, values: null };
 
   // The option's own line plus continuation lines (more indented, not starting a new option).
@@ -122,11 +136,11 @@ export async function probeBinaryFingerprint({
   } catch {
     return { ok: false, failure: FingerprintFailure.UNREADABLE, detail: 'the coding CLI could not be read' };
   }
-  if (WRAPPER_INTERPRETERS.test(head.toString('latin1'))) {
+  if (SHEBANG.test(head.toString('latin1'))) {
     return {
       ok: false,
       failure: FingerprintFailure.WRAPPER,
-      detail: 'the configured coding CLI is a shell wrapper, which can rewrite argv, so a launch through it cannot be enforced',
+      detail: 'the configured coding CLI is an interpreted script, which can rewrite argv, so a launch through it cannot be enforced',
     };
   }
 
@@ -195,29 +209,44 @@ async function hashFile(filePath) {
  * does not hit the cache — there is no staleness window to reason about.
  */
 export class FingerprintCache {
-  constructor({ exec } = {}) {
+  constructor({ exec, ttlMs = 15 * 60 * 1_000 } = {}) {
     this._entries = new Map();
     this._exec = exec;
+    this.ttlMs = ttlMs;
   }
 
   async get({ executable, options, expectedSha256 = null }) {
+    // A pinned deployment never serves from cache. Identity is not content: an in-place write that
+    // preserves inode, size and mtime (trivial with `touch -r`) collides with the key, and the pin
+    // is the one control designed to catch exactly that substitution. Re-hashing costs ~1s and is
+    // the whole point of having pinned.
+    if (expectedSha256) {
+      return probeBinaryFingerprint({
+        executable, options, expectedSha256, ...(this._exec ? { exec: this._exec } : {}),
+      });
+    }
+
     let identityKey = null;
     try {
       const realpath = await fsp.realpath(executable);
       const stat = await fsp.stat(realpath);
-      identityKey = `${realpath}:${stat.dev}:${stat.ino}:${stat.size}:${Math.floor(stat.mtimeMs)}:${expectedSha256 ?? ''}:${[...options].sort().join(',')}`;
+      identityKey = `${realpath}:${stat.dev}:${stat.ino}:${stat.size}:${Math.floor(stat.mtimeMs)}:${[...options].sort().join(',')}`;
     } catch {
       // Unresolvable: fall through to the probe, which reports the failure properly.
     }
 
-    if (identityKey && this._entries.has(identityKey)) return this._entries.get(identityKey);
+    const cached = identityKey ? this._entries.get(identityKey) : null;
+    // Bounded even for the unpinned case: identity collision is possible, so trust has a lifetime.
+    if (cached && Date.now() - cached._cachedAt < this.ttlMs) return cached;
 
     const fingerprint = await probeBinaryFingerprint({
       executable, options, expectedSha256, ...(this._exec ? { exec: this._exec } : {}),
     });
     // Only a successful probe is cached. A failure may be transient (a partially written binary
     // mid-upgrade), and caching it would keep the instance down after the cause cleared.
-    if (identityKey && fingerprint.ok) this._entries.set(identityKey, fingerprint);
+    if (identityKey && fingerprint.ok) {
+      this._entries.set(identityKey, Object.assign(fingerprint, { _cachedAt: Date.now() }));
+    }
     return fingerprint;
   }
 

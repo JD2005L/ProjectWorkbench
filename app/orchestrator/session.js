@@ -454,7 +454,11 @@ export class OrchestratorSessionManager {
     };
     await this.store.transact((tx) => { this.repo.putSession(tx, updated); });
 
-    return this._verificationResponse(updated, effective, outcome.detail ?? null);
+    // `outcome` carries the attestation, the provenance, the observed model and the operator
+    // requirement. Omitting it here nulled all four, so a launch-enforced verification reached the
+    // peer as `attestation: null` — and since the contract derives `effective` from the attestation,
+    // every job blocked while the audit line still recorded it as verified.
+    return this._verificationResponse(updated, effective, outcome.detail ?? null, outcome);
   }
 
   /**

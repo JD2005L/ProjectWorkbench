@@ -12,7 +12,7 @@
 import express from 'express';
 
 import {
-  SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION, PATTERNS, ErrorCode, newId,
+  SCHEMA_VERSION, ATTESTATION_CONTRACT_VERSION, PATTERNS, ErrorCode, newId,
 } from './contract.js';
 import { ApiError, notFound, sendError, payloadTooLarge } from './errors.js';
 import {
@@ -187,10 +187,13 @@ export function createOrchestratorRouter({
       const fingerprint = await backend.fingerprint();
       attestation = {
         schema_version: SCHEMA_VERSION,
-        contract_version: PROVENANCE_SCHEMA_VERSION,
+        contract_version: ATTESTATION_CONTRACT_VERSION,
         model: 'runtime_reported',
         // Effort is enforceable only when the fingerprinted binary declares the option.
-        effort: fingerprint.ok && fingerprint.capabilities?.['--effort']?.declared
+        // Declared is not enough: enforcement also needs the VALUE list, because a value the
+        // binary does not list can never be enforced. Claiming otherwise here would advertise a
+        // capability every verification then refuses.
+        effort: fingerprint.ok && Array.isArray(fingerprint.capabilities?.['--effort']?.values)
           ? 'launch_enforced'
           : 'unavailable',
         binary: fingerprint.ok
@@ -222,7 +225,7 @@ export function createOrchestratorRouter({
       checked_at: new Date().toISOString(),
       // No secret, no account address, no org id, no token — probeAuth already strips those.
       components: components.map((c) => ({ schema_version: SCHEMA_VERSION, ...c })),
-      schema_versions_supported: ['1.0', '1.1'],
+      schema_versions_supported: ['1.0'],
       attestation,
     });
   }));
@@ -259,6 +262,9 @@ export function createOrchestratorRouter({
       // one run being replayed onto another after the binary, model or policy has drifted.
       run_id: { type: 'identifier', default: 'unbound' },
       config_generation: { type: 'int', min: 0, default: 0 },
+      // The attestation contract the orchestrator speaks. A peer that asks for one this build
+      // cannot meet is told so, rather than answered in a shape that implies checks never made.
+      attestation_contract_version: { type: 'shortText', default: ATTESTATION_CONTRACT_VERSION },
     },
   };
 

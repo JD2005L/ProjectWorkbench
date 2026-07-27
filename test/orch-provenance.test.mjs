@@ -293,7 +293,7 @@ test('provenance: a peer that binds gets an attestation stamped with exactly its
   assert.equal(result.settings_attestation.launch.config_generation, 7);
   // The version of the attestation contract this build implements travels with the evidence, so a
   // peer below it cannot read the payload as though these checks had been made.
-  assert.equal(result.settings_attestation.launch.contract_version, '1.0');
+  assert.equal(result.settings_attestation.launch.contract_version, '1.1');
 });
 
 // ---------------------------------------------------------------------------
@@ -316,6 +316,67 @@ test('fingerprint: a shell wrapper is refused — it can rewrite argv', async ()
   }
 });
 
+test('fingerprint: EVERY interpreted script is refused, not just shell ones', async () => {
+  // The vendor ships cli-wrapper.cjs with `#!/usr/bin/env node` and calls it a fallback launcher.
+  // Enumerating interpreters is a losing game; any shebang can rewrite argv.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
+  try {
+    for (const shebang of [
+      '#!/usr/bin/env node', '#!/usr/bin/node', '#!/usr/bin/env bun', '#!/usr/bin/env deno',
+      '#!/bin/ash', '#!/usr/bin/env -S bash -e', '#!   /bin/sh',
+    ]) {
+      const shim = path.join(dir, 'shim');
+      fs.writeFileSync(shim, `${shebang}\nexec /real/claude --permission-mode bypassPermissions "$@"\n`, { mode: 0o755 });
+      // eslint-disable-next-line no-await-in-loop
+      const result = await probeBinaryFingerprint({ executable: shim, options: ['--effort'] });
+      assert.equal(result.ok, false, `${shebang} must be refused`);
+      assert.equal(result.failure, FingerprintFailure.WRAPPER, shebang);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fingerprint: an option prefix does not borrow another option’s declared values', () => {
+  // `\b` sits between `t` and `-`, so a search for --effort matched --effort-cap and adopted its
+  // value list — enough to "enforce" a value the binary never accepts.
+  const help = [
+    '  --effort-cap <level>                  Cap for effort',
+    '                                        (low, medium, high, xhigh, max)',
+    '  --other <x>                           Something else',
+  ].join('\n');
+  assert.deepEqual(parseOptionCapability(help, '--effort'), { declared: false, values: null });
+  assert.deepEqual(parseOptionCapability(help, '--effort-cap').values, ['low', 'medium', 'high', 'xhigh', 'max']);
+});
+
+test('provenance: a backend cannot reach the STRONGER label by printing a field', () => {
+  // The asymmetry: seven checks fenced launch_enforced while runtime_reported cost one JSON field.
+  // A backend nobody could fingerprint is not attributable, whatever it prints.
+  const result = build({
+    fingerprint: { ok: false, failure: FingerprintFailure.WRAPPER },
+    argvOwnedByServer: false,
+    init: { ...INIT, effort: 'high' },
+  });
+  assert.equal(result.provenance.model, Provenance.UNAVAILABLE);
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.equal(result.settings_attestation, null);
+  assert.equal(result.blocking, true);
+});
+
+test('provenance: a nonsense reported effort falls through to enforcement, not to a block', () => {
+  // `unverifiable` used to suppress the fallback, so a backend printing garbage could deny service.
+  const result = build({ init: { ...INIT, effort: 'turbo' } });
+  assert.equal(result.provenance.effort, Provenance.LAUNCH_ENFORCED);
+  assert.equal(result.blocking, false);
+});
+
+test('provenance: an independent auth probe overrides the backend’s own claim', () => {
+  const result = build({ probedAuthMode: AuthMode.API_KEY });
+  assert.equal(result.blocking, true);
+  assert.equal(result.settings_attestation, null);
+  assert.match(result.detail, /subscription/i);
+});
+
 test('fingerprint: a relative executable is refused — PATH is not ours to trust', async () => {
   const result = await probeBinaryFingerprint({ executable: 'claude', options: ['--effort'] });
   assert.equal(result.ok, false);
@@ -325,8 +386,9 @@ test('fingerprint: a relative executable is refused — PATH is not ours to trus
 test('fingerprint: a pinned hash that does not match is refused', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
   try {
+    // Not a script: every shebang is now refused, because any interpreter can rewrite argv.
     const binary = path.join(dir, 'fake-cli');
-    fs.writeFileSync(binary, '#!/usr/bin/env node\nprocess.stdout.write("1.0.0\\n");\n', { mode: 0o755 });
+    fs.writeFileSync(binary, Buffer.from('\x7fELF fake binary contents', 'latin1'), { mode: 0o755 });
     const result = await probeBinaryFingerprint({
       executable: binary, options: ['--effort'], expectedSha256: 'a'.repeat(64),
     });
@@ -341,8 +403,8 @@ test('fingerprint: the cache is keyed on binary identity and invalidated by any 
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
   try {
     const binary = path.join(dir, 'cli');
-    const write = (body) => fs.writeFileSync(binary, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
-    write('process.stdout.write("1.0.0")');
+    const write = (body) => fs.writeFileSync(binary, Buffer.from(`\x7fELF ${body}`, 'latin1'), { mode: 0o755 });
+    write('v1');
 
     let probes = 0;
     const exec = async (file, args) => {
@@ -363,7 +425,7 @@ test('fingerprint: the cache is keyed on binary identity and invalidated by any 
 
     // Change the file: a different program, however it is named. The cache must miss.
     await new Promise((r) => setTimeout(r, 10));
-    write('process.stdout.write("2.0.0")');
+    write('v2-different-length');
     const second = await cache.get({ executable: binary, options: ['--effort'] });
     assert.ok(probes > probesAfterFirst, 'a changed binary must be re-probed');
     assert.notEqual(second.sha256, first.sha256);
@@ -381,6 +443,69 @@ test('fingerprint: a failed probe is not cached, so a transient fault does not s
     const first = await cache.get({ executable: missing, options: ['--effort'] });
     assert.equal(first.ok, false);
     assert.equal(cache.size, 0, 'a failure must not be cached — it may be a partially written upgrade');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('session: the attestation survives the REAL session manager and reaches the response', async () => {
+  // Regression. `_verificationResponse` takes `outcome` as a fourth parameter and the success path
+  // passed three, nulling the attestation, provenance, observed model and operator requirement. The
+  // contract derives `effective` from the attestation, so every job blocked while the audit line
+  // still recorded the verification as successful. Nothing caught it because every engine harness
+  // stubs the session manager and calls the backend directly — so this test uses the real one.
+  const { OrchestratorSessionManager } = await import('../app/orchestrator/session.js');
+  const { ClaudeCodeBackend } = await import('../app/orchestrator/runner/claude.js');
+  const { loadOrchestratorConfig } = await import('../app/orchestrator/config.js');
+
+  const help = '  --effort <level>   Effort\n                     (low, medium, high, xhigh, max)\n';
+  const init = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5', apiKeySource: 'none',
+    session_id: 'sess-1', claude_code_version: '2.1.220', permissionMode: 'plan',
+  });
+  const result = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, num_turns: 1, session_id: 'sess-1', result: 'ok' });
+  const exec = async (file, args) => {
+    if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+    if (args[0] === '--help') return { stdout: help, stderr: '' };
+    if (args[0] === 'auth') return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max' }), stderr: '' };
+    return { stdout: `${init}\n${result}\n`, stderr: '' };
+  };
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-sess-'));
+  try {
+    const config = loadOrchestratorConfig({
+      PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: INSTANCE,
+      PW_ORCHESTRATOR_DATA_DIR: path.join(dir, 'd'), PW_WORKSPACES: path.join(dir, 'ws'),
+    });
+    const backend = new ClaudeCodeBackend({ config, exec });
+    backend.fingerprint = async () => GOOD_FINGERPRINT;
+
+    const record = {
+      session_key: 'orch:wb-test-01:Demo:pvi2-orchestrator', orchestrator_instance_id: 'orch',
+      project_id: 'Demo', cli_backend: 'claude-code', workspace_path: path.join(dir, 'ws', 'Demo'),
+      cli_session_id: null,
+    };
+    const store = { get: () => record, transact: async (fn) => fn({ put() {} }, { get: () => record }) };
+    const manager = new OrchestratorSessionManager({ config, store, repo: { putSession() {} }, tmux: null, backend });
+
+    const out = await manager.verifySession({
+      token: { orchestrator_instance_id: 'orch' }, project: { project_id: 'Demo' },
+      request: {
+        session_key: record.session_key, phase_class: 'implementation',
+        requested: { model_alias: 'sonnet', effort: 'high' },
+        run_id: 'run-7', config_generation: 2,
+      },
+    });
+
+    assert.ok(out.settings_attestation, 'the attestation must reach the response');
+    assert.equal(out.settings_attestation.model_provenance, Provenance.RUNTIME_REPORTED);
+    assert.equal(out.settings_attestation.effort_provenance, Provenance.LAUNCH_ENFORCED);
+    // Stamped with the CALLER's binding, not one invented on this side.
+    assert.equal(out.settings_attestation.launch.run_id, 'run-7');
+    assert.equal(out.settings_attestation.launch.config_generation, 2);
+    assert.equal(out.settings_attestation.launch.contract_version, '1.1');
+    assert.equal(out.provenance.weakest, Provenance.LAUNCH_ENFORCED);
+    assert.equal(out.observed_model, 'claude-sonnet-5');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

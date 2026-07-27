@@ -25,6 +25,7 @@ import { promisify } from 'util';
 
 import {
   SCHEMA_VERSION, PATTERNS, Effort, PhaseClass, CodingBackend, HealthState, AuthMethod,
+  AuthMode,
 } from '../contract.js';
 import { redactText } from '../redact.js';
 import { buildAttestation } from '../attestation.js';
@@ -175,6 +176,9 @@ export class ClaudeCodeBackend {
         detail: kind === 'unavailable'
           ? 'the coding CLI is not installed on this instance'
           : 'the coding CLI could not report its authentication status',
+        // Inconclusive: not a positive finding of API billing, so it must not override the session's
+        // own report either way.
+        auth_mode: null,
       };
     }
 
@@ -182,11 +186,11 @@ export class ClaudeCodeBackend {
     try {
       status = JSON.parse(stdout);
     } catch {
-      return { ...base, state: HealthState.DOWN, method: AuthMethod.UNKNOWN, detail: 'the coding CLI produced unreadable authentication status' };
+      return { ...base, state: HealthState.DOWN, method: AuthMethod.UNKNOWN, detail: 'the coding CLI produced unreadable authentication status', auth_mode: null };
     }
 
     if (!status?.loggedIn) {
-      return { ...base, state: HealthState.DOWN, method: AuthMethod.SUBSCRIPTION_OAUTH, detail: 'the coding CLI is signed out' };
+      return { ...base, state: HealthState.DOWN, method: AuthMethod.SUBSCRIPTION_OAUTH, detail: 'the coding CLI is signed out', auth_mode: null };
     }
 
     // Only subscription OAuth against the first-party provider is permitted. An API key or a
@@ -199,6 +203,8 @@ export class ClaudeCodeBackend {
         state: HealthState.DOWN,
         method: AuthMethod.UNKNOWN,
         detail: 'only subscription-backed sign-in is permitted; this backend is not subscription authenticated',
+        // A positive finding: this backend IS API-billed, whatever the session later prints.
+        auth_mode: AuthMode.API_KEY,
       };
     }
 
@@ -209,6 +215,7 @@ export class ClaudeCodeBackend {
       method: AuthMethod.SUBSCRIPTION_OAUTH,
       account_label: tier ? `Claude ${tier.charAt(0).toUpperCase()}${tier.slice(1)}` : 'Claude subscription',
       cli_version: status.version ? String(status.version).slice(0, 200) : null,
+      auth_mode: AuthMode.SUBSCRIPTION,
     };
   }
 
@@ -276,6 +283,11 @@ export class ClaudeCodeBackend {
       resumeSessionId: cliSessionId,
     });
 
+    // Fingerprint BEFORE launching. Taking it afterwards left a window in which the binary that ran
+    // and the binary that was attested need not be the same file.
+    const fingerprint = await this.fingerprint();
+    const probedAuth = await this.probeAuth().catch(() => null);
+
     let stdout = '';
     let stderr = '';
     try {
@@ -292,10 +304,6 @@ export class ClaudeCodeBackend {
 
     const { init } = this.parseStream(stdout);
 
-    // The fingerprint is what lets an enforcement claim name a specific program. Probed before the
-    // claim is made, and cached only on the binary's own identity.
-    const fingerprint = await this.fingerprint();
-
     // Everything the caller learns comes from `buildAttestation`, which never copies a requested
     // value into its answer. Where the CLI reports a setting the provenance is `runtime_reported`;
     // where ProjectWorkbench could only enforce it at launch the provenance says so, and a peer
@@ -307,8 +315,13 @@ export class ClaudeCodeBackend {
       argv,
       // True by construction: buildPhaseArgv is the only argv source and takes no caller argv.
       argvOwnedByServer: true,
+      // Only a POSITIVE finding overrides the session's own report. An inconclusive probe leaves
+      // the decision to the init event rather than blocking on the probe's inability to answer.
+      probedAuthMode: probedAuth?.auth_mode ?? null,
       binding: {
-        session_key: sessionKey ?? init?.session_id ?? null,
+        // Never the backend's own session id: letting the program being attested choose the
+        // anti-replay key would let it pick one, and it is unbounded and unvalidated.
+        session_key: sessionKey,
         run_id: runId,
         // The caller's generation when it sent one, else this instance's own. Either way the claim
         // is stamped with a generation, so it cannot outlive a configuration change.
@@ -371,7 +384,9 @@ export class ClaudeCodeBackend {
         session_id: null,
         model: null,
         permission_mode: permissionMode,
-        summary: redactText(String(err?.message ?? 'the phase failed'), { maxLength: 500 }),
+        // Bounded hard: an execFile failure message is `Command failed: <full argv>` followed by
+        // stderr, and redaction is pattern-based — a secret in an unusual shape would survive.
+        summary: redactText(String(err?.message ?? 'the phase failed').split('\n')[0].slice(0, 200), { maxLength: 200 }),
         turns_used: 0,
         max_turns_reached: false,
       };

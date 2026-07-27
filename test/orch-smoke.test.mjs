@@ -169,7 +169,9 @@ test('smoke: the mounted HTTP surface authenticates, discovers, and refuses corr
       // this instance produces before submitting work that might only block.
       assert.equal(readiness.json.attestation.model, 'runtime_reported');
       assert.ok(['launch_enforced', 'unavailable'].includes(readiness.json.attestation.effort));
-      assert.equal(readiness.json.attestation.contract_version, '1.0');
+      // The attestation contract this build implements — the version travels with the evidence, so
+      // a peer below it cannot read the payload as though these checks had been made.
+      assert.equal(readiness.json.attestation.contract_version, '1.1');
       // The binary identity travels with it, and no credential does.
       const blob = JSON.stringify(readiness.json.attestation);
       assert.ok(!blob.includes(TOKEN));

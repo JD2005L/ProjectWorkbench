@@ -30,7 +30,7 @@ export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze(new Set(['1.0']));
  * A peer below the current version never made these checks, so its payload cannot be read as though
  * it had — which is why the version travels with the evidence rather than with the envelope.
  */
-export const PROVENANCE_SCHEMA_VERSION = '1.0';
+export const PROVENANCE_SCHEMA_VERSION = '1.1';
 
 /**
  * How ProjectWorkbench knows an effective setting.
@@ -72,7 +72,7 @@ export function weakerProvenance(left, right) {
 export const AuthMode = Object.freeze({ SUBSCRIPTION: 'subscription', API_KEY: 'api_key' });
 
 /** The attestation contract this build implements, as carried on LaunchAttestation. */
-export const ATTESTATION_CONTRACT_VERSION = '1.0';
+export const ATTESTATION_CONTRACT_VERSION = '1.1';
 
 /** Identifies the fixed server-side argv builder that produced a command line. */
 export const ARGV_BUILDER_ID = 'pw-claude-phase-argv-v1';
