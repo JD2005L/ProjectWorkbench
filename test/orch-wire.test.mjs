@@ -155,9 +155,17 @@ async function capturePayloads() {
   const backend = new FakeCodingBackend({ effective: { model_alias: 'sonnet', effort: 'high' } });
   const sessionManager = {
     ensureSession: async () => ({ session_key: `${ORCH}:${INSTANCE}:Demo:pvi2-orchestrator` }),
+    // Forwards the binding, as the real OrchestratorSessionManager does — a stub that dropped it
+    // would hide the engine failing to bind its own request.
     verifySession: async ({ request }) => ({
       session_key: request.session_key,
-      ...(await backend.verifyConfiguration({ requested: request.requested, phaseClass: request.phase_class })),
+      ...(await backend.verifyConfiguration({
+        requested: request.requested,
+        phaseClass: request.phase_class,
+        sessionKey: request.session_key,
+        runId: request.run_id ?? 'unbound',
+        configGeneration: Number.isInteger(request.config_generation) ? request.config_generation : 0,
+      })),
     }),
   };
   const engine = new OrchestrationEngine({

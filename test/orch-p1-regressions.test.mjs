@@ -98,9 +98,17 @@ async function withEngine(fn, { backendOptions, envOverrides } = {}) {
   const backend = new FakeCodingBackend(backendOptions);
   const sessionManager = {
     ensureSession: async () => ({ session_key: `${ORCH}:${INSTANCE}:Demo:pvi2-orchestrator` }),
+    // Forwards the binding, as the real OrchestratorSessionManager does — a stub that dropped it
+    // would hide the engine failing to bind its own request.
     verifySession: async ({ request }) => ({
       session_key: request.session_key,
-      ...(await backend.verifyConfiguration({ requested: request.requested, phaseClass: request.phase_class })),
+      ...(await backend.verifyConfiguration({
+        requested: request.requested,
+        phaseClass: request.phase_class,
+        sessionKey: request.session_key,
+        runId: request.run_id ?? 'unbound',
+        configGeneration: Number.isInteger(request.config_generation) ? request.config_generation : 0,
+      })),
     }),
   };
   const engine = new OrchestrationEngine({
@@ -536,6 +544,33 @@ gitTest('idempotency: a body key that disagrees with the transport key is refuse
       (err) => err instanceof ApiError && err.code === 'validation_failed',
       'two disagreeing keys must not silently pick one',
     );
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// the engine must bind its own verification request
+// ---------------------------------------------------------------------------
+
+gitTest('attestation: the engine binds its verification to the job and configuration generation', async () => {
+  // Without a binding the attestation is stamped `unbound`, no launch enforcement can be claimed,
+  // and EVERY job blocks at blocked_configuration even though the binary supports the option. The
+  // fake backend returns `effective` directly, so nothing else in the suite exercises this.
+  const seen = [];
+  await withEngine(async ({ engine, repo, backend }) => {
+    const inner = backend.verifyConfiguration.bind(backend);
+    backend.verifyConfiguration = async (request) => {
+      seen.push(request);
+      return inner(request);
+    };
+    const handle = await submit(engine);
+    await engine.drain();
+
+    assert.equal(seen.length >= 1, true, 'verification must have run');
+    const [request] = seen;
+    assert.equal(request.runId, handle.workbench_job_id, 'the run must be the job being asked about');
+    assert.notEqual(request.runId, 'unbound');
+    assert.equal(Number.isInteger(request.configGeneration), true, 'a configuration generation must be bound');
+    assert.equal(repo.getJob(handle.workbench_job_id).status, JobStatus.WAITING_FOR_PUBLICATION_APPROVAL);
   }, { backendOptions: ATTESTING });
 });
 

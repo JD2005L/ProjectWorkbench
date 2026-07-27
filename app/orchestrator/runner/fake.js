@@ -88,8 +88,8 @@ export class FakeCodingBackend {
    * `effective: null` is a first-class answer, not an error: the contract deliberately offers no way
    * to say "probably correct", and a job whose configuration cannot be confirmed must block.
    */
-  async verifyConfiguration({ requested, phaseClass, sessionKey }) {
-    this.invocations.push({ kind: 'verify', requested, phaseClass, sessionKey });
+  async verifyConfiguration({ requested, phaseClass, sessionKey, runId, configGeneration }) {
+    this.invocations.push({ kind: 'verify', requested, phaseClass, sessionKey, runId, configGeneration });
     if (this.unavailable) throw Object.assign(new Error('backend unavailable'), { kind: 'unavailable' });
     if (this.authExpired) throw Object.assign(new Error('signed out'), { kind: 'auth_expired' });
     if (this.rateLimited) {

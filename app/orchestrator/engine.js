@@ -557,7 +557,17 @@ export class OrchestrationEngine {
       try {
         verification = await this.sessionManager.verifySession({
           token, project,
-          request: { session_key: session.session_key, phase_class: PhaseClass.IMPLEMENTATION, requested: job.requested },
+          request: {
+            session_key: session.session_key,
+            phase_class: PhaseClass.IMPLEMENTATION,
+            requested: job.requested,
+            // The engine is the caller here and knows exactly which run it is asking about, so it
+            // binds the request. Without this the attestation would be stamped `unbound` and no
+            // launch enforcement could be claimed — every job would block at blocked_configuration
+            // even though the binary supports the option.
+            run_id: jobId,
+            config_generation: this.config.configGeneration,
+          },
           correlationId: job.correlation_id,
         });
       } catch (err) {

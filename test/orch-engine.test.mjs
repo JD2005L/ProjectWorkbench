@@ -116,7 +116,14 @@ async function withEngine(fn, { backendOptions, projectOverrides } = {}) {
   const sessionManager = {
     ensureSession: async () => ({ session_key: `${ORCH}:${INSTANCE}:Demo:pvi2-orchestrator`, status: 'missing' }),
     verifySession: async ({ request }) => {
-      const outcome = await backend.verifyConfiguration({ requested: request.requested, phaseClass: request.phase_class, sessionKey: request.session_key });
+      // Forwards the binding, as the real session manager does.
+      const outcome = await backend.verifyConfiguration({
+        requested: request.requested,
+        phaseClass: request.phase_class,
+        sessionKey: request.session_key,
+        runId: request.run_id ?? 'unbound',
+        configGeneration: Number.isInteger(request.config_generation) ? request.config_generation : 0,
+      });
       return { session_key: request.session_key, ...outcome };
     },
   };
