@@ -56,6 +56,28 @@ export function loadOrchestratorConfig(env = process.env) {
     }
   }
 
+  // The router mounts ahead of the dashboard's CSRF guard and body parser, so an overlapping
+  // prefix silently takes over those routes: `/api` swallows every dashboard API call and `/` bricks
+  // the instance while still reporting itself up. Validated as strictly as the instance id.
+  const basePath = str(env.PW_ORCHESTRATOR_BASE_PATH, '/api/orchestrator/v1');
+  if (enabled) {
+    const segments = basePath.split('/');
+    const wellFormed = basePath.startsWith('/')
+      && segments.length > 1
+      && segments.slice(1).every((seg) => /^[A-Za-z0-9._-]+$/.test(seg) && seg !== '.' && seg !== '..');
+    if (!wellFormed) {
+      throw new Error('PW_ORCHESTRATOR_BASE_PATH must be an absolute path of simple, non-traversing segments');
+    }
+    // The danger is the base path being an *ancestor* of a dashboard route, which would capture it.
+    // Living *under* one is fine and is what the contract's own `/api/orchestrator/v1` does — the
+    // router only matches its exact prefix.
+    const reserved = ['/api', '/login', '/logout', '/healthz', '/settings', '/term', '/pty', '/preview', '/static', '/agents.md'];
+    const swallows = reserved.some((route) => route === basePath || `${route}/`.startsWith(`${basePath}/`));
+    if (swallows) {
+      throw new Error(`PW_ORCHESTRATOR_BASE_PATH '${basePath}' would capture a dashboard route`);
+    }
+  }
+
   const dataDir = str(env.PW_ORCHESTRATOR_DATA_DIR, '/var/lib/project-workbench/orchestrator');
 
   return Object.freeze({
@@ -63,7 +85,7 @@ export function loadOrchestratorConfig(env = process.env) {
     instanceId: instanceIdRaw || null,
 
     // ---- HTTP surface ----
-    basePath: str(env.PW_ORCHESTRATOR_BASE_PATH, '/api/orchestrator/v1'),
+    basePath,
     maxBodyBytes: int(env.PW_ORCHESTRATOR_MAX_BODY_BYTES, 1_048_576, { min: 1_024, max: 33_554_432 }),
     maxEventsPerPage: int(env.PW_ORCHESTRATOR_MAX_EVENTS_PER_PAGE, 200, { min: 1, max: 200 }),
     rateLimitPerMinute: int(env.PW_ORCHESTRATOR_RATE_LIMIT, 120, { min: 1, max: 100_000 }),
@@ -96,9 +118,15 @@ export function loadOrchestratorConfig(env = process.env) {
     reservedWindow: str(env.PW_ORCHESTRATOR_WINDOW, 'orch_pvibot'),
     tmuxPrefix: str(env.PW_ORCHESTRATOR_TMUX_PREFIX, 'pw_'),
     displayNamePrefix: str(env.PW_ORCHESTRATOR_DISPLAY_PREFIX, 'pvibot-orchestrator-'),
-    // Non-empty selects an alternate tmux server socket, which is how the test suite stays out of
-    // the live tmux namespace entirely.
-    tmuxSocket: str(env.PW_ORCHESTRATOR_TMUX_SOCKET, ''),
+    // Defaults to the dashboard's own PW_TMUX_SOCKET so the lane lands on the tmux server the
+    // human terminals actually use. Overriding it is how the test suite stays out of the live
+    // namespace entirely; defaulting it to empty would silently create a second, parallel server.
+    tmuxSocket: str(env.PW_ORCHESTRATOR_TMUX_SOCKET, str(env.PW_TMUX_SOCKET, '')),
+    // Host-mode deployments run the dashboard as root but every terminal as `admin`. The lane must
+    // drop the same way, or it creates a root-owned session the dashboard cannot see or reap, and
+    // writes root-owned files into a workspace whose human terminal runs as admin.
+    deployMode: String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host',
+    tmuxUser: str(env.PW_ORCHESTRATOR_TMUX_USER, 'admin'),
 
     // ---- coding backend ----
     backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, 'claude'),

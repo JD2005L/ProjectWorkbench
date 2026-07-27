@@ -130,8 +130,15 @@ function buildTable() {
 /** `current status -> permitted next statuses`. Terminal states map to the empty set. */
 export const ALLOWED_TRANSITIONS = buildTable();
 
+/**
+ * Whether `current -> requested` is permitted.
+ *
+ * Same-to-same is NOT permitted. Allowing it as an "idempotent re-assertion" quietly turned the
+ * state machine from a concurrency guard into a formality: a second concurrent publish found the
+ * job already `publishing` and was waved through, producing two commits in one working tree.
+ * A caller that genuinely wants a no-op should check the status first.
+ */
 export function canTransition(current, requested) {
-  if (current === requested) return true; // an idempotent re-assertion of the same state
   return Boolean(ALLOWED_TRANSITIONS.get(current)?.has(requested));
 }
 

@@ -46,12 +46,27 @@ export async function createOrchestratorSubsystem({ env = process.env, workbench
     migrations: MIGRATIONS,
   });
 
+  // Everything from here on can throw — reconciliation writes to the journal, and a full or
+  // read-only disk is the likely cause. Without this the dashboard would run for its whole
+  // lifetime holding the store lock with no orchestrator behind it, and no sibling process could
+  // ever take it.
+  try {
+    return await buildSubsystem({ config, store, workbenchVersion, audit });
+  } catch (err) {
+    await store.close().catch(() => {});
+    throw err;
+  }
+}
+
+async function buildSubsystem({ config, store, workbenchVersion, audit }) {
   const repo = new OrchestratorRepository(store);
   const projectStore = new ProjectConfigStore(config.projectsPath);
   const artifacts = new ArtifactStore({ config, repo, store });
   const checkRunner = new CheckRunner({ config, repo, store, artifacts });
   const backend = new ClaudeCodeBackend({ config });
-  const tmux = new TmuxAdapter({ socket: config.tmuxSocket });
+  const tmux = new TmuxAdapter({
+    socket: config.tmuxSocket, deployMode: config.deployMode, user: config.tmuxUser,
+  });
   const sessionManager = new OrchestratorSessionManager({ config, store, repo, tmux, backend });
   const engine = new OrchestrationEngine({
     config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, audit,

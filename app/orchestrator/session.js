@@ -45,18 +45,34 @@ const MARKER = Object.freeze({
  * live tmux namespace: a private server, its own windows, killed on teardown.
  */
 export class TmuxAdapter {
-  constructor({ socket = '', executable = 'tmux', timeoutMs = 15_000 } = {}) {
+  constructor({ socket = '', executable = 'tmux', timeoutMs = 15_000, deployMode = 'container', user = '' } = {}) {
     this.socket = socket;
     this.executable = executable;
     this.timeoutMs = timeoutMs;
+    // In host mode the dashboard runs as root but every project terminal runs as `admin`, so it
+    // execs `sudo -u admin tmux …`. The lane must take the same path: talking to root's tmux server
+    // would create a second session the dashboard cannot see or reap, and would run the coding CLI
+    // as root in a workspace whose human terminal, inbox and git all run as admin.
+    this.deployMode = deployMode;
+    this.user = user;
   }
 
   args(rest) {
     return this.socket ? ['-L', this.socket, ...rest] : [...rest];
   }
 
+  /** The argv actually executed, exposed so a test can assert the privilege path. */
+  spawnArgs(argv) {
+    const tmuxArgv = this.args(argv);
+    if (this.deployMode === 'host' && this.user) {
+      return { file: 'sudo', argv: ['-u', this.user, this.executable, ...tmuxArgv] };
+    }
+    return { file: this.executable, argv: tmuxArgv };
+  }
+
   async raw(argv) {
-    return execFileAsync(this.executable, this.args(argv), { timeout: this.timeoutMs });
+    const { file, argv: spawned } = this.spawnArgs(argv);
+    return execFileAsync(file, spawned, { timeout: this.timeoutMs });
   }
 
   async hasSession(session) {
@@ -110,12 +126,32 @@ export class TmuxAdapter {
     await this.raw(['new-window', '-d', '-t', `=${session}`, '-n', name, '-c', cwd, ...(command ? [command] : [])]);
   }
 
-  async killWindow(session, name) {
-    await this.raw(['kill-window', '-t', `=${session}:=${name}`]);
+  /**
+   * Address a window by its tmux window id (`@N`), never by name.
+   *
+   * `=name` looks like an exact-match target, and it is — except that tmux resolves an all-digit
+   * target as a window *index* first. A reserved window called `1` therefore resolves to whatever
+   * window sits at index 1, which is how a human's window came to be marked and then killed. A
+   * window id is unambiguous and cannot collide with an index.
+   */
+  async killWindowById(windowId) {
+    await this.raw(['kill-window', '-t', windowId]);
+  }
+
+  async setWindowOptionById(windowId, option, value) {
+    await this.raw(['set-option', '-w', '-t', windowId, option, value]);
+  }
+
+  /** Resolve a window by exact name, returning its id — or null when there is no such window. */
+  async findWindow(session, name) {
+    const windows = await this.listWindows(session);
+    return windows.find((w) => w.name === name) ?? null;
   }
 
   async setWindowOption(session, window, option, value) {
-    await this.raw(['set-option', '-w', '-t', `=${session}:=${window}`, option, value]);
+    const found = await this.findWindow(session, window);
+    if (!found) throw new Error(`no window named ${window} in ${session}`);
+    await this.setWindowOptionById(found.id, option, value);
   }
 
   /** Write a line into the lane's pane so a watching operator sees progress. */
@@ -138,18 +174,45 @@ export class OrchestratorSessionManager {
     this.tmux = tmux;
     this.backend = backend;
     this.clock = clock;
+    // Per-lane serialisation. Concurrent ensures raced through the exists-check and each created a
+    // window with the same name, after which the lane could not be addressed or repaired at all.
+    this._laneLocks = new Map();
+  }
+
+  /** Run `fn` with the named lane held exclusively within this process. */
+  async _withLaneLock(key, fn) {
+    const previous = this._laneLocks.get(key) ?? Promise.resolve();
+    let release;
+    const held = new Promise((resolve) => { release = resolve; });
+    this._laneLocks.set(key, previous.then(() => held));
+    await previous.catch(() => {});
+    try {
+      return await fn();
+    } finally {
+      release();
+      if (this._laneLocks.get(key) === held) this._laneLocks.delete(key);
+    }
   }
 
   now() { return this.clock().toISOString(); }
 
   laneFor(project, request = {}) {
     const naming = laneNaming(this.config, project.project_id);
+    const requestedWindow = request.reserved_tmux_window || naming.reservedWindow;
+    // tmux resolves an all-digit target as a window index before trying it as a name, so a numeric
+    // reserved-window name would silently address whichever window sits at that index.
+    if (/^\d+$/.test(requestedWindow)) {
+      throw new ApiError(
+        ErrorCode.VALIDATION_FAILED,
+        'the reserved window name must not be numeric: tmux would resolve it as a window index',
+      );
+    }
     return {
       ...naming,
       // A request may override the role and window, but only within the configured convention —
       // both are slugs validated upstream, so neither can become a tmux target expression.
       role: request.role || naming.role,
-      reservedWindow: request.reserved_tmux_window || naming.reservedWindow,
+      reservedWindow: requestedWindow,
     };
   }
 
@@ -160,7 +223,12 @@ export class OrchestratorSessionManager {
    * `verifySession` has captured real effective settings — the contract's session model rejects a
    * `ready` session without both, so claiming readiness early would be caught on the other side.
    */
-  async ensureSession({ token, project, request, correlationId = null }) {
+  async ensureSession(args) {
+    const lane = this.laneFor(args.project, args.request);
+    return this._withLaneLock(`${lane.tmuxSession}:${lane.reservedWindow}`, () => this._ensureSession(args));
+  }
+
+  async _ensureSession({ token, project, request, correlationId = null }) {
     const lane = this.laneFor(project, request);
     const sessionKey = deriveSessionKey(
       token.orchestrator_instance_id, this.config.instanceId, project.project_id, lane.role,
@@ -208,7 +276,9 @@ export class OrchestratorSessionManager {
 
       const stale = !ownedByThisLane || existing.paneCurrentPath !== workspacePath;
       if (stale || request.force_replace) {
-        await this.tmux.killWindow(lane.tmuxSession, lane.reservedWindow);
+        // By id: the window was resolved from an exact-name match in listWindows, and killing by
+        // name would reintroduce the index ambiguity this whole path exists to avoid.
+        await this.tmux.killWindowById(existing.id);
         await this._createLane(lane, workspacePath, project, sessionKey, token);
         replaced = true;
       }
@@ -250,14 +320,27 @@ export class OrchestratorSessionManager {
     return this._publicSession(record);
   }
 
+  /**
+   * Create the lane: temporary name, mark, then rename into place.
+   *
+   * Creating it under the reserved name and marking afterwards is not atomic — a crash in between
+   * leaves an *unmarked* window squatting the reserved name, which `ensureSession` then refuses to
+   * touch forever, including under force_replace. Marking under a scratch name and renaming last
+   * means the reserved name only ever appears on a window that is already marked.
+   */
   async _createLane(lane, workspacePath, project, sessionKey, token) {
-    await this.tmux.newWindow(lane.tmuxSession, lane.reservedWindow, workspacePath);
-    // Mark immediately after creation. Until the markers are set the window is indistinguishable
-    // from a human's, so nothing else may happen in between.
-    await this.tmux.setWindowOption(lane.tmuxSession, lane.reservedWindow, MARKER.ROLE, lane.role);
-    await this.tmux.setWindowOption(lane.tmuxSession, lane.reservedWindow, MARKER.PROJECT, project.project_id);
-    await this.tmux.setWindowOption(lane.tmuxSession, lane.reservedWindow, MARKER.SESSION_KEY, sessionKey);
-    await this.tmux.setWindowOption(lane.tmuxSession, lane.reservedWindow, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
+    const scratch = `${lane.reservedWindow}_new`;
+    await this.tmux.newWindow(lane.tmuxSession, scratch, workspacePath);
+    const created = await this.tmux.findWindow(lane.tmuxSession, scratch);
+    if (!created) throw new ApiError(ErrorCode.CONFLICT, 'the orchestrator lane could not be created');
+
+    // Address by window id from here on: a name can be ambiguous, an id cannot.
+    await this.tmux.setWindowOptionById(created.id, MARKER.ROLE, lane.role);
+    await this.tmux.setWindowOptionById(created.id, MARKER.PROJECT, project.project_id);
+    await this.tmux.setWindowOptionById(created.id, MARKER.SESSION_KEY, sessionKey);
+    await this.tmux.setWindowOptionById(created.id, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
+    await this.tmux.raw(['rename-window', '-t', created.id, lane.reservedWindow]);
+    return created.id;
   }
 
   /**

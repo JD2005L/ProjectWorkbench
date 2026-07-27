@@ -38,28 +38,46 @@ export const FORBIDDEN_GIT_SUBCOMMANDS = Object.freeze(new Set([
   'update-index', 'symbolic-ref-d', 'fsck', 'repack',
 ]));
 
-/** Options that turn an allowed subcommand into a destructive one. */
-const FORBIDDEN_ARGS = [
-  '--force', '--force-with-lease', '--force-if-includes', '-f',
-  '--hard', '--mixed', '--soft', '--keep', '--merge',
-  '--delete', '-d', '-D', '--prune', '--all', '--mirror',
-  '--exec', '--upload-pack', '--receive-pack', '--config-env',
-  '-c', '--work-tree', '--git-dir', '--namespace',
-];
-
 /**
- * Arguments that are legitimate on specific read-only subcommands even though they appear in the
- * blanket list above. Keeping this narrow and per-subcommand means a broad flag cannot be smuggled
- * in on a subcommand where it *would* be dangerous.
+ * Per-subcommand option allowlists.
+ *
+ * An earlier version denylisted exact option strings, which three real bypasses walked straight
+ * through: `push -fu` clusters to `-f -u` (force push), `push origin +HEAD:refs/heads/main` forces
+ * via the refspec rather than a flag, and `fetch origin +refs/heads/main:refs/heads/feature`
+ * clobbers a local branch holding unpushed commits. An allowlist has the opposite failure mode:
+ * something legitimate gets refused until it is added deliberately, which is the direction this
+ * module should fail in.
  */
-const ARG_EXCEPTIONS = Object.freeze({
-  branch: new Set(['--all']),
-  log: new Set(['--all']),
-  'rev-list': new Set(['--all']),
-  'for-each-ref': new Set([]),
-  diff: new Set([]),
-  status: new Set([]),
-  fetch: new Set(['--all', '--prune']),
+const ALLOWED_OPTIONS = Object.freeze({
+  'rev-parse': new Set(['--abbrev-ref', '--short', '--verify', '--quiet', '--is-inside-work-tree', '--show-toplevel', '--git-dir']),
+  status: new Set(['--porcelain', '--porcelain=v1', '--porcelain=v2', '--untracked-files=all', '--untracked-files=no', '-z']),
+  diff: new Set(['--check', '--cached', '--staged', '--name-only', '--numstat', '--stat', '--unified=0', '--no-renames', '-z', '--no-color']),
+  log: new Set(['--oneline', '--format', '--pretty', '-n', '--max-count', '--no-color']),
+  'ls-files': new Set(['--others', '--exclude-standard', '--cached', '-z']),
+  show: new Set(['--numstat', '--stat', '--format=', '--name-only', '--no-color']),
+  'cat-file': new Set(['-t', '-p', '-e']),
+  'rev-list': new Set(['--count', '--max-count', '-n']),
+  'symbolic-ref': new Set(['--short', '-q']),
+  'for-each-ref': new Set(['--format', '--count']),
+  remote: new Set([]),
+  config: new Set(['--get', '--get-all', '--list']),
+  branch: new Set(['--list', '--show-current', '--format']),
+  fetch: new Set(['--prune', '--quiet', '--no-tags']),
+  'ls-remote': new Set(['--heads', '--tags', '--quiet']),
+  add: new Set(['--']),
+  commit: new Set(['-m', '--message', '--quiet']),
+  push: new Set(['--quiet', '--porcelain', '--set-upstream']),
+  worktree: new Set(['--detach', '-b']),
+  'check-ignore': new Set(['--quiet', '-q']),
+  var: new Set([]),
+  describe: new Set(['--tags', '--always']),
+  'hash-object': new Set([]),
+});
+
+/** Verbs each multi-verb subcommand may use. */
+const ALLOWED_VERBS = Object.freeze({
+  worktree: new Set(['list', 'add']),
+  remote: new Set(['get-url', 'show', '-v']),
 });
 
 function refuse(message) {
@@ -95,33 +113,47 @@ export function assertGitArgvAllowed(argv) {
     throw refuse(`git ${subcommand} is not in the permitted set`);
   }
 
-  const allowedHere = ARG_EXCEPTIONS[subcommand] ?? new Set();
+  const allowedHere = ALLOWED_OPTIONS[subcommand] ?? new Set();
+  let afterDoubleDash = false;
   for (const arg of rest) {
+    // Everything after `--` is a pathspec, not an option.
+    if (afterDoubleDash) continue;
+    if (arg === '--') { afterDoubleDash = true; continue; }
     if (!arg.startsWith('-')) continue;
+
+    // A short-option cluster is expanded by git: `-fu` is `-f -u`, and denylisting the literal
+    // string `-f` never saw it. Refusing clusters outright keeps the check readable.
+    if (/^-[A-Za-z]{2,}$/.test(arg)) {
+      throw refuse(`clustered git short options (${arg}) are not permitted on ${subcommand}`);
+    }
     const bare = arg.split('=')[0];
-    if (allowedHere.has(bare)) continue;
-    if (FORBIDDEN_ARGS.includes(bare)) {
+    if (!allowedHere.has(bare) && !allowedHere.has(`${bare}=`) && !allowedHere.has(arg)) {
       throw refuse(`the git option ${bare} is not permitted on ${subcommand}`);
     }
   }
 
-  // `worktree` is allowed for isolation, but only the non-destructive verbs.
-  if (subcommand === 'worktree') {
+  const verbs = ALLOWED_VERBS[subcommand];
+  if (verbs) {
     const verb = rest.find((a) => !a.startsWith('-'));
-    if (!['list', 'add'].includes(verb)) {
-      throw refuse(`git worktree ${verb ?? ''} is not permitted`.trim());
-    }
+    if (!verbs.has(verb)) throw refuse(`git ${subcommand} ${verb ?? ''} is not permitted`.trim());
   }
 
-  // `config` is read-only here: writing config would let a caller change how git behaves later.
+  // `config` is read-only here. Writing config would let a caller change how git behaves on every
+  // later invocation — hooks, safe.directory, credential helpers — which is a durable escalation
+  // rather than a single command.
   if (subcommand === 'config') {
-    const readOnly = rest.some((a) => a === '--get' || a === '--get-all' || a === '--list');
-    if (!readOnly) throw refuse('git config may only be read');
+    const reads = rest.some((a) => a === '--get' || a === '--get-all' || a === '--list');
+    if (!reads) throw refuse('git config may only be read');
   }
 
-  // `push` must name a remote and a refspec, and must never delete a ref.
-  if (subcommand === 'push') {
-    if (rest.some((a) => a.startsWith(':'))) throw refuse('a deleting push is not permitted');
+  // A refspec is a second way to force, needing no flag at all: `+src:dst` overwrites the
+  // destination regardless of fast-forward, and `:dst` deletes it.
+  if (subcommand === 'push' || subcommand === 'fetch') {
+    for (const arg of rest) {
+      if (arg.startsWith('-')) continue;
+      if (arg.startsWith(':')) throw refuse(`a deleting ${subcommand} refspec is not permitted`);
+      if (arg.startsWith('+')) throw refuse(`a forced ${subcommand} refspec is not permitted`);
+    }
   }
 
   return true;

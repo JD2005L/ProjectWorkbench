@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hot-deploy helper for a container-mode (PW_DEPLOY_MODE=container) instance.
 #
-#   ./deploy-local.sh          # hot deploy: copy app/server.js + scripts/*, restart node only
+#   ./deploy-local.sh          # hot deploy: copy app/*.js + app/orchestrator/ + scripts/*, restart node only
 #   ./deploy-local.sh --full   # also copy Containerfile + rebuild image (RESTART kills sessions)
 #
 # Hot deploy (default): the entrypoint respawns node in ~2s; tmux/terminal
@@ -41,6 +41,9 @@ if $FULL_REBUILD; then
   read -rp "Continue? [y/N] " confirm; [[ "$confirm" =~ ^[Yy]$ ]] || { log "Aborted."; exit 0; }
   log "Copying source..."
   sudo cp "$REPO_DIR/app/server.js" "$SRC/app/server.js"
+  # server.js imports ./orchestrator/index.js unconditionally, so the directory has to travel with
+  # it — copying server.js alone leaves the live app unable to start at all.
+  sudo cp -a "$REPO_DIR/app/orchestrator/." "$SRC/app/orchestrator/"
   sudo cp "$REPO_DIR/scripts/"*     "$SRC/scripts/"
   sudo cp "$REPO_DIR/Containerfile" "$SRC/Containerfile"
   log "Rebuilding image $IMAGE..."
@@ -49,14 +52,18 @@ if $FULL_REBUILD; then
   sudo systemctl restart "$SERVICE"
   log "Done — wait ~10s then reload the dashboard."
 elif $INSIDE_CONTAINER; then
-  log "Hot deploy (inside container): copying app/server.js + scripts/*..."
+  log "Hot deploy (inside container): copying app/server.js + app/orchestrator/ + scripts/*..."
   cp "$REPO_DIR/app/server.js" "$LIVE_APP/server.js"
+  mkdir -p "$LIVE_APP/orchestrator"
+  cp -a "$REPO_DIR/app/orchestrator/." "$LIVE_APP/orchestrator/"
   cp "$REPO_DIR/scripts/"*     "$LIVE_SCRIPTS/" 2>/dev/null || true
   log "Restarting PW node..."; restart_pw_node
   log "Done — node restarts in ~2s; terminal sessions unaffected."
 else
-  log "Hot deploy (from host): copying app/server.js + scripts/*..."
+  log "Hot deploy (from host): copying app/server.js + app/orchestrator/ + scripts/*..."
   sudo cp "$REPO_DIR/app/server.js" "$SRC/app/server.js"
+  sudo mkdir -p "$SRC/app/orchestrator"
+  sudo cp -a "$REPO_DIR/app/orchestrator/." "$SRC/app/orchestrator/"
   sudo cp "$REPO_DIR/scripts/"*     "$SRC/scripts/" 2>/dev/null || true
   log "Restarting PW node inside $CONTAINER..."
   sudo podman exec "$CONTAINER" bash -c '

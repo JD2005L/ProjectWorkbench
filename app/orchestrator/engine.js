@@ -21,9 +21,10 @@ import crypto from 'crypto';
 import {
   SCHEMA_VERSION, JobStatus, EventType, ActorKind, PhaseClass, CheckOutcome, ReviewVerdict,
   QuestionStatus, ApprovalStatus, ApprovalType, DecisionScope, TimeoutAction, ArtifactKind,
-  ErrorCode, WORKSPACE_ACTIVE_STATES, TERMINAL_STATES, newId,
+  ErrorCode, WORKSPACE_ACTIVE_STATES, TERMINAL_STATES, TEXT_LIMITS, newId,
 } from './contract.js';
 import { ApiError, notFound } from './errors.js';
+import { redactText } from './redact.js';
 import { assertTransition, canTransition } from './statemachine.js';
 import { validate } from './validate.js';
 import { KIND } from './store/repo.js';
@@ -32,6 +33,7 @@ import { repositoryBaseline, workingTreeFingerprint } from './git.js';
 import { diffStat, canonicaliseCheckName, CHECK_CATALOGUE } from './checks.js';
 import {
   SUBMIT_JOB_SCHEMA, REPLY_SCHEMA, APPROVE_SCHEMA, REVISE_SCHEMA, REVIEW_SCHEMA, CANCEL_SCHEMA,
+  HEARTBEAT_SCHEMA,
 } from './schemas.js';
 import { Publisher, assertPublicationApproved } from './publish.js';
 
@@ -74,7 +76,7 @@ export class OrchestrationEngine {
   async drain() {
     while (this._running.size) {
       // eslint-disable-next-line no-await-in-loop
-      await Promise.allSettled([...this._running.values()]);
+      await Promise.allSettled([...this._running.values()].map((entry) => entry.promise));
     }
   }
 
@@ -133,19 +135,22 @@ export class OrchestrationEngine {
 
     const contentHash = hashContent(request);
     const scope = `submit:${token.orchestrator_instance_id}`;
-    const seen = this.repo.checkIdempotency(scope, idempotencyKey, contentHash);
-    if (seen.match === 'conflict') {
-      throw new ApiError(ErrorCode.IDEMPOTENCY_KEY_REUSED, 'the idempotency key was reused with different content');
-    }
-    if (seen.match === 'hit') {
-      // A repeat must return the original outcome and produce no second side effect.
-      return { ...seen.record.outcome, deduplicated: true };
-    }
-
     const jobId = newId('pwjob');
     const acceptedAt = this.now();
 
+    // The idempotency check and the record it guards must be in ONE transaction. Reading first and
+    // writing later leaves a window in which two concurrent requests carrying the same key both see
+    // a miss and both create a job — which is exactly the retry the contract anticipates.
     const handle = await this.store.transact((tx, state) => {
+      const existing = state.get(KIND.IDEMPOTENCY, `${scope}:${idempotencyKey}`);
+      if (existing) {
+        if (existing.content_hash !== contentHash) {
+          throw new ApiError(ErrorCode.IDEMPOTENCY_KEY_REUSED, 'the idempotency key was reused with different content');
+        }
+        // A repeat returns the original outcome and produces no second side effect.
+        return { ...existing.outcome, deduplicated: true };
+      }
+
       // A submission carrying a token lower than one already accepted for this project is a
       // revived orchestrator writing after its lease was taken over.
       this.repo.acceptOrchestratorFencing(tx, state, {
@@ -198,6 +203,9 @@ export class OrchestrationEngine {
       this.repo.recordIdempotency(tx, scope, idempotencyKey, contentHash, outcome);
       return outcome;
     });
+
+    // A deduplicated submission must not start a second worker for the original job.
+    if (handle.deduplicated) return handle;
 
     this._auditEvent('orchestrator.job.accepted', { workbench_job_id: jobId, project_id: request.project_id });
     this._startWorker(jobId, project);
@@ -370,7 +378,11 @@ export class OrchestrationEngine {
         ...job, ...patch,
         status: nextStatus,
         phase: phase ?? job.phase,
-        detail: detail ?? job.detail,
+        // Every other free-text field is redacted; this one was not, and `_blockWith` puts raw
+        // execFile failure text — `Command failed: <full argv>\n<stderr>` — straight into it.
+        detail: detail === null || detail === undefined
+          ? job.detail
+          : redactText(String(detail), { maxLength: TEXT_LIMITS.shortText }),
         updated_at: this.now(),
         ended_at: TERMINAL_STATES.has(nextStatus) ? this.now() : job.ended_at,
       };
@@ -407,23 +419,47 @@ export class OrchestrationEngine {
   // the phase pipeline
   // -------------------------------------------------------------------------
 
+  /**
+   * Start the single worker for a job.
+   *
+   * Two guards, both learned from a repro: a job that already has a worker must not get a second
+   * one — two coding sessions would write the same workspace, and the project write lease does not
+   * stop them because both would hold it under the same owner. And the `finally` must only evict
+   * *its own* map entry, or a finishing worker deletes a newer worker's registration and `drain()`
+   * returns while work is still in flight — which is what made the cancellation tree-preservation
+   * comparison unsound.
+   */
   _startWorker(jobId, project) {
-    const worker = this._run(jobId, project)
+    if (this._running.has(jobId)) return this._running.get(jobId);
+
+    const entry = {};
+    entry.promise = this._run(jobId, project)
       .catch(async (err) => {
         // A worker must never die silently: an unexplained stall is worse than a recorded failure.
         await this._failSafely(jobId, `the job stopped unexpectedly (${err?.code ?? 'internal'})`);
       })
-      .finally(() => this._running.delete(jobId));
-    this._running.set(jobId, worker);
-    return worker;
+      .finally(() => {
+        if (this._running.get(jobId) === entry) this._running.delete(jobId);
+      });
+    this._running.set(jobId, entry);
+    return entry.promise;
   }
 
+  /**
+   * Record an unexpected worker death.
+   *
+   * Blocked, not failed. `failed` is terminal, and an internal error says nothing about whether the
+   * work is salvageable — the repository is untouched and an operator may well be able to resume.
+   * Spending the job's only remaining state on a bug in this service is the wrong trade.
+   */
   async _failSafely(jobId, message) {
     try {
       const job = this.repo.getJob(jobId);
       if (!job || TERMINAL_STATES.has(job.status)) return;
       await this._releaseLease(jobId);
-      await this._transition(jobId, JobStatus.FAILED, { message, detail: message, eventType: EventType.FAILED });
+      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
+        message, detail: message, eventType: EventType.BLOCKED,
+      });
     } catch {
       /* nothing further can be done safely */
     }
@@ -434,9 +470,18 @@ export class OrchestrationEngine {
   async _run(jobId, project) {
     const workspacePath = resolveWorkspacePath(this.config, project);
 
-    await this._transition(jobId, JobStatus.VALIDATING, { message: 'validating the task contract' });
-    if (await this._stopIfCancelled(jobId, workspacePath)) return;
-    await this._transition(jobId, JobStatus.QUEUED, { message: 'queued for the project lane' });
+    // Intake runs once, on a freshly received job. A resumed job is already past it — re-entering
+    // at `validating` is not a legal edge from `queued`, and treating that as a worker crash sent
+    // every resumed job to `failed`, which is terminal. A blocked job is not a failed job.
+    const entry = this.repo.getJob(jobId);
+    if (entry.status === JobStatus.RECEIVED) {
+      await this._transition(jobId, JobStatus.VALIDATING, { message: 'validating the task contract' });
+      if (await this._stopIfCancelled(jobId, workspacePath)) return;
+      await this._transition(jobId, JobStatus.QUEUED, { message: 'queued for the project lane' });
+    } else if (entry.status !== JobStatus.QUEUED) {
+      // Any other starting point is a bug in the caller, not something to guess about.
+      throw new ApiError(ErrorCode.INVALID_TRANSITION, `a worker cannot start from '${entry.status}'`);
+    }
 
     // One writer per project. Everything from here to release is workspace-active.
     const lease = await this._acquireLease(jobId, project.project_id);
@@ -448,6 +493,15 @@ export class OrchestrationEngine {
       });
       return;
     }
+
+    // The lease TTL (default 5 minutes) is far shorter than a phase budget (default 30), so without
+    // renewal it lapsed mid-implementation and a second job walked into the same checkout. The
+    // renewal is driven by the worker's own liveness — it stops the moment the worker does, which
+    // is what keeps a dead worker from holding the project forever.
+    const renewal = setInterval(() => {
+      this._renewLease(jobId, project.project_id).catch(() => {});
+    }, Math.max(1_000, Math.floor(this.config.leaseTtlMs / 3)));
+    if (typeof renewal.unref === 'function') renewal.unref();
 
     try {
       const job = this.repo.getJob(jobId);
@@ -607,7 +661,19 @@ export class OrchestrationEngine {
     } catch (err) {
       await this._releaseLease(jobId);
       throw err;
+    } finally {
+      clearInterval(renewal);
     }
+  }
+
+  /** Extend this job's lease while its worker is alive. Silent when the lease was already lost. */
+  async _renewLease(jobId, projectId) {
+    const job = this.repo.getJob(jobId);
+    if (!job?.lease_fencing_token) return;
+    const resource = `project-write:${this.config.instanceId}:${projectId}`;
+    await this.store.transact((tx, state) => this.repo.renewLease(tx, state, {
+      resource, owner: jobId, fencingToken: job.lease_fencing_token, ttlMs: this.config.leaseTtlMs,
+    }));
   }
 
   // -- phase execution -------------------------------------------------------
@@ -858,23 +924,25 @@ export class OrchestrationEngine {
       throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the path job and the payload job must agree');
     }
 
-    const question = this.store.get(KIND.QUESTIONS, request.question_id);
-    if (!question) throw notFound('no such question');
-    if (question.job_id !== jobId) throw notFound('no such question');
-    if (question.status !== QuestionStatus.OPEN) {
-      throw new ApiError(ErrorCode.CONFLICT, 'this question has already been answered or withdrawn');
-    }
-    if (question.expires_at && new Date(question.expires_at) < this.clock()) {
-      throw new ApiError(ErrorCode.CONFLICT, 'this question has expired');
-    }
-    if (request.selected_option_index !== null && request.selected_option_index !== undefined
-      && request.selected_option_index >= question.options.length) {
-      throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the selected option does not exist');
-    }
+    // The whole check runs inside the transaction. Reading the status first and writing later let
+    // two concurrent replies to one open question both succeed, last write winning — and each then
+    // resumed the job, starting two workers on one workspace.
+    const question = await this.store.transact((tx, state) => {
+      const current = state.get(KIND.QUESTIONS, request.question_id);
+      if (!current || current.job_id !== jobId) throw notFound('no such question');
+      if (current.status !== QuestionStatus.OPEN) {
+        throw new ApiError(ErrorCode.CONFLICT, 'this question has already been answered or withdrawn');
+      }
+      if (current.expires_at && new Date(current.expires_at) < this.clock()) {
+        throw new ApiError(ErrorCode.CONFLICT, 'this question has expired');
+      }
+      if (request.selected_option_index !== null && request.selected_option_index !== undefined
+        && request.selected_option_index >= current.options.length) {
+        throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the selected option does not exist');
+      }
 
-    await this.store.transact((tx, state) => {
-      tx.put(KIND.QUESTIONS, question.question_id, {
-        ...question,
+      tx.put(KIND.QUESTIONS, current.question_id, {
+        ...current,
         status: QuestionStatus.ANSWERED,
         answer: request.answer,
         selected_option_index: request.selected_option_index ?? null,
@@ -883,8 +951,9 @@ export class OrchestrationEngine {
       this.repo.appendEvent(tx, state, {
         job_id: jobId, event_type: EventType.QUESTION_ANSWERED, status: job.status,
         actor: { kind: ActorKind.ORCHESTRATOR, identifier: token.orchestrator_instance_id },
-        message: `question ${question.question_id} answered`,
+        message: `question ${current.question_id} answered`,
       });
+      return current;
     });
 
     this._auditEvent('orchestrator.question.answered', { workbench_job_id: jobId, question_id: question.question_id });
@@ -934,38 +1003,57 @@ export class OrchestrationEngine {
       throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the path job and the payload job must agree');
     }
 
-    const approval = this.store.get(KIND.APPROVALS, request.approval_id);
-    if (!approval || approval.job_id !== jobId) throw notFound('no such approval');
-    if (approval.status !== ApprovalStatus.PENDING) {
-      throw new ApiError(ErrorCode.CONFLICT, 'this approval has already been decided or withdrawn');
-    }
-    if (approval.expires_at && new Date(approval.expires_at) < this.clock()) {
-      throw new ApiError(ErrorCode.CONFLICT, 'this approval request has expired');
+    // The decider must be named. There is no placeholder: an approval whose audit trail says
+    // "recorded-human-decision" identifies nobody, and this is the record that authorises a push.
+    if (!request.decided_by) {
+      throw new ApiError(ErrorCode.VALIDATION_FAILED, 'a recorded decision must name who made it', {
+        fieldErrors: [{ field: 'decided_by', message: 'required: the human who decided' }],
+      });
     }
 
-    const decided = {
-      ...approval,
-      status: request.approved ? ApprovalStatus.APPROVED : ApprovalStatus.REJECTED,
-      decided_at: this.now(),
-      // The human is the decider; the orchestrator is the channel. `decided_via` records the
-      // channel so the audit trail never loses the distinction.
-      decided_by: { kind: ActorKind.HUMAN, identifier: request.decided_by ?? 'recorded-human-decision' },
-      decided_via: token.orchestrator_instance_id,
-      decision_reason: request.reason ?? null,
-    };
+    // Compare-and-set inside the transaction: a concurrent approve and reject on one PENDING
+    // approval would otherwise both pass their status check, last write winning while both emit an
+    // approval_decided event.
+    const decided = await this.store.transact((tx, state) => {
+      const approval = state.get(KIND.APPROVALS, request.approval_id);
+      if (!approval || approval.job_id !== jobId) throw notFound('no such approval');
+      if (approval.status !== ApprovalStatus.PENDING) {
+        throw new ApiError(ErrorCode.CONFLICT, 'this approval has already been decided or withdrawn');
+      }
+      if (approval.expires_at && new Date(approval.expires_at) < this.clock()) {
+        throw new ApiError(ErrorCode.CONFLICT, 'this approval request has expired');
+      }
 
-    await this.store.transact((tx, state) => {
-      tx.put(KIND.APPROVALS, approval.approval_id, decided);
+      const record = {
+        ...approval,
+        status: request.approved ? ApprovalStatus.APPROVED : ApprovalStatus.REJECTED,
+        decided_at: this.now(),
+        // ProjectWorkbench cannot verify that a human was involved — it is at the far end of a
+        // machine-to-machine interface, and the decision was recorded on the orchestrator side.
+        // What it can do is refuse to invent a decider, record the relaying credential separately
+        // so the audit never conflates the two, and require a distinct scope (see auth.js) so
+        // granting an orchestrator the ability to approve its own work is a deliberate act.
+        decided_by: { kind: ActorKind.HUMAN, identifier: request.decided_by },
+        decided_via: token.orchestrator_instance_id,
+        decision_reason: request.reason ?? null,
+      };
+      tx.put(KIND.APPROVALS, approval.approval_id, record);
       const job = state.get(KIND.JOBS, jobId);
       this.repo.appendEvent(tx, state, {
         job_id: jobId, event_type: EventType.APPROVAL_DECIDED, status: job.status,
-        actor: { kind: ActorKind.HUMAN, identifier: decided.decided_by.identifier },
-        message: `approval ${approval.approval_id} ${decided.status}`,
+        actor: { kind: ActorKind.HUMAN, identifier: record.decided_by.identifier },
+        message: `approval ${approval.approval_id} ${record.status}`,
       });
+      return record;
     });
 
     this._auditEvent('orchestrator.approval.decided', {
-      workbench_job_id: jobId, approval_id: approval.approval_id, status: decided.status,
+      workbench_job_id: jobId,
+      approval_id: request.approval_id,
+      status: decided.status,
+      // Who decided, and through which credential — recorded separately and never conflated.
+      decided_by: decided.decided_by.identifier,
+      relayed_by: decided.decided_via,
     });
 
     if (!request.approved) {
@@ -977,7 +1065,7 @@ export class OrchestrationEngine {
         });
       }
     }
-    return { schema_version: SCHEMA_VERSION, approval_id: approval.approval_id, status: decided.status };
+    return { schema_version: SCHEMA_VERSION, approval_id: request.approval_id, status: decided.status };
   }
 
   /** A bounded, explicit correction. Never an invitation to redesign. */
@@ -1057,23 +1145,44 @@ export class OrchestrationEngine {
 
     const scope = `publish:${token.orchestrator_instance_id}`;
     const contentHash = hashContent(request);
-    const seen = this.repo.checkIdempotency(scope, idempotencyKey, contentHash);
-    if (seen.match === 'conflict') {
-      throw new ApiError(ErrorCode.IDEMPOTENCY_KEY_REUSED, 'the idempotency key was reused with different content');
-    }
-    if (seen.match === 'hit') return seen.record.outcome;
 
-    // The gate, before any staging: chat text never approves, and neither does an agent assertion.
-    const approval = request.approval_id ? this.store.get(KIND.APPROVALS, request.approval_id) : null;
-    if (approval && approval.job_id !== jobId) throw notFound('no such approval');
-    assertPublicationApproved({ approval, approvalId: request.approval_id });
+    // Reserve the key, check the approval, and claim the PUBLISHING state in ONE transaction. Doing
+    // these as separate steps let two concurrent retries — which the contract explicitly
+    // anticipates — both pass, interleaving two git add/commit sequences in the same working tree
+    // and leaving both publications unverified.
+    const claim = await this.store.transact((tx, state) => {
+      const existing = state.get(KIND.IDEMPOTENCY, `${scope}:${idempotencyKey}`);
+      if (existing) {
+        if (existing.content_hash !== contentHash) {
+          throw new ApiError(ErrorCode.IDEMPOTENCY_KEY_REUSED, 'the idempotency key was reused with different content');
+        }
+        return { replay: existing.outcome };
+      }
 
-    if (job.status !== JobStatus.WAITING_FOR_PUBLICATION_APPROVAL) {
-      throw new ApiError(ErrorCode.INVALID_TRANSITION, 'this job is not awaiting publication');
-    }
+      // The gate, before anything is staged.
+      const approval = request.approval_id ? state.get(KIND.APPROVALS, request.approval_id) : null;
+      if (approval && approval.job_id !== jobId) throw notFound('no such approval');
+      assertPublicationApproved({ approval, approvalId: request.approval_id });
+
+      const current = state.get(KIND.JOBS, jobId);
+      if (current.status !== JobStatus.WAITING_FOR_PUBLICATION_APPROVAL) {
+        throw new ApiError(ErrorCode.INVALID_TRANSITION, 'this job is not awaiting publication');
+      }
+      assertTransition(current.status, JobStatus.PUBLISHING);
+      this.repo.putJob(tx, {
+        ...current, status: JobStatus.PUBLISHING, phase: 'publication', updated_at: this.now(),
+      });
+      this.repo.appendEvent(tx, state, {
+        job_id: jobId, event_type: EventType.STATE_CHANGED, status: JobStatus.PUBLISHING,
+        previous_status: current.status, phase: 'publication', actor: this.actor(),
+        message: 'publishing under a recorded approval', correlation_id: current.correlation_id,
+      });
+      return { replay: null };
+    });
+
+    if (claim.replay) return claim.replay;
 
     const workspacePath = resolveWorkspacePath(this.config, project);
-    await this._transition(jobId, JobStatus.PUBLISHING, { message: 'publishing under a recorded approval', phase: 'publication' });
 
     const record = await this.publisher.publish({ job, project, workspacePath, request });
 
@@ -1144,9 +1253,11 @@ export class OrchestrationEngine {
     const workspacePath = resolveWorkspacePath(this.config, project);
     const before = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
 
-    // Let the in-flight phase reach a boundary rather than killing it mid-write.
+    // Let the in-flight phase reach a boundary rather than killing it mid-write. The "before" and
+    // "after" fingerprints are only comparable once nothing is still writing, so this await is
+    // load-bearing for the tree-preservation claim.
     const inFlight = this._running.get(jobId);
-    if (inFlight) await inFlight.catch(() => {});
+    if (inFlight) await inFlight.promise.catch(() => {});
 
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
     const preserved = before.status === after.status && before.head === after.head && before.diff === after.diff;
@@ -1175,8 +1286,17 @@ export class OrchestrationEngine {
   /** Renew the project write lease while a job is genuinely progressing. */
   async heartbeat({ token, jobId, body }) {
     const job = this.requireJob(token, jobId);
+    const request = validate(HEARTBEAT_SCHEMA, body ?? {});
+    if (request.workbench_job_id !== jobId) {
+      throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the path job and the payload job must agree');
+    }
     if (!WORKSPACE_ACTIVE_STATES.has(job.status)) {
       throw new ApiError(ErrorCode.INVALID_TRANSITION, 'this job does not hold a workspace lease');
+    }
+    // A caller that names a fencing token must name the current one. Renewing purely from the
+    // stored value would let a revived worker carrying a stale token keep a lease alive.
+    if (request.fencing_token !== null && request.fencing_token !== job.lease_fencing_token) {
+      throw new ApiError(ErrorCode.LEASE_LOST, 'the heartbeat carries a fencing token that is no longer current');
     }
     const resource = `project-write:${this.config.instanceId}:${job.project_id}`;
     const lease = await this.store.transact((tx, state) => this.repo.renewLease(tx, state, {
@@ -1240,6 +1360,8 @@ export class OrchestrationEngine {
     // for instance, needs a revision or another review — answering an unrelated question must not
     // quietly restart it.
     if (!canTransition(job.status, JobStatus.QUEUED)) return;
+    // A job that already has a worker must not get another one.
+    if (this._running.has(jobId)) return;
     await this._transition(jobId, JobStatus.QUEUED, { message: `resuming: ${reason}` });
     const project = this._resolveProjectOrThrow(job.project_id);
     this._startWorker(jobId, project);

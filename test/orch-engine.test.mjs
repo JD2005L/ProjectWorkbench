@@ -25,7 +25,7 @@ import { FakeCodingBackend } from '../app/orchestrator/runner/fake.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { ApiError } from '../app/orchestrator/errors.js';
 import { assertGitArgvAllowed, FORBIDDEN_GIT_SUBCOMMANDS } from '../app/orchestrator/git.js';
-import { JobStatus, ApprovalStatus, QuestionStatus, ReviewVerdict } from '../app/orchestrator/contract.js';
+import { JobStatus, ApprovalStatus, QuestionStatus, ReviewVerdict, TERMINAL_STATES } from '../app/orchestrator/contract.js';
 
 const execFileAsync = promisify(execFile);
 const HAVE_GIT = await execFileAsync('git', ['--version']).then(() => true).catch(() => false);
@@ -162,17 +162,48 @@ test('git: every destructive subcommand is unreachable, not merely unused', () =
     assert.ok(FORBIDDEN_GIT_SUBCOMMANDS.has(subcommand), `${subcommand} must be listed as forbidden`);
     assert.throws(() => assertGitArgvAllowed([subcommand]), ApiError, `git ${subcommand} must be refused`);
   }
-  // Options that would turn an allowed subcommand destructive.
-  assert.throws(() => assertGitArgvAllowed(['push', '--force', 'origin', 'main']), ApiError);
-  assert.throws(() => assertGitArgvAllowed(['push', 'origin', ':refs/heads/main']), ApiError);
-  assert.throws(() => assertGitArgvAllowed(['branch', '-D', 'main']), ApiError);
-  assert.throws(() => assertGitArgvAllowed(['worktree', 'remove', 'x']), ApiError);
-  assert.throws(() => assertGitArgvAllowed(['config', 'user.email', 'x@example.com']), ApiError);
-  // A global option before the subcommand could relocate the repository or inject config.
-  assert.throws(() => assertGitArgvAllowed(['-c', 'core.hooksPath=/tmp/evil', 'status']), ApiError);
-  assert.throws(() => assertGitArgvAllowed(['--git-dir=/etc', 'status']), ApiError);
-  // And the safe ones still work.
-  for (const argv of [['status', '--porcelain=v1'], ['diff', '--check'], ['add', '--', 'a.js'], ['commit', '-m', 'x'], ['push', 'origin', 'HEAD:refs/heads/b'], ['config', '--get', 'remote.origin.url']]) {
+  // Options that turn an allowed subcommand destructive. Most of these were WORKING BYPASSES of an
+  // earlier exact-string denylist, proved against real git by an independent review: `-fu` clusters
+  // to `-f -u`, and a refspec can force or delete with no flag at all — `fetch origin
+  // +refs/heads/main:refs/heads/feature` was confirmed to clobber a local branch holding an
+  // unpushed commit.
+  for (const argv of [
+    ['push', '--force', 'origin', 'main'],
+    ['push', '-fu', 'origin', 'HEAD:refs/heads/main'],
+    ['push', 'origin', '+HEAD:refs/heads/main'],
+    ['push', 'origin', ':refs/heads/main'],
+    ['fetch', 'origin', '+refs/heads/main:refs/heads/feature'],
+    ['commit', '--amend', '-m', 'x'],
+    ['commit', '-a', '-m', 'x'],
+    ['add', '-A'],
+    ['add', '-u'],
+    ['branch', '-D', 'main'],
+    ['branch', '-M', 'main'],
+    ['worktree', 'add', '-B', 'br', '/tmp/x'],
+    ['worktree', 'remove', 'x'],
+    ['remote', 'set-url', 'origin', 'x'],
+    ['remote', 'remove', 'origin'],
+    ['config', 'user.email', 'x@example.com'],
+    ['config', '--get', 'x', '--unset', 'y'],
+    ['hash-object', '-w', 'f'],
+    // A global option before the subcommand could relocate the repository or inject config.
+    ['-c', 'core.hooksPath=/tmp/evil', 'status'],
+    ['--git-dir=/etc', 'status'],
+  ]) {
+    assert.throws(() => assertGitArgvAllowed(argv), ApiError, `git ${argv.join(' ')} must be refused`);
+  }
+
+  // And everything the subsystem legitimately runs still works.
+  for (const argv of [
+    ['status', '--porcelain=v1'], ['status', '--porcelain=v1', '--untracked-files=all'],
+    ['rev-parse', 'HEAD'], ['rev-parse', '--abbrev-ref', 'HEAD'],
+    ['diff'], ['diff', '--check'], ['diff', '--cached', '--name-only'],
+    ['diff', 'HEAD', '--numstat'], ['diff', 'HEAD', '--unified=0'],
+    ['add', '--', 'a.js'], ['commit', '-m', 'x'],
+    ['push', 'origin', 'HEAD:refs/heads/b'], ['ls-remote', 'origin', 'refs/heads/b'],
+    ['remote', 'get-url', 'origin'], ['show', '--numstat', '--format=', 'abc'],
+    ['config', '--get', 'remote.origin.url'], ['worktree', 'list'],
+  ]) {
     assert.doesNotThrow(() => assertGitArgvAllowed(argv), `${argv.join(' ')} should be permitted`);
   }
 });
@@ -417,6 +448,51 @@ gitTest('engine: a question flows out with a real id and only its own answer res
     await assert.rejects(
       engine.replyToQuestion({ token: TOKEN, jobId, body: { workbench_job_id: jobId, question_id: question.question_id, answer: 'changed my mind' }, idempotencyKey: 'k2' }),
       (err) => err instanceof ApiError && err.code === 'conflict',
+    );
+  }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
+});
+
+gitTest('engine: answering a question resumes the job — it does not destroy it', async () => {
+  // Regression. `_run` always re-entered at `validating`, which is legal from `received` but not
+  // from `queued`, so every resumption threw invalid_transition, the worker's catch called
+  // _failSafely, and the job landed in `failed` — a TERMINAL state. Contract §11.8 (a question
+  // flowing PW → orchestrator → human → back) was broken outright, and no test saw it because the
+  // question test only ever ran against a job already parked past the point where _resume acts.
+  await withEngine(async ({ engine, repo, backend }) => {
+    // Park the job on a question raised by the coding session itself, mid-discovery.
+    backend.phaseResults = [{
+      ok: true, session_id: 'sess-1', summary: 'need a decision', turns_used: 1,
+      max_turns_reached: false,
+      questions: [{ question: 'Preserve the existing token format?', options: ['yes', 'no'] }],
+    }];
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+
+    assert.equal(repo.getJob(jobId).status, JobStatus.WAITING_FOR_INPUT, 'the job must be blocked on the question');
+    const question = engine.getQuestions(TOKEN, jobId).questions[0];
+    assert.ok(question, 'the coding session’s question must be recorded with a real id');
+
+    await engine.replyToQuestion({
+      token: TOKEN, jobId,
+      body: { workbench_job_id: jobId, question_id: question.question_id, answer: 'yes', selected_option_index: 0 },
+      idempotencyKey: 'k1',
+    });
+    await engine.drain();
+
+    const job = repo.getJob(jobId);
+    assert.notEqual(job.status, JobStatus.FAILED, 'a resumed job must never be failed by resumption itself');
+    assert.ok(!TERMINAL_STATES.has(job.status) || job.status === JobStatus.COMPLETED,
+      `resumption left the job in '${job.status}'`);
+    // And it genuinely moved on rather than sitting where it was.
+    const events = engine.getEvents(TOKEN, jobId, { limit: 200 }).events;
+    assert.ok(
+      events.some((e) => e.message?.includes('resuming')),
+      'the timeline must record the resumption',
+    );
+    assert.ok(
+      events.every((e) => !/stopped unexpectedly/.test(e.message ?? '')),
+      'no worker may have crashed during resumption',
     );
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
 });

@@ -18,8 +18,9 @@ const SECRET_KEY_RE = /^(.*_)?(secret|token|password|passwd|pwd|api_?key|access_
  * assignment rule so the replacement text stays informative.
  */
 const VALUE_RULES = [
-  // PEM private key blocks, including the body.
-  [/-----BEGIN (?:[A-Z ]+ )?PRIVATE KEY-----[\s\S]*?-----END (?:[A-Z ]+ )?PRIVATE KEY-----/g, REDACTED],
+  // PEM private key blocks, including the body. The body is length-bounded so an unterminated
+  // BEGIN marker cannot make this quadratic in the number of markers.
+  [/-----BEGIN (?:[A-Z ]{0,32} )?PRIVATE KEY-----[\s\S]{0,65536}?-----END (?:[A-Z ]{0,32} )?PRIVATE KEY-----/g, REDACTED],
   // Vendor-prefixed keys and tokens.
   [/\bsk-[A-Za-z0-9_-]{8,}/g, REDACTED],
   [/\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]{16,}/g, REDACTED],
@@ -30,10 +31,15 @@ const VALUE_RULES = [
   [/\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{4,}\.[A-Za-z0-9_-]{4,}/g, REDACTED],
   // Credentials embedded in a URL: https://user:secret@host/…
   [/\b([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^/\s@]+)@/gi, (_m, scheme, user) => `${scheme}${user}:${REDACTED}@`],
-  // Authorization headers of any scheme.
-  [/\b(authorization\s*[:=]\s*)(?:bearer|basic|token)?\s*\S+/gi, (_m, prefix) => `${prefix}${REDACTED}`],
-  // Generic `name = value` assignments where the name says "credential".
-  [/\b([A-Za-z0-9_.-]*(?:secret|token|password|passwd|pwd|api_?key|access_?key|private_?key|credential)[A-Za-z0-9_.-]*)(\s*[:=]\s*)(?:"([^"]*)"|'([^']*)'|(\S+))/gi,
+  // Authorization headers of any scheme. Written with bounded, non-adjacent quantifiers: an
+  // earlier version had two `\s*` runs separated by an optional group, which backtracks
+  // quadratically — 200k spaces took 63 seconds, and this runs on the main event loop.
+  [/\b(authorization[ \t]{0,32}[:=][ \t]{0,32})(?:bearer[ \t]+|basic[ \t]+|token[ \t]+)?[^\s]{1,4096}/gi,
+    (_m, prefix) => `${prefix}${REDACTED}`],
+  // Generic `name = value` assignments where the name says "credential". The name run is bounded
+  // on both sides of the keyword so a long string of `token` repeats cannot make matching
+  // super-linear.
+  [/\b([A-Za-z0-9_.-]{0,64}(?:secret|token|password|passwd|pwd|api_?key|access_?key|private_?key|credential)[A-Za-z0-9_.-]{0,64})([ \t]{0,32}[:=][ \t]{0,32})(?:"([^"]{0,4096})"|'([^']{0,4096})'|([^\s]{1,4096}))/gi,
     (_m, name, sep) => `${name}${sep}${REDACTED}`],
 ];
 
@@ -45,14 +51,18 @@ const VALUE_RULES = [
  */
 export function redactText(text, { maxLength = 4_000 } = {}) {
   if (typeof text !== 'string') return '';
-  let out = text;
+
+  // Truncate FIRST. Running the rules over the full input and truncating afterwards means the
+  // regex cost is driven by the raw size — and `ArtifactStore.write` passes 32 MB of subprocess
+  // output. Since this subsystem shares a process with the dashboard, a slow match here stalls
+  // every terminal, preview and inbox on the instance.
+  const bounded = text.length > maxLength ? text.slice(0, maxLength) : text;
+
+  let out = bounded;
   for (const [pattern, replacement] of VALUE_RULES) {
     out = out.replace(pattern, replacement);
   }
-  if (out.length > maxLength) {
-    out = `${out.slice(0, maxLength)}…[truncated]`;
-  }
-  return out;
+  return text.length > maxLength ? `${out}…[truncated]` : out;
 }
 
 /**
@@ -83,9 +93,14 @@ export function redactDeep(value, { maxLength = 4_000, depth = 0 } = {}) {
  */
 export function scanForSecrets(addedLines) {
   const findings = [];
-  addedLines.forEach(({ file, line, text }) => {
-    const redacted = redactText(text, { maxLength: 2_000 });
-    if (redacted !== text) findings.push({ file, line, rule: 'credential-shape' });
-  });
+  // Per-line bound: a minified bundle or a base64 blob on one line would otherwise hand an
+  // unbounded string to the matcher once per added line.
+  const LINE_LIMIT = 4_000;
+  for (const { file, line, text } of addedLines.slice(0, 50_000)) {
+    const bounded = String(text ?? '').slice(0, LINE_LIMIT);
+    if (redactText(bounded, { maxLength: LINE_LIMIT }) !== bounded) {
+      findings.push({ file, line, rule: 'credential-shape' });
+    }
+  }
   return findings;
 }
