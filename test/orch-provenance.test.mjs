@@ -400,6 +400,42 @@ test('provenance: a peer that does not bind its request gets no launch attestati
   assert.match(result.detail, /bind/i);
 });
 
+test('provenance: a nonce outside the contract alphabet is treated as unbound', () => {
+  // The envelope constrains the nonce to `^[A-Za-z0-9_-]+$`, not merely to a length — because
+  // `hmac.compare_digest` raises TypeError on a non-ASCII `str`, and that exception escaped every
+  // handler and stranded the job mid-verification. PW echoes the nonce the caller supplied, so a
+  // value it cannot legally echo must be refused here rather than sent onward: producing a payload
+  // the far side cannot even compare is how this side becomes the source of that failure.
+  for (const nonce of [
+    'nonce-with-é-accent-0123456789',       // non-ASCII: the TypeError case
+    'nonce with spaces 0123456789ab',       // whitespace
+    'nonce:with:colons:0123456789ab',       // an identifier, but not a nonce
+    'nonce/with/slashes/0123456789',
+    'nonce with-a-nul-0123456789',
+  ]) {
+    const result = build({ binding: { ...BINDING, verification_nonce: nonce } });
+    assert.equal(result.settings_attestation, null, `a ${JSON.stringify(nonce)} nonce must not be attested`);
+    assert.equal(result.blocking, true);
+  }
+
+  // And the legitimate one — hex, as PW itself generates — still works.
+  assert.ok(build().settings_attestation);
+});
+
+test('provenance: codex-cli claims nothing at runtime until someone measures it', () => {
+  // The row was a copy-paste asserting the same `init.model` source as Claude Code, with no
+  // fixture, no documentation and no measurement behind it — in the one table that makes
+  // `runtime_reported` checkable rather than self-certifying. The orchestrator removed it, and a
+  // backend with no row cannot have observed anything, which is the correct answer until someone
+  // measures it. PW mirrors the table, so PW must mirror the removal or it claims something the
+  // far side now refuses.
+  const result = build({ backend: 'codex-cli' });
+  assert.equal(result.provenance.model, Provenance.UNAVAILABLE);
+  assert.equal(result.settings_attestation, null);
+  assert.equal(result.blocking, true);
+  assert.match(result.detail, /not recorded as reporting the resolved model/);
+});
+
 test('provenance: a caller that reuses the default nonce is treated as unbound', () => {
   // The sentinel default means "no fresh nonce supplied". Accepting it would let an attestation
   // captured on one verification be replayed onto a later one for the same job.

@@ -42,6 +42,12 @@ export const PINNED_FILES = Object.freeze([
   'src/pvi_orchestrator/contracts/workbench.py',
   'src/pvi_orchestrator/contracts/health.py',
   'src/pvi_orchestrator/workbench/protocol.py',
+  // The registration surface. Not a wire contract, but ProjectWorkbench's bootstrap report is an
+  // *input* to it — the orchestrator's CLI reads the JSON this repository's
+  // `pw-orch-fingerprint.mjs` writes — so a change to how that report is consumed breaks this side
+  // just as a schema change does. Pinned so it fails by name rather than as a mystery.
+  'src/pvi_orchestrator/registry_admin.py',
+  'src/pvi_orchestrator/registry_cli.py',
 ]);
 
 /** Whether the orchestrator source tree is present at all. */

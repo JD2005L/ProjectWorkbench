@@ -216,6 +216,41 @@ test('api: the fingerprint endpoint is authenticated, read-only, and carries no 
   });
 });
 
+test('api: a verification nonce outside the contract alphabet is refused at the door', async () => {
+  // Refused here, not further in. PW echoes the caller's nonce into the envelope, and the envelope
+  // constrains it to `^[A-Za-z0-9_-]+$` — because a non-ASCII value reaching `hmac.compare_digest`
+  // raises TypeError on the far side, escaping every handler and stranding the job. A value this
+  // service cannot legally echo has no business being accepted.
+  //
+  // The length bound is checked too: it was written as `minLength`/`maxLength` on a `shortText`,
+  // which the validator silently ignores, so a two-character nonce passed and was echoed.
+  await withApi(async ({ call }) => {
+    const verify = (nonce) => call('POST', '/projects/Demo/session/verify', {
+      body: {
+        session_key: `${ORCH}:wb-test-01:Demo:pvi2-orchestrator`,
+        phase_class: 'implementation',
+        requested: { model_alias: 'sonnet', effort: 'high' },
+        run_id: 'job_1:implementation',
+        config_generation: 3,
+        verification_nonce: nonce,
+      },
+      headers: { 'Idempotency-Key': `v-${Buffer.from(nonce).toString('hex').slice(0, 20)}` },
+    });
+
+    for (const bad of ['nonce-with-é-0123456789ab', 'nonce with spaces 0123456', 'a:b:c:0123456789abcdef', 'tooshort', 'x'.repeat(129)]) {
+      const res = await verify(bad);
+      assert.equal(res.status, 400, `${JSON.stringify(bad)} must be refused: ${JSON.stringify(res.json)}`);
+      assert.equal(res.json.error, 'validation_failed');
+      assert.ok(res.json.field_errors?.some((e) => e.field === 'verification_nonce'),
+        `the refusal must name the field: ${JSON.stringify(res.json)}`);
+    }
+
+    // The shape PW itself generates — 32 hex characters — is accepted.
+    const good = await verify('a1b2c3d4e5f60718293a4b5c6d7e8f90');
+    assert.notEqual(good.status, 400, `a legitimate nonce must pass: ${JSON.stringify(good.json)}`);
+  });
+});
+
 test('api: a body that fails schema validation is a typed refusal, not an internal error', async () => {
   // Found by the nonce requirement below, and much wider than it: `validate()` throws its own
   // `ValidationError`, which `sendError` did not recognise — so EVERY route that validates a body

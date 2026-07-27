@@ -112,7 +112,15 @@ export const PATTERNS = Object.freeze({
   mediaType: /^[\w.+-]+\/[\w.+-]+$/,
   schemaVersion: /^\d+\.\d+$/,
   idPrefix: /^[a-z][a-z0-9_]{0,15}$/,
+  // The envelope constrains the nonce to an ASCII alphabet, not merely to a length: a non-ASCII
+  // value reaching `hmac.compare_digest` on the far side raises TypeError, which escaped every
+  // handler and stranded the job mid-verification. This service echoes the caller's nonce, so it
+  // must refuse anything it cannot legally echo. Length is enforced alongside, in TEXT_LIMITS.
+  verificationNonce: /^[A-Za-z0-9_-]+$/,
 });
+
+/** The nonce length the contract accepts. Below it a value is guessable; above it, refused. */
+export const VERIFICATION_NONCE_LENGTH = Object.freeze({ min: 16, max: 128 });
 
 // ---------------------------------------------------------------------------
 // Job lifecycle vocabulary (contracts/states.py)

@@ -1496,7 +1496,8 @@
     "branch": "^[A-Za-z0-9._/-]+$",
     "mediaType": "^[\\w.+-]+\\/[\\w.+-]+$",
     "schemaVersion": "^\\d+\\.\\d+$",
-    "idPrefix": "^[a-z][a-z0-9_]{0,15}$"
+    "idPrefix": "^[a-z][a-z0-9_]{0,15}$",
+    "verificationNonce": "^[A-Za-z0-9_-]+$"
   },
   "safety": {
     "allowed_check_names": [

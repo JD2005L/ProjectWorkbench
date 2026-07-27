@@ -501,6 +501,71 @@ wireTest('wire: the orchestrator’s own policy validator accepts what a real ru
   assert.match(unknownBinary.error, /no capability fingerprint is on record/);
 });
 
+wireTest('wire: the orchestrator’s registry CLI accepts the report this repository produces', async () => {
+  // The other half of the bootstrap, and the one this side could not previously demonstrate: the
+  // report is not just well-formed, it is *consumable* by the command an administrator actually
+  // runs. The orchestrator's registration doc invokes `scripts/pw-orch-fingerprint.mjs` by name and
+  // pipes its JSON straight into `pin`, so the report's shape is now load-bearing on both sides.
+  //
+  // Runs against a throwaway database under the test's own temp directory. The orchestrator
+  // repository is read-only here: nothing is written inside it, and its own database is untouched.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-reg-'));
+  try {
+    const { buildFingerprintReport } = await import('../app/orchestrator/bootstrap.js');
+    const { FakeCodingBackend } = await import('../app/orchestrator/runner/fake.js');
+    const backend = new FakeCodingBackend();
+    const report = buildFingerprintReport({
+      instanceId: INSTANCE, fingerprint: await backend.fingerprint(),
+    });
+    const reportPath = path.join(dir, 'report.json');
+    fs.writeFileSync(reportPath, JSON.stringify(report, null, 2));
+
+    const registry = (...args) => {
+      const result = execFileSync(VENV_PYTHON, [
+        '-c', 'import sys;from pvi_orchestrator.registry_cli import main;sys.exit(main(sys.argv[1:]))', ...args,
+      ], {
+        cwd: ORCHESTRATOR_ROOT,
+        env: {
+          ...process.env,
+          PYTHONPATH: path.join(ORCHESTRATOR_ROOT, 'src'),
+          PVIORCH_DATABASE_PATH: path.join(dir, 'registry.db'),
+          PVIORCH_WORKBENCH_INSTANCES: JSON.stringify([{
+            schema_version: '1.0', instance_id: INSTANCE,
+            display_name: 'wire test', base_url: 'http://127.0.0.1:9999',
+          }]),
+        },
+        encoding: 'utf8',
+        timeout: 120_000,
+      });
+      return result;
+    };
+
+    // Unregistered is refused, and says how to fix itself.
+    assert.match(registry('show', INSTANCE), /fingerprint\s+not pinned/);
+
+    // The pin reads our report and records the value we would attest with.
+    const pinned = registry('--operator', 'wire-test', 'pin', INSTANCE, '--report', reportPath, '--expected-version', '0');
+    assert.match(pinned, /^pinned /m, pinned);
+    // The prefix it prints must be a prefix of the digest, or an operator confirming a rotation by
+    // eye is confirming something else.
+    assert.ok(report.capability_fingerprint.startsWith(pinned.match(/pinned ([0-9a-f]+)/)[1]),
+      `the CLI printed a prefix that is not ours: ${pinned}`);
+
+    registry('--operator', 'wire-test', 'grant-launch-trust', INSTANCE, '--expected-version', '1');
+    const after = registry('show', INSTANCE);
+    assert.match(after, /launch trust\s+granted/);
+
+    // Compare-and-set: a stale write is refused rather than silently winning. Two operators pinning
+    // from two terminals is ordinary, and the loser needs to know they lost.
+    assert.throws(
+      () => registry('--operator', 'wire-test', 'pin', INSTANCE, '--report', reportPath, '--expected-version', '0'),
+      /registry version/,
+    );
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 wireTest('wire: a verification response sends the attestation and never `effective`', async () => {
   // The contract derives `effective` from the attestation. A payload carrying `effective` is
   // refused rather than read as an observation, so sending it would be a hard incompatibility.

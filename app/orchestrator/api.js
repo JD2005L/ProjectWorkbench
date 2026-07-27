@@ -301,7 +301,10 @@ export function createOrchestratorRouter({
       // other security-relevant default on this surface refuses, and a fixed, publicly-known nonce
       // would be the one that does not. A peer that omitted the field used to get a well-formed
       // answer whose binding was worthless.
-      verification_nonce: { type: 'shortText', required: true, minLength: 16, maxLength: 128 },
+      // A dedicated type, not `shortText` with bounds the validator silently ignored: the envelope
+      // constrains the nonce to `^[A-Za-z0-9_-]+$` and 16..128 characters, and this service echoes
+      // whatever the caller sent. A value it cannot legally echo is refused here.
+      verification_nonce: { type: 'verificationNonce', required: true },
     },
   };
 

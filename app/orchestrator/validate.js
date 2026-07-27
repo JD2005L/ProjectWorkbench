@@ -16,6 +16,7 @@ import {
   MAX_LIST_ITEMS,
   TEXT_LIMITS,
   PATTERNS,
+  VERIFICATION_NONCE_LENGTH,
   ErrorCode,
 } from './contract.js';
 import { ApiError } from './errors.js';
@@ -48,7 +49,9 @@ function isPlainObject(value) {
 }
 
 /** Bounded, pattern-checked string primitives. Whitespace is stripped, then min length 1 applies. */
-function validateText(value, { kind, path, errors, maxLength, pattern, allowEmpty = false }) {
+function validateText(value, {
+  kind, path, errors, maxLength, minLength = 0, pattern, allowEmpty = false,
+}) {
   if (typeof value !== 'string') {
     errors.push({ field: path, message: `expected a ${kind} string` });
     return undefined;
@@ -56,6 +59,12 @@ function validateText(value, { kind, path, errors, maxLength, pattern, allowEmpt
   const stripped = value.trim();
   if (!allowEmpty && stripped.length < 1) {
     errors.push({ field: path, message: `${kind} must not be empty` });
+    return undefined;
+  }
+  // Honoured, rather than accepted and ignored. A `minLength` this function quietly dropped is why
+  // a two-character verification nonce passed a schema that appeared to require sixteen.
+  if (stripped.length < minLength) {
+    errors.push({ field: path, message: `${kind} must be at least ${minLength} characters` });
     return undefined;
   }
   if (stripped.length > maxLength) {
@@ -108,6 +117,13 @@ function validateValue(spec, value, path, errors) {
       return validateBranch(value, path, errors);
     case 'mediaType':
       return validateText(value, { kind: 'media type', path, errors, maxLength: 100, pattern: PATTERNS.mediaType });
+    case 'verificationNonce':
+      return validateText(value, {
+        kind: 'verification nonce', path, errors,
+        minLength: VERIFICATION_NONCE_LENGTH.min,
+        maxLength: VERIFICATION_NONCE_LENGTH.max,
+        pattern: PATTERNS.verificationNonce,
+      });
     case 'shortText':
       return validateText(value, { kind: 'text', path, errors, maxLength: TEXT_LIMITS.shortText });
     case 'mediumText':

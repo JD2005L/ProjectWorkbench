@@ -247,12 +247,19 @@ and the job blocks:
    `config_generation` and a **required** `verification_nonce` — no default, deliberately, because
    every other security-relevant default on this surface refuses and a fixed, publicly-known nonce
    would be the one that does not. A peer that omits it is refused rather than answered unbound.
+   The nonce is constrained to `^[A-Za-z0-9_-]+$` and 16–128 characters, and refused here rather
+   than echoed: a non-ASCII value reaching `hmac.compare_digest` on the far side raises `TypeError`,
+   which escapes every handler and strands the job mid-verification. This service must not be the
+   source of a value the comparison cannot accept.
 
 ### Why effort is never `runtime_reported`
 
 A `runtime_reported` label is only worth something if the party being told already knows the backend
 can report the field. The orchestrator keeps that table itself (`RUNTIME_REPORTABLE`), and for
-`claude-code` it holds exactly one entry: `model_alias` from `init.model`. There is no entry for
+`claude-code` it holds exactly one entry: `model_alias` from `init.model`. **It is the only entry.**
+`codex-cli` was there asserting the same source with no fixture, no documentation and no measurement
+behind it; a backend with no row cannot have observed anything, which is the correct answer until
+someone measures it. There is no entry for
 `effort`, because Claude Code 2.1.220 does not report it — so a payload claiming to have *observed*
 effort asserts something the CLI cannot do, and is refused.
 
@@ -365,9 +372,23 @@ orchestrator's registry; if it could, the pin would be a value the attested part
    against `binary.sha256`, `/bin/claude --version` against `binary.version`, and
    `/bin/claude --help` against the advertised option surface. An administrator who pins an opaque
    hash cannot tell whether it describes the binary they think it does.
-3. **Record** `capability_fingerprint` against that instance id in the orchestrator's registry,
-   together with `may_attest_launch`. The two are separate decisions: the fingerprint says *which
-   program*, `may_attest_launch` says *whether this instance's word about a launch is accepted*.
+3. **Record** it with the orchestrator's own registry command. Pinning and trusting are two
+   commands because they are two decisions, and one must not imply the other — the fingerprint says
+   *which program*, the grant says *whether this instance's word about a launch is accepted*:
+
+   ```bash
+   pvi-orchestrator-registry show <instance-id>                      # note the registry version
+   pvi-orchestrator-registry --operator <you> pin <instance-id> \
+       --report <report.json> --expected-version <N>
+   pvi-orchestrator-registry --operator <you> grant-launch-trust <instance-id> --expected-version <N+1>
+   ```
+
+   `--expected-version` is compare-and-set: a stale write is refused rather than silently winning,
+   because two operators pinning from two terminals is ordinary and the loser needs to know they
+   lost. `--operator` puts a name on the audit record. See the orchestrator's
+   `docs/instance-registration.md` for the authoritative procedure; it invokes the command in 4.1
+   directly, so the report's shape is load-bearing on both sides and this repository's wire tests
+   run the real `pin`, `grant-launch-trust` and compare-and-set path against a throwaway database.
 4. **Confirm** by running one verification. It should be accepted; the summary names both provenance
    labels. If it is refused with `no capability fingerprint is on record`, the pin did not land
    against the id the instance actually answers with.
@@ -380,7 +401,9 @@ upgrade nobody authorised is indistinguishable from a substituted binary, becaus
 
 1. Upgrade the CLI on the PW host as usual.
 2. Re-run `scripts/pw-orch-fingerprint.mjs` and re-verify the components by hand, as at 4.2.
-3. Record the new value against the instance.
+3. Record the new value with `pin --expected-version <N>`, re-reading the version with `show`
+   first. Rotation **keeps** the launch-trust grant — a binary changing is not a reason to
+   re-decide whether the instance is trusted; if it is, revoke instead.
 
 Between steps 1 and 3 the instance is **refused**, not degraded: every attestation it makes carries
 the new fingerprint against the old pin. Jobs block with `the binary capability fingerprint has

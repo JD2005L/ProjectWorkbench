@@ -27,7 +27,8 @@ import crypto from 'crypto';
 
 import {
   SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION, Provenance, weakerProvenance, AuthMode,
-  ATTESTATION_CONTRACT_VERSION, ARGV_BUILDER_ID, Effort, CodingBackend,
+  ATTESTATION_CONTRACT_VERSION, ARGV_BUILDER_ID, Effort, CodingBackend, PATTERNS,
+  VERIFICATION_NONCE_LENGTH,
 } from './contract.js';
 
 /** The one source key claude-code is recorded as reporting the resolved model from. */
@@ -88,8 +89,12 @@ const EFFORT_FIELDS = ['effort', 'effortLevel', 'reasoning_effort', 'effort_leve
  * strands every job.
  */
 export const RUNTIME_REPORTABLE = Object.freeze({
-  'claude-code': Object.freeze({ model_alias: Object.freeze(['init.model']) }),
-  'codex-cli': Object.freeze({ model_alias: Object.freeze(['init.model']) }),
+  'claude-code': Object.freeze({ model_alias: Object.freeze([MODEL_SOURCE_KEY]) }),
+  // `codex-cli` is deliberately absent. It was here asserting the same `init.model` source as
+  // Claude Code, with no fixture, no documentation and no measurement behind it — a copy-paste in
+  // the one table that makes `runtime_reported` checkable rather than self-certifying. A backend
+  // with no row cannot have observed anything, which is the correct answer until someone measures
+  // it. Adding a row is how that changes, and it is a deliberate act on both sides.
 });
 
 /** Whether `backend` is recorded as reporting `field`, from `sourceKey`. Unknown backend → no. */
@@ -439,7 +444,13 @@ export function bindingIsUsable(binding) {
   if (binding.run_id === 'unbound') return false;
   if (!Number.isInteger(binding.config_generation) || binding.config_generation < 0) return false;
   const nonce = binding.verification_nonce;
-  if (typeof nonce !== 'string' || nonce.length < 16 || nonce.length > 128) return false;
+  if (typeof nonce !== 'string') return false;
+  if (nonce.length < VERIFICATION_NONCE_LENGTH.min || nonce.length > VERIFICATION_NONCE_LENGTH.max) return false;
+  // The alphabet, not merely the length. The envelope constrains it because a non-ASCII value
+  // reaching `hmac.compare_digest` raises TypeError on the far side — an exception that escaped
+  // every handler and stranded the job mid-verification. This side echoes the caller's nonce, so
+  // refusing what it cannot legally echo is what stops it becoming the source of that failure.
+  if (!PATTERNS.verificationNonce.test(nonce)) return false;
   if (nonce === UNBOUND_NONCE) return false;
   return true;
 }
