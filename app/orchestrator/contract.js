@@ -367,9 +367,16 @@ export function deriveCliDisplayName(projectId, prefix = 'pvibot-orchestrator-')
 }
 
 /**
- * The tmux session name for a project. Non-alphanumerics collapse to `_`, matching the existing
- * `tmuxSession()` helper in server.js so the orchestrator lane lands in the *same* session a human
- * would open, rather than a parallel one.
+ * The tmux session name for a project.
+ *
+ * Non-alphanumerics collapse to `_`, matching the existing `tmuxSession()` helper in server.js so
+ * the orchestrator lane lands in the *same* session a human would open rather than a parallel one.
+ *
+ * This diverges from the orchestrator's `derive_tmux_session`, which is a plain `f"pw_{project_id}"`
+ * — for a project id like `PVH-Gateway` the two disagree. ProjectWorkbench reports the name of the
+ * session that actually exists, because reporting a name that does not exist would be worse. The
+ * orchestrator only stores and displays this value; it has no shell and never constructs a tmux
+ * target from it. Recorded in the contract fixture's `known_gaps` for coordination.
  */
 export function deriveTmuxSession(projectId, prefix = 'pw_') {
   return prefix + String(projectId).replace(/[^A-Za-z0-9_]/g, '_');

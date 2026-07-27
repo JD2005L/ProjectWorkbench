@@ -189,7 +189,7 @@ test('mcp: discovery tools return the same payloads as the HTTP surface', async 
     assert.equal(health.contract_version, '1.0');
 
     const projects = await dispatch('pw_list_projects', TOKEN, {}, {});
-    assert.deepEqual(projects.projects.map((p) => p.project_id), ['Demo']);
+    assert.deepEqual(projects.map((p) => p.project_id), ['Demo']);
 
     const capabilities = await dispatch('pw_get_project_capabilities', TOKEN, { project_id: 'Demo' }, {});
     assert.deepEqual(capabilities.capabilities, ['implementation']);

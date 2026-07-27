@@ -63,8 +63,13 @@ export const FORBIDDEN_TOOL_FRAGMENTS = Object.freeze([
   'clone', 'checkout', 'eval', 'script', 'secret', 'credential', 'env',
 ]);
 
+// Every orchestrator request model serialises `schema_version`, so a closed input schema has to
+// declare it or a spec-conformant MCP client would strip or reject the argument.
 const object = (properties, required = []) => ({
-  type: 'object', properties, required, additionalProperties: false,
+  type: 'object',
+  properties: { schema_version: { type: 'string', pattern: '^\\d+\\.\\d+$' }, ...properties },
+  required,
+  additionalProperties: false,
 });
 
 const JOB_ID = { type: 'string', maxLength: 128, pattern: '^[A-Za-z0-9:._-]+$' };
@@ -92,6 +97,9 @@ export const TOOL_DEFINITIONS = Object.freeze([
   {
     name: 'pw_verify_session_configuration',
     description: 'Report the effective model and effort. Returns null when it cannot be determined.',
+    // `project_id` is optional: VerifySessionRequest has no such field, so an orchestrator
+    // serialising the model straight into tool arguments could not supply it. The project is
+    // derived from the session key, which encodes it by construction (§5).
     inputSchema: object({
       project_id: SLUG, session_key: JOB_ID,
       phase_class: { type: 'string', enum: ['discovery', 'planning', 'implementation', 'mechanical_correction', 'high_risk_design', 'routine_review', 'high_risk_review'] },
@@ -99,7 +107,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
         model_alias: { type: 'string', maxLength: 120, pattern: '^[A-Za-z0-9._-]+$' },
         effort: { type: 'string', enum: ['low', 'medium', 'high', 'max'] },
       }, ['model_alias', 'effort']),
-    }, ['project_id', 'session_key', 'phase_class', 'requested']),
+    }, ['session_key', 'phase_class', 'requested']),
   },
   { name: 'pw_submit_job', description: 'Delegate a task contract. Idempotent; carries a lease fencing token.', inputSchema: { type: 'object', additionalProperties: true } },
   { name: 'pw_get_job', description: 'A snapshot of a remote job.', inputSchema: object({ workbench_job_id: JOB_ID }, ['workbench_job_id']) },
@@ -235,10 +243,8 @@ export function createToolDispatcher({ engine, sessionManager, backend, config, 
       checked_at: new Date().toISOString(),
     }),
 
-    pw_list_projects: async (token) => ({
-      schema_version: SCHEMA_VERSION,
-      projects: resolveProject.list(config, projectStore, token),
-    }),
+    // §4 declares the response model as `list[Project]`, so this returns a bare array.
+    pw_list_projects: async (token) => resolveProject.list(config, projectStore, token),
 
     pw_get_project_capabilities: async (token, args) => resolveProject.capabilities(
       config, projectStore, token, requireArg(args, 'project_id'),
@@ -260,7 +266,12 @@ export function createToolDispatcher({ engine, sessionManager, backend, config, 
 
     pw_verify_session_configuration: async (token, args, ctx) => sessionManager.verifySession({
       token,
-      project: resolveProject.resolve(config, projectStore, token, requireArg(args, 'project_id')),
+      // The session key is `<orchestrator>:<workbench>:<project>:<role>`, so the project is
+      // recoverable from it. Resolution still goes through the grant check.
+      project: resolveProject.resolve(
+        config, projectStore, token,
+        args.project_id ?? String(requireArg(args, 'session_key')).split(':')[2],
+      ),
       request: {
         session_key: requireArg(args, 'session_key'),
         phase_class: requireArg(args, 'phase_class'),

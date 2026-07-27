@@ -256,11 +256,58 @@ export class OrchestrationEngine {
     return rest;
   }
 
+  /**
+   * Project a stored question to the exact `Question` contract shape.
+   *
+   * The stored record carries bookkeeping the contract does not model — an expiry, the answer, when
+   * it was answered. The contract models use `extra="forbid"`, so returning the raw record fails
+   * validation on the other side. Everything that leaves this service is projected deliberately.
+   */
+  _publicQuestion(record) {
+    return {
+      schema_version: SCHEMA_VERSION,
+      question_id: record.question_id,
+      job_id: record.job_id,
+      workbench_question_id: record.question_id,
+      question: record.question,
+      options: record.options,
+      blocking: record.blocking,
+      decision_scope: record.decision_scope,
+      default_action_on_timeout: record.default_action_on_timeout,
+      status: record.status,
+      asked_at: record.asked_at,
+      phase: record.phase,
+    };
+  }
+
+  /** Project a stored approval to the exact `Approval` contract shape. */
+  _publicApproval(record) {
+    return {
+      schema_version: SCHEMA_VERSION,
+      approval_id: record.approval_id,
+      job_id: record.job_id,
+      approval_type: record.approval_type,
+      requested_action: record.requested_action,
+      evidence_summary: record.evidence_summary,
+      artifact_ids: record.artifact_ids,
+      status: record.status,
+      requested_at: record.requested_at,
+      decided_at: record.decided_at,
+      // `Actor` carries no schema_version, and extra="forbid" would reject one.
+      decided_by: record.decided_by
+        ? { kind: record.decided_by.kind, identifier: record.decided_by.identifier }
+        : null,
+      decision_reason: record.decision_reason,
+    };
+  }
+
   getQuestions(token, jobId) {
     this.requireJob(token, jobId);
     return {
       schema_version: SCHEMA_VERSION,
-      questions: this.repo.listForJob(KIND.QUESTIONS, jobId).sort((a, b) => (a.asked_at < b.asked_at ? -1 : 1)),
+      questions: this.repo.listForJob(KIND.QUESTIONS, jobId)
+        .sort((a, b) => (a.asked_at < b.asked_at ? -1 : 1))
+        .map((q) => this._publicQuestion(q)),
     };
   }
 
@@ -268,7 +315,9 @@ export class OrchestrationEngine {
     this.requireJob(token, jobId);
     return {
       schema_version: SCHEMA_VERSION,
-      approvals: this.repo.listForJob(KIND.APPROVALS, jobId).sort((a, b) => (a.requested_at < b.requested_at ? -1 : 1)),
+      approvals: this.repo.listForJob(KIND.APPROVALS, jobId)
+        .sort((a, b) => (a.requested_at < b.requested_at ? -1 : 1))
+        .map((a) => this._publicApproval(a)),
     };
   }
 
@@ -900,7 +949,7 @@ export class OrchestrationEngine {
       decided_at: this.now(),
       // The human is the decider; the orchestrator is the channel. `decided_via` records the
       // channel so the audit trail never loses the distinction.
-      decided_by: { schema_version: SCHEMA_VERSION, kind: ActorKind.HUMAN, identifier: request.decided_by ?? 'recorded-human-decision' },
+      decided_by: { kind: ActorKind.HUMAN, identifier: request.decided_by ?? 'recorded-human-decision' },
       decided_via: token.orchestrator_instance_id,
       decision_reason: request.reason ?? null,
     };

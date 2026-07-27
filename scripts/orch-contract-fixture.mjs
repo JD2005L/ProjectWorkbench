@@ -178,6 +178,20 @@ export function buildFixture() {
           + 'such response is labelled argv-attested in `detail`.',
         needs_coordination: true,
       },
+      {
+        id: 'tmux-session-name-normalisation',
+        summary:
+          "The orchestrator's derive_tmux_session is a plain f\"pw_{project_id}\", while "
+          + 'ProjectWorkbench collapses non-alphanumerics to underscore to match the session name its '
+          + 'existing human terminals already use. For a project id such as PVH-Gateway the two '
+          + 'disagree (pw_PVH-Gateway vs pw_PVH_Gateway).',
+        workaround:
+          'ProjectWorkbench reports the session that actually exists in '
+          + 'OrchestratorSession.project_tmux_session. The orchestrator stores and displays that '
+          + 'value and never constructs a tmux target from it, so the divergence is observable but '
+          + 'not load-bearing. Either side may adopt the other convention.',
+        needs_coordination: true,
+      },
     ],
   };
 }

@@ -102,7 +102,9 @@ export class OrchestratorRepository {
       status: event.status,
       previous_status: previousStatus,
       phase: event.phase ?? null,
-      actor: { schema_version: SCHEMA_VERSION, ...event.actor },
+      // `Actor` is a bare BaseModel on the orchestrator side, not a VersionedContract: it has no
+      // schema_version, and extra="forbid" means adding one fails validation for every event.
+      actor: { kind: event.actor.kind, identifier: event.actor.identifier },
       // ProjectWorkbench holds the raw material, so it redacts first. The orchestrator redacts
       // again on receipt, but by then a leak has already crossed a service boundary.
       message: redactText(String(event.message ?? ''), { maxLength: 2_000 }),

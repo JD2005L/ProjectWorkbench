@@ -210,7 +210,7 @@ test('api: a project the token was not granted is not found or not authorized, n
 
     // The project listing must not disclose it either.
     const listed = await call('GET', '/projects');
-    assert.deepEqual(listed.json.projects.map((p) => p.project_id), ['Demo']);
+    assert.deepEqual(listed.json.map((p) => p.project_id), ['Demo']);
   }, {
     projects: {
       Demo: { display_name: 'Demo', capabilities: ['implementation'] },
@@ -282,7 +282,9 @@ test('api: the project list carries the owning instance on every entry', async (
   await withApi(async ({ call }) => {
     const res = await call('GET', '/projects');
     assert.equal(res.status, 200);
-    const [project] = res.json.projects;
+    // §4 declares the response model as `list[Project]`, so the body is a bare array.
+    assert.ok(Array.isArray(res.json), 'the contract declares list[Project], not an envelope');
+    const [project] = res.json;
     assert.equal(project.workbench_instance_id, INSTANCE, 'an instance is configured, never inferred');
     assert.equal(project.project_id, 'Demo');
     assert.equal(project.authorized, true);

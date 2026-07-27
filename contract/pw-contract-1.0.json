@@ -205,6 +205,10 @@
       "pw_approve_stage": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -244,6 +248,10 @@
       "pw_cancel_job": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -263,6 +271,10 @@
       "pw_ensure_orchestrator_session": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "orchestrator_instance_id": {
             "type": "string",
             "maxLength": 128,
@@ -303,6 +315,10 @@
       "pw_get_approvals": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -317,6 +333,10 @@
       "pw_get_artifact_excerpt": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "artifact_id": {
             "type": "string",
             "maxLength": 128,
@@ -340,6 +360,10 @@
       "pw_get_artifact_metadata": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "artifact_id": {
             "type": "string",
             "maxLength": 128,
@@ -354,6 +378,10 @@
       "pw_get_checks": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -368,6 +396,10 @@
       "pw_get_events": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -391,6 +423,10 @@
       "pw_get_job": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -405,6 +441,10 @@
       "pw_get_project_capabilities": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "project_id": {
             "type": "string",
             "maxLength": 100,
@@ -419,6 +459,10 @@
       "pw_get_questions": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -433,6 +477,10 @@
       "pw_get_result": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -447,6 +495,10 @@
       "pw_get_reviews": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -460,19 +512,33 @@
       },
       "pw_health": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          }
+        },
         "required": [],
         "additionalProperties": false
       },
       "pw_list_projects": {
         "type": "object",
-        "properties": {},
+        "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          }
+        },
         "required": [],
         "additionalProperties": false
       },
       "pw_publish": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "job_id": {
             "type": "string",
             "maxLength": 128,
@@ -516,6 +582,10 @@
       "pw_reply_to_question": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -545,6 +615,10 @@
       "pw_request_review": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -556,6 +630,10 @@
           "requested": {
             "type": "object",
             "properties": {
+              "schema_version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+$"
+              },
               "model_alias": {
                 "type": "string",
                 "maxLength": 120,
@@ -587,6 +665,10 @@
       "pw_request_revision": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -615,6 +697,10 @@
       "pw_stream_events": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "workbench_job_id": {
             "type": "string",
             "maxLength": 128,
@@ -642,6 +728,10 @@
       "pw_verify_session_configuration": {
         "type": "object",
         "properties": {
+          "schema_version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+$"
+          },
           "project_id": {
             "type": "string",
             "maxLength": 100,
@@ -667,6 +757,10 @@
           "requested": {
             "type": "object",
             "properties": {
+              "schema_version": {
+                "type": "string",
+                "pattern": "^\\d+\\.\\d+$"
+              },
               "model_alias": {
                 "type": "string",
                 "maxLength": 120,
@@ -690,7 +784,6 @@
           }
         },
         "required": [
-          "project_id",
           "session_key",
           "phase_class",
           "requested"
@@ -1442,6 +1535,12 @@
       "id": "effective-effort-unverifiable",
       "summary": "Claude Code reports the active model in its stream-json init event but does not report the active effort, and silently ignores an unrecognised --effort value (stderr warning, exit 0, runs at the default). ProjectWorkbench therefore returns effective: null by default, which blocks the job, rather than reporting a guess.",
       "workaround": "PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv makes the operator accept argv attestation; every such response is labelled argv-attested in `detail`.",
+      "needs_coordination": true
+    },
+    {
+      "id": "tmux-session-name-normalisation",
+      "summary": "The orchestrator's derive_tmux_session is a plain f\"pw_{project_id}\", while ProjectWorkbench collapses non-alphanumerics to underscore to match the session name its existing human terminals already use. For a project id such as PVH-Gateway the two disagree (pw_PVH-Gateway vs pw_PVH_Gateway).",
+      "workaround": "ProjectWorkbench reports the session that actually exists in OrchestratorSession.project_tmux_session. The orchestrator stores and displays that value and never constructs a tmux target from it, so the divergence is observable but not load-bearing. Either side may adopt the other convention.",
       "needs_coordination": true
     }
   ]

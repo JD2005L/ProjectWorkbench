@@ -182,21 +182,21 @@ export function createOrchestratorRouter({
     res.json({
       schema_version: SCHEMA_VERSION,
       state: worst,
+      service: 'project-workbench',
+      version: workbenchVersion ?? 'unknown',
       instance_id: config.instanceId,
-      contract_version: '1.0',
       checked_at: new Date().toISOString(),
       // No secret, no account address, no org id, no token — probeAuth already strips those.
-      components,
+      components: components.map((c) => ({ schema_version: SCHEMA_VERSION, ...c })),
       schema_versions_supported: ['1.0'],
     });
   }));
 
+  // §4 declares the response model as `list[Project]`, so this is a bare array rather than an
+  // envelope. An envelope would be friendlier to paginate later, but the contract is normative.
   router.get('/projects', handle(async (req, res) => {
     requireScope(req.token, SCOPES.JOBS_READ);
-    res.json({
-      schema_version: SCHEMA_VERSION,
-      projects: listGrantedProjects(config, projectStore, req.token),
-    });
+    res.json(listGrantedProjects(config, projectStore, req.token));
   }));
 
   router.get('/projects/:project/capabilities', handle(async (req, res) => {
@@ -288,11 +288,28 @@ export function createOrchestratorRouter({
     res.json(requireEngine().getJob(req.token, req.params.id));
   }));
 
+  /**
+   * Parse a bounded integer query parameter.
+   *
+   * `Number(x) || default` silently turns a malformed cursor into 0, which would replay a job's
+   * whole timeline instead of reporting that the caller sent nonsense.
+   */
+  const intParam = (raw, { name, fallback, min, max }) => {
+    if (raw === undefined || raw === '') return fallback;
+    const value = Number(raw);
+    if (!Number.isInteger(value) || value < min || value > max) {
+      throw new ApiError(ErrorCode.VALIDATION_FAILED, `the '${name}' parameter is out of range`, {
+        fieldErrors: [{ field: name, message: `must be an integer between ${min} and ${max}` }],
+      });
+    }
+    return value;
+  };
+
   router.get('/jobs/:id/events', handle(async (req, res) => {
     requireScope(req.token, SCOPES.JOBS_READ);
     res.json(requireEngine().getEvents(req.token, req.params.id, {
-      afterSequence: Number(req.query.after_sequence) || 0,
-      limit: Number(req.query.limit) || 100,
+      afterSequence: intParam(req.query.after_sequence, { name: 'after_sequence', fallback: 0, min: 0, max: Number.MAX_SAFE_INTEGER }),
+      limit: intParam(req.query.limit, { name: 'limit', fallback: 100, min: 1, max: config.maxEventsPerPage }),
     }));
   }));
 

@@ -306,7 +306,11 @@ gitTest('engine: a job runs to the publication gate with real check evidence', a
     assert.equal(approvals[0].approval_type, 'publication');
     assert.equal(approvals[0].status, ApprovalStatus.PENDING);
     assert.ok(approvals[0].requested_action, 'a human must be shown the exact proposed action');
-    assert.ok(approvals[0].expires_at);
+    assert.ok(approvals[0].evidence_summary, 'a human must be shown the evidence behind the request');
+    // The expiry is enforced but not exposed: the contract's Approval model uses extra="forbid"
+    // and has no expires_at member, so emitting one would fail validation on the other side. What
+    // matters is the behaviour, which is asserted in its own test below.
+    assert.equal(approvals[0].expires_at, undefined);
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
 });
 
@@ -381,8 +385,13 @@ gitTest('engine: a question flows out with a real id and only its own answer res
     assert.equal(listed[0].decision_scope, 'architecture');
     assert.equal(listed[0].default_action_on_timeout, 'remain_blocked');
     assert.equal(listed[0].blocking, true);
-    assert.ok(listed[0].expires_at);
     assert.equal(listed[0].options.length, 3);
+    // The contract's Question model forbids extra fields, so the internal expiry, answer and
+    // answered_at are not emitted. Expiry enforcement is asserted in its own test below.
+    for (const internal of ['expires_at', 'answer', 'answered_at', 'selected_option_index']) {
+      assert.equal(listed[0][internal], undefined, `${internal} is internal and must not be emitted`);
+    }
+    assert.equal(listed[0].workbench_question_id, question.question_id);
 
     // A fabricated id fails.
     await assert.rejects(
@@ -407,6 +416,37 @@ gitTest('engine: a question flows out with a real id and only its own answer res
     // A second answer to the same question is refused: it is no longer live.
     await assert.rejects(
       engine.replyToQuestion({ token: TOKEN, jobId, body: { workbench_job_id: jobId, question_id: question.question_id, answer: 'changed my mind' }, idempotencyKey: 'k2' }),
+      (err) => err instanceof ApiError && err.code === 'conflict',
+    );
+  }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
+});
+
+gitTest('engine: an expired question and an expired approval are both refused', async () => {
+  await withEngine(async ({ engine, store }) => {
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+
+    // Expiry is enforced from the durable record even though the contract payload cannot carry it.
+    const question = await engine.raiseQuestion(jobId, { question: 'still relevant?' });
+    await store.transact((tx, state) => {
+      tx.put('questions', question.question_id, { ...state.get('questions', question.question_id), expires_at: '2020-01-01T00:00:00.000Z' });
+    });
+    await assert.rejects(
+      engine.replyToQuestion({ token: TOKEN, jobId, body: { workbench_job_id: jobId, question_id: question.question_id, answer: 'yes' }, idempotencyKey: 'k' }),
+      (err) => err instanceof ApiError && err.code === 'conflict',
+    );
+
+    const approval = engine.getApprovals(TOKEN, jobId).approvals[0];
+    await store.transact((tx, state) => {
+      tx.put('approvals', approval.approval_id, { ...state.get('approvals', approval.approval_id), expires_at: '2020-01-01T00:00:00.000Z' });
+    });
+    await assert.rejects(
+      engine.approveStage({
+        token: TOKEN, jobId,
+        body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+        idempotencyKey: 'a',
+      }),
       (err) => err instanceof ApiError && err.code === 'conflict',
     );
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
