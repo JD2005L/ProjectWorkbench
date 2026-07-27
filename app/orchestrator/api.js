@@ -11,7 +11,9 @@
 
 import express from 'express';
 
-import { SCHEMA_VERSION, PATTERNS, ErrorCode, newId } from './contract.js';
+import {
+  SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION, PATTERNS, ErrorCode, newId,
+} from './contract.js';
 import { ApiError, notFound, sendError, payloadTooLarge } from './errors.js';
 import {
   SCOPES, ServiceTokenStore, RateLimiter, authenticateRequest, requireScope,
@@ -176,6 +178,38 @@ export function createOrchestratorRouter({
       },
       { component: 'runner', state: auth.state, detail: auth.detail ?? null },
     ];
+
+    // Attestation capability, published so an orchestrator can see what kind of evidence this
+    // instance can produce BEFORE it submits work — including which settings it can only enforce
+    // rather than observe.
+    let attestation = null;
+    if (typeof backend.fingerprint === 'function') {
+      const fingerprint = await backend.fingerprint();
+      attestation = {
+        schema_version: SCHEMA_VERSION,
+        contract_version: PROVENANCE_SCHEMA_VERSION,
+        model: 'runtime_reported',
+        // Effort is enforceable only when the fingerprinted binary declares the option.
+        effort: fingerprint.ok && fingerprint.capabilities?.['--effort']?.declared
+          ? 'launch_enforced'
+          : 'unavailable',
+        binary: fingerprint.ok
+          ? {
+            realpath: fingerprint.realpath,
+            version: fingerprint.version,
+            sha256: fingerprint.sha256,
+            declared_effort_values: fingerprint.capabilities?.['--effort']?.values ?? null,
+          }
+          : { failure: fingerprint.failure, detail: fingerprint.detail ?? null },
+      };
+      components.push({
+        component: 'attestation',
+        state: attestation.effort === 'unavailable' ? 'degraded' : 'ok',
+        detail: attestation.effort === 'unavailable'
+          ? 'effective effort cannot be attested against the configured coding CLI'
+          : 'effective effort is enforced at launch, not observed at runtime',
+      });
+    }
     const worst = components.some((c) => c.state === 'down')
       ? 'down'
       : (components.some((c) => c.state === 'degraded') ? 'degraded' : 'ok');
@@ -188,7 +222,8 @@ export function createOrchestratorRouter({
       checked_at: new Date().toISOString(),
       // No secret, no account address, no org id, no token — probeAuth already strips those.
       components: components.map((c) => ({ schema_version: SCHEMA_VERSION, ...c })),
-      schema_versions_supported: ['1.0'],
+      schema_versions_supported: ['1.0', '1.1'],
+      attestation,
     });
   }));
 
@@ -219,6 +254,11 @@ export function createOrchestratorRouter({
         required: true,
       },
       requested: { type: 'object', schema: MODEL_SETTINGS_SCHEMA, required: true },
+      // What the answer must bind to. The peer sends these so the attestation is stamped with the
+      // run and configuration generation being asked about, which is what stops a good answer from
+      // one run being replayed onto another after the binary, model or policy has drifted.
+      run_id: { type: 'identifier', default: 'unbound' },
+      config_generation: { type: 'int', min: 0, default: 0 },
     },
   };
 
@@ -255,9 +295,19 @@ export function createOrchestratorRouter({
       verified: result.effective !== null,
       observed_model: result.observed_model ?? null,
     });
-    // `SessionVerificationResponse` forbids extra fields, so the ProjectWorkbench-side extras are
-    // stripped here rather than at the source — the engine and the audit log still need them.
-    const { observed_model: _observed, requirement: _requirement, cli_session_id: _cli, ...wire } = result;
+    // `SessionVerificationResponse` at 1.0 forbids extra fields, so the ProjectWorkbench-side
+    // extras are stripped rather than leaked — the engine and the audit log still need them. A 1.1
+    // caller additionally receives `provenance` and the enforcement evidence, which is the whole
+    // point of the version: it can tell an observation from an enforcement.
+    // `SessionVerificationResponse` now carries the attestation and DERIVES `effective` from it.
+    // Sending `effective` as a field is refused on the other side — deliberately, because an older
+    // peer never distinguished a value it watched from one it merely passed on the command line.
+    const {
+      observed_model: _observed, requirement: _requirement, cli_session_id: _cli,
+      provenance: _provenance, settings_attestation: settingsAttestation,
+      effective: _effective, ...rest
+    } = result;
+    const wire = { ...rest, attestation: settingsAttestation ?? null };
     if (result.requirement) {
       // The operator-facing reason every job is blocking, where an operator will actually see it.
       // eslint-disable-next-line no-console

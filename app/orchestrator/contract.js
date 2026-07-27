@@ -14,8 +14,68 @@ import crypto from 'crypto';
 /** The wire/storage contract version this build speaks. */
 export const SCHEMA_VERSION = '1.0';
 
-/** Contract versions accepted on inbound payloads. A different *major* is refused, not probed. */
+/**
+ * Contract versions accepted on inbound payloads. A different *major* is refused, not probed.
+ *
+ * Attestation provenance is native to 1.0: `SessionVerificationResponse` carries a
+ * `SettingsAttestation` whose fields each declare how they are known, and `effective` is derived
+ * from it rather than sent. A payload carrying `effective` with no attestation is refused on the
+ * other side rather than read as an observation.
+ */
 export const SUPPORTED_SCHEMA_VERSIONS = Object.freeze(new Set(['1.0']));
+
+/**
+ * The attestation contract version this build implements, carried on every LaunchAttestation.
+ *
+ * A peer below the current version never made these checks, so its payload cannot be read as though
+ * it had — which is why the version travels with the evidence rather than with the envelope.
+ */
+export const PROVENANCE_SCHEMA_VERSION = '1.0';
+
+/**
+ * How ProjectWorkbench knows an effective setting.
+ *
+ * The whole point of naming this is that the two are not equivalent, and a consumer deciding
+ * whether to trust a job should be able to tell them apart:
+ *
+ *   * `runtime_reported` — the running backend reported the value in its own structured output, and
+ *     it was normalised through an explicit alias mapping. This is an observation.
+ *   * `launch_enforced` — ProjectWorkbench owns the argv, verified against the exact configured
+ *     binary's fingerprint that it declares the option and the value, saw no warning that the
+ *     option was ignored, and bound the evidence to this run. This is control, not observation.
+ *     It is weaker: it says what was asked for and that the program said it understood, not what
+ *     the program then did.
+ *   * `unavailable` — neither. The setting is not effective and the job blocks.
+ */
+export const Provenance = Object.freeze({
+  RUNTIME_REPORTED: 'runtime_reported',
+  LAUNCH_ENFORCED: 'launch_enforced',
+  UNAVAILABLE: 'unavailable',
+});
+
+/**
+ * Weakest first. A record is described by its WEAKEST field, never its strongest — describing it by
+ * the strongest would let one observed value launder an unobserved one. Mirrors `_PROVENANCE_STRENGTH`
+ * and `weaker()` in the orchestrator's policy contracts.
+ */
+const PROVENANCE_STRENGTH = Object.freeze({
+  [Provenance.UNAVAILABLE]: 0,
+  [Provenance.LAUNCH_ENFORCED]: 1,
+  [Provenance.RUNTIME_REPORTED]: 2,
+});
+
+export function weakerProvenance(left, right) {
+  return PROVENANCE_STRENGTH[left] <= PROVENANCE_STRENGTH[right] ? left : right;
+}
+
+/** How the coding CLI is authenticated. `api_key` exists so it can be named and refused. */
+export const AuthMode = Object.freeze({ SUBSCRIPTION: 'subscription', API_KEY: 'api_key' });
+
+/** The attestation contract this build implements, as carried on LaunchAttestation. */
+export const ATTESTATION_CONTRACT_VERSION = '1.0';
+
+/** Identifies the fixed server-side argv builder that produced a command line. */
+export const ARGV_BUILDER_ID = 'pw-claude-phase-argv-v1';
 
 /** Default cap on repeated contract fields. */
 export const MAX_LIST_ITEMS = 50;
@@ -172,7 +232,16 @@ export const EVIDENCE_REQUIRING_EVENTS = Object.freeze(new Set([
 // Policy, backend, capability (contracts/policy.py, workbench.py, protocol.py)
 // ---------------------------------------------------------------------------
 
-export const Effort = Object.freeze({ LOW: 'low', MEDIUM: 'medium', HIGH: 'high', MAX: 'max' });
+export const Effort = Object.freeze({
+  LOW: 'low',
+  MEDIUM: 'medium',
+  HIGH: 'high',
+  // Advertised by Claude Code 2.1.220 between `high` and `max`. Added on the orchestrator side for
+  // the same reason it is accepted here: a policy that cannot name a level the binary supports
+  // would silently round down.
+  XHIGH: 'xhigh',
+  MAX: 'max',
+});
 
 export const RiskClass = Object.freeze({ LOW: 'low', NORMAL: 'normal', HIGH: 'high', CRITICAL: 'critical' });
 

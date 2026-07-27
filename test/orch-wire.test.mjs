@@ -59,12 +59,13 @@ import pvi_orchestrator.contracts.events as events
 import pvi_orchestrator.contracts.evidence as evidence
 import pvi_orchestrator.contracts.interaction as interaction
 import pvi_orchestrator.contracts.jobs as jobs
+import pvi_orchestrator.contracts.policy as policy
 import pvi_orchestrator.contracts.publication as publication
 import pvi_orchestrator.contracts.workbench as workbench
 import pvi_orchestrator.contracts.health as health
 import pvi_orchestrator.workbench.protocol as protocol
 
-MODULES = [common, events, evidence, interaction, jobs, publication, workbench, health, protocol]
+MODULES = [common, events, evidence, interaction, jobs, policy, publication, workbench, health, protocol]
 
 def find(name):
     for module in MODULES:
@@ -251,7 +252,10 @@ wireTest('wire: every payload a real job emits validates against the orchestrato
     Project: ['Project', p.project],
     ProjectCapabilities: ['ProjectCapabilities', p.capabilities],
     SessionVerificationResponse: ['SessionVerificationResponse', {
-      schema_version: '1.0', session_key: 'k', effective: p.verification.effective,
+      schema_version: '1.0', session_key: 'k',
+      // `effective` is derived on the other side, never sent: an older peer never distinguished a
+      // value it watched from one it merely passed on the command line, so its word covers neither.
+      attestation: p.verification.settings_attestation ?? null,
       backend: p.verification.backend, checked_at: p.verification.checked_at,
       detail: p.verification.detail,
     }],
@@ -286,6 +290,83 @@ wireTest('wire: every payload a real job emits validates against the orchestrato
   assert.ok(p.approval, 'expected a publication approval');
 
   assertAllValid(validateAgainstContract(cases));
+});
+
+wireTest('wire: the attestation payloads validate against the orchestrator’s policy contracts', async () => {
+  const { buildAttestation, DEFAULT_MODEL_ALIASES } = await import('../app/orchestrator/attestation.js');
+  const fingerprint = {
+    ok: true,
+    realpath: '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+    sha256: '674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863',
+    version: '2.1.220 (Claude Code)',
+    capabilities: {
+      '--effort': { declared: true, values: ['low', 'medium', 'high', 'xhigh', 'max'] },
+      '--model': { declared: true, values: null },
+    },
+  };
+  const common = {
+    aliases: DEFAULT_MODEL_ALIASES,
+    fingerprint,
+    argvOwnedByServer: true,
+    binding: {
+      session_key: 'orch:wb-test-01:Demo:pvi2-orchestrator',
+      run_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+      config_generation: 3,
+      at: '2026-07-27T12:00:00.000Z',
+    },
+    peerSchemaVersion: '1.1',
+    instanceId: INSTANCE,
+    argv: ['-p', 'x', '--model', 'sonnet', '--effort', 'high'],
+    stderr: '',
+  };
+  const init = {
+    model: 'claude-sonnet-5', apiKeySource: 'none', claude_code_version: '2.1.220',
+    session_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+  };
+
+  // The combination the installed CLI actually produces: model observed, effort enforced.
+  const enforced = buildAttestation({ ...common, init, requested: { model_alias: 'sonnet', effort: 'high' } });
+  // And a hypothetical CLI that reports effort, where no launch record is needed at all.
+  const observed = buildAttestation({
+    ...common, init: { ...init, effort: 'high' }, requested: { model_alias: 'sonnet', effort: 'high' },
+  });
+  // xhigh, which the binary advertises and the orchestrator's Effort enum now names.
+  const xhigh = buildAttestation({ ...common, init, requested: { model_alias: 'sonnet', effort: 'xhigh' } });
+
+  assertAllValid(validateAgainstContract({
+    'SettingsAttestation(model runtime, effort enforced)': ['SettingsAttestation', enforced.settings_attestation],
+    'SettingsAttestation(both runtime)': ['SettingsAttestation', observed.settings_attestation],
+    'SettingsAttestation(xhigh enforced)': ['SettingsAttestation', xhigh.settings_attestation],
+    'LaunchAttestation': ['LaunchAttestation', enforced.settings_attestation.launch],
+    'ModelSettings(xhigh)': ['ModelSettings', xhigh.settings_attestation.effective],
+  }));
+
+  // The launch record must be present exactly when something is launch_enforced, and absent when
+  // nothing is — the contract's validator enforces both directions.
+  assert.ok(enforced.settings_attestation.launch);
+  assert.equal(observed.settings_attestation.launch, null);
+});
+
+wireTest('wire: a verification response sends the attestation and never `effective`', async () => {
+  // The contract derives `effective` from the attestation. A payload carrying `effective` is
+  // refused rather than read as an observation, so sending it would be a hard incompatibility.
+  const withEffective = {
+    schema_version: '1.0', session_key: 'orch:wb:Demo:pvi2-orchestrator',
+    effective: { schema_version: '1.0', model_alias: 'sonnet', effort: 'high' },
+    backend: 'claude-code', checked_at: '2026-07-27T12:00:00.000Z', detail: null,
+  };
+  const rejected = validateAgainstContract({ x: ['SessionVerificationResponse', withEffective] });
+  assert.ok(rejected.x, 'a payload carrying `effective` must be refused by the contract');
+  assert.match(rejected.x, /extra_forbidden/);
+
+  // A null attestation is the honest "could not determine, with any provenance".
+  assertAllValid(validateAgainstContract({
+    'SessionVerificationResponse(blocked)': ['SessionVerificationResponse', {
+      schema_version: '1.0', session_key: 'orch:wb:Demo:pvi2-orchestrator',
+      attestation: null, backend: 'claude-code',
+      checked_at: '2026-07-27T12:00:00.000Z', detail: 'effort could not be attested',
+    }],
+  }));
 });
 
 wireTest('wire: an Actor carries no schema_version — it is a bare model on the other side', async () => {

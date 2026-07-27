@@ -52,8 +52,12 @@ import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 // contract vocabulary
 // ---------------------------------------------------------------------------
 
-test('contract: schema version is the normative 1.0 and is the only supported version', () => {
+test('contract: 1.0 is the only wire version, and it carries provenance natively', () => {
   assert.equal(SCHEMA_VERSION, '1.0');
+  // Provenance is not a version bump: SessionVerificationResponse carries a SettingsAttestation
+  // whose fields each declare how they are known, and derives `effective` from it. There is no
+  // second envelope version to negotiate, and no shape in which an observation and an enforcement
+  // look alike.
   assert.deepEqual([...SUPPORTED_SCHEMA_VERSIONS].sort(), ['1.0']);
   assert.equal(MAX_LIST_ITEMS, 50);
 });
@@ -105,7 +109,9 @@ test('contract: evidence-requiring event types match the orchestrator events.py 
 });
 
 test('contract: enum vocabularies match the orchestrator contracts', () => {
-  assert.deepEqual(Object.values(Effort).sort(), ['high', 'low', 'max', 'medium']);
+  // xhigh is advertised by the CLI and named by the orchestrator's Effort enum; a policy that
+  // cannot name a level the binary supports would silently round down.
+  assert.deepEqual(Object.values(Effort).sort(), ['high', 'low', 'max', 'medium', 'xhigh']);
   assert.deepEqual(Object.values(CodingBackend).sort(), ['claude-code', 'codex-cli']);
   assert.deepEqual(Object.values(PhaseClass).sort(), [
     'discovery', 'high_risk_design', 'high_risk_review', 'implementation',
@@ -284,7 +290,9 @@ test('validate: integer bounds, list caps, enums and nested objects are enforced
   assert.throws(() => validate(schema, { turns: 0, effort: 'high', criteria: ['a'] }), ValidationError);
   assert.throws(() => validate(schema, { turns: 61, effort: 'high', criteria: ['a'] }), ValidationError);
   assert.throws(() => validate(schema, { turns: 1.5, effort: 'high', criteria: ['a'] }), ValidationError);
-  assert.throws(() => validate(schema, { turns: 1, effort: 'xhigh', criteria: ['a'] }), ValidationError);
+  // `xhigh` is now a contract effort; `ultra` is not, and is still refused.
+  assert.doesNotThrow(() => validate(schema, { turns: 1, effort: 'xhigh', criteria: ['a'] }));
+  assert.throws(() => validate(schema, { turns: 1, effort: 'ultra', criteria: ['a'] }), ValidationError);
   assert.throws(() => validate(schema, { turns: 1, effort: 'high', criteria: [] }), ValidationError);
   assert.throws(
     () => validate(schema, { turns: 1, effort: 'high', criteria: Array(MAX_LIST_ITEMS + 1).fill('a') }),

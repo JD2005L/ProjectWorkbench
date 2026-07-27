@@ -424,6 +424,13 @@ export class OrchestratorSessionManager {
         cliSessionId: record.cli_session_id,
         cwd: record.workspace_path,
         displayName: record.cli_display_name,
+        // The version the CALLER spoke. A peer that cannot express provenance is not told a setting
+        // is effective when the only basis is launch enforcement.
+        sessionKey: record.session_key,
+        // The caller's binding, not one invented here. A peer that sends the default `unbound` has
+        // not bound its request to a run, so nothing can be attested to that run.
+        runId: request.run_id ?? 'unbound',
+        configGeneration: Number.isInteger(request.config_generation) ? request.config_generation : 0,
       });
     } catch (err) {
       // A backend that cannot answer is reported as unverifiable rather than as a server error: the
@@ -469,6 +476,8 @@ export class OrchestratorSessionManager {
       observed_model: outcome?.observed_model ?? null,
       requirement: outcome?.requirement ?? null,
       cli_session_id: outcome?.cli_session_id ?? record.cli_session_id ?? null,
+      provenance: outcome?.provenance ?? null,
+      settings_attestation: outcome?.settings_attestation ?? null,
     };
   }
 

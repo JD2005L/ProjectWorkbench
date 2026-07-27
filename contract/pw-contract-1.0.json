@@ -853,7 +853,8 @@
       "high",
       "low",
       "max",
-      "medium"
+      "medium",
+      "xhigh"
     ],
     "RiskClass": [
       "critical",
@@ -1025,6 +1026,36 @@
       "unsupported_schema_version",
       "validation_failed",
       "workbench_unavailable"
+    ],
+    "AttestationProvenance": [
+      "launch_enforced",
+      "runtime_reported",
+      "unavailable"
+    ],
+    "AuthMode": [
+      "api_key",
+      "subscription"
+    ]
+  },
+  "attestation": {
+    "contract_version": "1.0",
+    "argv_builder_id": "pw-claude-phase-argv-v1",
+    "model": "runtime_reported",
+    "effort": "launch_enforced",
+    "provenance_strength": [
+      "unavailable",
+      "launch_enforced",
+      "runtime_reported"
+    ],
+    "launch_enforcement_preconditions": [
+      "the configured executable is an absolute path, not a PATH lookup",
+      "it is not a shell wrapper that could rewrite argv",
+      "its content SHA-256 matches the pin when one is configured",
+      "its own --help declares the option and lists the exact value",
+      "the run emitted no ignored-option warning",
+      "the argv came from the fixed server-side builder with no caller override",
+      "the session is subscription authenticated",
+      "the caller bound the request to a run and configuration generation"
     ]
   },
   "state_families": {
@@ -1535,7 +1566,8 @@
     "cancellation_preserves_working_tree": true,
     "cancellation_signals_the_running_phase": true,
     "publication_uses_a_private_index": true,
-    "effort_attestation_available": false,
+    "effort_attestation_runtime_reported": false,
+    "effort_attestation_launch_enforced": true,
     "approval_requires_separate_scope": true,
     "approval_requires_separate_credential_by_default": true,
     "api_key_authentication_representable": false,
@@ -1544,10 +1576,10 @@
   },
   "known_gaps": [
     {
-      "id": "effective-effort-unattestable",
-      "summary": "Measured against Claude Code 2.1.220: the stream-json system/init event carries model, permissionMode and apiKeySource but NO effort field of any kind, and an unrecognised --effort value is silently ignored (stderr warning, exit 0, running at the default). Effective effort therefore cannot be attested against this CLI at all.",
-      "behaviour": "ProjectWorkbench reports effective: null and moves the job to blocked_configuration. There is no configuration that relaxes this — an earlier argv-attestation mode made the check requested === requested and has been removed. Jobs will not run against a CLI that cannot report effort.",
-      "requirement": "Effective effort can only be attested by a coding CLI that reports the effort actually in force for the running session — as an `effort`, `effortLevel`, or `reasoning_effort` field on the stream-json `system/init` event, or via an equivalent status command. Claude Code 2.1.220 reports the active model and permission mode but no effort, and silently ignores an unrecognised --effort value, so effort cannot be attested against it and jobs will block at blocked_configuration. Passing the flag is not attestation: it is the assumption the contract exists to forbid.",
+      "id": "effective-effort-not-runtime-reported",
+      "summary": "Measured against Claude Code 2.1.220: the stream-json system/init event carries model, permissionMode and apiKeySource but NO effort field, so effort cannot be OBSERVED. Its --help does declare `--effort <level>` with (low, medium, high, xhigh, max), so it can be ENFORCED at launch against a fingerprinted binary.",
+      "behaviour": "Effort is reported with provenance launch_enforced, never runtime_reported. That is a chain of custody over an input, not an observation: a launched flag can still be ignored by a build nobody fingerprinted. Any precondition failing yields no attestation at all and the job blocks.",
+      "requirement": "Runtime-reported effort requires a coding CLI that reports the effort in force for the running session — an `effort`, `effortLevel` or `reasoning_effort` field on the stream-json `system/init` event, or an equivalent status command. Claude Code 2.1.220 reports the active model and permission mode but no effort. Where the CLI instead *declares* the option and its permitted values in --help, ProjectWorkbench can enforce the value at launch and report provenance launch_enforced (schema 1.1) — which states what was passed to a fingerprinted binary that accepted it, not what the model then did. A 1.0 peer cannot express that distinction and is told the setting is not effective.",
       "needs_coordination": true
     },
     {

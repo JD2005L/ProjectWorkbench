@@ -57,13 +57,15 @@ test('fixture: it describes the whole surface the orchestrator needs to check co
   }
   // The known gaps must be declared rather than buried, so the other side can plan around them.
   const gaps = fixture.known_gaps.map((g) => g.id);
-  assert.ok(gaps.includes('effective-effort-unattestable'));
+  assert.ok(gaps.includes('effective-effort-not-runtime-reported'));
   assert.ok(gaps.includes('model-alias-namespace'));
-  // And the capability statement must be machine-readable: an orchestrator should be able to see
-  // that this instance cannot attest effort *before* it submits work that will only block.
-  assert.equal(fixture.safety.effort_attestation_available, false);
+  // The capability statement must be machine-readable: an orchestrator should be able to see the
+  // KIND of evidence it will get before it submits work.
+  assert.equal(fixture.safety.effort_attestation_runtime_reported, false);
+  assert.equal(fixture.safety.effort_attestation_launch_enforced, true);
   assert.equal(fixture.safety.approval_requires_separate_credential_by_default, true);
-  assert.ok(fixture.known_gaps.find((g) => g.id === 'effective-effort-unattestable').requirement.length > 40);
+  assert.deepEqual(fixture.attestation.provenance_strength, ['unavailable', 'launch_enforced', 'runtime_reported']);
+  assert.ok(fixture.attestation.launch_enforcement_preconditions.length >= 8);
 });
 
 crossTest('cross-contract: the job state vocabulary matches the orchestrator member for member', () => {
@@ -97,7 +99,9 @@ from pvi_orchestrator.contracts.evidence import ArtifactKind, CheckKind, CheckOu
 from pvi_orchestrator.contracts.interaction import (
     DecisionScope, QuestionStatus, TimeoutAction, ApprovalType, ApprovalStatus, HUMAN_ONLY_SCOPES,
 )
-from pvi_orchestrator.contracts.policy import PhaseClass, ModelVerificationOutcome
+from pvi_orchestrator.contracts.policy import (
+    PhaseClass, ModelVerificationOutcome, AttestationProvenance, AuthMode,
+)
 from pvi_orchestrator.contracts.publication import CiState, DeploymentStatus
 from pvi_orchestrator.contracts.health import HealthState, AuthMethod
 from pvi_orchestrator.contracts.workbench import CodingBackend, OrchestratorSessionStatus
@@ -116,6 +120,7 @@ print(json.dumps({
     "TimeoutAction": members(TimeoutAction), "ApprovalType": members(ApprovalType),
     "ApprovalStatus": members(ApprovalStatus), "PhaseClass": members(PhaseClass),
     "ModelVerificationOutcome": members(ModelVerificationOutcome),
+    "AttestationProvenance": members(AttestationProvenance), "AuthMode": members(AuthMode),
     "CiState": members(CiState), "DeploymentStatus": members(DeploymentStatus),
     "HealthState": members(HealthState), "AuthMethod": members(AuthMethod),
     "CodingBackend": members(CodingBackend),
@@ -132,7 +137,7 @@ print(json.dumps({
     'ArtifactKind', 'CheckKind', 'CheckOutcome', 'ReviewVerdict', 'DecisionScope', 'QuestionStatus',
     'TimeoutAction', 'ApprovalType', 'ApprovalStatus', 'PhaseClass', 'ModelVerificationOutcome',
     'CiState', 'DeploymentStatus', 'HealthState', 'AuthMethod', 'CodingBackend',
-    'OrchestratorSessionStatus', 'CapabilityFlag',
+    'OrchestratorSessionStatus', 'CapabilityFlag', 'AttestationProvenance', 'AuthMode',
   ]) {
     assert.deepEqual(fixture.enums[name], remote[name], `${name} differs from the orchestrator`);
   }

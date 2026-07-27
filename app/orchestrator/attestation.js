@@ -23,7 +23,12 @@
 // silently ignored (warning on stderr, exit 0, running at the default). Effort is therefore not
 // attestable, and this module says so rather than inventing a value.
 
-import { SCHEMA_VERSION, Effort } from './contract.js';
+import crypto from 'crypto';
+
+import {
+  SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION, Provenance, weakerProvenance, AuthMode,
+  ATTESTATION_CONTRACT_VERSION, ARGV_BUILDER_ID, Effort,
+} from './contract.js';
 
 /**
  * What a coding CLI must provide before ProjectWorkbench can attest effective effort.
@@ -32,13 +37,24 @@ import { SCHEMA_VERSION, Effort } from './contract.js';
  * here is what would unblock it".
  */
 export const EFFORT_ATTESTATION_REQUIREMENT =
-  'Effective effort can only be attested by a coding CLI that reports the effort actually in force '
-  + 'for the running session — as an `effort`, `effortLevel`, or `reasoning_effort` field on the '
-  + 'stream-json `system/init` event, or via an equivalent status command. Claude Code 2.1.220 '
-  + 'reports the active model and permission mode but no effort, and silently ignores an '
-  + 'unrecognised --effort value, so effort cannot be attested against it and jobs will block at '
-  + 'blocked_configuration. Passing the flag is not attestation: it is the assumption the contract '
-  + 'exists to forbid.';
+  'Runtime-reported effort requires a coding CLI that reports the effort in force for the running '
+  + 'session — an `effort`, `effortLevel` or `reasoning_effort` field on the stream-json '
+  + '`system/init` event, or an equivalent status command. Claude Code 2.1.220 reports the active '
+  + 'model and permission mode but no effort. Where the CLI instead *declares* the option and its '
+  + 'permitted values in --help, ProjectWorkbench can enforce the value at launch and report '
+  + 'provenance launch_enforced (schema 1.1) — which states what was passed to a fingerprinted '
+  + 'binary that accepted it, not what the model then did. A 1.0 peer cannot express that '
+  + 'distinction and is told the setting is not effective.';
+
+/** Preconditions for claiming a setting was enforced at launch. All must hold; each is reported. */
+export const LaunchEnforcementFailure = Object.freeze({
+  NO_FINGERPRINT: 'no_fingerprint',
+  OPTION_NOT_DECLARED: 'option_not_declared',
+  VALUE_NOT_DECLARED: 'value_not_declared',
+  OPTION_IGNORED: 'option_ignored',
+  ARGV_NOT_OWNED: 'argv_not_owned',
+  NOT_BOUND: 'not_bound',
+});
 
 /**
  * Shortest usable model-id prefix. Anything shorter is a wildcard in disguise: `"*"` or `"c*"` would
@@ -185,21 +201,181 @@ export function attestEffort({ requestedEffort, init, stderr = '' }) {
       reason: `the session is running at '${observed}' effort, not '${requestedEffort}'`,
     };
   }
-  return { verified: true, outcome: 'verified', observed, reason: null };
+  return { verified: true, outcome: 'verified', observed, reason: null, provenance: Provenance.RUNTIME_REPORTED };
 }
 
 /**
- * Build the combined verdict for a session.
+ * Attest a setting ProjectWorkbench enforced at launch.
  *
- * `effective` is non-null only when the model is attested, the effort is attested, and the session
- * is subscription-backed. Anything else yields `null` and `blocking: true`, which the engine turns
- * into `blocked_configuration` before a single file is read.
+ * This is deliberately hard to satisfy, because the claim is weaker than an observation and must not
+ * be mistaken for one. Every condition below is a way the claim could be false:
+ *
+ *   * the binary must be the exact configured one, fingerprinted — otherwise "we launched it with
+ *     this flag" names no particular program;
+ *   * that binary's own `--help` must declare the option *and* list the value — a flag a program
+ *     does not know about is not enforcement, and Claude Code accepts an unknown --effort value
+ *     silently;
+ *   * the run must not have warned that it ignored the option;
+ *   * the argv must have come from the fixed server-side builder, never from a caller;
+ *   * and the evidence must be bound to this session, this run and this configuration generation,
+ *     so it cannot be replayed from an earlier, differently configured launch.
  */
-export function buildAttestation({ requested, aliases, init, stderr = '' }) {
+export function attestLaunchEnforced({
+  option, value, fingerprint, stderr = '', argvOwnedByServer, binding,
+}) {
+  const fail = (failure, reason) => ({
+    verified: false, outcome: failure, observed: null, reason, provenance: Provenance.UNAVAILABLE,
+  });
+
+  if (!argvOwnedByServer) {
+    return fail(LaunchEnforcementFailure.ARGV_NOT_OWNED,
+      'the launch arguments were not built solely by ProjectWorkbench');
+  }
+  if (!fingerprint?.ok) {
+    return fail(LaunchEnforcementFailure.NO_FINGERPRINT,
+      `the coding CLI could not be fingerprinted (${fingerprint?.failure ?? 'unknown'})`);
+  }
+  const capability = fingerprint.capabilities?.[option];
+  if (!capability?.declared) {
+    return fail(LaunchEnforcementFailure.OPTION_NOT_DECLARED,
+      `the coding CLI does not declare ${option}`);
+  }
+  if (!Array.isArray(capability.values) || !capability.values.includes(value)) {
+    // Claude Code accepts an unrecognised --effort value with only a stderr warning and runs at its
+    // default, so "the option exists" is not enough — the *value* has to be one it declares.
+    return fail(LaunchEnforcementFailure.VALUE_NOT_DECLARED,
+      `the coding CLI does not declare '${value}' as a permitted value for ${option}`);
+  }
+  const warning = extractIgnoredOptionWarning(stderr, option);
+  if (warning) {
+    return fail(LaunchEnforcementFailure.OPTION_IGNORED, warning);
+  }
+  if (!binding?.session_key || !binding?.run_id
+    || !Number.isInteger(binding?.config_generation) || binding.config_generation < 0) {
+    return fail(LaunchEnforcementFailure.NOT_BOUND,
+      'the enforcement evidence is not bound to a session, run and configuration generation');
+  }
+  // `unbound` is the contract's default for a peer that did not say which run it is asking about.
+  // An attestation stamped with it is not bound to anything, so it is not made at all.
+  if (binding.run_id === 'unbound') {
+    return fail(LaunchEnforcementFailure.NOT_BOUND,
+      'the caller did not bind its request to a run, so a launch cannot be attested to one');
+  }
+  if (binding.auth_mode !== AuthMode.SUBSCRIPTION) {
+    return fail(LaunchEnforcementFailure.NOT_BOUND,
+      'launch enforcement requires a subscription-authenticated backend');
+  }
+
+  return { verified: true, outcome: 'enforced', observed: value, reason: null, provenance: Provenance.LAUNCH_ENFORCED };
+}
+
+/** A backend that says it ignored the flag has already told us the enforcement did not happen. */
+export function extractIgnoredOptionWarning(stderr, option) {
+  const text = String(stderr ?? '');
+  const patterns = [
+    new RegExp(`unknown ${option.replace(/^-+/, '--')} value[^\\n]*`, 'i'),
+    new RegExp(`ignoring[^\\n]*${option.replace(/^-+/, '')}[^\\n]*`, 'i'),
+    new RegExp(`${option}[^\\n]*\\bignor(?:ed|ing)\\b[^\\n]*`, 'i'),
+    /unsupported option[^\n]*/i,
+  ];
+  for (const pattern of patterns) {
+    const match = pattern.exec(text);
+    if (match) return match[0].trim().slice(0, 200);
+  }
+  return null;
+}
+
+/** Subscription or API key — named so it can be refused rather than silently accepted. */
+export function authModeOf(init) {
+  return init?.apiKeySource === 'none' ? AuthMode.SUBSCRIPTION : AuthMode.API_KEY;
+}
+
+/** Stable digest of a structure, used for the capability and argv fingerprints. */
+function digest(value) {
+  return crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
+}
+
+/**
+ * The `LaunchAttestation` the orchestrator's contract defines.
+ *
+ * Every field is something the orchestrator cannot check for itself — it does not run the binary.
+ * The value of the record is that a named party puts its name to each claim, and the contract's own
+ * validator refuses the lot if any is missing. Note the two hostile defaults on that side:
+ * `caller_controlled_argv` defaults to true and `auth_mode` to `api_key`, so a payload that omits
+ * them fails closed rather than reading as safe.
+ */
+export function buildLaunchAttestation({
+  instanceId, fingerprint, argv, binding, stderr = '', authMode,
+}) {
+  const advertisedOptions = Object.keys(fingerprint.capabilities ?? {})
+    .filter((option) => fingerprint.capabilities[option]?.declared);
+  const advertisedValues = {};
+  for (const option of advertisedOptions) {
+    const values = fingerprint.capabilities[option]?.values;
+    if (Array.isArray(values)) advertisedValues[option] = values;
+  }
+
+  return {
+    schema_version: SCHEMA_VERSION,
+    attested_by: instanceId,
+    binary_path: fingerprint.realpath.slice(0, 200),
+    binary_version: fingerprint.version.slice(0, 200),
+    // A digest of the advertised capability *surface*, not merely of the file: if what the binary
+    // advertises moves, the binary that advertised the option is not the binary that ran.
+    capability_fingerprint: digest({
+      realpath: fingerprint.realpath,
+      version: fingerprint.version,
+      sha256: fingerprint.sha256,
+      capabilities: fingerprint.capabilities,
+    }),
+    advertised_options: advertisedOptions,
+    advertised_values: advertisedValues,
+    argv_builder_id: ARGV_BUILDER_ID,
+    argv_digest: digest(argv),
+    // False, and it has to be: if a caller could put anything on the command line, the digest would
+    // attest to the caller's intent rather than to policy.
+    caller_controlled_argv: false,
+    ignored_option_warning: extractIgnoredOptionWarning(stderr, '--effort'),
+    auth_mode: authMode,
+    session_key: binding.session_key,
+    run_id: binding.run_id,
+    config_generation: binding.config_generation,
+    attested_at: binding.at,
+    contract_version: ATTESTATION_CONTRACT_VERSION,
+  };
+}
+
+export function buildAttestation({
+  requested, aliases, init, stderr = '',
+  fingerprint = null, argvOwnedByServer = false, binding = null,
+  instanceId = null, argv = [],
+}) {
   const model = attestModel({
     requestedAlias: requested.model_alias, observedModel: init?.model, aliases,
   });
-  const effort = attestEffort({ requestedEffort: requested.effort, init, stderr });
+  model.provenance = model.verified ? Provenance.RUNTIME_REPORTED : Provenance.UNAVAILABLE;
+
+  // Runtime observation first: it is strictly stronger, so a CLI that grows an effort field is
+  // preferred automatically and the enforcement path simply stops being used.
+  let effort = attestEffort({ requestedEffort: requested.effort, init, stderr });
+  if (!effort.verified && effort.outcome === 'unavailable') {
+    const enforced = attestLaunchEnforced({
+      option: '--effort', value: requested.effort, fingerprint, stderr, argvOwnedByServer,
+      binding: { ...binding, auth_mode: authModeOf(init) },
+    });
+    if (enforced.verified) {
+      effort = enforced;
+    } else {
+      // Keep the runtime explanation — the CLI genuinely does not report effort — but say why the
+      // fallback did not apply either. Without both halves an operator sees "not reported" and has
+      // no idea that enforcement was attempted and refused, or on what grounds.
+      effort = {
+        ...effort,
+        reason: `${effort.reason}; and it could not be enforced at launch: ${enforced.reason}`,
+        enforcement_failure: enforced.outcome,
+      };
+    }
+  }
 
   // `apiKeySource` is reported in the init event; "none" is the subscription case. Anything else
   // means inference is billed to an API account, which the product forbids — and the contract's
@@ -221,19 +397,60 @@ export function buildAttestation({ requested, aliases, init, stderr = '' }) {
 
   const attested = subscriptionBacked && model.verified && effort.verified;
 
+  // No separate disclosure gate: the contract itself carries provenance, so there is no shape in
+  // which an enforcement can be mistaken for an observation. A peer that fails to bind its request
+  // simply gets no launch attestation, and therefore no effective settings.
+  const disclosable = attested;
+
   return {
     // The contract vocabulary, not the vendor id: the orchestrator asked for an alias and compares
     // against the alias it asked for.
-    effective: attested
+    effective: disclosable
       ? { schema_version: SCHEMA_VERSION, model_alias: requested.model_alias, effort: effort.observed }
       : null,
-    blocking: !attested,
+    blocking: !disclosable,
+    // The provenance of each half, published rather than flattened away. `attested` records that
+    // ProjectWorkbench itself is satisfied even when the answer is withheld from an old peer, so an
+    // operator can tell "not attested" from "not disclosable to this caller".
+    attested,
+    provenance: {
+      schema_version: PROVENANCE_SCHEMA_VERSION,
+      model: model.provenance,
+      effort: effort.provenance ?? Provenance.UNAVAILABLE,
+      // A record is described by its weakest field. Describing it by the strongest would let the
+      // observed model launder an effort nobody observed.
+      weakest: weakerProvenance(model.provenance, effort.provenance ?? Provenance.UNAVAILABLE),
+    },
+    // The `SettingsAttestation` the orchestrator's contract defines, or null. Its validator refuses
+    // a record carrying an UNAVAILABLE field outright — "omit the attestation entirely so the caller
+    // fails closed rather than reading a partial one as partial trust" — so it is only built when
+    // both halves are established.
+    settings_attestation: attested && instanceId
+      ? {
+        schema_version: SCHEMA_VERSION,
+        effective: { schema_version: SCHEMA_VERSION, model_alias: requested.model_alias, effort: effort.observed },
+        model_provenance: model.provenance,
+        effort_provenance: effort.provenance,
+        launch: effort.provenance === Provenance.LAUNCH_ENFORCED || model.provenance === Provenance.LAUNCH_ENFORCED
+          ? buildLaunchAttestation({
+            instanceId, fingerprint, argv, stderr,
+            binding: { ...binding, auth_mode: authModeOf(init) },
+            authMode: authModeOf(init),
+          })
+          : null,
+        // Required for any runtime_reported field: "the backend said sonnet" means nothing unless
+        // the step from what it actually printed is written down.
+        normalization: model.provenance === Provenance.RUNTIME_REPORTED
+          ? [`init.model=${model.observed} -> ${requested.model_alias}`]
+          : [],
+      }
+      : null,
     model,
     effort,
     observed_model: model.observed,
     api_key_source: apiKeySource,
     cli_version: typeof init?.claude_code_version === 'string' ? init.claude_code_version : null,
-    detail: attested ? null : reasons.filter(Boolean).join('; ').slice(0, 200),
+    detail: disclosable ? null : reasons.filter(Boolean).join('; ').slice(0, 200),
     // Surfaced separately so an operator sees the actionable requirement rather than only a refusal.
     requirement: effort.outcome === 'unavailable' ? EFFORT_ATTESTATION_REQUIREMENT : null,
   };

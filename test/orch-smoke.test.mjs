@@ -163,8 +163,17 @@ test('smoke: the mounted HTTP surface authenticates, discovers, and refuses corr
       assert.equal(readiness.status, 200);
       assert.deepEqual(
         readiness.json.components.map((c) => c.component).sort(),
-        ['queue', 'runner', 'store'],
+        ['attestation', 'queue', 'runner', 'store'],
       );
+      // The attestation capability is published so an orchestrator can see the KIND of evidence
+      // this instance produces before submitting work that might only block.
+      assert.equal(readiness.json.attestation.model, 'runtime_reported');
+      assert.ok(['launch_enforced', 'unavailable'].includes(readiness.json.attestation.effort));
+      assert.equal(readiness.json.attestation.contract_version, '1.0');
+      // The binary identity travels with it, and no credential does.
+      const blob = JSON.stringify(readiness.json.attestation);
+      assert.ok(!blob.includes(TOKEN));
+      assert.ok(!/sk-ant|ghp_|Bearer /.test(blob));
       assert.ok(!JSON.stringify(readiness.json).includes(TOKEN));
 
       // Discovery.

@@ -1,0 +1,411 @@
+// Attestation provenance (orchestrator contracts/policy.py).
+//
+// The distinction this pins down: `runtime_reported` is an observation — the backend emitted the
+// value and it was normalised through a recorded mapping. `launch_enforced` is control over an
+// *input* — ProjectWorkbench owned the argv, the exact fingerprinted binary advertises the option
+// and the value, and no ignored-option warning appeared. The second is genuinely weaker, and the
+// product must never print one while meaning the other.
+//
+// Live evidence from the installed CLI (2.1.220), which is what makes each case concrete:
+//   --help declares `--effort <level>` with `(low, medium, high, xhigh, max)`
+//   the runtime init event reports the resolved model and says nothing about effort
+//   /usr/local/bin/claude is a WRAPPER that appends --permission-mode and --mcp-config to argv
+//   /bin/claude -> .../claude-code/bin/claude.exe is the real ELF binary
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+import {
+  buildAttestation, attestLaunchEnforced, buildLaunchAttestation, extractIgnoredOptionWarning,
+  authModeOf, DEFAULT_MODEL_ALIASES,
+} from '../app/orchestrator/attestation.js';
+import {
+  parseOptionCapability, probeBinaryFingerprint, FingerprintCache, FingerprintFailure,
+} from '../app/orchestrator/runner/fingerprint.js';
+import { Provenance, weakerProvenance, AuthMode, Effort } from '../app/orchestrator/contract.js';
+
+const INSTANCE = 'wb-test-01';
+
+/** The real `--help` block for --effort, verbatim from the installed CLI. */
+const REAL_HELP = [
+  '  --dangerously-skip-permissions        Bypass all permission checks.',
+  '  --effort <level>                      Effort level for the current session',
+  '                                        (low, medium, high, xhigh, max)',
+  '  --exclude-dynamic-system-prompt-sections',
+  '  --model <model>                       Model for the current session',
+].join('\n');
+
+/** A fingerprint of the real binary, as the prober would return it. */
+const GOOD_FINGERPRINT = Object.freeze({
+  ok: true,
+  realpath: '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+  sha256: '674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863',
+  version: '2.1.220 (Claude Code)',
+  capabilities: {
+    '--effort': { declared: true, values: ['low', 'medium', 'high', 'xhigh', 'max'] },
+    '--model': { declared: true, values: null },
+  },
+  identity: { dev: 47, inode: 1253244, size: 275012592, mtimeMs: 1785144521000 },
+});
+
+const BINDING = Object.freeze({
+  session_key: 'orch:wb-test-01:Demo:pvi2-orchestrator',
+  run_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+  config_generation: 3,
+  at: '2026-07-27T12:00:00.000Z',
+  auth_mode: AuthMode.SUBSCRIPTION,
+});
+
+/** The real init event: resolved model, no effort, subscription auth. */
+const INIT = Object.freeze({
+  type: 'system', subtype: 'init', model: 'claude-sonnet-5', apiKeySource: 'none',
+  claude_code_version: '2.1.220', session_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+  permissionMode: 'plan',
+});
+
+const ARGV = ['-p', 'x', '--model', 'sonnet', '--effort', 'high', '--output-format', 'stream-json'];
+
+const build = (overrides = {}) => buildAttestation({
+  requested: { model_alias: 'sonnet', effort: 'high' },
+  aliases: DEFAULT_MODEL_ALIASES,
+  init: INIT,
+  stderr: '',
+  fingerprint: GOOD_FINGERPRINT,
+  argvOwnedByServer: true,
+  binding: BINDING,
+  instanceId: INSTANCE,
+  argv: ARGV,
+  ...overrides,
+});
+
+// ---------------------------------------------------------------------------
+// the vocabulary
+// ---------------------------------------------------------------------------
+
+test('provenance: a record is described by its weakest field, never its strongest', () => {
+  // Describing it by the strongest would let one observed value launder an unobserved one.
+  assert.equal(weakerProvenance(Provenance.RUNTIME_REPORTED, Provenance.LAUNCH_ENFORCED), Provenance.LAUNCH_ENFORCED);
+  assert.equal(weakerProvenance(Provenance.LAUNCH_ENFORCED, Provenance.UNAVAILABLE), Provenance.UNAVAILABLE);
+  assert.equal(weakerProvenance(Provenance.RUNTIME_REPORTED, Provenance.RUNTIME_REPORTED), Provenance.RUNTIME_REPORTED);
+});
+
+test('provenance: xhigh is a contract effort, because the binary advertises it', () => {
+  // A policy that cannot name a level the binary supports would silently round down to `high`.
+  assert.ok(Object.values(Effort).includes('xhigh'));
+});
+
+// ---------------------------------------------------------------------------
+// capability parsing, against the real help text
+// ---------------------------------------------------------------------------
+
+test('fingerprint: the declared values are read from the real --help output', () => {
+  const capability = parseOptionCapability(REAL_HELP, '--effort');
+  assert.equal(capability.declared, true);
+  assert.deepEqual(capability.values, ['low', 'medium', 'high', 'xhigh', 'max']);
+});
+
+test('fingerprint: an option with no readable value list yields null, never an empty list', () => {
+  // An empty list would read as "no value is valid"; null says "declared, values unknown".
+  const capability = parseOptionCapability(REAL_HELP, '--model');
+  assert.equal(capability.declared, true);
+  assert.equal(capability.values, null);
+  assert.deepEqual(parseOptionCapability(REAL_HELP, '--nonexistent'), { declared: false, values: null });
+});
+
+// ---------------------------------------------------------------------------
+// the happy path this whole change exists to enable
+// ---------------------------------------------------------------------------
+
+test('provenance: the current CLI yields model runtime_reported and effort launch_enforced', () => {
+  const result = build();
+  assert.equal(result.provenance.model, Provenance.RUNTIME_REPORTED);
+  assert.equal(result.provenance.effort, Provenance.LAUNCH_ENFORCED);
+  assert.equal(result.provenance.weakest, Provenance.LAUNCH_ENFORCED);
+  assert.equal(result.blocking, false, 'a job must be able to run on this combination');
+  assert.deepEqual(
+    { model_alias: result.effective.model_alias, effort: result.effective.effort },
+    { model_alias: 'sonnet', effort: 'high' },
+  );
+
+  // The launch attestation must be present, and must not claim observation.
+  const attestation = result.settings_attestation;
+  assert.equal(attestation.model_provenance, Provenance.RUNTIME_REPORTED);
+  assert.equal(attestation.effort_provenance, Provenance.LAUNCH_ENFORCED);
+  assert.ok(attestation.launch, 'a launch_enforced field requires a launch attestation');
+  assert.equal(attestation.launch.caller_controlled_argv, false);
+  assert.equal(attestation.launch.auth_mode, AuthMode.SUBSCRIPTION);
+  assert.equal(attestation.launch.binary_version, '2.1.220 (Claude Code)');
+  assert.match(attestation.launch.capability_fingerprint, /^[a-f0-9]{64}$/);
+  assert.match(attestation.launch.argv_digest, /^[a-f0-9]{64}$/);
+  assert.deepEqual(attestation.launch.advertised_values['--effort'], ['low', 'medium', 'high', 'xhigh', 'max']);
+  assert.equal(attestation.launch.config_generation, 3);
+
+  // And the runtime-reported half must carry the normalization that produced it.
+  assert.deepEqual(attestation.normalization, ['init.model=claude-sonnet-5 -> sonnet']);
+});
+
+test('provenance: a CLI that DOES report effort is observed, and no launch record is needed', () => {
+  const result = build({ init: { ...INIT, effort: 'high' } });
+  assert.equal(result.provenance.effort, Provenance.RUNTIME_REPORTED);
+  assert.equal(result.provenance.weakest, Provenance.RUNTIME_REPORTED);
+  // Runtime observation is strictly stronger, so the enforcement path simply stops being used.
+  assert.equal(result.settings_attestation.launch, null);
+});
+
+// ---------------------------------------------------------------------------
+// adversarial: every way the claim could be false
+// ---------------------------------------------------------------------------
+
+test('provenance: a caller-supplied argv can never be launch_enforced', () => {
+  // If a caller can put anything on the command line, the digest attests to the caller's intent
+  // rather than to policy.
+  const result = build({ argvOwnedByServer: false });
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.equal(result.blocking, true);
+});
+
+test('provenance: a value the binary does not advertise is never enforced', () => {
+  // The CLI accepts an unknown --effort silently and runs at its default, so "the option exists" is
+  // not enough — the VALUE has to be one it declares.
+  const narrow = {
+    ...GOOD_FINGERPRINT,
+    capabilities: { '--effort': { declared: true, values: ['low', 'medium'] } },
+  };
+  const result = build({ fingerprint: narrow });
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.match(result.detail, /does not declare 'high'/);
+});
+
+test('provenance: an option the binary does not declare at all is never enforced', () => {
+  const result = build({
+    fingerprint: { ...GOOD_FINGERPRINT, capabilities: { '--model': { declared: true, values: null } } },
+  });
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.match(result.detail, /does not declare --effort/);
+});
+
+test('provenance: a warning that the option was ignored defeats the claim', () => {
+  for (const stderr of [
+    "Warning: Unknown --effort value 'high' — ignoring it and using the default effort.",
+    'warning: unsupported option --effort',
+  ]) {
+    const result = build({ stderr });
+    assert.equal(result.provenance.effort, Provenance.UNAVAILABLE, `stderr: ${stderr}`);
+  }
+  assert.equal(extractIgnoredOptionWarning('all quiet', '--effort'), null);
+});
+
+test('provenance: a missing or failed fingerprint is never enforced', () => {
+  for (const fingerprint of [
+    null,
+    { ok: false, failure: FingerprintFailure.WRAPPER },
+    { ok: false, failure: FingerprintFailure.PINNED_MISMATCH },
+    { ok: false, failure: FingerprintFailure.NOT_ABSOLUTE },
+  ]) {
+    const result = build({ fingerprint });
+    assert.equal(result.provenance.effort, Provenance.UNAVAILABLE, `fingerprint ${fingerprint?.failure ?? 'null'}`);
+    assert.equal(result.blocking, true);
+  }
+});
+
+test('provenance: evidence must be bound to a session, run and configuration generation', () => {
+  for (const binding of [
+    { ...BINDING, session_key: null },
+    { ...BINDING, run_id: null },
+    { ...BINDING, config_generation: undefined },
+    { ...BINDING, config_generation: -1 },
+  ]) {
+    const result = build({ binding });
+    assert.equal(result.provenance.effort, Provenance.UNAVAILABLE, JSON.stringify(binding));
+  }
+});
+
+test('provenance: an API-billed session is never enforced and never effective', () => {
+  const result = build({ init: { ...INIT, apiKeySource: 'ANTHROPIC_API_KEY' } });
+  assert.equal(result.blocking, true);
+  assert.equal(result.settings_attestation, null);
+  assert.equal(authModeOf({ apiKeySource: 'ANTHROPIC_API_KEY' }), AuthMode.API_KEY);
+  assert.equal(authModeOf({ apiKeySource: 'none' }), AuthMode.SUBSCRIPTION);
+});
+
+test('provenance: a stale capability fingerprint changes the attested digest', () => {
+  // If what the binary advertises moves, the binary that advertised the option is not the binary
+  // that ran, and prior attestations mean nothing.
+  const first = build().settings_attestation.launch.capability_fingerprint;
+  const drifted = build({
+    fingerprint: { ...GOOD_FINGERPRINT, version: '2.2.0 (Claude Code)' },
+  }).settings_attestation.launch.capability_fingerprint;
+  assert.notEqual(first, drifted, 'a version change must move the capability fingerprint');
+
+  const rehashed = build({
+    fingerprint: { ...GOOD_FINGERPRINT, sha256: 'f'.repeat(64) },
+  }).settings_attestation.launch.capability_fingerprint;
+  assert.notEqual(first, rehashed, 'a content change must move the capability fingerprint');
+});
+
+test('provenance: the argv digest binds the exact command line', () => {
+  const first = build().settings_attestation.launch.argv_digest;
+  const other = build({ argv: [...ARGV, '--extra'] }).settings_attestation.launch.argv_digest;
+  assert.notEqual(first, other);
+});
+
+test('provenance: forged provenance cannot be smuggled in through the init event', () => {
+  // A backend emitting these fields must not be able to assert its own provenance.
+  const result = build({
+    init: {
+      ...INIT,
+      provenance: 'runtime_reported',
+      effort_provenance: 'runtime_reported',
+      settings_attestation: { effective: { model_alias: 'sonnet', effort: 'max' } },
+    },
+  });
+  assert.equal(result.provenance.effort, Provenance.LAUNCH_ENFORCED, 'provenance is decided here, not by the backend');
+  assert.equal(result.effective.effort, 'high', 'the effective value must not come from the backend’s claim');
+});
+
+test('provenance: an attestation is never emitted with an unavailable field', () => {
+  // The contract's own validator refuses a partial record — "omit the attestation entirely so the
+  // caller fails closed rather than reading a partial one as partial trust".
+  const result = build({ fingerprint: null });
+  assert.equal(result.settings_attestation, null);
+});
+
+// ---------------------------------------------------------------------------
+// old peers
+// ---------------------------------------------------------------------------
+
+test('provenance: a peer that does not bind its request gets no launch attestation', () => {
+  // `unbound` is the contract's default run_id — an old peer that never learned to say which run it
+  // is asking about. An attestation stamped with it is bound to nothing, so it is not made, and the
+  // job blocks rather than running on evidence that could be replayed onto any other run.
+  const result = build({ binding: { ...BINDING, run_id: 'unbound' } });
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.equal(result.blocking, true);
+  assert.equal(result.settings_attestation, null);
+  assert.match(result.detail, /bind/i);
+});
+
+test('provenance: a peer that binds gets an attestation stamped with exactly its binding', () => {
+  const result = build({ binding: { ...BINDING, run_id: 'run-42', config_generation: 7 } });
+  assert.equal(result.settings_attestation.launch.run_id, 'run-42');
+  assert.equal(result.settings_attestation.launch.config_generation, 7);
+  // The version of the attestation contract this build implements travels with the evidence, so a
+  // peer below it cannot read the payload as though these checks had been made.
+  assert.equal(result.settings_attestation.launch.contract_version, '1.0');
+});
+
+// ---------------------------------------------------------------------------
+// the real binary, and the wrapper that must be refused
+// ---------------------------------------------------------------------------
+
+test('fingerprint: a shell wrapper is refused — it can rewrite argv', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
+  try {
+    // Exactly the shape of ProjectWorkbench's own /usr/local/bin/claude, which appends
+    // --permission-mode and --mcp-config before exec'ing the real binary.
+    const wrapper = path.join(dir, 'claude');
+    fs.writeFileSync(wrapper, '#!/usr/bin/env bash\nexec /real/claude --permission-mode skip "$@"\n', { mode: 0o755 });
+    const result = await probeBinaryFingerprint({ executable: wrapper, options: ['--effort'] });
+    assert.equal(result.ok, false);
+    assert.equal(result.failure, FingerprintFailure.WRAPPER);
+    assert.match(result.detail, /rewrite argv/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fingerprint: a relative executable is refused — PATH is not ours to trust', async () => {
+  const result = await probeBinaryFingerprint({ executable: 'claude', options: ['--effort'] });
+  assert.equal(result.ok, false);
+  assert.equal(result.failure, FingerprintFailure.NOT_ABSOLUTE);
+});
+
+test('fingerprint: a pinned hash that does not match is refused', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
+  try {
+    const binary = path.join(dir, 'fake-cli');
+    fs.writeFileSync(binary, '#!/usr/bin/env node\nprocess.stdout.write("1.0.0\\n");\n', { mode: 0o755 });
+    const result = await probeBinaryFingerprint({
+      executable: binary, options: ['--effort'], expectedSha256: 'a'.repeat(64),
+    });
+    assert.equal(result.ok, false);
+    assert.equal(result.failure, FingerprintFailure.PINNED_MISMATCH);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fingerprint: the cache is keyed on binary identity and invalidated by any change', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
+  try {
+    const binary = path.join(dir, 'cli');
+    const write = (body) => fs.writeFileSync(binary, `#!/usr/bin/env node\n${body}\n`, { mode: 0o755 });
+    write('process.stdout.write("1.0.0")');
+
+    let probes = 0;
+    const exec = async (file, args) => {
+      probes += 1;
+      if (args[0] === '--version') return { stdout: '1.0.0', stderr: '' };
+      return { stdout: '  --effort <level>   Effort\n                     (low, high)\n', stderr: '' };
+    };
+    const cache = new FingerprintCache({ exec });
+
+    const first = await cache.get({ executable: binary, options: ['--effort'] });
+    assert.equal(first.ok, true);
+    const probesAfterFirst = probes;
+
+    // Same identity: served from cache, no re-probe and no re-hash.
+    await cache.get({ executable: binary, options: ['--effort'] });
+    assert.equal(probes, probesAfterFirst, 'an unchanged binary must not be re-probed');
+    assert.equal(cache.size, 1);
+
+    // Change the file: a different program, however it is named. The cache must miss.
+    await new Promise((r) => setTimeout(r, 10));
+    write('process.stdout.write("2.0.0")');
+    const second = await cache.get({ executable: binary, options: ['--effort'] });
+    assert.ok(probes > probesAfterFirst, 'a changed binary must be re-probed');
+    assert.notEqual(second.sha256, first.sha256);
+    assert.equal(cache.size, 2, 'the old identity is not reused for the new file');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('fingerprint: a failed probe is not cached, so a transient fault does not stick', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-'));
+  try {
+    const missing = path.join(dir, 'not-there');
+    const cache = new FingerprintCache({ exec: async () => ({ stdout: '', stderr: '' }) });
+    const first = await cache.get({ executable: missing, options: ['--effort'] });
+    assert.equal(first.ok, false);
+    assert.equal(cache.size, 0, 'a failure must not be cached — it may be a partially written upgrade');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('launch attestation: the hostile defaults on the contract side are answered explicitly', () => {
+  // `caller_controlled_argv` defaults to TRUE and `auth_mode` to `api_key` on the orchestrator side,
+  // so a payload that omits them fails closed. Both must be set explicitly here.
+  const launch = buildLaunchAttestation({
+    instanceId: INSTANCE, fingerprint: GOOD_FINGERPRINT, argv: ARGV,
+    binding: BINDING, stderr: '', authMode: AuthMode.SUBSCRIPTION,
+  });
+  assert.equal(launch.caller_controlled_argv, false);
+  assert.equal(launch.auth_mode, AuthMode.SUBSCRIPTION);
+  assert.equal(launch.ignored_option_warning, null);
+  assert.equal(launch.argv_builder_id, 'pw-claude-phase-argv-v1');
+  assert.equal(launch.attested_by, INSTANCE);
+  assert.deepEqual(launch.advertised_options.sort(), ['--effort', '--model']);
+});
+
+test('launch attestation: an enforcement claim is refused outright when a precondition fails', () => {
+  const refused = attestLaunchEnforced({
+    option: '--effort', value: 'high', fingerprint: GOOD_FINGERPRINT, stderr: '',
+    argvOwnedByServer: true, binding: { ...BINDING, auth_mode: AuthMode.API_KEY },
+  });
+  assert.equal(refused.verified, false);
+  assert.equal(refused.provenance, Provenance.UNAVAILABLE);
+});

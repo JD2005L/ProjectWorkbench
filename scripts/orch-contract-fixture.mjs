@@ -30,6 +30,7 @@ import { statusForCode } from '../app/orchestrator/errors.js';
 import { ALLOWED_CHECK_NAMES } from '../app/orchestrator/checks.js';
 import { ALLOWED_GIT_SUBCOMMANDS, FORBIDDEN_GIT_SUBCOMMANDS } from '../app/orchestrator/git.js';
 import { EFFORT_ATTESTATION_REQUIREMENT } from '../app/orchestrator/attestation.js';
+import { Provenance, AuthMode, ATTESTATION_CONTRACT_VERSION, ARGV_BUILDER_ID } from '../app/orchestrator/contract.js';
 import { SCOPES } from '../app/orchestrator/auth.js';
 
 const sorted = (values) => [...values].sort();
@@ -115,6 +116,29 @@ export function buildFixture() {
       HealthState: sorted(Object.values(HealthState)),
       AuthMethod: sorted(Object.values(AuthMethod)),
       ErrorCode: sorted(Object.values(ErrorCode)),
+      AttestationProvenance: sorted(Object.values(Provenance)),
+      AuthMode: sorted(Object.values(AuthMode)),
+    },
+
+    // How this instance knows an effective setting, published so an orchestrator can see the kind
+    // of evidence it will get BEFORE submitting work.
+    attestation: {
+      contract_version: ATTESTATION_CONTRACT_VERSION,
+      argv_builder_id: ARGV_BUILDER_ID,
+      model: Provenance.RUNTIME_REPORTED,
+      effort: Provenance.LAUNCH_ENFORCED,
+      // Weakest-first: a record is described by its weakest field, never its strongest.
+      provenance_strength: [Provenance.UNAVAILABLE, Provenance.LAUNCH_ENFORCED, Provenance.RUNTIME_REPORTED],
+      launch_enforcement_preconditions: [
+        'the configured executable is an absolute path, not a PATH lookup',
+        'it is not a shell wrapper that could rewrite argv',
+        'its content SHA-256 matches the pin when one is configured',
+        'its own --help declares the option and lists the exact value',
+        'the run emitted no ignored-option warning',
+        'the argv came from the fixed server-side builder with no caller override',
+        'the session is subscription authenticated',
+        'the caller bound the request to a run and configuration generation',
+      ],
     },
 
     state_families: {
@@ -165,7 +189,8 @@ export function buildFixture() {
       cancellation_preserves_working_tree: true,
       cancellation_signals_the_running_phase: true,
       publication_uses_a_private_index: true,
-      effort_attestation_available: false,
+      effort_attestation_runtime_reported: false,
+      effort_attestation_launch_enforced: true,
       approval_requires_separate_scope: true,
       approval_requires_separate_credential_by_default: true,
       api_key_authentication_representable: false,
@@ -175,17 +200,17 @@ export function buildFixture() {
 
     known_gaps: [
       {
-        id: 'effective-effort-unattestable',
+        id: 'effective-effort-not-runtime-reported',
         summary:
           'Measured against Claude Code 2.1.220: the stream-json system/init event carries model, '
-          + 'permissionMode and apiKeySource but NO effort field of any kind, and an unrecognised '
-          + '--effort value is silently ignored (stderr warning, exit 0, running at the default). '
-          + 'Effective effort therefore cannot be attested against this CLI at all.',
+          + 'permissionMode and apiKeySource but NO effort field, so effort cannot be OBSERVED. Its '
+          + '--help does declare `--effort <level>` with (low, medium, high, xhigh, max), so it can '
+          + 'be ENFORCED at launch against a fingerprinted binary.',
         behaviour:
-          'ProjectWorkbench reports effective: null and moves the job to blocked_configuration. '
-          + 'There is no configuration that relaxes this — an earlier argv-attestation mode made '
-          + 'the check requested === requested and has been removed. Jobs will not run against a '
-          + 'CLI that cannot report effort.',
+          'Effort is reported with provenance launch_enforced, never runtime_reported. That is a '
+          + 'chain of custody over an input, not an observation: a launched flag can still be '
+          + 'ignored by a build nobody fingerprinted. Any precondition failing yields no '
+          + 'attestation at all and the job blocks.',
         requirement: EFFORT_ATTESTATION_REQUIREMENT,
         needs_coordination: true,
       },

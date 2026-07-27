@@ -159,6 +159,16 @@ export function loadOrchestratorConfig(env = process.env) {
 
     // ---- coding backend ----
     backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, 'claude'),
+    // Pin the CLI's content hash. When set, a binary whose SHA-256 differs is refused outright
+    // rather than merely re-fingerprinted — an upgrade becomes a deliberate configuration change.
+    backendFingerprintSha256: str(env.PW_ORCHESTRATOR_CLI_SHA256, ''),
+    // Identifies the configuration this attestation was made under. Launch-enforcement evidence is
+    // bound to it, so evidence cannot be replayed across a configuration change that might have
+    // altered the executable, the aliases, or the enforcement policy.
+    // An integer, because the contract types it as one: a monotone generation an operator bumps
+    // when the executable, the aliases or the enforcement policy change, so old evidence cannot be
+    // replayed across the change.
+    configGeneration: int(env.PW_ORCHESTRATOR_CONFIG_GENERATION, 0, { min: 0, max: 2 ** 31 }),
     backendTimeoutMs: int(env.PW_ORCHESTRATOR_BACKEND_TIMEOUT_MS, 1_800_000, { min: 1_000, max: 21_600_000 }),
     checkTimeoutMs: int(env.PW_ORCHESTRATOR_CHECK_TIMEOUT_MS, 900_000, { min: 1_000, max: 21_600_000 }),
     defaultMaxPhaseTurns: int(env.PW_ORCHESTRATOR_MAX_PHASE_TURNS, 10, { min: 1, max: 60 }),

@@ -28,6 +28,7 @@ import {
 } from '../contract.js';
 import { redactText } from '../redact.js';
 import { buildAttestation } from '../attestation.js';
+import { FingerprintCache } from './fingerprint.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -79,11 +80,23 @@ export function classifyBackendFailure(err) {
 }
 
 export class ClaudeCodeBackend {
-  constructor({ config, exec = execFileAsync, clock = () => new Date() } = {}) {
+  constructor({ config, exec = execFileAsync, clock = () => new Date(), fingerprints = null } = {}) {
     this.config = config;
     this.exec = exec;
     this.clock = clock;
     this.name = CodingBackend.CLAUDE_CODE;
+    // Cached per binary identity, so the ~1s hash of a 275 MB binary happens once and any change
+    // to the file misses the cache rather than being trusted.
+    this.fingerprints = fingerprints ?? new FingerprintCache({ exec });
+  }
+
+  /** Fingerprint the configured CLI, for enforcement claims and for health reporting. */
+  async fingerprint() {
+    return this.fingerprints.get({
+      executable: this.config.backendExecutable,
+      options: ['--effort', '--model'],
+      expectedSha256: this.config.backendFingerprintSha256 || null,
+    });
   }
 
   // -------------------------------------------------------------------------
@@ -98,8 +111,9 @@ export class ClaudeCodeBackend {
       throw new Error(`invalid model alias: ${JSON.stringify(model)}`);
     }
     if (typeof effort !== 'string' || !VALID_EFFORTS.has(effort)) {
-      // `xhigh` is a real CLI value but is not in the contract's Effort enum; accepting it would put
-      // the session in a state the orchestrator cannot express, compare, or verify.
+      // The contract's Effort enum is the authority, and it now includes `xhigh` — the CLI
+      // advertises it, and a policy that cannot name a level the binary supports would silently
+      // round down. Anything outside the enum is still refused before it reaches the CLI.
       throw new Error(`invalid effort: ${JSON.stringify(effort)}`);
     }
     if (!Number.isInteger(maxTurns) || maxTurns < 1 || maxTurns > 60) {
@@ -247,7 +261,11 @@ export class ClaudeCodeBackend {
    * Deliberately runs a real, bounded, read-only phase rather than inspecting a config file: what
    * matters is what the *running session* reports, and a file cannot answer that.
    */
-  async verifyConfiguration({ requested, phaseClass = PhaseClass.DISCOVERY, cwd, cliSessionId = null }) {
+  async verifyConfiguration({
+    requested, phaseClass = PhaseClass.DISCOVERY, cwd, cliSessionId = null,
+    runId = 'unbound', sessionKey = null,
+    configGeneration = null,
+  }) {
     const argv = this.buildPhaseArgv({
       prompt: 'Reply with exactly: ready',
       model: requested.model_alias,
@@ -274,16 +292,36 @@ export class ClaudeCodeBackend {
 
     const { init } = this.parseStream(stdout);
 
+    // The fingerprint is what lets an enforcement claim name a specific program. Probed before the
+    // claim is made, and cached only on the binary's own identity.
+    const fingerprint = await this.fingerprint();
+
     // Everything the caller learns comes from `buildAttestation`, which never copies a requested
-    // value into its answer. With a CLI that does not report effort this returns `effective: null`
-    // and `blocking: true`, and the job blocks at blocked_configuration having read nothing.
+    // value into its answer. Where the CLI reports a setting the provenance is `runtime_reported`;
+    // where ProjectWorkbench could only enforce it at launch the provenance says so, and a peer
+    // that cannot express the distinction is told the setting is not effective.
     const attestation = buildAttestation({
       requested, aliases: this.config.modelAliases, init: init ?? {}, stderr,
+      fingerprint,
+      instanceId: this.config.instanceId,
+      argv,
+      // True by construction: buildPhaseArgv is the only argv source and takes no caller argv.
+      argvOwnedByServer: true,
+      binding: {
+        session_key: sessionKey ?? init?.session_id ?? null,
+        run_id: runId,
+        // The caller's generation when it sent one, else this instance's own. Either way the claim
+        // is stamped with a generation, so it cannot outlive a configuration change.
+        config_generation: Number.isInteger(configGeneration) ? configGeneration : this.config.configGeneration,
+        at: this.clock().toISOString(),
+      },
     });
 
     return {
       effective: attestation.effective,
       observed_model: attestation.observed_model,
+      provenance: attestation.provenance,
+      settings_attestation: attestation.settings_attestation,
       attestation,
       backend: this.name,
       checked_at: this.clock().toISOString(),

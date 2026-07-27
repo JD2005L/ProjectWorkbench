@@ -92,14 +92,16 @@ defaults. A deployment with different conventions is *configured*, never patched
 | `PW_ORCHESTRATOR_TMUX_PREFIX` | `pw_` | tmux session prefix |
 | `PW_ORCHESTRATOR_DISPLAY_PREFIX` | `pvibot-orchestrator-` | CLI display-name prefix |
 | `PW_ORCHESTRATOR_TMUX_SOCKET` | _(empty)_ | Alternate tmux server; used by tests |
-| `PW_ORCHESTRATOR_CLAUDE_BIN` | `claude` | Coding CLI executable |
+| `PW_ORCHESTRATOR_CLAUDE_BIN` | `claude` | Coding CLI executable. Must be an **absolute path to the real binary** for launch enforcement — not the PW wrapper on `PATH`, which rewrites argv |
 | `PW_ORCHESTRATOR_GIT_BIN` / `_GH_BIN` | `git` / `gh` | Git and GitHub CLI |
 | `PW_ORCHESTRATOR_MAX_BODY_BYTES` | `1048576` | Request body ceiling |
 | `PW_ORCHESTRATOR_RATE_LIMIT` | `120` | Requests per minute per credential |
 | `PW_ORCHESTRATOR_LEASE_TTL_MS` | `300000` | Project write-lease lifetime |
 | `PW_ORCHESTRATOR_BACKEND_TIMEOUT_MS` | `1800000` | Per-phase ceiling |
 | `PW_ORCHESTRATOR_CHECK_TIMEOUT_MS` | `900000` | Per-check ceiling |
-| `PW_ORCHESTRATOR_MODEL_ALIASES` | measured defaults | JSON `alias -> [model ids]`; a `*` suffix matches a dated release. Setting it REPLACES the defaults. See [§4](#4-a-contract-gap-effective-effort-cannot-be-attested) |
+| `PW_ORCHESTRATOR_MODEL_ALIASES` | measured defaults | JSON `alias -> [model ids]`; a `*` suffix matches a dated release. Setting it REPLACES the defaults. See [§4](#4-attestation-provenance-what-effective-actually-means) |
+| `PW_ORCHESTRATOR_CLI_SHA256` | _(unpinned)_ | Pin the coding CLI's content hash; a binary that differs is refused rather than re-fingerprinted |
+| `PW_ORCHESTRATOR_CONFIG_GENERATION` | `0` | Bump when the executable, aliases or enforcement policy change, so old evidence cannot be replayed across the change |
 | `PW_ORCHESTRATOR_REQUIRE_SEPARATE_APPROVER` | `true` | Refuse an approval from the credential that submitted the job |
 
 The subsystem reuses the dashboard's existing `PW_WORKSPACES` for the workspace root, so there is
@@ -184,68 +186,87 @@ contract exists to prevent.
 
 ---
 
-## 4. A contract gap: effective effort cannot be attested
+## 4. Attestation provenance: what "effective" actually means
 
 Contract §6 requires ProjectWorkbench to report what is *actually* active and to be able to say "I do
-not know", with no way to say "probably correct". Probing the installed CLI directly (Claude Code
-2.1.220) shows the two halves of `ModelSettings` are not equally knowable.
+not know". Probing the installed CLI (Claude Code 2.1.220) shows the two halves of `ModelSettings`
+are known with genuinely different strength, so the contract names the difference rather than
+flattening it.
 
-**Model is attestable — through an explicit mapping.** `--output-format stream-json` emits a
-`system/init` event carrying the live model. But it carries the *resolved id*, not the alias that was
-requested:
+| provenance | meaning |
+|---|---|
+| `runtime_reported` | The running backend emitted the value in its own structured output, normalised through a recorded mapping. **An observation.** |
+| `launch_enforced` | Nobody observed it. ProjectWorkbench owned the argv, the exact fingerprinted binary advertises the option *and the value*, the run emitted no ignored-option warning, and the evidence is bound to this run. **Chain of custody over an input.** |
+| `unavailable` | Neither. Always blocking, never a default. |
+
+A record is described by its **weakest** field. Describing it by the strongest would let one observed
+value launder an unobserved one.
+
+### What the installed CLI supports
+
+**Model is `runtime_reported`.** The `system/init` event carries the live model — as a *resolved id*,
+not the alias that was requested:
 
 | requested | reported |
 |---|---|
-| `--model sonnet` | `claude-sonnet-5` |
-| `--model opus` | `claude-opus-5` |
-| `--model haiku` | `claude-haiku-4-5-20251001` |
+| `sonnet` | `claude-sonnet-5` |
+| `opus` | `claude-opus-5` |
+| `haiku` | `claude-haiku-4-5-20251001` |
 
-The two are in different namespaces and can never compare equal directly, so attestation goes through
-a configured `alias -> ids` mapping (`PW_ORCHESTRATOR_MODEL_ALIASES`, defaults measured from the
-installed CLI, `*` suffix for dated releases). An alias with no mapping is **unverifiable** and blocks.
-An alias is never compared to itself.
+so attestation goes through a configured `alias -> ids` mapping (`PW_ORCHESTRATOR_MODEL_ALIASES`),
+and the normalization that produced it travels with the claim. An alias is never compared to itself.
 
-**Effort is not attestable at all.** The full set of `system/init` keys is:
+**Effort is `launch_enforced`.** The init event has no effort field of any kind, so it cannot be
+observed. But `--help` declares:
 
 ```
-agents, analytics_disabled, apiKeySource, capabilities, claude_code_version, cwd,
-fast_mode_disabled_reason, fast_mode_state, mcp_servers, memory_paths, model, output_style,
-permissionMode, plugins, product_feedback_disabled, session_id, skills, slash_commands, subtype,
-tools, type, uuid
+  --effort <level>    Effort level for the current session
+                      (low, medium, high, xhigh, max)
 ```
 
-There is no effort field, and an unrecognised `--effort` value is *silently ignored* — a warning on
-stderr, exit 0, and the run proceeds at the default. There is no read-back path of any kind.
+which is enough to *enforce* it. Every one of these must hold, or no attestation is produced at all
+and the job blocks:
 
-**Therefore ProjectWorkbench reports `effective: null` and moves the job to
-`blocked_configuration`.** Jobs will not run against a CLI that cannot report effort. That is the
-required behaviour, not a limitation to work around: an earlier build offered an
-`PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv` mode which reported the effort it had passed — making the
-comparison `requested === requested`, a check that could never fail. **That mode has been removed.**
-There is no configuration that relaxes this.
+1. the configured executable is an **absolute path** — a PATH lookup is the operator's environment,
+   not ours;
+2. it is **not a shell wrapper**. This is not hypothetical: ProjectWorkbench's own installer puts
+   `/usr/local/bin/claude` on `PATH`, and that script sources `claude-wrapper.env` and appends
+   `--permission-mode`, `--mcp-config` and `--strict-mcp-config` before exec'ing the real binary. A
+   launch through it is not a launch we control. Configure the real binary
+   (`/bin/claude` → `…/claude-code/bin/claude.exe`);
+3. its content SHA-256 matches `PW_ORCHESTRATOR_CLI_SHA256` when one is pinned;
+4. its own `--help` declares `--effort` **and lists the exact value** — the CLI accepts an
+   unrecognised `--effort` with only a stderr warning and runs at its default, so "the option exists"
+   is not enough;
+5. the run emitted no ignored-option warning;
+6. the argv came from the fixed server-side builder (`pw-claude-phase-argv-v1`) with no caller
+   override — if a caller could put anything on the command line, the argv digest would attest to the
+   caller's intent rather than to policy;
+7. the session is subscription authenticated (`apiKeySource: none`);
+8. the caller **bound** its request. `VerifySessionRequest` carries `run_id` and
+   `config_generation`; a peer that sends the default `unbound` has not said which run it is asking
+   about, so nothing can be attested to one.
 
-### What a compatible CLI must provide
+`xhigh` is now a contract effort on both sides: the binary advertises it, and a policy that cannot
+name a level the binary supports would silently round down to `high`.
 
-> Effective effort can only be attested by a coding CLI that reports the effort actually in force for
-> the running session — as an `effort`, `effortLevel`, or `reasoning_effort` field on the stream-json
-> `system/init` event, or via an equivalent status command. Passing the flag is not attestation: it is
-> the assumption the contract exists to forbid.
+### What is published, and where
 
-ProjectWorkbench probes for this per session, so a CLI that gains the field is picked up with **no
-configuration change** — `effective` starts being populated and jobs start running. The capability is
-also machine-readable in [`contract/pw-contract-1.0.json`](../contract/pw-contract-1.0.json) under
-`safety.effort_attestation_available` and `known_gaps`, so an orchestrator can see that an instance
-cannot attest effort *before* submitting work that would only block.
+`SessionVerificationResponse` carries a `SettingsAttestation` and **derives** `effective` from it.
+ProjectWorkbench never sends `effective` as a field — the contract refuses such a payload rather than
+reading it as an observation, because an older peer never distinguished a value it watched from one
+it merely passed on the command line.
 
-**This needs coordination.** Either the contract gains a way to express the provenance of an
-effective setting, or the coding CLI gains an effort read-back. Until one of those happens, this
-instance blocks — which is the honest outcome.
+The `LaunchAttestation` inside it names the binary (realpath, self-reported version, a digest of its
+advertised capability surface), the advertised options and values, the argv builder id and a digest
+of the exact argv, `caller_controlled_argv: false`, `auth_mode`, any ignored-option warning, and the
+session/run/configuration-generation binding. No credential appears in any of it. `GET /readiness`
+publishes the same capability summary so an orchestrator can see the kind of evidence an instance
+produces *before* submitting work.
 
-### One more thing the init event gives us
-
-`apiKeySource` is reported alongside the model. `"none"` is the subscription case; anything else means
-inference is billed to an API account, which the product forbids. A session reporting an API key
-source is refused outright however well it otherwise attests.
+Fingerprints are cached on the binary's own identity (realpath, device, inode, size, mtime), so the
+~1 s hash of a 275 MB binary happens once and **any** change to the file misses the cache rather than
+being trusted. A failed probe is never cached: it may be a partially written upgrade.
 
 ## 5. The contract fixture
 

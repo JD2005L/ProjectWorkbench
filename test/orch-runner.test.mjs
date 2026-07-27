@@ -115,9 +115,9 @@ test('runner: the permission mode is an allowlist keyed by phase class, never ca
 
 test('runner: an effort outside the contract vocabulary is refused before it reaches the CLI', () => {
   const { backend } = backendWith({});
-  // `xhigh` is a real CLI value but is not in the contract's Effort enum. Passing it through would
-  // put the session in a state the orchestrator cannot express or verify.
-  for (const bad of ['xhigh', 'ultra', '', 'high; rm -rf /', null]) {
+  // `xhigh` is now a contract effort — the binary advertises it. Anything outside the enum is still
+  // refused before it can reach the CLI.
+  for (const bad of ['ultra', '', 'high; rm -rf /', null]) {
     assert.throws(
       () => backend.buildPhaseArgv({ prompt: 'x', model: 'sonnet', effort: bad, maxTurns: 1, phaseClass: PhaseClass.IMPLEMENTATION }),
       /effort/i,
