@@ -416,7 +416,7 @@ export class OrchestratorSessionManager {
       // reach that decision.
       return this._verificationResponse(record, null, err?.kind
         ? `the coding backend could not be queried (${err.kind})`
-        : 'the coding backend could not be queried');
+        : 'the coding backend could not be queried', null);
     }
 
     const effective = outcome.effective ?? null;
@@ -435,7 +435,15 @@ export class OrchestratorSessionManager {
     return this._verificationResponse(updated, effective, outcome.detail ?? null);
   }
 
-  _verificationResponse(record, effective, detail) {
+  /**
+   * The `SessionVerificationResponse` payload, plus the fields the engine needs.
+   *
+   * `observed_model`, `requirement` and `cli_session_id` are ProjectWorkbench-side and are stripped
+   * before the response reaches the wire — the contract model forbids extra fields — but dropping
+   * them here entirely meant the engine never learned the session id (so the verified session was
+   * never resumed) and the operator never saw *why* every job was blocking.
+   */
+  _verificationResponse(record, effective, detail, outcome = null) {
     return {
       schema_version: SCHEMA_VERSION,
       session_key: record.session_key,
@@ -443,6 +451,9 @@ export class OrchestratorSessionManager {
       backend: record.cli_backend,
       checked_at: this.now(),
       detail: detail ?? null,
+      observed_model: outcome?.observed_model ?? null,
+      requirement: outcome?.requirement ?? null,
+      cli_session_id: outcome?.cli_session_id ?? record.cli_session_id ?? null,
     };
   }
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Hot-deploy helper for a container-mode (PW_DEPLOY_MODE=container) instance.
 #
-#   ./deploy-local.sh          # hot deploy: copy app/*.js + app/orchestrator/ + scripts/*, restart node only
+#   ./deploy-local.sh          # hot deploy: copy app/server.js + app/orchestrator/ + scripts/*, restart node only
 #   ./deploy-local.sh --full   # also copy Containerfile + rebuild image (RESTART kills sessions)
 #
 # Hot deploy (default): the entrypoint respawns node in ~2s; tmux/terminal

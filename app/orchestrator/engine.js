@@ -29,6 +29,7 @@ import { assertTransition, canTransition } from './statemachine.js';
 import { validate } from './validate.js';
 import { KIND } from './store/repo.js';
 import { SCOPES } from './auth.js';
+import { attestModel } from './attestation.js';
 import { resolveWorkspacePath } from './projects.js';
 import { repositoryBaseline, workingTreeFingerprint } from './git.js';
 import { diffStat, canonicaliseCheckName, CHECK_CATALOGUE } from './checks.js';
@@ -584,12 +585,18 @@ export class OrchestrationEngine {
         );
         return;
       }
-      // Belt and braces: `effective` is only ever built from observations, but a future adapter
-      // returning something inconsistent must not be able to slip past.
-      if (verification.effective.model_alias !== job.requested.model_alias
-        || verification.effective.effort !== job.requested.effort) {
+      // A second, independent check against the OBSERVED model rather than the reported alias.
+      // Comparing `effective.model_alias` to the request would be `requested === requested`, since
+      // the attestation sets that field from the request by construction — it could not catch the
+      // adapter bug its predecessor claimed to.
+      const observedModel = attestModel({
+        requestedAlias: job.requested.model_alias,
+        observedModel: verification.observed_model,
+        aliases: this.config.modelAliases,
+      });
+      if (!observedModel.verified || verification.effective.effort !== job.requested.effort) {
         await this._emit(jobId, { event_type: EventType.MODEL_MISMATCH, message: 'the attested configuration differs from the requested one' });
-        await this._blockWith(jobId, JobStatus.BLOCKED_CONFIGURATION, 'the attested model or effort differs from the requested one');
+        await this._blockWith(jobId, JobStatus.BLOCKED_CONFIGURATION, observedModel.reason ?? 'the attested model or effort differs from the requested one');
         return;
       }
       await this._emit(jobId, { event_type: EventType.MODEL_VERIFIED, message: `verified ${verification.effective.model_alias} at ${verification.effective.effort} effort` });
@@ -831,6 +838,29 @@ export class OrchestrationEngine {
 
       await this._blockWith(jobId, target, `the ${phaseClass} phase did not complete (${result.failure_kind})`);
       return null;
+    }
+
+    // Attest the model of the session that actually did the work. Verification runs a separate
+    // probe session, so without this a run degraded mid-job — an Opus usage limit falling back to
+    // Sonnet, say — would complete while the job still reported the model it verified. That is a
+    // guess reported as fact, which is the thing §1.4 forbids.
+    if (result.model) {
+      const attested = attestModel({
+        requestedAlias: job.requested.model_alias,
+        observedModel: result.model,
+        aliases: this.config.modelAliases,
+      });
+      if (!attested.verified) {
+        await this._emit(jobId, {
+          event_type: EventType.MODEL_MISMATCH,
+          message: `the ${phaseClass} phase ran under an unattested model: ${attested.reason}`,
+        });
+        await this._blockWith(
+          jobId, JobStatus.BLOCKED_CONFIGURATION,
+          `the ${phaseClass} phase ran under a model that could not be attested`,
+        );
+        return null;
+      }
     }
 
     await this._emit(jobId, {
@@ -1113,14 +1143,33 @@ export class OrchestrationEngine {
     if (!token.scopes?.includes(SCOPES.APPROVE)) {
       throw new ApiError(ErrorCode.FORBIDDEN_SCOPE, "recording a decision requires the 'approve' scope");
     }
-    // And, by default, must not come from the credential that asked for the work. One token
-    // requesting, granting, and acting on its own authorisation is the failure mode the gate exists
-    // to prevent; without this the human check is satisfiable by the machine alone.
-    if (this.config.requireSeparateApprover && job.submitted_by_token === token.token_id) {
-      throw new ApiError(
-        ErrorCode.FORBIDDEN_SCOPE,
-        'the credential that submitted this job may not approve it',
-      );
+    if (this.config.requireSeparateApprover) {
+      // Separation has to rest on capability, not identity. Keying it on token_id alone is defeated
+      // by the rotation the token store is explicitly designed for: one orchestrator holding
+      // `submitter` and `submitter-v2` could submit with one and approve with the other. A
+      // credential that can both request work and approve it is not a separated authority whatever
+      // it is called.
+      if (token.scopes?.includes(SCOPES.JOBS_WRITE)) {
+        throw new ApiError(
+          ErrorCode.FORBIDDEN_SCOPE,
+          'a credential that can submit work may not also approve it',
+        );
+      }
+      // And the specific credential that submitted this job may not approve it. A job stored before
+      // this field existed has no recorded submitter, and unknown is refused rather than treated as
+      // "different" — the previous behaviour silently no-opped for exactly those jobs.
+      if (!job.submitted_by_token) {
+        throw new ApiError(
+          ErrorCode.FORBIDDEN_SCOPE,
+          'this job has no recorded submitting credential, so separation of duty cannot be established',
+        );
+      }
+      if (job.submitted_by_token === token.token_id) {
+        throw new ApiError(
+          ErrorCode.FORBIDDEN_SCOPE,
+          'the credential that submitted this job may not approve it',
+        );
+      }
     }
     if (request.workbench_job_id !== jobId) {
       throw new ApiError(ErrorCode.VALIDATION_FAILED, 'the path job and the payload job must agree');

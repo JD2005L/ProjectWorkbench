@@ -55,22 +55,27 @@ export class Publisher {
   }
 
   /**
-   * A private copy of the repository index.
+   * A private index, seeded from HEAD rather than copied from the repository's own.
    *
    * Staging into the real index would be irreversible from inside this subsystem: git.js forbids
    * `reset` and `restore` precisely so nothing here can discard work, which also means nothing here
-   * could undo a partial stage. Working on a copy makes a failed publication a no-op on the
-   * operator's index rather than a mess they have to clean up by hand.
+   * could undo a partial stage. So publication works on its own index.
+   *
+   * It is *seeded*, not *copied*, and that distinction is load-bearing. A copied index carries the
+   * repository's cached `stat` data, and `git add` trusts that cache: with it, `git add -- src.js`
+   * intermittently exits 0 having staged nothing while `git status` still reports the file as
+   * modified, and publication then fails with "there is nothing to publish". Seeding with
+   * `read-tree HEAD` produces an index with no stat data at all, so git has to hash the file to
+   * decide — which is the only way to be right about it.
    */
-  _privateIndex(workspacePath) {
+  async _privateIndex(workspacePath) {
     const scratch = path.join(
       os.tmpdir(), `pw-orch-index-${crypto.randomBytes(8).toString('hex')}`,
     );
-    const real = path.join(workspacePath, '.git', 'index');
-    try {
-      if (fs.existsSync(real)) fs.copyFileSync(real, scratch);
-    } catch {
-      // A repository with no index yet: git will create one at the scratch path.
+    const seeded = await this._git(['read-tree', 'HEAD'], workspacePath, scratch);
+    if (!seeded.ok) {
+      // An unborn HEAD (a repository with no commits) leaves an empty index, which is correct.
+      try { fs.rmSync(scratch, { force: true }); } catch { /* nothing to remove */ }
     }
     return scratch;
   }
@@ -109,7 +114,7 @@ export class Publisher {
       return result;
     };
 
-    const index = this._privateIndex(workspacePath);
+    const index = await this._privateIndex(workspacePath);
     try {
       return await this._publishWithIndex({ job, project, workspacePath, request, steps, record, index });
     } finally {
@@ -160,6 +165,15 @@ export class Publisher {
     const localHead = await this._git(['rev-parse', 'HEAD'], workspacePath);
     const localCommit = localHead.stdout.trim();
     if (!FULL_SHA.test(localCommit)) return this._failed(job, 'the local commit could not be determined', steps);
+
+    // The commit was made from a private index, so the repository's own index still holds the
+    // pre-publication version of the published files. Relative to the NEW HEAD that reads as a
+    // staged *reversion* — an operator running `git status` would see the change queued to be
+    // undone. Re-staging exactly the published paths against the real index brings it back into
+    // agreement with HEAD, and touches nothing else the operator had staged.
+    //
+    // Only on success. A failed publication still never touches the real index at all.
+    await this._git(['add', '--', ...request.intended_files], workspacePath);
 
     // -- push -------------------------------------------------------------
     // An explicit refspec, never a bare `git push`: what gets pushed must not depend on the

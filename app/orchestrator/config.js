@@ -16,6 +16,21 @@ import path from 'path';
 import { PATTERNS } from './contract.js';
 import { parseModelAliases } from './attestation.js';
 
+/**
+ * Parse the alias map, telling the operator when their configuration produced nothing.
+ *
+ * A typo here fails closed — every job blocks as unverifiable — which is safe but mystifying
+ * without a line saying why.
+ */
+function loadModelAliases(raw) {
+  const parsed = parseModelAliases(raw);
+  if (raw && parsed.size === 0) {
+    // eslint-disable-next-line no-console
+    console.warn('[orchestrator] PW_ORCHESTRATOR_MODEL_ALIASES produced no usable mappings; model attestation will fail closed');
+  }
+  return parsed;
+}
+
 const TRUE_VALUES = new Set(['true', '1', 'yes', 'on']);
 
 function bool(raw, fallback = false) {
@@ -69,10 +84,23 @@ export function loadOrchestratorConfig(env = process.env) {
     if (!wellFormed) {
       throw new Error('PW_ORCHESTRATOR_BASE_PATH must be an absolute path of simple, non-traversing segments');
     }
-    // The danger is the base path being an *ancestor* of a dashboard route, which would capture it.
-    // Living *under* one is fine and is what the contract's own `/api/orchestrator/v1` does — the
-    // router only matches its exact prefix.
-    const reserved = ['/api', '/login', '/logout', '/healthz', '/settings', '/term', '/pty', '/preview', '/static', '/agents.md'];
+    // The danger is the base path being an *ancestor* of a dashboard route, which would capture it —
+    // and the orchestrator router terminates unmatched requests with its own 401/404 rather than
+    // falling through, so an overlap black-holes the route rather than merely shadowing it. Living
+    // *under* a dashboard prefix is fine, and is what the contract's own `/api/orchestrator/v1` does.
+    const dashboardRoutes = [
+      '/api', '/login', '/logout', '/healthz', '/settings', '/term', '/pty', '/preview', '/static',
+      '/agents.md', '/manage', '/files', '/file', '/deploy',
+      '/terminal-preload.js', '/terminal-paste.js',
+    ];
+    // Every dashboard route is served under PW_BASE_PATH when one is configured, so the collision
+    // check has to be made in the same space. Without this, `PW_ORCHESTRATOR_BASE_PATH=/workbench`
+    // on a `PW_BASE_PATH=/workbench` install passed the guard and took the whole dashboard down
+    // while reporting itself mounted.
+    const dashboardBase = String(env.PW_BASE_PATH || '').replace(/\/+$/, '');
+    const reserved = dashboardRoutes.map((route) => `${dashboardBase}${route}`);
+    if (dashboardBase) reserved.push(dashboardBase, '/healthz');
+
     const swallows = reserved.some((route) => route === basePath || `${route}/`.startsWith(`${basePath}/`));
     if (swallows) {
       throw new Error(`PW_ORCHESTRATOR_BASE_PATH '${basePath}' would capture a dashboard route`);
@@ -138,7 +166,7 @@ export function loadOrchestratorConfig(env = process.env) {
     // An alias never equals what the CLI reports back (`sonnet` -> `claude-sonnet-5`), so the
     // comparison has to go through an explicit mapping; comparing the alias to itself would be no
     // check at all. Setting this REPLACES the measured defaults rather than extending them.
-    modelAliases: parseModelAliases(env.PW_ORCHESTRATOR_MODEL_ALIASES),
+    modelAliases: loadModelAliases(env.PW_ORCHESTRATOR_MODEL_ALIASES),
     // Separation of duty on approvals, on by default. Turning it off lets one credential request
     // and approve its own work, which makes the publication gate satisfiable by the machine alone.
     requireSeparateApprover: !['false', '0', 'no', 'off'].includes(

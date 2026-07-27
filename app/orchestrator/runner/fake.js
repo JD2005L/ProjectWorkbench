@@ -10,6 +10,20 @@
 // raised) instead of depending on a hidden heuristic.
 
 import { CodingBackend, HealthState, AuthMethod, SCHEMA_VERSION } from '../contract.js';
+import { DEFAULT_MODEL_ALIASES } from '../attestation.js';
+
+/**
+ * What a real CLI reports for an alias.
+ *
+ * The fake has to model this: a real session reports a resolved id (`claude-sonnet-5`), never the
+ * alias. A fake that echoed the alias would make attestation look like it worked when the thing it
+ * guards against — an alias compared to itself — is exactly what it was doing.
+ */
+function resolvedIdFor(alias) {
+  const patterns = DEFAULT_MODEL_ALIASES.get(alias);
+  if (!patterns) return `resolved-${alias}`;
+  return patterns[0].endsWith('*') ? patterns[0].slice(0, -1) : patterns[0];
+}
 
 export class FakeCodingBackend {
   constructor({ effective = { model_alias: 'sonnet', effort: 'high' }, clock = () => new Date('2026-07-27T12:00:00.000Z') } = {}) {
@@ -84,6 +98,9 @@ export class FakeCodingBackend {
     const effective = this.mirrorRequested ? { ...requested } : this.effective;
     return {
       effective: effective ? { schema_version: SCHEMA_VERSION, ...effective } : null,
+      // The resolved id a real session would report, so the engine's attestation is exercised
+      // rather than bypassed.
+      observed_model: effective ? resolvedIdFor(effective.model_alias) : null,
       backend: this.name,
       checked_at: this.clock().toISOString(),
       detail: effective ? null : 'the CLI did not report its effective configuration',
@@ -113,6 +130,9 @@ export class FakeCodingBackend {
     return {
       ok: true,
       session_id: sessionId,
+      // Every phase reports the model it ran under, as a real session does — this is what the
+      // engine's per-phase attestation checks.
+      model: this.effective ? resolvedIdFor(this.effective.model_alias) : null,
       effective: this.effective ? { schema_version: SCHEMA_VERSION, ...this.effective } : null,
       summary: 'fake phase completed',
       questions: [],

@@ -17,6 +17,11 @@ import { ErrorCode } from './contract.js';
 
 const execFileAsync = promisify(execFile);
 
+/** The only environment variables a caller may set. Deliberately not a general escape hatch. */
+const GIT_IDENTITY_VARS = Object.freeze([
+  'GIT_AUTHOR_NAME', 'GIT_AUTHOR_EMAIL', 'GIT_COMMITTER_NAME', 'GIT_COMMITTER_EMAIL',
+]);
+
 /**
  * Subcommands this subsystem may run. Read-only inspection, plus exactly the writes publication
  * needs: stage named files, commit, push a branch, and manage its own worktrees.
@@ -25,6 +30,10 @@ export const ALLOWED_GIT_SUBCOMMANDS = Object.freeze(new Set([
   'rev-parse', 'status', 'diff', 'log', 'ls-files', 'show', 'cat-file', 'rev-list',
   'symbolic-ref', 'for-each-ref', 'remote', 'config', 'branch', 'fetch', 'ls-remote',
   'add', 'commit', 'push', 'worktree', 'check-ignore', 'var', 'describe', 'hash-object',
+  // Seeds a scratch index from a commit. Writes ONLY the index — never the working tree, because
+  // the options that would do that (-u, -m, --reset) are not in the option allowlist below, and
+  // runGit additionally refuses read-tree unless an explicit private index file is supplied.
+  'read-tree',
 ]));
 
 /**
@@ -72,6 +81,9 @@ const ALLOWED_OPTIONS = Object.freeze({
   var: new Set([]),
   describe: new Set(['--tags', '--always']),
   'hash-object': new Set([]),
+  // No options at all. -u/--reset/-m would touch the working tree; omitting them from this set is
+  // what makes read-tree an index-only operation.
+  'read-tree': new Set([]),
 });
 
 /** Verbs each multi-verb subcommand may use. */
@@ -138,6 +150,9 @@ export function assertGitArgvAllowed(argv) {
     if (!verbs.has(verb)) throw refuse(`git ${subcommand} ${verb ?? ''} is not permitted`.trim());
   }
 
+  // read-tree may only ever write a caller-supplied scratch index. Enforced in runGit, which has
+  // the indexFile in hand; asserted here so the intent is visible next to the allowlist.
+
   // `config` is read-only here. Writing config would let a caller change how git behaves on every
   // later invocation — hooks, safe.directory, credential helpers — which is a durable escalation
   // rather than a single command.
@@ -175,11 +190,25 @@ export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120
   // why the variable is stripped first. Publication stages into a throwaway copy of the index so a
   // failure cannot leave the operator's staged work rearranged, and git.js deliberately offers no
   // way to unstage.
+  // read-tree writes an index. Without an explicit scratch index it would write the repository's
+  // own — which is the one thing this module exists to keep out of.
+  if (argv[0] === 'read-tree' && !indexFile) {
+    throw new ApiError(
+      ErrorCode.DIRECT_CODING_FORBIDDEN,
+      'git read-tree is only permitted against an explicit private index',
+    );
+  }
   if (indexFile) env.GIT_INDEX_FILE = indexFile;
-  // Explicit, caller-supplied variables — currently the commit identity. Passed as environment
+  // Explicit, caller-supplied variables — currently only the commit identity. Passed as environment
   // rather than `-c`, which the allowlist refuses because it is a general configuration-injection
-  // vector; the identity variables are a fixed, named set.
-  if (envExtra) Object.assign(env, envExtra);
+  // vector. Restricted to a named set: a blanket assign here would let a caller re-inject the very
+  // variables the prune above exists to strip, or override the private scratch index that makes a
+  // failed publication a no-op.
+  if (envExtra) {
+    for (const key of GIT_IDENTITY_VARS) {
+      if (typeof envExtra[key] === 'string') env[key] = envExtra[key];
+    }
+  }
   // A prompt would hang the phase rather than fail it.
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_ASKPASS = env.GIT_ASKPASS ?? '/bin/true';

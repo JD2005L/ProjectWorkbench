@@ -86,8 +86,10 @@ test('attestation: the shipped default mapping covers the aliases the CLI actual
   assert.equal(attestModel({ requestedAlias: 'sonnet', observedModel: 'claude-sonnet-5', aliases: DEFAULT_MODEL_ALIASES }).verified, true);
   assert.equal(attestModel({ requestedAlias: 'haiku', observedModel: 'claude-haiku-4-5-20251001', aliases: DEFAULT_MODEL_ALIASES }).verified, true);
   assert.equal(attestModel({ requestedAlias: 'opus', observedModel: 'claude-opus-5', aliases: DEFAULT_MODEL_ALIASES }).verified, true);
-  // A concrete id may also be requested directly, and attests against itself only when it matches.
-  assert.equal(attestModel({ requestedAlias: 'claude-sonnet-5', observedModel: 'claude-sonnet-5', aliases: DEFAULT_MODEL_ALIASES }).verified, true);
+  // A concrete id requested directly does NOT self-attest: an echoed string is not an observation,
+  // and letting it verify would reintroduce the alias-compared-to-itself hole in another shape. An
+  // operator who wants to request a concrete id maps it explicitly.
+  assert.equal(attestModel({ requestedAlias: 'claude-sonnet-5', observedModel: 'claude-sonnet-5', aliases: DEFAULT_MODEL_ALIASES }).verified, false);
   assert.equal(attestModel({ requestedAlias: 'claude-sonnet-5', observedModel: 'claude-opus-5', aliases: DEFAULT_MODEL_ALIASES }).verified, false);
 });
 
@@ -99,6 +101,34 @@ test('attestation: a prefix mapping cannot be widened into a wildcard by a craft
       `${observed} must not satisfy the claude-haiku-4-5* mapping`,
     );
   }
+});
+
+test('attestation: a pattern short enough to be a wildcard is dropped, not honoured', () => {
+  // `{"sonnet": ["*"]}` would verify ANY observed id, including a silent downgrade to a cheaper
+  // model — a configuration mistake succeeding by accident, which is what this module exists to
+  // prevent.
+  for (const raw of ['{"sonnet": ["*"]}', '{"sonnet": ["c*"]}', '{"sonnet": ["cla*"]}']) {
+    const aliases = parseModelAliases(raw);
+    for (const observed of ['claude-sonnet-5', 'claude-haiku-4-5-20251001', 'gpt-4o-mini']) {
+      assert.equal(
+        attestModel({ requestedAlias: 'sonnet', observedModel: observed, aliases }).verified, false,
+        `${raw} must not verify ${observed}`,
+      );
+    }
+  }
+});
+
+test('attestation: a session that does not report its authentication source is refused', () => {
+  // Absence is not assent. A build that stopped emitting apiKeySource would otherwise let an
+  // API-billed session attest — fail-open inside a module whose thesis is fail-closed on absence.
+  const result = buildAttestation({
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    aliases: DEFAULT_MODEL_ALIASES,
+    init: { model: 'claude-sonnet-5', effort: 'high' },
+    stderr: '',
+  });
+  assert.equal(result.effective, null);
+  assert.match(result.detail, /authentication source/i);
 });
 
 test('attestation: a malformed alias configuration yields no mappings rather than a permissive one', () => {

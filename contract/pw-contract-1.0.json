@@ -1493,6 +1493,7 @@
       "ls-files",
       "ls-remote",
       "push",
+      "read-tree",
       "remote",
       "rev-list",
       "rev-parse",

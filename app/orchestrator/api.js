@@ -253,8 +253,17 @@ export function createOrchestratorRouter({
       project_id: project.project_id,
       session_key: body.session_key,
       verified: result.effective !== null,
+      observed_model: result.observed_model ?? null,
     });
-    res.json(result);
+    // `SessionVerificationResponse` forbids extra fields, so the ProjectWorkbench-side extras are
+    // stripped here rather than at the source — the engine and the audit log still need them.
+    const { observed_model: _observed, requirement: _requirement, cli_session_id: _cli, ...wire } = result;
+    if (result.requirement) {
+      // The operator-facing reason every job is blocking, where an operator will actually see it.
+      // eslint-disable-next-line no-console
+      console.warn('[orchestrator] effort attestation unavailable:', result.requirement);
+    }
+    res.json(wire);
   }));
 
   // -------------------------------------------------------------------------

@@ -708,13 +708,14 @@ gitTest('engine: publication stages only the intended files and verifies the rea
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
 });
 
-gitTest('engine: a mismatch between intended and staged files aborts before committing', async () => {
-  await withEngine(async ({ engine, repo, repoDir }) => {
+gitTest("engine: the operator's pre-staged work is invisible to publication, not a conflict", async () => {
+  await withEngine(async ({ engine, repo, repoDir, remote }) => {
     const { jobId, approval } = await readyToPublish(engine, repoDir);
     fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
     fs.writeFileSync(path.join(repoDir, 'README.md'), '# demo\nunrelated\n');
-    // Something already staged that was never intended.
+    // The operator has their own unrelated work staged in the repository index.
     await execFileAsync('git', ['add', 'README.md'], { cwd: repoDir });
+    const stagedBefore = (await execFileAsync('git', ['diff', '--cached', '--name-only'], { cwd: repoDir })).stdout;
 
     await engine.approveStage({
       token: APPROVER, jobId,
@@ -731,10 +732,19 @@ gitTest('engine: a mismatch between intended and staged files aborts before comm
       idempotencyKey: 'p1', correlationId: 'c',
     });
 
-    assert.equal(record.pushed, false);
-    assert.equal(record.remote_sha_verified, false);
-    assert.equal(record.local_commit, null, 'nothing may have been committed');
-    assert.notEqual(repo.getJob(jobId).status, JobStatus.COMPLETED);
+    // Publication stages into its own index, seeded from HEAD, so a pre-existing index entry cannot
+    // ride along into the commit — it is simply not there. Earlier this was detected as a mismatch
+    // and aborted; not being able to happen at all is the stronger guarantee.
+    assert.equal(record.pushed, true, record.failure_reason ?? 'publication should have succeeded');
+    assert.deepEqual(record.changed_files, ['src.js'], 'the unrelated staged file must not be published');
+
+    // And the operator's index is exactly as they left it.
+    const stagedAfter = (await execFileAsync('git', ['diff', '--cached', '--name-only'], { cwd: repoDir })).stdout;
+    assert.equal(stagedAfter, stagedBefore, "the operator's staged set must be untouched");
+
+    // The published commit really does contain only src.js.
+    const published = await execFileAsync('git', ['show', '--name-only', '--format=', record.local_commit], { cwd: repoDir });
+    assert.deepEqual(published.stdout.split('\n').filter(Boolean), ['src.js']);
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
 });
 

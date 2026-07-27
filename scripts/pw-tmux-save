@@ -60,20 +60,26 @@ nwin=0
 
 # One row per window (represented by its active pane). Split panes collapse to
 # the active pane's cwd — these sessions are single-pane in practice.
-while IFS=$'\t' read -r s w wn pp cwd wact pact role; do
+while IFS=$'\t' read -r s w wn pp cwd wact pact role skey; do
 	[[ "$s" == pw_* ]] || continue
 	[[ "$EXCLUDE" == *" $s "* ]] && continue
 	[[ "$pact" == "1" ]] || continue
-	# Skip orchestrator-owned lanes. They carry an @pw_role marker, are recreated on demand by the
-	# orchestration subsystem, and hold no human's work. Restoring one by name would recreate it as
-	# a plain shell WITHOUT the marker — an unmarked window squatting the reserved name, which the
-	# lane manager then (correctly) refuses to touch, wedging every job for that project.
-	[[ -n "$role" ]] && continue
+	# Skip orchestrator-owned lanes. They are recreated on demand by the orchestration subsystem and
+	# hold no human's work; restoring one by name would recreate it as a plain shell WITHOUT its
+	# markers — an unmarked window squatting the reserved name, which the lane manager then
+	# (correctly) refuses to touch, wedging every job for that project.
+	#
+	# BOTH markers are required. tmux resolves #{@option} through the window -> session -> global
+	# scope chain, so a single stray `set-option -g @pw_role ...` would otherwise make every window
+	# on the server look like a lane and silently exclude the entire manifest. The orchestrator
+	# always sets all four markers together at window scope, so requiring two of them makes an
+	# accidental global option insufficient.
+	[[ -n "$role" && -n "$skey" ]] && continue
 	key="$s"$'\t'"$w"
 	K_CWD[$key]="$cwd"; K_NAME[$key]="$wn"; K_ACTIVE[$key]="$wact"
 	PP2KEY[$pp]="$key"
 	nwin=$((nwin + 1))
-done < <(tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_pid}	#{pane_current_path}	#{window_active}	#{pane_active}	#{@pw_role}' 2>/dev/null)
+done < <(tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_pid}	#{pane_current_path}	#{window_active}	#{pane_active}	#{@pw_role}	#{@pw_session_key}' 2>/dev/null)
 
 # Refuse to clobber a good manifest with an empty one: if we somehow found no
 # windows (server vanished mid-run, format mangled, etc.), keep what we have.

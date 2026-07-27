@@ -40,6 +40,12 @@ export const EFFORT_ATTESTATION_REQUIREMENT =
   + 'blocked_configuration. Passing the flag is not attestation: it is the assumption the contract '
   + 'exists to forbid.';
 
+/**
+ * Shortest usable model-id prefix. Anything shorter is a wildcard in disguise: `"*"` or `"c*"` would
+ * verify every id a vendor could ever return.
+ */
+const MIN_PATTERN_PREFIX = 6;
+
 /** Init-event fields a CLI might use to report effective effort. Checked in order. */
 const EFFORT_FIELDS = ['effort', 'effortLevel', 'reasoning_effort', 'effort_level'];
 
@@ -79,7 +85,15 @@ export function parseModelAliases(raw) {
   for (const [alias, targets] of Object.entries(parsed)) {
     if (!alias || typeof alias !== 'string') continue;
     if (!Array.isArray(targets) || targets.length === 0) continue;
-    const cleaned = targets.filter((t) => typeof t === 'string' && t.length > 0);
+    // A pattern whose prefix is empty or near-empty is a wildcard, and a wildcard verifies
+    // anything — including a silent downgrade to a cheaper model. The module's whole thesis is that
+    // a configuration mistake must make attestation fail, not succeed by accident, so such a
+    // pattern is dropped rather than honoured.
+    const cleaned = targets.filter((t) => {
+      if (typeof t !== 'string') return false;
+      const prefix = t.endsWith('*') ? t.slice(0, -1) : t;
+      return prefix.length >= MIN_PATTERN_PREFIX;
+    });
     if (cleaned.length) out.set(alias, Object.freeze(cleaned));
   }
   return out;
@@ -111,13 +125,9 @@ export function attestModel({ requestedAlias, observedModel, aliases }) {
   const patterns = map.get(requestedAlias);
 
   if (!patterns) {
-    // A concrete vendor id may be requested directly. It attests only against itself — and only
-    // when the alias is not a bare alias masquerading as an id.
-    const looksConcrete = map.size > 0
-      && [...map.values()].some((entries) => entries.some((p) => matchesPattern(requestedAlias, p)));
-    if (looksConcrete && observedModel === requestedAlias) {
-      return { verified: true, outcome: 'verified', observed: observedModel, reason: null };
-    }
+    // No self-attestation branch. An earlier version let a "concrete id" verify against itself,
+    // which is the alias-compared-to-itself hole in another shape: an echoed string is not an
+    // observation. If an operator wants to request a concrete id, they map it explicitly.
     return {
       verified: false,
       outcome: 'unverifiable',
@@ -195,10 +205,17 @@ export function buildAttestation({ requested, aliases, init, stderr = '' }) {
   // means inference is billed to an API account, which the product forbids — and the contract's
   // AuthMethod enum has no member that could even express it.
   const apiKeySource = typeof init?.apiKeySource === 'string' ? init.apiKeySource : null;
-  const subscriptionBacked = apiKeySource === null || apiKeySource === 'none';
+  // Absence is NOT assent. A build that stopped emitting the field would otherwise let an
+  // API-billed session attest, which is fail-open inside the one module whose thesis is fail-closed
+  // on absence.
+  const subscriptionBacked = apiKeySource === 'none';
 
   const reasons = [];
-  if (!subscriptionBacked) reasons.push('the session is not subscription authenticated');
+  if (!subscriptionBacked) {
+    reasons.push(apiKeySource === null
+      ? 'the session did not report its authentication source'
+      : 'the session is not subscription authenticated');
+  }
   if (!model.verified) reasons.push(model.reason);
   if (!effort.verified) reasons.push(effort.reason);
 
