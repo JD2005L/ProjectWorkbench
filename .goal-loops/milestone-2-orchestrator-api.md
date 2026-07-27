@@ -341,12 +341,56 @@ clone with `npm ci`**; 20 focused repetitions of the reported test with no git i
 fixture drift + cross-contract against real Pydantic; isolated HTTP/MCP smoke; zero temp dirs,
 sockets or processes left behind; live tmux (15 sessions) untouched; CT2115 undeployed.
 
+### 2026-07-27 (round 4) — cross-repository contract increment: attestation provenance
+
+**The orchestrator repository had moved.** Discovered by the cross-contract test failing on `Effort`,
+not by being told: `contracts/policy.py` now defines `AttestationProvenance`, `LaunchAttestation`,
+`SettingsAttestation`, `AuthMode` and `weaker()`; `Effort` gained `xhigh`; `VerifySessionRequest`
+gained `run_id` and `config_generation`; and — the significant one — `SessionVerificationResponse`
+now carries an `attestation` and **derives** `effective` from it, refusing a payload that sends
+`effective` as a field. ProjectWorkbench is conformed to all of it; that repository was not edited.
+
+**Live probes settled the design** rather than assumption:
+
+| probe | result |
+|---|---|
+| `--help` | declares `--effort <level>` with `(low, medium, high, xhigh, max)` |
+| init event | reports the resolved model; **no effort field of any kind** |
+| `/usr/local/bin/claude` | a **bash wrapper** that appends `--permission-mode`, `--mcp-config` |
+| `/bin/claude` | → `…/claude-code/bin/claude.exe`, a 275 MB ELF; sha256 recorded |
+
+So: **model = `runtime_reported`** (observed, normalised through the alias mapping, with the
+normalization carried alongside), **effort = `launch_enforced`** (chain of custody over an input, not
+an observation). Jobs can now run without either overstating effort or needlessly downgrading model.
+A record is described by its **weakest** field.
+
+The wrapper finding matters: PW's own installer puts an argv-rewriting script on `PATH`, so
+`launch_enforced` refuses any executable that is a shell wrapper, relative, or unpinned. Eight
+preconditions must all hold or **no attestation is produced at all** and the job blocks.
+
+Fingerprints cache on the binary's own identity, so the ~1 s hash of 275 MB happens once and any
+change to the file misses the cache; a failed probe is never cached, since it may be a partially
+written upgrade.
+
+**Adversarial coverage:** forged provenance smuggled through the init event, caller-supplied argv, a
+value the binary does not advertise, an undeclared option, an ignored-option warning, missing/failed
+fingerprint, capability and content drift, unbound and partially bound callers, API-key auth, the
+real wrapper shape, a relative executable, a pinned-hash mismatch, and cache invalidation.
+
+**Verification:** 315/315, three consecutive runs each on Node 20.19.0 and Node 22 from a fresh clone
+with `npm ci`; 20 publication-idempotency repetitions with no git identity; every emitted payload
+validated against the orchestrator's real Pydantic (`SettingsAttestation`, `LaunchAttestation`,
+`ModelSettings(xhigh)`, `SessionVerificationResponse`) plus a test asserting a payload carrying
+`effective` is refused; `AttestationProvenance` and `AuthMode` now cross-checked member-for-member;
+HTTP/MCP smoke green; no temp dirs, sockets or processes left; CT2115 undeployed.
+
 ### Status
 
 All P0 and P1 findings from all three review rounds are resolved with regression tests. The PR stays
 a draft: the residual below is a coordination decision, not a code change.
 
-**Residual, by design not omission:** with the installed CLI, effort cannot be attested, so jobs block
-at `blocked_configuration`. That is the required fail-closed behaviour and needs a coordinated
-decision with the orchestrator side (contract gains a provenance field, or the CLI gains an effort
-read-back) before this instance can run work end to end.
+**The previous residual is resolved.** Effort is no longer unattestable-therefore-blocking: the
+contract now carries provenance, so effort is reported as `launch_enforced` and jobs run — while the
+distinction from an observation is preserved in the payload rather than flattened away. What remains
+is a *property* of that provenance, stated plainly in the contract and the docs: a launched flag can
+still be ignored by a build nobody fingerprinted, which is exactly why it is a different word.
