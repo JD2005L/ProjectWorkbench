@@ -18,8 +18,8 @@ import os from 'node:os';
 import path from 'node:path';
 
 import {
-  buildAttestation, attestLaunchEnforced, buildLaunchAttestation, extractIgnoredOptionWarning,
-  authModeOf, DEFAULT_MODEL_ALIASES,
+  buildAttestation, attestLaunchEnforced, buildLaunchAttestation, buildAttestationEnvelope,
+  extractIgnoredOptionWarning, authModeOf, DEFAULT_MODEL_ALIASES, UNBOUND_NONCE,
 } from '../app/orchestrator/attestation.js';
 import {
   parseOptionCapability, probeBinaryFingerprint, FingerprintCache, FingerprintFailure,
@@ -53,6 +53,10 @@ const GOOD_FINGERPRINT = Object.freeze({
 const BINDING = Object.freeze({
   session_key: 'orch:wb-test-01:Demo:pvi2-orchestrator',
   run_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+  // Fresh for every verification. A nonce derived from the job and phase alone would repeat on every
+  // retry, so an attestation captured on the first attempt would stay valid on the fifth — including
+  // after the lane had been relaunched with different flags.
+  verification_nonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   config_generation: 3,
   at: '2026-07-27T12:00:00.000Z',
   auth_mode: AuthMode.SUBSCRIPTION,
@@ -135,15 +139,24 @@ test('provenance: the current CLI yields model runtime_reported and effort launc
   assert.equal(attestation.effort_provenance, Provenance.LAUNCH_ENFORCED);
   assert.ok(attestation.launch, 'a launch_enforced field requires a launch attestation');
   assert.equal(attestation.launch.caller_controlled_argv, false);
-  assert.equal(attestation.launch.auth_mode, AuthMode.SUBSCRIPTION);
   assert.equal(attestation.launch.binary_version, '2.1.220 (Claude Code)');
+  // Identity, authentication and binding live in the envelope now, and apply to EVERY claim — with
+  // them inside the launch record, declaring both fields runtime_reported skipped all of them and
+  // got the stronger provenance for free.
+  assert.equal(attestation.envelope.auth_mode, AuthMode.SUBSCRIPTION);
+  assert.equal(attestation.envelope.attested_by, INSTANCE);
+  assert.equal(attestation.envelope.verification_nonce, BINDING.verification_nonce);
   assert.match(attestation.launch.capability_fingerprint, /^[a-f0-9]{64}$/);
   assert.match(attestation.launch.argv_digest, /^[a-f0-9]{64}$/);
   assert.deepEqual(attestation.launch.advertised_values['--effort'], ['low', 'medium', 'high', 'xhigh', 'max']);
-  assert.equal(attestation.launch.config_generation, 3);
+  assert.equal(attestation.envelope.config_generation, 3);
 
-  // And the runtime-reported half must carry the normalization that produced it.
-  assert.deepEqual(attestation.normalization, ['init.model=claude-sonnet-5 -> sonnet']);
+  // And the runtime-reported half must carry the structured normalization that produced it: free
+  // text was not evidence, because the validator could only ask whether the list was non-empty.
+  assert.deepEqual(attestation.normalization.map((n) => n.field), ['model_alias']);
+  assert.equal(attestation.normalization[0].source_key, 'init.model');
+  assert.equal(attestation.normalization[0].raw_value, 'claude-sonnet-5');
+  assert.equal(attestation.normalization[0].value, 'sonnet');
 });
 
 test('provenance: a CLI that DOES report effort is observed, and no launch record is needed', () => {
@@ -287,13 +300,35 @@ test('provenance: a peer that does not bind its request gets no launch attestati
   assert.match(result.detail, /bind/i);
 });
 
+test('provenance: a caller that reuses the default nonce is treated as unbound', () => {
+  // The sentinel default means "no fresh nonce supplied". Accepting it would let an attestation
+  // captured on one verification be replayed onto a later one for the same job.
+  for (const nonce of [UNBOUND_NONCE, undefined, null, 'tooshort', 'x'.repeat(200)]) {
+    const result = build({ binding: { ...BINDING, verification_nonce: nonce } });
+    assert.equal(result.settings_attestation, null, `nonce ${String(nonce).slice(0, 12)} must not attest`);
+    assert.equal(result.blocking, true);
+  }
+});
+
+test('provenance: an unbound caller cannot get the STRONGER label either', () => {
+  // The envelope's checks apply to every claim. Previously binding gated only launch enforcement,
+  // so a backend printing `effort` could skip it entirely and be believed.
+  const result = build({
+    binding: { ...BINDING, run_id: 'unbound' },
+    init: { ...INIT, effort: 'high' },
+  });
+  assert.equal(result.provenance.model, Provenance.UNAVAILABLE);
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.equal(result.settings_attestation, null);
+});
+
 test('provenance: a peer that binds gets an attestation stamped with exactly its binding', () => {
   const result = build({ binding: { ...BINDING, run_id: 'run-42', config_generation: 7 } });
-  assert.equal(result.settings_attestation.launch.run_id, 'run-42');
-  assert.equal(result.settings_attestation.launch.config_generation, 7);
+  assert.equal(result.settings_attestation.envelope.run_id, 'run-42');
+  assert.equal(result.settings_attestation.envelope.config_generation, 7);
   // The version of the attestation contract this build implements travels with the evidence, so a
   // peer below it cannot read the payload as though these checks had been made.
-  assert.equal(result.settings_attestation.launch.contract_version, '1.1');
+  assert.equal(result.settings_attestation.envelope.contract_version, '1.1');
 });
 
 // ---------------------------------------------------------------------------
@@ -494,6 +529,7 @@ test('session: the attestation survives the REAL session manager and reaches the
         session_key: record.session_key, phase_class: 'implementation',
         requested: { model_alias: 'sonnet', effort: 'high' },
         run_id: 'run-7', config_generation: 2,
+        verification_nonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
       },
     });
 
@@ -501,9 +537,10 @@ test('session: the attestation survives the REAL session manager and reaches the
     assert.equal(out.settings_attestation.model_provenance, Provenance.RUNTIME_REPORTED);
     assert.equal(out.settings_attestation.effort_provenance, Provenance.LAUNCH_ENFORCED);
     // Stamped with the CALLER's binding, not one invented on this side.
-    assert.equal(out.settings_attestation.launch.run_id, 'run-7');
-    assert.equal(out.settings_attestation.launch.config_generation, 2);
-    assert.equal(out.settings_attestation.launch.contract_version, '1.1');
+    assert.equal(out.settings_attestation.envelope.run_id, 'run-7');
+    assert.equal(out.settings_attestation.envelope.config_generation, 2);
+    assert.equal(out.settings_attestation.envelope.contract_version, '1.1');
+    assert.equal(out.settings_attestation.envelope.verification_nonce, 'a1b2c3d4e5f60718293a4b5c6d7e8f90');
     assert.equal(out.provenance.weakest, Provenance.LAUNCH_ENFORCED);
     assert.equal(out.observed_model, 'claude-sonnet-5');
   } finally {
@@ -519,11 +556,13 @@ test('launch attestation: the hostile defaults on the contract side are answered
     binding: BINDING, stderr: '', authMode: AuthMode.SUBSCRIPTION,
   });
   assert.equal(launch.caller_controlled_argv, false);
-  assert.equal(launch.auth_mode, AuthMode.SUBSCRIPTION);
   assert.equal(launch.ignored_option_warning, null);
   assert.equal(launch.argv_builder_id, 'pw-claude-phase-argv-v1');
-  assert.equal(launch.attested_by, INSTANCE);
   assert.deepEqual(launch.advertised_options.sort(), ['--effort', '--model']);
+  // `auth_mode` defaults to api_key on the contract side, so a payload that omits it fails closed.
+  const envelope = buildAttestationEnvelope({ instanceId: INSTANCE, binding: BINDING, authMode: AuthMode.SUBSCRIPTION });
+  assert.equal(envelope.auth_mode, AuthMode.SUBSCRIPTION);
+  assert.equal(envelope.attested_by, INSTANCE);
 });
 
 test('launch attestation: an enforcement claim is refused outright when a precondition fails', () => {

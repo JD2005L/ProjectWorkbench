@@ -240,6 +240,7 @@ test('runner: the effective model comes from the init event, not from an echoed 
     sessionKey: 'o:w:Demo:pvi2-orchestrator',
     cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
 
   // The observed model is retained even when `effective` must be null for want of a verifiable
@@ -261,6 +262,7 @@ test('runner: a session reporting no effort is launch-enforced, not blocked', as
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
   // Effort is not reported, so it is ENFORCED at launch rather than blocking — the whole point of
   // the provenance contract. The model half remains an observation.
@@ -284,6 +286,7 @@ test('runner: a session that DOES report effort attests, with no configuration c
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
   assert.deepEqual(
     { model_alias: outcome.effective.model_alias, effort: outcome.effective.effort },
@@ -301,6 +304,7 @@ test('runner: a session running a different model than requested is a mismatch, 
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
   assert.equal(outcome.effective, null);
   assert.equal(outcome.attestation.model.outcome, 'mismatch');
@@ -316,6 +320,7 @@ test('runner: an API-billed session is refused even when it attests perfectly', 
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
   assert.equal(outcome.effective, null);
   assert.match(outcome.detail, /subscription/i);
@@ -334,6 +339,7 @@ test('runner: a CLI warning that it ignored the effort flag is never attested as
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
   assert.equal(outcome.effective, null, 'an ignored flag must never be attested as applied');
   assert.equal(outcome.attestation.effort.outcome, 'ignored');
@@ -345,6 +351,7 @@ test('runner: output with no init event is unverifiable rather than optimistical
     requested: { model_alias: 'sonnet', effort: 'high' },
     phaseClass: PhaseClass.DISCOVERY, sessionKey: 'k', cwd: '/srv/workspaces/Demo',
     runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
   });
   assert.equal(outcome.effective, null);
 });

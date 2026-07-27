@@ -431,6 +431,7 @@ export class OrchestratorSessionManager {
         // not bound its request to a run, so nothing can be attested to that run.
         runId: request.run_id ?? 'unbound',
         configGeneration: Number.isInteger(request.config_generation) ? request.config_generation : 0,
+        verificationNonce: request.verification_nonce ?? null,
       });
     } catch (err) {
       // A backend that cannot answer is reported as unverifiable rather than as a server error: the

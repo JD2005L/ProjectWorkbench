@@ -14,6 +14,7 @@ import express from 'express';
 import {
   SCHEMA_VERSION, ATTESTATION_CONTRACT_VERSION, PATTERNS, ErrorCode, newId,
 } from './contract.js';
+import { UNBOUND_NONCE } from './attestation.js';
 import { ApiError, notFound, sendError, payloadTooLarge } from './errors.js';
 import {
   SCOPES, ServiceTokenStore, RateLimiter, authenticateRequest, requireScope,
@@ -265,6 +266,10 @@ export function createOrchestratorRouter({
       // The attestation contract the orchestrator speaks. A peer that asks for one this build
       // cannot meet is told so, rather than answered in a shape that implies checks never made.
       attestation_contract_version: { type: 'shortText', default: ATTESTATION_CONTRACT_VERSION },
+      // Fresh for every verification. Derived from the job and phase alone, the binding repeated on
+      // every retry, so an attestation captured on the first attempt stayed valid on the fifth —
+      // including after the lane had been relaunched with different flags.
+      verification_nonce: { type: 'shortText', default: UNBOUND_NONCE },
     },
   };
 

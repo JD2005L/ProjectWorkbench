@@ -567,6 +567,10 @@ export class OrchestrationEngine {
             // even though the binary supports the option.
             run_id: jobId,
             config_generation: this.config.configGeneration,
+            // Fresh per verification, not derived from the job and phase: a nonce that repeated on
+            // every retry would let an attestation captured on the first attempt stay valid on the
+            // fifth, after the lane had been relaunched with different flags.
+            verification_nonce: crypto.randomBytes(16).toString('hex'),
           },
           correlationId: job.correlation_id,
         });

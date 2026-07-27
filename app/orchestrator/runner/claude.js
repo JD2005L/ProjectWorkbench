@@ -271,7 +271,7 @@ export class ClaudeCodeBackend {
   async verifyConfiguration({
     requested, phaseClass = PhaseClass.DISCOVERY, cwd, cliSessionId = null,
     runId = 'unbound', sessionKey = null,
-    configGeneration = null,
+    configGeneration = null, verificationNonce = null,
   }) {
     const argv = this.buildPhaseArgv({
       prompt: 'Reply with exactly: ready',
@@ -326,6 +326,7 @@ export class ClaudeCodeBackend {
         // The caller's generation when it sent one, else this instance's own. Either way the claim
         // is stamped with a generation, so it cannot outlive a configuration change.
         config_generation: Number.isInteger(configGeneration) ? configGeneration : this.config.configGeneration,
+        verification_nonce: verificationNonce,
         at: this.clock().toISOString(),
       },
     });

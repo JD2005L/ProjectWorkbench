@@ -250,16 +250,9 @@ export function attestLaunchEnforced({
   if (warning) {
     return fail(LaunchEnforcementFailure.OPTION_IGNORED, warning);
   }
-  if (!binding?.session_key || !binding?.run_id
-    || !Number.isInteger(binding?.config_generation) || binding.config_generation < 0) {
+  if (!bindingIsUsable(binding)) {
     return fail(LaunchEnforcementFailure.NOT_BOUND,
-      'the enforcement evidence is not bound to a session, run and configuration generation');
-  }
-  // `unbound` is the contract's default for a peer that did not say which run it is asking about.
-  // An attestation stamped with it is not bound to anything, so it is not made at all.
-  if (binding.run_id === 'unbound') {
-    return fail(LaunchEnforcementFailure.NOT_BOUND,
-      'the caller did not bind its request to a run, so a launch cannot be attested to one');
+      'the caller did not bind its request to a run with a fresh verification nonce');
   }
   if (binding.auth_mode !== AuthMode.SUBSCRIPTION) {
     return fail(LaunchEnforcementFailure.NOT_BOUND,
@@ -317,7 +310,6 @@ export function buildLaunchAttestation({
 
   return {
     schema_version: SCHEMA_VERSION,
-    attested_by: instanceId,
     binary_path: fingerprint.realpath.slice(0, 200),
     binary_version: fingerprint.version.slice(0, 200),
     // A digest of the advertised capability *surface*, not merely of the file: if what the binary
@@ -336,13 +328,50 @@ export function buildLaunchAttestation({
     // attest to the caller's intent rather than to policy.
     caller_controlled_argv: false,
     ignored_option_warning: extractIgnoredOptionWarning(stderr, '--effort'),
-    auth_mode: authMode,
+  };
+}
+
+/**
+ * Who is speaking, under what authentication, about which run.
+ *
+ * Required for *every* claim, not just an enforced one. That is the correction the envelope exists
+ * to make: with identity, auth and binding living inside the launch record, a peer that declared
+ * both fields `runtime_reported` skipped all of them and got the *stronger* provenance for free —
+ * the checks were opt-in by the party being checked.
+ */
+export function buildAttestationEnvelope({ instanceId, binding, authMode }) {
+  return {
+    schema_version: SCHEMA_VERSION,
+    attested_by: instanceId,
     session_key: binding.session_key,
     run_id: binding.run_id,
+    // The nonce the orchestrator asked with, so a good answer cannot be replayed onto a later
+    // verification of the same job — including after the lane was relaunched with different flags.
+    verification_nonce: binding.verification_nonce,
     config_generation: binding.config_generation,
+    auth_mode: authMode,
     attested_at: binding.at,
     contract_version: ATTESTATION_CONTRACT_VERSION,
   };
+}
+
+/** The default nonce means "the caller did not supply a fresh one". */
+export const UNBOUND_NONCE = '0'.repeat(32);
+
+/**
+ * Whether a binding is complete enough to attest anything at all.
+ *
+ * Applies to both provenance labels now: an unbound answer is replayable, and a replayable answer
+ * about a session that has since been relaunched is not evidence about the run being asked about.
+ */
+export function bindingIsUsable(binding) {
+  if (!binding?.session_key || !binding?.run_id) return false;
+  if (binding.run_id === 'unbound') return false;
+  if (!Number.isInteger(binding.config_generation) || binding.config_generation < 0) return false;
+  const nonce = binding.verification_nonce;
+  if (typeof nonce !== 'string' || nonce.length < 16 || nonce.length > 128) return false;
+  if (nonce === UNBOUND_NONCE) return false;
+  return true;
 }
 
 export function buildAttestation({
@@ -355,26 +384,32 @@ export function buildAttestation({
   // — the STRONGER label — cost a hostile or substituted backend one extra JSON field. "The backend
   // said so" is only worth anything once we know which backend.
   const identified = Boolean(fingerprint?.ok);
+  // The envelope's checks apply to every claim. An unbound answer cannot be attributed to the run
+  // being asked about, whichever way its values were learned.
+  const bound = bindingIsUsable(binding);
 
   const model = attestModel({
     requestedAlias: requested.model_alias, observedModel: init?.model, aliases,
   });
-  if (!identified) {
+  if (!identified || !bound) {
     model.verified = false;
-    model.reason = model.reason
-      ?? `the coding CLI could not be fingerprinted (${fingerprint?.failure ?? 'unknown'}), so nothing it reports can be attributed`;
+    model.reason = model.reason ?? (identified
+      ? 'the caller did not bind its request to a run with a fresh verification nonce'
+      : `the coding CLI could not be fingerprinted (${fingerprint?.failure ?? 'unknown'}), so nothing it reports can be attributed`);
   }
   model.provenance = model.verified ? Provenance.RUNTIME_REPORTED : Provenance.UNAVAILABLE;
 
   // Runtime observation first: it is strictly stronger, so a CLI that grows an effort field is
   // preferred automatically and the enforcement path simply stops being used.
   let effort = attestEffort({ requestedEffort: requested.effort, init, stderr });
-  if (!identified) {
+  if (!identified || !bound) {
     effort = {
       ...effort,
       verified: false,
       provenance: Provenance.UNAVAILABLE,
-      reason: 'the coding CLI could not be fingerprinted, so nothing it reports can be attributed',
+      reason: identified
+        ? 'the caller did not bind its request to a run with a fresh verification nonce'
+        : 'the coding CLI could not be fingerprinted, so nothing it reports can be attributed',
     };
   }
   // `unverifiable` also falls through to enforcement: a backend printing a nonsense effort would
@@ -457,18 +492,29 @@ export function buildAttestation({
         effective: { schema_version: SCHEMA_VERSION, model_alias: requested.model_alias, effort: effort.observed },
         model_provenance: model.provenance,
         effort_provenance: effort.provenance,
+        envelope: buildAttestationEnvelope({ instanceId, binding, authMode: authModeOf(init) }),
         launch: effort.provenance === Provenance.LAUNCH_ENFORCED || model.provenance === Provenance.LAUNCH_ENFORCED
-          ? buildLaunchAttestation({
-            instanceId, fingerprint, argv, stderr,
-            binding: { ...binding, auth_mode: authModeOf(init) },
-            authMode: authModeOf(init),
-          })
+          ? buildLaunchAttestation({ instanceId, fingerprint, argv, stderr, binding, authMode: authModeOf(init) })
           : null,
-        // Required for any runtime_reported field: "the backend said sonnet" means nothing unless
-        // the step from what it actually printed is written down.
-        normalization: model.provenance === Provenance.RUNTIME_REPORTED
-          ? [`init.model=${model.observed} -> ${requested.model_alias}`]
-          : [],
+        // One structured entry per runtime_reported field, naming the source it came from and the
+        // value that source produced. Free text was not evidence: the validator could only ask
+        // whether the list was non-empty, which made the STRONGER claim the cheaper one.
+        normalization: [
+          ...(model.provenance === Provenance.RUNTIME_REPORTED ? [{
+            schema_version: SCHEMA_VERSION,
+            field: 'model_alias',
+            source_key: 'init.model',
+            raw_value: model.observed,
+            value: requested.model_alias,
+          }] : []),
+          ...(effort.provenance === Provenance.RUNTIME_REPORTED ? [{
+            schema_version: SCHEMA_VERSION,
+            field: 'effort',
+            source_key: 'init.effort',
+            raw_value: effort.observed,
+            value: effort.observed,
+          }] : []),
+        ],
       }
       : null,
     model,

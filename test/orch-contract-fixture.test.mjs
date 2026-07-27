@@ -14,6 +14,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { buildFixture, serialiseFixture, FIXTURE_PATH } from '../scripts/orch-contract-fixture.mjs';
+import { compareToPin, orchestratorAvailable } from '../scripts/orch-contract-pin.mjs';
 
 const ORCHESTRATOR_ROOT = '/opt/project-workbench/workspaces/PVICodingOrchestrator';
 const VENV_PYTHON = path.join(ORCHESTRATOR_ROOT, '.venv', 'bin', 'python');
@@ -32,6 +33,31 @@ function orchestratorJson(script) {
   });
   return JSON.parse(out);
 }
+
+test('drift: the orchestrator contract has not moved since this repository was conformed to it', () => {
+  // The failure this converts. The cross-contract tests validate against the orchestrator's LIVE
+  // working tree — a sibling repository that changes independently — so a change there surfaced here
+  // as an "intermittent" suite failure with nothing in this repository having moved. An independent
+  // verifier hit exactly that: two runs of the same commit disagreed because commit 703d765 landed
+  // on the other side between them, restructuring SettingsAttestation.
+  //
+  // Pinning does not stop the contract moving. It makes the move say so, name the files, and stop
+  // masquerading as flakiness.
+  if (!orchestratorAvailable()) {
+    // Nothing to compare against; the cross-contract tests skip for the same reason.
+    return;
+  }
+  const drift = compareToPin();
+  assert.equal(
+    drift.drifted, false,
+    `the orchestrator contract has moved and this repository has not been conformed to it.\n`
+    + `  pinned revision : ${drift.pinnedRevision ?? '(none)'}\n`
+    + `  current revision: ${drift.currentRevision ?? '(unknown)'}\n`
+    + `  changed files   : ${drift.changed.join(', ') || '(none)'}\n`
+    + `  missing files   : ${drift.missing.join(', ') || '(none)'}\n`
+    + '  Conform the implementation, then re-pin: node scripts/orch-contract-pin.mjs --write',
+  );
+});
 
 test('fixture: the committed contract fixture is exactly what the implementation generates', () => {
   assert.ok(fs.existsSync(FIXTURE_PATH), 'contract/pw-contract-1.0.json must be committed');

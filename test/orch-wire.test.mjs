@@ -319,6 +319,9 @@ wireTest('wire: the attestation payloads validate against the orchestrator’s p
     binding: {
       session_key: 'orch:wb-test-01:Demo:pvi2-orchestrator',
       run_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+      // Fresh per verification: the envelope carries it so a good answer cannot be replayed onto a
+      // later verification of the same job.
+      verification_nonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
       config_generation: 3,
       at: '2026-07-27T12:00:00.000Z',
     },
@@ -346,8 +349,17 @@ wireTest('wire: the attestation payloads validate against the orchestrator’s p
     'SettingsAttestation(both runtime)': ['SettingsAttestation', observed.settings_attestation],
     'SettingsAttestation(xhigh enforced)': ['SettingsAttestation', xhigh.settings_attestation],
     'LaunchAttestation': ['LaunchAttestation', enforced.settings_attestation.launch],
+    'AttestationEnvelope': ['AttestationEnvelope', enforced.settings_attestation.envelope],
+    'NormalizedField': ['NormalizedField', enforced.settings_attestation.normalization[0]],
     'ModelSettings(xhigh)': ['ModelSettings', xhigh.settings_attestation.effective],
   }));
+
+  // The envelope applies to EVERY claim, so it must be present even when nothing is enforced.
+  assert.ok(observed.settings_attestation.envelope, 'a runtime-only attestation still needs an envelope');
+  assert.equal(observed.settings_attestation.envelope.auth_mode, 'subscription');
+  // One structured normalization entry per runtime_reported field.
+  assert.deepEqual(observed.settings_attestation.normalization.map((n) => n.field).sort(), ['effort', 'model_alias']);
+  assert.equal(enforced.settings_attestation.normalization.length, 1, 'only the model half is observed here');
 
   // The launch record must be present exactly when something is launch_enforced, and absent when
   // nothing is — the contract's validator enforces both directions.
