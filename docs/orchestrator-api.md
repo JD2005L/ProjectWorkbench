@@ -430,6 +430,32 @@ kernel refuses to `/bin/sh`, so a non-script that is not a *loadable* executable
 interpreted and can still rewrite argv. The ELF header is parsed far enough to answer that
 question rather than trusting the magic bytes.
 
+### Compatibility handshake, and the fields it turns on
+
+The orchestrator settles compatibility **once, before anything is mutated**, by reading `/health`
+and refusing to proceed until the answer is satisfactory. A peer that fails it never gets a lane, a
+worktree or a lease — so a regression here does not degrade one job, it blocks all of them.
+
+What it requires of this instance:
+
+| Field | Requirement |
+|---|---|
+| `instance_id` | matches the id the orchestrator's registry holds for the address it dialled |
+| `contract_version` | exactly the orchestration contract that build speaks (`1.0`) |
+| `reachable` | true |
+| `backends[].state` | at least one `ok` |
+| `backends[].auth_mode` | that backend must say **`subscription`** |
+
+The last row is the one to be careful with. **Absence is not consent**: a backend that does not
+state its billing is refused, not assumed. `auth_mode` is additive to contract 1.0 — declared in
+`contract/pw-contract-1.0.json` under `additive_fields` rather than removed, because it carries a
+*positive* finding of API billing, which the product forbids, and `AuthMethod` has no member that
+can express that state. Removing it to tidy the asymmetry would delete a control.
+
+Both backends emit it, including the deterministic fake. That is deliberate: the fake did not, so
+the suite could not have caught a regression in the single field the whole gate turns on, while
+production passed.
+
 ## 5. The contract fixture
 
 [`contract/pw-contract-1.0.json`](../contract/pw-contract-1.0.json) is a machine-readable description

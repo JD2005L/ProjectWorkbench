@@ -121,6 +121,21 @@ export function buildFixture() {
       AuthMode: sorted(Object.values(AuthMode)),
     },
 
+    // Fields this instance emits that contract 1.0 does not declare. Published rather than removed,
+    // and published rather than left implicit: `/health` has always carried `auth_mode`, and the
+    // orchestrator's compatibility handshake now *requires* it — a backend that does not state its
+    // billing is refused, because absence is not consent. Dropping the field to tidy the asymmetry
+    // would delete a control (a positive finding of API billing, which the product forbids) rather
+    // than close it, and `AuthMethod` cannot express that state at all.
+    additive_fields: {
+      'AuthHealth.auth_mode': {
+        values: sorted(Object.values(AuthMode)),
+        nullable: true,
+        emitted_on: 'GET /health, GET /readiness',
+        meaning: 'how the coding backend is billed; null means this instance could not determine it, and is never to be read as subscription',
+      },
+    },
+
     // How this instance knows an effective setting, published so an orchestrator can see the kind
     // of evidence it will get BEFORE submitting work.
     attestation: {

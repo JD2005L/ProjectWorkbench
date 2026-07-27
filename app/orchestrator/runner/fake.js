@@ -9,8 +9,10 @@
 // behaviour it wants (auth expired, rate limited, malformed output, process death, a question
 // raised) instead of depending on a hidden heuristic.
 
-import { CodingBackend, HealthState, AuthMethod, SCHEMA_VERSION } from '../contract.js';
-import { DEFAULT_MODEL_ALIASES } from '../attestation.js';
+import {
+  CodingBackend, HealthState, AuthMethod, SCHEMA_VERSION, ATTESTATION_CONTRACT_VERSION, AuthMode,
+} from '../contract.js';
+import { DEFAULT_MODEL_ALIASES, speaksAttestationContract } from '../attestation.js';
 
 /**
  * What a real CLI reports for an alias.
@@ -87,6 +89,7 @@ export class FakeCodingBackend {
       return {
         schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.DOWN,
         method: AuthMethod.UNKNOWN, checked_at: checkedAt, detail: 'the coding CLI is not installed',
+        auth_mode: null,
       };
     }
     if (this.authExpired) {
@@ -94,18 +97,27 @@ export class FakeCodingBackend {
         schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.DOWN,
         method: AuthMethod.SUBSCRIPTION_OAUTH, checked_at: checkedAt,
         detail: 'the subscription session is signed out',
+        auth_mode: null,
       };
     }
     if (this.rateLimited) {
       return {
         schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.DEGRADED,
         method: AuthMethod.SUBSCRIPTION_OAUTH, retry_after_seconds: this.retryAfterSeconds ?? 60,
+        // Rate-limited is still subscription-backed; the billing question is separate from the
+        // throttle, and conflating them would refuse a healthy account for being busy.
+        auth_mode: AuthMode.SUBSCRIPTION,
         checked_at: checkedAt, detail: 'a subscription rate limit is in effect',
       };
     }
     return {
       schema_version: SCHEMA_VERSION, backend: this.name, state: HealthState.OK,
       method: AuthMethod.SUBSCRIPTION_OAUTH, account_label: 'Fake Subscription',
+      // The orchestrator's compatibility handshake requires a POSITIVE finding here — "absence is
+      // not consent", so a backend that does not say is refused. The real backend has always
+      // reported it; without it here, this suite could not catch a regression in the one field
+      // that gate turns on.
+      auth_mode: AuthMode.SUBSCRIPTION,
       cli_version: '0.0.0-fake', checked_at: checkedAt,
     };
   }
@@ -116,12 +128,31 @@ export class FakeCodingBackend {
    * `effective: null` is a first-class answer, not an error: the contract deliberately offers no way
    * to say "probably correct", and a job whose configuration cannot be confirmed must block.
    */
-  async verifyConfiguration({ requested, phaseClass, sessionKey, runId, configGeneration }) {
-    this.invocations.push({ kind: 'verify', requested, phaseClass, sessionKey, runId, configGeneration });
+  async verifyConfiguration({
+    requested, phaseClass, sessionKey, runId, configGeneration,
+    // As the real backend: this build's own contract when no peer is in the picture.
+    attestationContractVersion = ATTESTATION_CONTRACT_VERSION,
+  }) {
+    this.invocations.push({
+      kind: 'verify', requested, phaseClass, sessionKey, runId, configGeneration,
+      attestationContractVersion,
+    });
     if (this.unavailable) throw Object.assign(new Error('backend unavailable'), { kind: 'unavailable' });
     if (this.authExpired) throw Object.assign(new Error('signed out'), { kind: 'auth_expired' });
     if (this.rateLimited) {
       throw Object.assign(new Error('rate limited'), { kind: 'rate_limited', retryAfterSeconds: this.retryAfterSeconds ?? 60 });
+    }
+    // A peer speaking a contract this build cannot meet gets no settings at all — the same refusal
+    // the real backend makes, modelled here so the session path is exercised without the live CLI.
+    if (!speaksAttestationContract(attestationContractVersion)) {
+      return {
+        effective: null,
+        observed_model: null,
+        settings_attestation: null,
+        backend: this.name,
+        checked_at: this.clock().toISOString(),
+        detail: `the caller speaks attestation contract ${attestationContractVersion ?? '(unstated)'}, and this instance implements ${ATTESTATION_CONTRACT_VERSION}`,
+      };
     }
     const effective = this.mirrorRequested ? { ...requested } : this.effective;
     return {

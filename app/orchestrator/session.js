@@ -19,6 +19,7 @@ import { promisify } from 'util';
 import { ApiError, notFound } from './errors.js';
 import {
   SCHEMA_VERSION, ErrorCode, CodingBackend, OrchestratorSessionStatus, deriveSessionKey,
+  ATTESTATION_CONTRACT_VERSION,
 } from './contract.js';
 import { laneNaming } from './config.js';
 import { resolveWorkspacePath } from './projects.js';
@@ -426,7 +427,13 @@ export class OrchestratorSessionManager {
         displayName: record.cli_display_name,
         // The version the CALLER spoke. A peer that cannot express provenance is not told a setting
         // is effective when the only basis is launch enforcement.
-        sessionKey: record.session_key,
+        //
+        // The `??` fires only for an internal caller — the engine verifying on its own behalf,
+        // where there is no peer and this instance plainly speaks its own contract. A *peer* can
+        // never reach here without the field: `VerifySessionRequest` carries the contract's own
+        // default and the API applies it, so an omitted version is a declaration made on the
+        // contract's terms. A version that is present and different is refused downstream.
+        attestationContractVersion: request.attestation_contract_version ?? ATTESTATION_CONTRACT_VERSION,
         // The caller's binding, not one invented here. A peer that sends the default `unbound` has
         // not bound its request to a run, so nothing can be attested to that run.
         runId: request.run_id ?? 'unbound',
