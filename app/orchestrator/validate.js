@@ -18,16 +18,24 @@ import {
   PATTERNS,
   ErrorCode,
 } from './contract.js';
+import { ApiError } from './errors.js';
 
 /** Keys that must never be copied out of an inbound object, whatever a schema says. */
 const DANGEROUS_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
 
-export class ValidationError extends Error {
+/**
+ * A schema failure, and an `ApiError` — which it has to be.
+ *
+ * It was a bare `Error` carrying a `code`, and nothing downstream knew to look at that field. So
+ * `sendError` fell through to its 500 branch and every route that validates a body answered a
+ * malformed payload with `internal_error`, no field errors, and the explanation deliberately
+ * swallowed as potentially sensitive. The one code path the `validation_failed` envelope exists for
+ * could not produce it, and a caller could not tell a bad request from a broken server.
+ */
+export class ValidationError extends ApiError {
   constructor(message, { code = ErrorCode.VALIDATION_FAILED, fieldErrors = [] } = {}) {
-    super(message);
+    super(code, message, { fieldErrors });
     this.name = 'ValidationError';
-    this.code = code;
-    this.fieldErrors = fieldErrors;
   }
 }
 

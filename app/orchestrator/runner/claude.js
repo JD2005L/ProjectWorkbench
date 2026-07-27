@@ -311,6 +311,9 @@ export class ClaudeCodeBackend {
     const attestation = buildAttestation({
       requested, aliases: this.config.modelAliases, init: init ?? {}, stderr,
       fingerprint,
+      // Explicit, because this is what decides which runtime claims are permitted at all: the
+      // orchestrator's record of what this backend can report is consulted by name.
+      backend: this.name,
       instanceId: this.config.instanceId,
       argv,
       // True by construction: buildPhaseArgv is the only argv source and takes no caller argv.

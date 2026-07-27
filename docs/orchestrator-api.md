@@ -239,13 +239,32 @@ and the job blocks:
    unrecognised `--effort` with only a stderr warning and runs at its default, so "the option exists"
    is not enough;
 5. the run emitted no ignored-option warning;
-6. the argv came from the fixed server-side builder (`pw-claude-phase-argv-v1`) with no caller
+6. the argv came from the fixed server-side builder (`pw-fixed-argv-v1`) with no caller
    override — if a caller could put anything on the command line, the argv digest would attest to the
    caller's intent rather than to policy;
 7. the session is subscription authenticated (`apiKeySource: none`);
-8. the caller **bound** its request. `VerifySessionRequest` carries `run_id` and
-   `config_generation`; a peer that sends the default `unbound` has not said which run it is asking
-   about, so nothing can be attested to one.
+8. the caller **bound** its request. `VerifySessionRequest` carries `run_id`,
+   `config_generation` and a **required** `verification_nonce` — no default, deliberately, because
+   every other security-relevant default on this surface refuses and a fixed, publicly-known nonce
+   would be the one that does not. A peer that omits it is refused rather than answered unbound.
+
+### Why effort is never `runtime_reported`
+
+A `runtime_reported` label is only worth something if the party being told already knows the backend
+can report the field. The orchestrator keeps that table itself (`RUNTIME_REPORTABLE`), and for
+`claude-code` it holds exactly one entry: `model_alias` from `init.model`. There is no entry for
+`effort`, because Claude Code 2.1.220 does not report it — so a payload claiming to have *observed*
+effort asserts something the CLI cannot do, and is refused.
+
+ProjectWorkbench mirrors that table and will not emit the claim, even if a future build starts
+printing an `effort` field. Upgrading is a two-step sequence and the order is the point: **the
+orchestrator records the new capability first**, and only then may this side claim it. A peer that
+can extend its own table has decided unilaterally that its own word is now stronger, which is the
+bypass the two words exist to prevent.
+
+A printed effort is still evidence in the other direction. One that *contradicts* the launched value
+refutes the claim and blocks the job — the observation cannot raise the label, but it can still
+refute it.
 
 `xhigh` is now a contract effort on both sides: the binary advertises it, and a policy that cannot
 name a level the binary supports would silently round down to `high`.
@@ -257,10 +276,18 @@ ProjectWorkbench never sends `effective` as a field — the contract refuses suc
 reading it as an observation, because an older peer never distinguished a value it watched from one
 it merely passed on the command line.
 
-The `LaunchAttestation` inside it names the binary (realpath, self-reported version, a digest of its
-advertised capability surface), the advertised options and values, the argv builder id and a digest
-of the exact argv, `caller_controlled_argv: false`, `auth_mode`, any ignored-option warning, and the
-session/run/configuration-generation binding. No credential appears in any of it. `GET /readiness`
+The **`AttestationEnvelope`** carries what applies to *every* claim, whatever its provenance: who is
+speaking (`attested_by`), **which program** they are speaking about (`binary_path`, `binary_version`
+and a `capability_fingerprint` the orchestrator compares against its own record), `auth_mode`, the
+contract version, and the binding to session, run, configuration generation and nonce. Those
+identity fields used to live under `launch`, which meant a peer that declared both fields
+`runtime_reported` skipped the whole binary-identity check — and the administrator's
+`may_attest_launch` decision with it — by claiming *more*, not less.
+
+The **`LaunchAttestation`** carries only what is specific to enforcing a setting: the advertised
+options and values, the argv builder id (an identifier the orchestrator allowlists — not a name this
+side chooses) and a digest of the exact argv, `caller_controlled_argv: false`, and any
+ignored-option warning. No credential appears in any of it. `GET /readiness`
 publishes the same capability summary so an orchestrator can see the kind of evidence an instance
 produces *before* submitting work.
 

@@ -95,6 +95,52 @@ print(json.dumps(out))
   return JSON.parse(stdout);
 }
 
+/**
+ * Run the orchestrator's **policy** validator over an attestation, not merely its schema.
+ *
+ * The schema check is not sufficient and the distinction is the point of this round: a payload
+ * claiming `effort_provenance: "runtime_reported"` is perfectly well-shaped, and is refused by
+ * `validate_attestation` because the orchestrator's own table records that claude-code cannot
+ * report effort. A shape-only check said yes to exactly the claim the contract exists to refuse.
+ *
+ * Returns `{ accepted, summary|error }`.
+ */
+function validatePolicy(attestation, { backend = 'claude-code', mayAttestLaunch = true, expectation }) {
+  const script = `
+import json, sys
+from datetime import datetime
+from pvi_orchestrator.contracts.policy import SettingsAttestation
+from pvi_orchestrator.policy.attestation import validate_attestation, AttestationRejectedError
+
+payload = json.load(sys.stdin)
+attestation = SettingsAttestation.model_validate(payload["attestation"])
+try:
+    result = validate_attestation(
+        attestation,
+        instance_id=payload["instance_id"],
+        may_attest_launch=payload["may_attest_launch"],
+        backend=payload["backend"],
+        session_key=payload["session_key"],
+        run_id=payload["run_id"],
+        verification_nonce=payload["verification_nonce"],
+        config_generation=payload["config_generation"],
+        known_fingerprint=payload["known_fingerprint"],
+        now=datetime.fromisoformat(payload["now"]),
+    )
+    print(json.dumps({"accepted": True, "summary": result.summary}))
+except AttestationRejectedError as exc:
+    print(json.dumps({"accepted": False, "error": str(exc)}))
+`;
+  const stdout = execFileSync(VENV_PYTHON, ['-c', script], {
+    cwd: ORCHESTRATOR_ROOT,
+    env: { ...process.env, PYTHONPATH: path.join(ORCHESTRATOR_ROOT, 'src') },
+    input: JSON.stringify({ attestation, backend, may_attest_launch: mayAttestLaunch, ...expectation }),
+    encoding: 'utf8',
+    timeout: 120_000,
+  });
+  return JSON.parse(stdout);
+}
+
 /** Assert every case validated, reporting all failures at once. */
 function assertAllValid(results) {
   const failures = Object.entries(results).filter(([, error]) => error !== null);
@@ -337,8 +383,9 @@ wireTest('wire: the attestation payloads validate against the orchestrator’s p
 
   // The combination the installed CLI actually produces: model observed, effort enforced.
   const enforced = buildAttestation({ ...common, init, requested: { model_alias: 'sonnet', effort: 'high' } });
-  // And a hypothetical CLI that reports effort, where no launch record is needed at all.
-  const observed = buildAttestation({
+  // A CLI that prints an effort field. It still does not make effort *observed*: that is settled by
+  // the orchestrator's record of what the backend can report, not by what the payload says.
+  const printsEffort = buildAttestation({
     ...common, init: { ...init, effort: 'high' }, requested: { model_alias: 'sonnet', effort: 'high' },
   });
   // xhigh, which the binary advertises and the orchestrator's Effort enum now names.
@@ -346,7 +393,7 @@ wireTest('wire: the attestation payloads validate against the orchestrator’s p
 
   assertAllValid(validateAgainstContract({
     'SettingsAttestation(model runtime, effort enforced)': ['SettingsAttestation', enforced.settings_attestation],
-    'SettingsAttestation(both runtime)': ['SettingsAttestation', observed.settings_attestation],
+    'SettingsAttestation(CLI prints effort)': ['SettingsAttestation', printsEffort.settings_attestation],
     'SettingsAttestation(xhigh enforced)': ['SettingsAttestation', xhigh.settings_attestation],
     'LaunchAttestation': ['LaunchAttestation', enforced.settings_attestation.launch],
     'AttestationEnvelope': ['AttestationEnvelope', enforced.settings_attestation.envelope],
@@ -354,17 +401,104 @@ wireTest('wire: the attestation payloads validate against the orchestrator’s p
     'ModelSettings(xhigh)': ['ModelSettings', xhigh.settings_attestation.effective],
   }));
 
-  // The envelope applies to EVERY claim, so it must be present even when nothing is enforced.
-  assert.ok(observed.settings_attestation.envelope, 'a runtime-only attestation still needs an envelope');
-  assert.equal(observed.settings_attestation.envelope.auth_mode, 'subscription');
-  // One structured normalization entry per runtime_reported field.
-  assert.deepEqual(observed.settings_attestation.normalization.map((n) => n.field).sort(), ['effort', 'model_alias']);
-  assert.equal(enforced.settings_attestation.normalization.length, 1, 'only the model half is observed here');
+  // The envelope applies to EVERY claim, and now carries the binary identity for all of them: with
+  // those fields under `launch`, a peer skipped the whole fingerprint comparison — and the
+  // administrator's may_attest_launch decision with it — by claiming to have observed both fields.
+  const envelope = enforced.settings_attestation.envelope;
+  assert.equal(envelope.auth_mode, 'subscription');
+  assert.equal(envelope.binary_path, fingerprint.realpath);
+  assert.equal(envelope.binary_version, '2.1.220 (Claude Code)');
+  assert.match(envelope.capability_fingerprint, /^[a-f0-9]{64}$/);
+  for (const moved of ['binary_path', 'binary_version', 'capability_fingerprint']) {
+    assert.ok(!(moved in enforced.settings_attestation.launch), `${moved} is an envelope field now`);
+  }
 
-  // The launch record must be present exactly when something is launch_enforced, and absent when
-  // nothing is — the contract's validator enforces both directions.
+  // One structured normalization entry per runtime_reported field — and never one for effort, which
+  // this backend cannot report.
+  assert.deepEqual(enforced.settings_attestation.normalization.map((n) => n.field), ['model_alias']);
+  assert.deepEqual(printsEffort.settings_attestation.normalization.map((n) => n.field), ['model_alias']);
+  assert.equal(printsEffort.settings_attestation.effort_provenance, 'launch_enforced');
+  assert.ok(printsEffort.settings_attestation.launch, 'effort still rests on the launch record');
   assert.ok(enforced.settings_attestation.launch);
-  assert.equal(observed.settings_attestation.launch, null);
+});
+
+wireTest('wire: the orchestrator’s own policy validator accepts what a real run emits', async () => {
+  // Schema conformance is not acceptance. `validate_attestation` performs the checks the shape only
+  // makes room for — binary identity, subscription auth, binding, and whether the backend can
+  // report a field it claims to have observed — so this runs the real thing over the real payload.
+  const { buildAttestation, DEFAULT_MODEL_ALIASES } = await import('../app/orchestrator/attestation.js');
+  const binding = {
+    session_key: 'orch:wb-test-01:Demo:pvi2-orchestrator',
+    run_id: 'fcb8ceac-504f-4bb3-8f73-c963b7eae1af',
+    verification_nonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    config_generation: 3,
+    at: new Date().toISOString(),
+  };
+  const attestation = buildAttestation({
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    aliases: DEFAULT_MODEL_ALIASES,
+    init: {
+      model: 'claude-sonnet-5', apiKeySource: 'none', claude_code_version: '2.1.220',
+      session_id: binding.run_id,
+    },
+    fingerprint: {
+      ok: true,
+      realpath: '/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe',
+      sha256: '674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863',
+      version: '2.1.220 (Claude Code)',
+      capabilities: {
+        '--effort': { declared: true, values: ['low', 'medium', 'high', 'xhigh', 'max'] },
+        '--model': { declared: true, values: null },
+      },
+    },
+    argvOwnedByServer: true,
+    binding,
+    instanceId: INSTANCE,
+    argv: ['-p', 'x', '--model', 'sonnet', '--effort', 'high'],
+  }).settings_attestation;
+
+  const expectation = {
+    instance_id: INSTANCE,
+    session_key: binding.session_key,
+    run_id: binding.run_id,
+    verification_nonce: binding.verification_nonce,
+    config_generation: binding.config_generation,
+    // What the orchestrator has on record. PW computes it from the binary's advertised surface, so
+    // an administrator registering the instance records the value PW itself produces.
+    known_fingerprint: attestation.envelope.capability_fingerprint,
+    now: new Date().toISOString(),
+  };
+
+  const accepted = validatePolicy(attestation, { expectation });
+  assert.equal(accepted.accepted, true, `the orchestrator refused a real payload: ${accepted.error}`);
+
+  // The bypass, stated as a payload: relabel the enforced half as an observation and hand it the
+  // normalization the shape asks for. Well-formed, and refused — which is what makes the label mean
+  // anything. If this is ever accepted, `runtime_reported` has become the cheap word again.
+  const forged = {
+    ...attestation,
+    effort_provenance: 'runtime_reported',
+    launch: null,
+    normalization: [
+      ...attestation.normalization,
+      {
+        schema_version: '1.0', field: 'effort', source_key: 'init.effort',
+        raw_value: 'high', value: 'high',
+      },
+    ],
+  };
+  assert.equal(validateAgainstContract({ f: ['SettingsAttestation', forged] }).f, null,
+    'the forgery must be schema-valid, or this proves nothing about the policy check');
+  const refused = validatePolicy(forged, { expectation });
+  assert.equal(refused.accepted, false, 'a claim to have observed effort must be refused');
+  assert.match(refused.error, /does not report effort at runtime/);
+
+  // And the identity check now applies to every claim, whatever its provenance.
+  const unknownBinary = validatePolicy(attestation, {
+    expectation: { ...expectation, known_fingerprint: null },
+  });
+  assert.equal(unknownBinary.accepted, false);
+  assert.match(unknownBinary.error, /no capability fingerprint is on record/);
 });
 
 wireTest('wire: a verification response sends the attestation and never `effective`', async () => {
@@ -421,9 +555,12 @@ task = TaskContract(
 out = {
   "EnsureSessionRequest": protocol.EnsureSessionRequest(
       orchestrator_instance_id="orch-test", project_id="Demo").model_dump(mode="json"),
+  # No default any more, deliberately: every other security-relevant default on this surface
+  # refuses, and a fixed publicly-known nonce would be the one that does not.
   "VerifySessionRequest": protocol.VerifySessionRequest(
       session_key="orch-test:wb-test-01:Demo:pvi2-orchestrator",
-      phase_class=PhaseClass.IMPLEMENTATION, requested=settings).model_dump(mode="json"),
+      phase_class=PhaseClass.IMPLEMENTATION, requested=settings,
+      verification_nonce="a1b2c3d4e5f60718293a4b5c6d7e8f90").model_dump(mode="json"),
   "SubmitJobRequest": protocol.SubmitJobRequest(
       idempotency_key="req-1", orchestrator_instance_id="orch-test", orchestrator_job_id="job_1",
       project_id="Demo", session_key="orch-test:wb-test-01:Demo:pvi2-orchestrator",

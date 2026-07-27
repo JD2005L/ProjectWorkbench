@@ -74,8 +74,16 @@ export const AuthMode = Object.freeze({ SUBSCRIPTION: 'subscription', API_KEY: '
 /** The attestation contract this build implements, as carried on LaunchAttestation. */
 export const ATTESTATION_CONTRACT_VERSION = '1.1';
 
-/** Identifies the fixed server-side argv builder that produced a command line. */
-export const ARGV_BUILDER_ID = 'pw-claude-phase-argv-v1';
+/**
+ * Identifies the fixed server-side argv builder that produced a command line.
+ *
+ * Not a free-form name: the orchestrator holds an allowlist (`TRUSTED_ARGV_BUILDERS`) and refuses a
+ * launch attestation naming anything outside it, because "a fixed builder produced this" is only
+ * worth something if the party being told knows which builder. A locally chosen id was schema-valid
+ * and refused by the policy validator, so every enforced attestation would have been rejected in
+ * production while every shape-level test passed. Changing it is a coordinated contract change.
+ */
+export const ARGV_BUILDER_ID = 'pw-fixed-argv-v1';
 
 /** Default cap on repeated contract fields. */
 export const MAX_LIST_ITEMS = 50;

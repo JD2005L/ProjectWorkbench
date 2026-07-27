@@ -232,15 +232,19 @@ test('attestation: effective is null unless BOTH model and effort are attested',
   assert.equal(real.blocking, true);
   assert.match(real.detail, /effort/i);
 
-  // A hypothetical CLI reporting both.
+  // A CLI that also prints an effort field. That does not make effort *observed* — the orchestrator
+  // records what claude-code can report, and effort is not on that list — so the value still rests
+  // on the launch record, and therefore on ProjectWorkbench having owned the argv.
   const complete = buildAttestation({
     fingerprint: FP,
     binding: BINDING,
     instanceId: 'wb-1',
+    argvOwnedByServer: true,
     requested, aliases,
     init: { model: 'claude-sonnet-5', effort: 'high', apiKeySource: 'none' },
     stderr: '',
   });
+  assert.equal(complete.provenance.effort, 'launch_enforced');
   assert.deepEqual(
     { model_alias: complete.effective.model_alias, effort: complete.effective.effort },
     { model_alias: 'sonnet', effort: 'high' },

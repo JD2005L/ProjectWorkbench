@@ -27,8 +27,11 @@ import crypto from 'crypto';
 
 import {
   SCHEMA_VERSION, PROVENANCE_SCHEMA_VERSION, Provenance, weakerProvenance, AuthMode,
-  ATTESTATION_CONTRACT_VERSION, ARGV_BUILDER_ID, Effort,
+  ATTESTATION_CONTRACT_VERSION, ARGV_BUILDER_ID, Effort, CodingBackend,
 } from './contract.js';
+
+/** The one source key claude-code is recorded as reporting the resolved model from. */
+const MODEL_SOURCE_KEY = 'init.model';
 
 /**
  * What a coding CLI must provide before ProjectWorkbench can attest effective effort.
@@ -64,6 +67,45 @@ const MIN_PATTERN_PREFIX = 6;
 
 /** Init-event fields a CLI might use to report effective effort. Checked in order. */
 const EFFORT_FIELDS = ['effort', 'effortLevel', 'reasoning_effort', 'effort_level'];
+
+/**
+ * What each backend is *recorded* as able to report at runtime, and from which source key.
+ *
+ * This mirrors the orchestrator's own `RUNTIME_REPORTABLE`, and the mirroring is the point: a
+ * `runtime_reported` label is only worth anything if the party being told already knows the backend
+ * can report the field. Otherwise the strong claim costs one self-consistent JSON object whose only
+ * checked value is supplied by the same peer in the same payload — strictly cheaper than
+ * `launch_enforced` and strictly stronger, which inverts the whole contract.
+ *
+ * For `claude-code` there is exactly one entry. Claude Code 2.1.220 reports the resolved model in
+ * its init event and says nothing whatsoever about effort, so effort rests on the launch record and
+ * a payload claiming otherwise is refused on the other side.
+ *
+ * **If a CLI later reports effort, this table is not where it starts.** The orchestrator records the
+ * new capability first; only then may this side claim it. That order is deliberate — a peer that can
+ * extend its own table has decided unilaterally that its own word is now stronger, which is the
+ * bypass the two words exist to prevent. Adding an entry here before the orchestrator has one simply
+ * strands every job.
+ */
+export const RUNTIME_REPORTABLE = Object.freeze({
+  'claude-code': Object.freeze({ model_alias: Object.freeze(['init.model']) }),
+  'codex-cli': Object.freeze({ model_alias: Object.freeze(['init.model']) }),
+});
+
+/** Whether `backend` is recorded as reporting `field`, from `sourceKey`. Unknown backend → no. */
+export function runtimeReportable(backend, field, sourceKey) {
+  const sources = RUNTIME_REPORTABLE[backend]?.[field];
+  return Array.isArray(sources) && sources.includes(sourceKey);
+}
+
+/**
+ * Keys the orchestrator's `Slug` will hold: no slashes, no spaces, 100 characters, and a bounded
+ * map. An operator's configured option list is not validated by the contract until it is already on
+ * the wire, so a mistake there must drop the entry rather than produce a payload that is refused
+ * outright and strands every job on that instance.
+ */
+const CONTRACT_SLUG = /^[A-Za-z0-9._-]{1,100}$/;
+const MAX_LIST_ITEMS = 50;
 
 const VALID_EFFORTS = new Set(Object.values(Effort));
 
@@ -191,17 +233,19 @@ export function attestEffort({ requestedEffort, init, stderr = '' }) {
   const observed = init[field];
   if (!VALID_EFFORTS.has(observed)) {
     return {
-      verified: false, outcome: 'unverifiable', observed,
+      verified: false, outcome: 'unverifiable', observed, field,
       reason: `the session reported an effort outside the contract vocabulary: '${observed}'`,
     };
   }
   if (observed !== requestedEffort) {
     return {
-      verified: false, outcome: 'mismatch', observed,
+      verified: false, outcome: 'mismatch', observed, field,
       reason: `the session is running at '${observed}' effort, not '${requestedEffort}'`,
     };
   }
-  return { verified: true, outcome: 'verified', observed, reason: null, provenance: Provenance.RUNTIME_REPORTED };
+  // `field` travels with the result because a runtime claim has to name the source it came from,
+  // and that name is checked against what the backend is recorded as emitting.
+  return { verified: true, outcome: 'verified', observed, field, reason: null, provenance: Provenance.RUNTIME_REPORTED };
 }
 
 /**
@@ -289,6 +333,20 @@ function digest(value) {
 }
 
 /**
+ * The digest an administrator records for this instance's binary, and which every claim is compared
+ * against. Covers the advertised surface as well as the content: a rebuilt binary that advertises a
+ * different option set is not the binary the record was made about.
+ */
+export function capabilityFingerprint(fingerprint) {
+  return digest({
+    realpath: fingerprint.realpath,
+    version: fingerprint.version,
+    sha256: fingerprint.sha256,
+    capabilities: fingerprint.capabilities,
+  });
+}
+
+/**
  * The `LaunchAttestation` the orchestrator's contract defines.
  *
  * Every field is something the orchestrator cannot check for itself — it does not run the binary.
@@ -301,25 +359,23 @@ export function buildLaunchAttestation({
   instanceId, fingerprint, argv, binding, stderr = '', authMode,
 }) {
   const advertisedOptions = Object.keys(fingerprint.capabilities ?? {})
-    .filter((option) => fingerprint.capabilities[option]?.declared);
+    .filter((option) => fingerprint.capabilities[option]?.declared)
+    // Bounded and slug-safe: these keys are typed on the other side, and a payload the contract
+    // refuses outright would strand every job rather than dropping one misconfigured option.
+    .filter((option) => CONTRACT_SLUG.test(option))
+    .slice(0, MAX_LIST_ITEMS);
   const advertisedValues = {};
   for (const option of advertisedOptions) {
     const values = fingerprint.capabilities[option]?.values;
-    if (Array.isArray(values)) advertisedValues[option] = values;
+    if (Array.isArray(values)) advertisedValues[option] = values.slice(0, MAX_LIST_ITEMS);
   }
 
   return {
     schema_version: SCHEMA_VERSION,
-    binary_path: fingerprint.realpath.slice(0, 200),
-    binary_version: fingerprint.version.slice(0, 200),
-    // A digest of the advertised capability *surface*, not merely of the file: if what the binary
-    // advertises moves, the binary that advertised the option is not the binary that ran.
-    capability_fingerprint: digest({
-      realpath: fingerprint.realpath,
-      version: fingerprint.version,
-      sha256: fingerprint.sha256,
-      capabilities: fingerprint.capabilities,
-    }),
+    // The binary identity is NOT here. It moved to the envelope, because every claim is a claim
+    // about a specific program: with it under this branch, a peer skipped the entire
+    // binary-identity check — and the administrator's may_attest_launch decision with it — by
+    // declaring both fields observed, which is *more*, not less.
     advertised_options: advertisedOptions,
     advertised_values: advertisedValues,
     argv_builder_id: ARGV_BUILDER_ID,
@@ -339,10 +395,24 @@ export function buildLaunchAttestation({
  * both fields `runtime_reported` skipped all of them and got the *stronger* provenance for free —
  * the checks were opt-in by the party being checked.
  */
-export function buildAttestationEnvelope({ instanceId, binding, authMode }) {
+export function buildAttestationEnvelope({ instanceId, binding, authMode, fingerprint }) {
+  // Refused, not crashed. There is no envelope — and therefore no claim of any provenance — about a
+  // binary that could not be identified, and a caller that omits it should be told which rule it
+  // broke rather than reading a TypeError off a property access.
+  if (!fingerprint?.ok) {
+    throw new Error('an attestation envelope requires a successful binary fingerprint: every claim is a claim about a specific program');
+  }
   return {
     schema_version: SCHEMA_VERSION,
     attested_by: instanceId,
+    // Which program is speaking. "The backend emitted sonnet" says nothing if the party being told
+    // has no record of which backend that is, or if its fingerprint has moved since the record was
+    // made — so this is required of every claim, whatever provenance it carries.
+    binary_path: fingerprint.realpath.slice(0, 200),
+    binary_version: fingerprint.version.slice(0, 200),
+    // A digest of the advertised capability *surface*, not merely of the file: if what the binary
+    // advertises moves, the binary that advertised the option is not the binary that ran.
+    capability_fingerprint: capabilityFingerprint(fingerprint),
     session_key: binding.session_key,
     run_id: binding.run_id,
     // The nonce the orchestrator asked with, so a good answer cannot be replayed onto a later
@@ -378,6 +448,7 @@ export function buildAttestation({
   requested, aliases, init, stderr = '',
   fingerprint = null, argvOwnedByServer = false, binding = null,
   instanceId = null, argv = [], probedAuthMode = null,
+  backend = CodingBackend.CLAUDE_CODE,
 }) {
   // A trustworthy fingerprint is a precondition for BOTH labels, not just the weaker one. Without
   // this the apparatus was one-sided: seven checks fenced `launch_enforced`, while `runtime_reported`
@@ -397,11 +468,28 @@ export function buildAttestation({
       ? 'the caller did not bind its request to a run with a fresh verification nonce'
       : `the coding CLI could not be fingerprinted (${fingerprint?.failure ?? 'unknown'}), so nothing it reports can be attributed`);
   }
+  // …and the observation is only *labelled* one if the orchestrator knows this backend emits the
+  // field from this source. A backend it has no record of gets no runtime claim, however plausible
+  // the value looks: the point of the label is that the party being told can check it.
+  if (model.verified && !runtimeReportable(backend, 'model_alias', MODEL_SOURCE_KEY)) {
+    model.verified = false;
+    model.reason = `${backend} is not recorded as reporting the resolved model, so its word cannot be checked`;
+  }
   model.provenance = model.verified ? Provenance.RUNTIME_REPORTED : Provenance.UNAVAILABLE;
 
-  // Runtime observation first: it is strictly stronger, so a CLI that grows an effort field is
-  // preferred automatically and the enforcement path simply stops being used.
   let effort = attestEffort({ requestedEffort: requested.effort, init, stderr });
+  // An observation this backend is not recorded as being able to make cannot carry the claim — but
+  // it is still evidence, and a *contradicting* one still refutes. So only a clean, matching
+  // observation is converted; `mismatch` and `ignored` keep their outcome and go on to block.
+  if (effort.verified && !runtimeReportable(backend, 'effort', `init.${effort.field}`)) {
+    effort = {
+      ...effort,
+      verified: false,
+      outcome: 'unavailable',
+      provenance: Provenance.UNAVAILABLE,
+      reason: `${backend} is not recorded as reporting the effort in force, so a value it prints cannot be attested as observed`,
+    };
+  }
   if (!identified || !bound) {
     effort = {
       ...effort,
@@ -492,25 +580,31 @@ export function buildAttestation({
         effective: { schema_version: SCHEMA_VERSION, model_alias: requested.model_alias, effort: effort.observed },
         model_provenance: model.provenance,
         effort_provenance: effort.provenance,
-        envelope: buildAttestationEnvelope({ instanceId, binding, authMode: authModeOf(init) }),
+        envelope: buildAttestationEnvelope({
+          instanceId, binding, authMode: authModeOf(init), fingerprint,
+        }),
         launch: effort.provenance === Provenance.LAUNCH_ENFORCED || model.provenance === Provenance.LAUNCH_ENFORCED
           ? buildLaunchAttestation({ instanceId, fingerprint, argv, stderr, binding, authMode: authModeOf(init) })
           : null,
         // One structured entry per runtime_reported field, naming the source it came from and the
         // value that source produced. Free text was not evidence: the validator could only ask
         // whether the list was non-empty, which made the STRONGER claim the cheaper one.
+        // Per field, and only for a source the backend is recorded as emitting from — an entry
+        // naming a key the orchestrator does not know is refused there. The per-field shape matters
+        // too: one entry used to satisfy the check for both, so a peer could claim to have observed
+        // effort while only ever showing its working for the model.
         normalization: [
           ...(model.provenance === Provenance.RUNTIME_REPORTED ? [{
             schema_version: SCHEMA_VERSION,
             field: 'model_alias',
-            source_key: 'init.model',
+            source_key: MODEL_SOURCE_KEY,
             raw_value: model.observed,
             value: requested.model_alias,
           }] : []),
           ...(effort.provenance === Provenance.RUNTIME_REPORTED ? [{
             schema_version: SCHEMA_VERSION,
             field: 'effort',
-            source_key: 'init.effort',
+            source_key: `init.${effort.field}`,
             raw_value: effort.observed,
             value: effort.observed,
           }] : []),

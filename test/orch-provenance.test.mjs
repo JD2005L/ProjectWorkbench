@@ -139,14 +139,21 @@ test('provenance: the current CLI yields model runtime_reported and effort launc
   assert.equal(attestation.effort_provenance, Provenance.LAUNCH_ENFORCED);
   assert.ok(attestation.launch, 'a launch_enforced field requires a launch attestation');
   assert.equal(attestation.launch.caller_controlled_argv, false);
-  assert.equal(attestation.launch.binary_version, '2.1.220 (Claude Code)');
   // Identity, authentication and binding live in the envelope now, and apply to EVERY claim — with
   // them inside the launch record, declaring both fields runtime_reported skipped all of them and
   // got the stronger provenance for free.
   assert.equal(attestation.envelope.auth_mode, AuthMode.SUBSCRIPTION);
   assert.equal(attestation.envelope.attested_by, INSTANCE);
   assert.equal(attestation.envelope.verification_nonce, BINDING.verification_nonce);
-  assert.match(attestation.launch.capability_fingerprint, /^[a-f0-9]{64}$/);
+  assert.equal(attestation.envelope.binary_version, '2.1.220 (Claude Code)');
+  assert.equal(attestation.envelope.binary_path, GOOD_FINGERPRINT.realpath);
+  assert.match(attestation.envelope.capability_fingerprint, /^[a-f0-9]{64}$/);
+  // …and nowhere else. The launch record carrying them is what let a peer skip the binary-identity
+  // check, and the administrator's may_attest_launch decision with it, by claiming to have observed
+  // both fields — which is *more*, not less, so the bypass was to claim more.
+  for (const moved of ['binary_path', 'binary_version', 'capability_fingerprint']) {
+    assert.ok(!(moved in attestation.launch), `${moved} belongs to the envelope, not the launch record`);
+  }
   assert.match(attestation.launch.argv_digest, /^[a-f0-9]{64}$/);
   assert.deepEqual(attestation.launch.advertised_values['--effort'], ['low', 'medium', 'high', 'xhigh', 'max']);
   assert.equal(attestation.envelope.config_generation, 3);
@@ -159,12 +166,86 @@ test('provenance: the current CLI yields model runtime_reported and effort launc
   assert.equal(attestation.normalization[0].value, 'sonnet');
 });
 
-test('provenance: a CLI that DOES report effort is observed, and no launch record is needed', () => {
+test('provenance: a CLI printing an effort field does NOT make effort observed', () => {
+  // The claim that a field was observed is only checkable if the *orchestrator* already knows the
+  // backend emits it. Its RUNTIME_REPORTABLE table holds exactly one entry for claude-code —
+  // model_alias from init.model — and nothing for effort, because 2.1.220 does not report it.
+  //
+  // So a payload claiming to have observed effort asserts something the CLI cannot do, and is
+  // refused. Upgrading is a two-step sequence and the order is the point: the orchestrator records
+  // the new capability first, and only then may this side claim it. Otherwise a peer decides
+  // unilaterally that its own word is now stronger, which is the whole bypass.
   const result = build({ init: { ...INIT, effort: 'high' } });
-  assert.equal(result.provenance.effort, Provenance.RUNTIME_REPORTED);
-  assert.equal(result.provenance.weakest, Provenance.RUNTIME_REPORTED);
-  // Runtime observation is strictly stronger, so the enforcement path simply stops being used.
-  assert.equal(result.settings_attestation.launch, null);
+  assert.equal(result.provenance.effort, Provenance.LAUNCH_ENFORCED);
+  assert.equal(result.provenance.weakest, Provenance.LAUNCH_ENFORCED);
+  assert.ok(result.settings_attestation.launch, 'effort still rests on the launch record');
+  assert.deepEqual(
+    result.settings_attestation.normalization.map((n) => n.field), ['model_alias'],
+    'no normalization entry may be offered for a field the backend cannot report',
+  );
+  assert.equal(result.blocking, false, 'and the job still runs');
+});
+
+test('provenance: an observed effort that contradicts the launched value blocks', () => {
+  // The observation cannot *raise* the claim, but it can still refute it. A CLI reporting `low`
+  // while PW passed `--effort high` is direct evidence the enforcement did not take, and quietly
+  // reporting launch_enforced high would be attesting to the opposite of what was seen.
+  const result = build({ init: { ...INIT, effort: 'low' } });
+  assert.equal(result.provenance.effort, Provenance.UNAVAILABLE);
+  assert.equal(result.blocking, true);
+  assert.equal(result.settings_attestation, null);
+  assert.match(result.detail, /running at 'low' effort, not 'high'/);
+});
+
+test('provenance: a runtime-only claim still names the binary it is about', () => {
+  // "The backend emitted sonnet" says nothing if there is no record of which backend that is. The
+  // envelope carries the identity for every claim, so there is no shape of payload — whatever its
+  // provenance — that skips the fingerprint comparison.
+  const envelope = buildAttestationEnvelope({
+    instanceId: INSTANCE, binding: BINDING, authMode: AuthMode.SUBSCRIPTION,
+    fingerprint: GOOD_FINGERPRINT,
+  });
+  assert.equal(envelope.binary_path, GOOD_FINGERPRINT.realpath);
+  assert.equal(envelope.binary_version, '2.1.220 (Claude Code)');
+  assert.match(envelope.capability_fingerprint, /^[a-f0-9]{64}$/);
+});
+
+test('provenance: the normalization names a source key the orchestrator accepts', () => {
+  // `init.model` is the only source claude-code is recorded as emitting model_alias from. A key the
+  // orchestrator does not know is refused there, so inventing one here would strand the job.
+  const attestation = build().settings_attestation;
+  assert.deepEqual(
+    attestation.normalization.map((n) => [n.field, n.source_key]),
+    [['model_alias', 'init.model']],
+  );
+});
+
+test('provenance: advertised_values cannot carry a key the contract will not hold', () => {
+  // The keys are typed `Slug` on the other side — no slashes, no spaces, 100 characters — and the
+  // map is bounded. These come from a configured option list, so a mistake there must drop the
+  // entry rather than produce a payload the contract rejects outright and strand every job.
+  const hostile = {
+    ...GOOD_FINGERPRINT,
+    capabilities: {
+      ...GOOD_FINGERPRINT.capabilities,
+      '--effort/../etc': { declared: true, values: ['high'] },
+      [`--${'x'.repeat(200)}`]: { declared: true, values: ['high'] },
+      '--has space': { declared: true, values: ['high'] },
+    },
+  };
+  const launch = buildLaunchAttestation({
+    instanceId: INSTANCE, fingerprint: hostile, argv: ARGV, binding: BINDING,
+    authMode: AuthMode.SUBSCRIPTION,
+  });
+  const SLUG = /^[A-Za-z0-9._-]{1,100}$/;
+  for (const key of Object.keys(launch.advertised_values)) {
+    assert.match(key, SLUG, `advertised_values key ${key} is not a contract slug`);
+  }
+  for (const option of launch.advertised_options) {
+    assert.match(option, SLUG, `advertised_options entry ${option} is not a contract slug`);
+  }
+  assert.ok(launch.advertised_values['--effort'], 'the legitimate option survives the filter');
+  assert.ok(Object.keys(launch.advertised_values).length <= 50);
 });
 
 // ---------------------------------------------------------------------------
@@ -246,15 +327,15 @@ test('provenance: an API-billed session is never enforced and never effective', 
 test('provenance: a stale capability fingerprint changes the attested digest', () => {
   // If what the binary advertises moves, the binary that advertised the option is not the binary
   // that ran, and prior attestations mean nothing.
-  const first = build().settings_attestation.launch.capability_fingerprint;
+  const first = build().settings_attestation.envelope.capability_fingerprint;
   const drifted = build({
     fingerprint: { ...GOOD_FINGERPRINT, version: '2.2.0 (Claude Code)' },
-  }).settings_attestation.launch.capability_fingerprint;
+  }).settings_attestation.envelope.capability_fingerprint;
   assert.notEqual(first, drifted, 'a version change must move the capability fingerprint');
 
   const rehashed = build({
     fingerprint: { ...GOOD_FINGERPRINT, sha256: 'f'.repeat(64) },
-  }).settings_attestation.launch.capability_fingerprint;
+  }).settings_attestation.envelope.capability_fingerprint;
   assert.notEqual(first, rehashed, 'a content change must move the capability fingerprint');
 });
 
@@ -557,12 +638,25 @@ test('launch attestation: the hostile defaults on the contract side are answered
   });
   assert.equal(launch.caller_controlled_argv, false);
   assert.equal(launch.ignored_option_warning, null);
-  assert.equal(launch.argv_builder_id, 'pw-claude-phase-argv-v1');
+  // The id is allowlisted on the other side, not chosen here: a locally invented one is
+  // schema-valid and refused by the policy validator, so every enforced claim would have been
+  // rejected in production while every shape-level check passed.
+  assert.equal(launch.argv_builder_id, 'pw-fixed-argv-v1');
   assert.deepEqual(launch.advertised_options.sort(), ['--effort', '--model']);
   // `auth_mode` defaults to api_key on the contract side, so a payload that omits it fails closed.
-  const envelope = buildAttestationEnvelope({ instanceId: INSTANCE, binding: BINDING, authMode: AuthMode.SUBSCRIPTION });
+  const envelope = buildAttestationEnvelope({
+    instanceId: INSTANCE, binding: BINDING, authMode: AuthMode.SUBSCRIPTION,
+    fingerprint: GOOD_FINGERPRINT,
+  });
   assert.equal(envelope.auth_mode, AuthMode.SUBSCRIPTION);
   assert.equal(envelope.attested_by, INSTANCE);
+
+  // And there is no envelope at all without an identified binary — refused by name, rather than
+  // crashing on a property access somewhere inside.
+  assert.throws(
+    () => buildAttestationEnvelope({ instanceId: INSTANCE, binding: BINDING, authMode: AuthMode.SUBSCRIPTION }),
+    /requires a successful binary fingerprint/,
+  );
 });
 
 test('launch attestation: an enforcement claim is refused outright when a precondition fails', () => {

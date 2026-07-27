@@ -14,7 +14,6 @@ import express from 'express';
 import {
   SCHEMA_VERSION, ATTESTATION_CONTRACT_VERSION, PATTERNS, ErrorCode, newId,
 } from './contract.js';
-import { UNBOUND_NONCE } from './attestation.js';
 import { ApiError, notFound, sendError, payloadTooLarge } from './errors.js';
 import {
   SCOPES, ServiceTokenStore, RateLimiter, authenticateRequest, requireScope,
@@ -269,7 +268,12 @@ export function createOrchestratorRouter({
       // Fresh for every verification. Derived from the job and phase alone, the binding repeated on
       // every retry, so an attestation captured on the first attempt stayed valid on the fifth —
       // including after the lane had been relaunched with different flags.
-      verification_nonce: { type: 'shortText', default: UNBOUND_NONCE },
+      //
+      // Required, with no default. The contract dropped its own default for the same reason: every
+      // other security-relevant default on this surface refuses, and a fixed, publicly-known nonce
+      // would be the one that does not. A peer that omitted the field used to get a well-formed
+      // answer whose binding was worthless.
+      verification_nonce: { type: 'shortText', required: true, minLength: 16, maxLength: 128 },
     },
   };
 

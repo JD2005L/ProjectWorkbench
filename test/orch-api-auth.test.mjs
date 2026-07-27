@@ -187,6 +187,54 @@ test('api: a token lacking the operation scope is refused with forbidden_scope',
   });
 });
 
+test('api: a body that fails schema validation is a typed refusal, not an internal error', async () => {
+  // Found by the nonce requirement below, and much wider than it: `validate()` throws its own
+  // `ValidationError`, which `sendError` did not recognise — so EVERY route that validates a body
+  // answered a malformed payload with 500 `internal_error`, no field errors, and the explanation
+  // swallowed as potentially sensitive. A caller could not tell a bad request from a broken server,
+  // and the contract's `validation_failed` envelope was unreachable from the one place it is for.
+  const { validate } = await import('../app/orchestrator/validate.js');
+  const { ApiError, errorEnvelope, statusForCode } = await import('../app/orchestrator/errors.js');
+  let thrown = null;
+  try {
+    validate({ name: 'Probe', fields: { needed: { type: 'shortText', required: true } } }, {});
+  } catch (err) {
+    thrown = err;
+  }
+  assert.ok(thrown, 'a missing required field must throw');
+  assert.ok(thrown instanceof ApiError, 'a schema failure must be a typed API error, not a bare Error');
+  assert.equal(statusForCode(thrown.code), 400);
+  const envelope = errorEnvelope(thrown, 'corr-1');
+  assert.equal(envelope.error, 'validation_failed');
+  assert.deepEqual(envelope.field_errors.map((f) => f.field), ['needed']);
+});
+
+test('api: a verification that carries no nonce is refused rather than answered unbound', async () => {
+  // The contract dropped the default: every other security-relevant default on this surface
+  // refuses, and a fixed, publicly-known nonce would be the one that does not. Defaulting here
+  // meant a peer that simply omitted the field got a well-formed answer back — one that stayed
+  // valid across every later verification of the same job, including after the lane had been
+  // relaunched with different flags.
+  await withApi(async ({ call }) => {
+    const res = await call('POST', '/projects/Demo/session/verify', {
+      body: {
+        session_key: `${ORCH}:wb-test-01:Demo:pvi2-orchestrator`,
+        phase_class: 'implementation',
+        requested: { model_alias: 'sonnet', effort: 'high' },
+        run_id: 'job_1:implementation',
+        config_generation: 3,
+      },
+      headers: { 'Idempotency-Key': 'verify-1' },
+    });
+    assert.equal(res.status, 400);
+    assert.equal(res.json.error, 'validation_failed');
+    assert.ok(
+      res.json.field_errors?.some((e) => e.field === 'verification_nonce'),
+      `the refusal must name the missing field: ${JSON.stringify(res.json)}`,
+    );
+  });
+});
+
 // ---------------------------------------------------------------------------
 // scoping: instance and project
 // ---------------------------------------------------------------------------

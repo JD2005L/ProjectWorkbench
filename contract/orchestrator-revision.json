@@ -6,20 +6,20 @@
     "test failure with nothing in this repository having moved.",
     "Update deliberately, as part of conforming to the change: node scripts/orch-contract-pin.mjs --write"
   ],
-  "revision": "703d7657b229702b403596a3fc8aabbb51a4253b",
-  "pinned_at": "2026-07-27T12:17:37.710Z",
+  "revision": "ea9c7f81d6337e6af8d3f82d1ff21fea3eec8d94",
+  "pinned_at": "2026-07-27T13:15:12.949Z",
   "root": "/opt/project-workbench/workspaces/PVICodingOrchestrator",
   "files": {
-    "src/pvi_orchestrator/contracts/policy.py": "a9ce99759402f8a865f38d971bb09c57d70aaf3c456fc5159a6cbfd203d05e73",
+    "src/pvi_orchestrator/contracts/policy.py": "fb06290aadc75f2ac45c25d6dec9be8b45a6174fe537e7c441c9adfd24aa7fc8",
     "src/pvi_orchestrator/contracts/common.py": "b94604d0c2d27935d2ac155909d1d821da6b8842d09a82c81184b1be208e133e",
     "src/pvi_orchestrator/contracts/states.py": "a8387ad0224540cf1c375730af3eef6a5a636a020d854a93e5da0f11a71c4c5b",
     "src/pvi_orchestrator/contracts/events.py": "62fe11bc2369f5f7d16939488b7d82918e9de878843cc64b6c64a9276961acd7",
     "src/pvi_orchestrator/contracts/evidence.py": "1f1a63b9530f491ab23dcbb858727cc6acb18aeb8d830eb1a5ebb81077452893",
     "src/pvi_orchestrator/contracts/interaction.py": "fd711651604034f87bd661a838b6b832042f81ed295061b1f2b15f378ab93a3d",
-    "src/pvi_orchestrator/contracts/jobs.py": "603fce6d6d51940945abd2b82a46d71c8696726417b1843c7bed564d9b883d0f",
+    "src/pvi_orchestrator/contracts/jobs.py": "b6fa167bbde4d5976e4b3a84670a80459841730fb23ee13cd337173fec47ebf7",
     "src/pvi_orchestrator/contracts/publication.py": "d8180e3d3898db734d0f71c0f7e73ec4d3a990f2bac227ab081ef0a293fd15b9",
     "src/pvi_orchestrator/contracts/workbench.py": "ea2c3ff875bd28f1e161aaf3df8272d7a749d723963f66f39d4dad12900c52d2",
     "src/pvi_orchestrator/contracts/health.py": "657a902c32f9d7747265533f709ab17d2afbc048e18d441bbecc372da7172532",
-    "src/pvi_orchestrator/workbench/protocol.py": "e4e36e1cf0d3b8a7ad471441cc1e4de3b8412f230c78f80152caa62672842b86"
+    "src/pvi_orchestrator/workbench/protocol.py": "4c30ec6647a438be13e8a2a7a9a56ff16c1617ea4f6d2017ad753931125273d7"
   }
 }
