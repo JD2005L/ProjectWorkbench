@@ -73,6 +73,10 @@ export function loadOrchestratorConfig(env = process.env) {
     // in a unit file, or in this object.
     tokensPath: str(env.PW_ORCHESTRATOR_TOKENS_PATH, '/etc/project-workbench/orchestrator-tokens.json'),
     tokens: Object.freeze([]),
+    // Which projects this instance offers to an orchestrator, and what each project's lane can do.
+    // Separate from the dashboard's projects.json so enabling orchestration for one project is not
+    // a change to the registry every human terminal depends on.
+    projectsPath: str(env.PW_ORCHESTRATOR_PROJECTS_PATH, '/etc/project-workbench/orchestrator-projects.json'),
 
     // ---- durable state ----
     dataDir,
