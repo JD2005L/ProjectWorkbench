@@ -163,5 +163,46 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 - **Notes** The transition table mirrors the orchestrator's `state/machine.py` edge for edge, so both sides agree on `invalid_transition`. Asserted structurally: every status has an entry, terminals are sinks, `blocked_configuration` cannot reach any coding phase, `verifying_backend`'s only forward edge is `discovering`, and `implementing` can never reach `publishing`.
 - **Criteria advanced** B2, B4, B5, B6.
 
+### 2026-07-27 — Increment 4: HTTP surface, auth, scoping, limits
+- **Added** `auth.js`, `projects.js`, `api.js`, `runner/fake.js`, `test/orch-api-auth.test.mjs`.
+- **GREEN** 22/22. Mutations caught: ignoring instance match, accepting disabled tokens, ignoring scopes, ignoring project grants.
+- **One mutation initially survived** — the `.`/`..` project-id guard. URL normalisation means those never reach the route param, so the guard is only load-bearing for the MCP adapter's typed args. Tested it directly instead, which then exposed a **real bug**: `isSafeProjectId` had no length bound, so a 101-character id passed. Fixed.
+- **Criteria advanced** A1 (partial), A4, A5, C1, F1, F2, C5 (path containment incl. symlink escape).
+
+### 2026-07-27 — Increment 5: the named orchestrator lane
+- **Added** `session.js`, `test/orch-session.test.mjs` (private tmux server per test).
+- **GREEN** 12/12.
+- **Notes** tmux escapes control characters in `-F` output (a 0x1F separator returns as the literal four characters `\037`), so the field separator had to be printable. Teardown initially leaked socket *files* after `kill-server`; now unlinked, verified zero left behind.
+- **Criteria advanced** C2, C3, C4, D2 (partial).
+
+### 2026-07-27 — Increment 6: the subscription-backed runner
+- **Added** `runner/claude.js`, `test/orch-runner.test.mjs`.
+- **GREEN** 22/22.
+- **Measured the real CLI** (one small `-p` probe, as flagged in the plan) and found a **contract gap**: `stream-json` init reports the live `model` and `permissionMode`, but no effort — and `--effort bogus` is *silently ignored* (stderr warning, exit 0, runs at default). Effort is therefore not verifiable. Default is `effective: null` (fail closed); `PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv` is an explicit opt-in labelled `argv-attested`. Recorded in the fixture's `known_gaps` and in the docs for coordination.
+- **Also found by test** `--dangerously-skip-permissions` satisfies the model-alias pattern; execFile prevents shell injection, not argv injection. Leading `-` now refused.
+- **Criteria advanced** D1, D2, D3, D4 (partial).
+
+### 2026-07-27 — Increments 7-10: engine, checks, interaction, publication
+- **Added** `git.js`, `checks.js`, `engine.js`, `schemas.js`, `publish.js`, `test/orch-engine.test.mjs` (disposable git repo + real bare remote).
+- **RED→GREEN** 15/24 → 24/24. **Four real defects the tests caught:**
+  1. `blocked_verification` is unreachable from `discovering`, so a phase failure there crashed the worker. Now names the most specific state the machine permits from where the job is.
+  2. A backend that could not be queried during verification propagated as an unhandled error and *failed* the job; it now blocks.
+  3. Answering a question tried to re-queue a job blocked on review, which the table rightly forbids.
+  4. The fake returned one constant session id for every phase, making an independent review look non-independent. It now models the real CLI.
+- **One test expectation was wrong, not the code**: revising from `waiting_for_publication_approval` is illegal per the normative table. Test rewritten to revise from `blocked_review`.
+- **Criteria advanced** B3, C6, D4, D5, D6, E1, E2, E3, E4, F1 (IDOR), H1, H2 (partial).
+
+### 2026-07-27 — Increment 11: constrained MCP adapter
+- **Added** `mcp.js`, `index.js` (bootstrap + mount), `test/orch-mcp.test.mjs`; ~20-line mount in `server.js`.
+- **GREEN** 12/12; full suite 229/229 — no regression, subsystem inert by default.
+- **Criteria advanced** F3, G5 (pending independent confirmation).
+
+### 2026-07-27 — Increment 12: fixture, docs, portability sweep
+- **Added** `contract/pw-contract-1.0.json` (generated), `scripts/orch-contract-fixture.mjs`, `test/orch-contract-fixture.test.mjs`, `bin/pw-orchestrator-mcp.mjs`, `docs/orchestrator-api.md`, two config examples, `.gitignore` entries, `/readiness`.
+- **GREEN** 7/7 fixture tests including **5 cross-contract checks against the orchestrator's real Pydantic** (enums, state families, transition table, error codes, tool set) — all match member-for-member. Full suite 236/236.
+- **Sweep** no CT2115/PVI2/live-path constants outside config defaults; no >Node-20 API used; `git diff --check` clean; no secrets in added lines.
+- **Residual** no Node 20 runtime available locally to execute the suite against CI's pinned version; delegated to the non-regression reviewer.
+- **Criteria advanced** A2, G1, G3, G4, H3 (partial), H4.
+
 ### Next
-Increment 4 — HTTP surface: bearer auth, instance/project scoping, idempotency, correlation, limits, CSRF separation, discovery endpoints.
+Independent reviews (security+concurrency, session/worktree lifecycle, wire compatibility, non-regression) are running. Resolve findings, then open the PR.
