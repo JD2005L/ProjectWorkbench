@@ -455,12 +455,35 @@ export function bindingIsUsable(binding) {
   return true;
 }
 
+/**
+ * Whether this build can answer a peer speaking `asked` honestly.
+ *
+ * Exact, not "at least". A newer peer is not a superset of an older one: it expects checks this
+ * build has never heard of, and answering it at all is the failure. An older peer cannot interpret
+ * the shape this build sends. Absence is not assent either — a peer that says nothing has not told
+ * us it can read what we are about to send.
+ */
+export function speaksAttestationContract(asked) {
+  return typeof asked === 'string' && asked === ATTESTATION_CONTRACT_VERSION;
+}
+
 export function buildAttestation({
   requested, aliases, init, stderr = '',
   fingerprint = null, argvOwnedByServer = false, binding = null,
   instanceId = null, argv = [], probedAuthMode = null,
   backend = CodingBackend.CLAUDE_CODE,
+  // Defaulted only for a caller with no peer in the picture. `null` — which is what `session.js`
+  // passes when the request carries no version — is NOT the default: it means the peer said
+  // nothing, and absence is not assent. The contract gives `VerifySessionRequest` its own default
+  // and the API applies it, so a peer that omits the field has declared 1.1 on the contract's
+  // terms rather than on ours.
+  attestationContractVersion = ATTESTATION_CONTRACT_VERSION,
 }) {
+  // The version the CALLER spoke, checked before anything is assembled. `VerifySessionRequest`
+  // carries it precisely so a peer that cannot meet this contract is told so, rather than answered
+  // in a shape implying checks it never performed — and until this was wired up, PW accepted the
+  // field, discarded it in a duplicate object key, and answered every peer in 1.1 shape regardless.
+  const contractAgreed = speaksAttestationContract(attestationContractVersion);
   // A trustworthy fingerprint is a precondition for BOTH labels, not just the weaker one. Without
   // this the apparatus was one-sided: seven checks fenced `launch_enforced`, while `runtime_reported`
   // — the STRONGER label — cost a hostile or substituted backend one extra JSON field. "The backend
@@ -547,6 +570,14 @@ export function buildAttestation({
     && (probedAuthMode === null || probedAuthMode === AuthMode.SUBSCRIPTION);
 
   const reasons = [];
+  if (!contractAgreed) {
+    reasons.push(
+      `the caller speaks attestation contract ${
+        typeof attestationContractVersion === 'string' && attestationContractVersion
+          ? attestationContractVersion : '(unstated)'
+      }, and this instance implements ${ATTESTATION_CONTRACT_VERSION}`,
+    );
+  }
   if (!subscriptionBacked) {
     reasons.push(apiKeySource === null
       ? 'the session did not report its authentication source'
@@ -555,7 +586,7 @@ export function buildAttestation({
   if (!model.verified) reasons.push(model.reason);
   if (!effort.verified) reasons.push(effort.reason);
 
-  const attested = subscriptionBacked && model.verified && effort.verified;
+  const attested = contractAgreed && subscriptionBacked && model.verified && effort.verified;
 
   // No separate disclosure gate: the contract itself carries provenance, so there is no shape in
   // which an enforcement can be mistaken for an observation. A peer that fails to bind its request

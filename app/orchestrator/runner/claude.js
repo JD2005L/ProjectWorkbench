@@ -25,6 +25,7 @@ import { promisify } from 'util';
 
 import {
   SCHEMA_VERSION, PATTERNS, Effort, PhaseClass, CodingBackend, HealthState, AuthMethod,
+  ATTESTATION_CONTRACT_VERSION,
   AuthMode,
 } from '../contract.js';
 import { redactText } from '../redact.js';
@@ -272,6 +273,9 @@ export class ClaudeCodeBackend {
     requested, phaseClass = PhaseClass.DISCOVERY, cwd, cliSessionId = null,
     runId = 'unbound', sessionKey = null,
     configGeneration = null, verificationNonce = null,
+    // This build's own contract when no peer is in the picture — a direct caller is not a peer.
+    // A peer's version always arrives explicitly, via session.js from the validated request.
+    attestationContractVersion = ATTESTATION_CONTRACT_VERSION,
   }) {
     const argv = this.buildPhaseArgv({
       prompt: 'Reply with exactly: ready',
@@ -321,6 +325,9 @@ export class ClaudeCodeBackend {
       // Only a POSITIVE finding overrides the session's own report. An inconclusive probe leaves
       // the decision to the init event rather than blocking on the probe's inability to answer.
       probedAuthMode: probedAuth?.auth_mode ?? null,
+      // The contract the CALLER speaks. A peer this build cannot answer honestly gets no
+      // attestation rather than one in a shape implying checks it never made.
+      attestationContractVersion,
       binding: {
         // Never the backend's own session id: letting the program being attested choose the
         // anti-replay key would let it pick one, and it is unbounded and unvalidated.
