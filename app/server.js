@@ -13,6 +13,7 @@ import { normalizeUserRecord } from './users-compat.js';
 import { deployCss } from './deploy-css.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
+import { mountOrchestrator } from './orchestrator/index.js';
 
 const app = express();
 const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
@@ -60,6 +61,25 @@ const SUPPORTED_CLIS = {
  codex:   { label:'OpenAI Codex CLI',   pkg:'@openai/codex',             bin:'codex',   authCmd:'codex login',                                notes:'OpenAI. Sign in with ChatGPT or set OPENAI_API_KEY.' },
  copilot: { label:'GitHub Copilot CLI', pkg:'@github/copilot',           bin:'copilot', authCmd:'gh auth login --git-protocol=https --web',   notes:'GitHub. Auth via gh CLI; copilot reads gh credentials.' }
 };
+
+// The orchestration API mounts before the dashboard's body parser and CSRF guard, and only when an
+// operator has enabled it. Both placements are deliberate: it enforces its own much smaller body
+// limit, and the Origin/Referer gate below exists because nginx Basic Auth is replayed by browsers
+// on any origin — which a bearer service token is not. It is a machine surface with a dedicated
+// scoped credential and shares no credential material with the dashboard in either direction.
+// When disabled (the default) nothing here runs: no store, no lock, no listener, no behaviour change.
+let orchestrator = null;
+try {
+ orchestrator = await mountOrchestrator(app, {
+  workbenchVersion: RELEASE_VERSION,
+  audit: (event, detail) => { audit(event, detail).catch(() => {}); },
+ });
+ if(orchestrator) console.log(`[orchestrator] mounted at ${orchestrator.config.basePath} as instance ${orchestrator.config.instanceId} (${orchestrator.reconciled} job(s) reconciled)`);
+} catch(err) {
+ // A misconfigured orchestrator must not take the dashboard down with it: every human terminal,
+ // preview and inbox on this instance is unrelated to it.
+ console.error('[orchestrator] disabled — configuration error:', err?.message);
+}
 
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));

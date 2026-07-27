@@ -70,6 +70,8 @@ WORKDIR /opt/project-workbench/app
 # App + scripts (a volume mount typically overrides these at runtime).
 COPY app/ ./
 COPY scripts/ /opt/project-workbench/scripts/
+# The stdio MCP adapter documented in docs/orchestrator-api.md.
+COPY bin/ /opt/project-workbench/bin/
 RUN chmod +x /opt/project-workbench/scripts/* 2>/dev/null || true
 
 RUN mkdir -p /opt/project-workbench/workspaces /opt/project-workbench/memory \

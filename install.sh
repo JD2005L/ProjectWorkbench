@@ -102,6 +102,13 @@ fi
 
 log "Installing dashboard app…"
 cp -a "$SRC_DIR/app/." "$APP_DIR/"
+# The stdio MCP adapter documented in docs/orchestrator-api.md lives outside app/, so it needs its
+# own copy — without this the documented entry point simply does not exist on a deployed instance.
+if [ -d "$SRC_DIR/bin" ]; then
+  mkdir -p "$PW_INSTALL_DIR/bin"
+  cp -a "$SRC_DIR/bin/." "$INSTALL_DIR/bin/"
+  chmod +x "$PW_INSTALL_DIR"/bin/* 2>/dev/null || true
+fi
 # AGENTS.md is served unauthenticated at /agents.md so external automation
 # can discover the instance. Mirror it next to the dashboard so the route
 # resolves even when the source tree is wiped after install.
