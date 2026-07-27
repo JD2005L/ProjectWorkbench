@@ -105,6 +105,13 @@ export function loadOrchestratorConfig(env = process.env) {
     backendTimeoutMs: int(env.PW_ORCHESTRATOR_BACKEND_TIMEOUT_MS, 1_800_000, { min: 1_000, max: 21_600_000 }),
     checkTimeoutMs: int(env.PW_ORCHESTRATOR_CHECK_TIMEOUT_MS, 900_000, { min: 1_000, max: 21_600_000 }),
     defaultMaxPhaseTurns: int(env.PW_ORCHESTRATOR_MAX_PHASE_TURNS, 10, { min: 1, max: 60 }),
+    // How the effective *effort* may be evidenced. Claude Code reports the active model in its
+    // init event but not the active effort, and silently ignores an unrecognised --effort value.
+    // The default therefore reports `effective: null` and blocks, which is what the contract
+    // requires when a setting cannot be determined. Setting this to 'argv' is an explicit operator
+    // decision to accept that ProjectWorkbench passed the flag on every invocation as evidence; it
+    // is labelled `argv-attested` in every response so the orchestrator can see what it is holding.
+    effortAttestation: str(env.PW_ORCHESTRATOR_EFFORT_ATTESTATION, 'none') === 'argv' ? 'argv' : 'none',
 
     // ---- leases ----
     leaseTtlMs: int(env.PW_ORCHESTRATOR_LEASE_TTL_MS, 300_000, { min: 5_000, max: 86_400_000 }),
