@@ -65,6 +65,10 @@ const FORBIDDEN_ENV = [
  */
 export function classifyBackendFailure(err) {
   if (err?.code === 'ENOENT') return 'unavailable';
+  // An abort is a deliberate cancellation, and must be checked BEFORE the kill/SIGTERM cases —
+  // aborting execFile terminates the child with SIGTERM, which would otherwise read as a timeout
+  // and send the job to a blocked state instead of a cancelled one.
+  if (err?.name === 'AbortError' || err?.code === 'ABORT_ERR' || err?.kind === 'cancelled') return 'cancelled';
   if (err?.killed || err?.signal === 'SIGTERM') return 'timeout';
   if (err?.signal) return 'process_died';
 
@@ -300,7 +304,7 @@ export class ClaudeCodeBackend {
    * evidence of anything: whether the work was actually done is decided by the deterministic checks
    * and by git, never by what the model said about itself.
    */
-  async runPhase({ prompt, model, effort, maxTurns, phaseClass, cwd, resumeSessionId = null, sessionId = null, timeoutMs = null }) {
+  async runPhase({ prompt, model, effort, maxTurns, phaseClass, cwd, resumeSessionId = null, sessionId = null, timeoutMs = null, signal = null }) {
     const argv = this.buildPhaseArgv({ prompt, model, effort, maxTurns, phaseClass, resumeSessionId, sessionId });
     const permissionMode = PERMISSION_MODE_BY_PHASE[phaseClass];
 
@@ -312,9 +316,16 @@ export class ClaudeCodeBackend {
         timeout: timeoutMs ?? this.config.backendTimeoutMs,
         env: this.phaseEnv(),
         maxBuffer: 32 * 1024 * 1024,
+        // Cancellation has to reach the child process. Without this the agent kept editing while
+        // the caller waited out the phase budget — up to half an hour by default.
+        ...(signal ? { signal } : {}),
       }));
     } catch (err) {
       const kind = classifyBackendFailure(err);
+      if (kind === 'cancelled') {
+        // Let the caller record the cancellation; this is not a backend failure to be blocked on.
+        throw Object.assign(new Error('the phase was cancelled'), { kind: 'cancelled' });
+      }
       return {
         ok: false,
         failure_kind: kind,

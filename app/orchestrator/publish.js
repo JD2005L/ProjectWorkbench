@@ -40,7 +40,18 @@ export class Publisher {
   }
 
   _git(argv, cwd, indexFile = null) {
-    return runGit(argv, { cwd, gitExecutable: this.config.gitExecutable, exec: this.exec, indexFile });
+    return runGit(argv, {
+      cwd, gitExecutable: this.config.gitExecutable, exec: this.exec, indexFile,
+      // Supplied on every call so a commit never depends on the ambient identity of whatever user
+      // the dashboard runs as. A service account with no global git config is the normal case, and
+      // without this `git commit` fails with "Please tell me who you are".
+      envExtra: {
+        GIT_AUTHOR_NAME: this.config.gitAuthorName,
+        GIT_AUTHOR_EMAIL: this.config.gitAuthorEmail,
+        GIT_COMMITTER_NAME: this.config.gitAuthorName,
+        GIT_COMMITTER_EMAIL: this.config.gitAuthorEmail,
+      },
+    });
   }
 
   /**
@@ -139,7 +150,12 @@ export class Publisher {
     // No -a: only the explicitly staged set is committed. An `-a` here would sweep up every other
     // dirty file in the operator's checkout.
     const commit = record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath, index));
-    if (!commit.ok) return this._failed(job, 'the commit failed', steps);
+    if (!commit.ok) {
+      // Name the cause. "the commit failed" sent an operator hunting through artifacts for what was
+      // often a one-line git message.
+      const why = redactText(String(commit.stderr || commit.stdout || ''), { maxLength: 160 }).trim();
+      return this._failed(job, why ? `the commit failed: ${why}` : 'the commit failed', steps);
+    }
 
     const localHead = await this._git(['rev-parse', 'HEAD'], workspacePath);
     const localCommit = localHead.stdout.trim();

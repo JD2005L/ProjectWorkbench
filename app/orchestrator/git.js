@@ -165,7 +165,7 @@ export function assertGitArgvAllowed(argv) {
  * `-c` and every other configuration-injection option is refused above, and the environment is
  * pruned of the variables that would let git write somewhere else or prompt for credentials.
  */
-export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120_000, exec = execFileAsync, indexFile = null } = {}) {
+export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120_000, exec = execFileAsync, indexFile = null, envExtra = null } = {}) {
   assertGitArgvAllowed(argv);
   const env = { ...process.env };
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) {
@@ -176,6 +176,10 @@ export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120
   // failure cannot leave the operator's staged work rearranged, and git.js deliberately offers no
   // way to unstage.
   if (indexFile) env.GIT_INDEX_FILE = indexFile;
+  // Explicit, caller-supplied variables — currently the commit identity. Passed as environment
+  // rather than `-c`, which the allowlist refuses because it is a general configuration-injection
+  // vector; the identity variables are a fixed, named set.
+  if (envExtra) Object.assign(env, envExtra);
   // A prompt would hang the phase rather than fail it.
   env.GIT_TERMINAL_PROMPT = '0';
   env.GIT_ASKPASS = env.GIT_ASKPASS ?? '/bin/true';

@@ -345,6 +345,29 @@ test('runner: a max-turn exit is a failure, never a success', async () => {
   assert.equal(result.failure_kind, 'max_turns');
 });
 
+test('runner: an abort is classified as cancellation, not as a timeout', () => {
+  // Aborting execFile terminates the child with SIGTERM, which the timeout branch would otherwise
+  // claim — sending a deliberately cancelled job to a blocked state instead of a cancelled one.
+  for (const err of [
+    Object.assign(new Error('x'), { name: 'AbortError', killed: true, signal: 'SIGTERM' }),
+    Object.assign(new Error('x'), { code: 'ABORT_ERR', killed: true, signal: 'SIGTERM' }),
+  ]) {
+    assert.equal(classifyBackendFailure(err), 'cancelled');
+  }
+});
+
+test('runner: an abort signal is passed through to the child process', async () => {
+  // The signal has to reach execFile. Previously only the test fake honoured it, so cancellation
+  // was green in the suite and inert in production.
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  const controller = new AbortController();
+  await backend.runPhase({
+    prompt: 'x', model: 'sonnet', effort: 'high', maxTurns: 5,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo', signal: controller.signal,
+  });
+  assert.equal(calls[0].options.signal, controller.signal);
+});
+
 test('runner: failures map to distinct kinds so each can reach its own safe state', () => {
   const cases = [
     [{ stderr: 'Invalid API key · Please run /login', code: 1 }, 'auth_expired'],

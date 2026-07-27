@@ -150,6 +150,17 @@ export function loadOrchestratorConfig(env = process.env) {
 
     // ---- publication ----
     gitExecutable: str(env.PW_ORCHESTRATOR_GIT_BIN, 'git'),
+    // The identity publication commits under. Explicit, because a service account routinely has no
+    // global git identity — and without one `git commit` fails, which made publication report "the
+    // commit failed" on any host where nobody had configured one. It is also better attribution:
+    // the commit records that this instance's orchestration subsystem made it, not whichever
+    // identity happened to be on the box.
+    gitAuthorName: str(env.PW_ORCHESTRATOR_GIT_AUTHOR_NAME, 'ProjectWorkbench Orchestrator'),
+    gitAuthorEmail: str(
+      env.PW_ORCHESTRATOR_GIT_AUTHOR_EMAIL,
+      // `.invalid` is the reserved non-resolvable TLD: a valid address shape that cannot receive mail.
+      `orchestrator@${(instanceIdRaw || 'project-workbench').toLowerCase()}.invalid`,
+    ),
     ghExecutable: str(env.PW_ORCHESTRATOR_GH_BIN, 'gh'),
   });
 }

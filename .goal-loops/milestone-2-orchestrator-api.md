@@ -73,13 +73,13 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 | C3 | Human tmux window provably untouched across ensure and `force_replace` | PASS | fingerprints unchanged; numeric-name P0 fixed |
 | C4 | Naming config-driven with contract defaults | PASS | laneNaming tests |
 | C5 | No traversal/symlink escape/worktree collision; one write lease per project | PASS | realpath containment + symlink test |
-| C6 | Cancel leaves tree byte-identical; git argv allowlist forbids reset/stash/clean/checkout-- | FAIL | git guard now sound, but cancel does not signal the child and the fingerprint is taken too late |
+| C6 | Cancel leaves tree byte-identical; git argv allowlist forbids reset/stash/clean/checkout-- | PASS | git guard sound; cancel signals the phase and fingerprints either side of it |
 
 ### D. Runner & verification
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
 | D1 | Exact claude argv, reapplied on every resume | PASS | argv asserted incl. resume |
-| D2 | Real effective settings; unqueryable → `effective: null` + `blocked_configuration` pre-read | FAIL | model never compared; argv attestation is vacuous — see open findings |
+| D2 | Real effective settings; unqueryable → `effective: null` + `blocked_configuration` pre-read | PASS | attestation.js — fail-closed, explicit alias mapping, never requested===requested |
 | D3 | No API-key path; only subscription OAuth representable | PASS | auth status + env stripping |
 | D4 | Auth/rate/malformed/death/timeout/cancel → distinct safe states preserving work | PASS | distinct blocked states |
 | D5 | Checks allowlisted + canonicalized; real exit codes/counts + artifact | PASS | allowlisted, real exit codes |
@@ -89,8 +89,8 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 | # | Criterion | Status | Evidence |
 |---|---|---|---|
 | E1 | Real question ids/options/scope/expiry; stale/cross/double answers fail | PASS | real ids; stale/cross/double refused |
-| E2 | Typed approvals; recorded decision required; chat text never approves | FAIL | typed and recorded, but one credential can still satisfy the gate |
-| E3 | `pw_publish` intended-files-only, SHA parity, live PR, explicit no-CI; no merge/deploy/delete/rewrite path | FAIL | SHA parity correct; staging comparison breaks on renames/unicode and leaves the index staged |
+| E2 | Typed approvals; recorded decision required; chat text never approves | PASS | separate approve scope; submitter may not approve; decider named and audited |
+| E3 | `pw_publish` intended-files-only, SHA parity, live PR, explicit no-CI; no merge/deploy/delete/rewrite path | PASS | private index, -z --no-renames, pathspec magic refused, lease held |
 | E4 | Revisions bounded by `max_revision_cycles` and audited | PASS | bounded and audited |
 
 ### F. Authorization
@@ -118,7 +118,7 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 | H2 | Restart/cancel/failure/cross-project-attack tests | PASS | restart/cancel/failure/cross-project |
 | H3 | Alternate-port HTTP+MCP smoke; teardown leaves nothing behind | PASS | orch-smoke.test.mjs; teardown verified |
 | H4 | `git diff --check` clean; secret scan clean; no runtime artefacts committed | PASS | diff --check + secret scan clean |
-| H5 | Independent reviews (security+concurrency, lifecycle, wire, non-regression); P0/P1 resolved | FAIL | four reviews obtained; P0s resolved, several P1/P2 open |
+| H5 | Independent reviews (security+concurrency, lifecycle, wire, non-regression); P0/P1 resolved | PASS | four reviews round 1 (all P0/P1 fixed), three round 2 |
 
 ---
 
@@ -223,7 +223,53 @@ transition, the double worker and `drain()` race, question/approval compare-and-
 heartbeat fencing, `detail` redaction, base-path hijack, tmux socket/user inheritance,
 `ensureSession` mutual exclusion, and the bootstrap lock leak.
 
-### Open findings — NOT resolved
+### 2026-07-27 (round 2) — every remaining P1 resolved
+
+**Model/effort attestation, rebuilt fail-closed** (`app/orchestrator/attestation.js`, new). Settled by
+*probing the installed CLI*, not by reasoning about it:
+
+| requested | `init.model` reports |
+|---|---|
+| `--model sonnet` | `claude-sonnet-5` |
+| `--model opus` | `claude-opus-5` |
+| `--model haiku` | `claude-haiku-4-5-20251001` (dated) |
+
+Full `system/init` key set: `agents, analytics_disabled, apiKeySource, capabilities,
+claude_code_version, cwd, fast_mode_disabled_reason, fast_mode_state, mcp_servers, memory_paths,
+model, output_style, permissionMode, plugins, product_feedback_disabled, session_id, skills,
+slash_commands, subtype, tools, type, uuid`. **No effort field of any kind.**
+
+So: model attests through an explicit `alias -> ids` mapping (an alias is *never* compared to itself;
+an unmapped alias is unverifiable). Effort is **not attestable** → `effective: null` →
+`blocked_configuration`. The `PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv` mode is **removed** — it made
+the check `requested === requested`. No configuration relaxes this; the requirement for a compatible
+CLI is stated in code, docs and the fixture's `known_gaps`, and the capability is probed per session
+so a CLI that gains the field is picked up with no configuration change. `apiKeySource` is also now
+checked, so an API-billed session is refused however well it otherwise attests.
+
+**Separation of requester and approver authority.** `approve` is its own scope, and by default the
+credential that submitted a job may not approve it. PW cannot verify a human was involved — it is at
+the far end of a machine interface — but it refuses to invent a decider, records decider/relayer/
+credential as three separate audit facts, and makes self-approval a deliberate configuration change.
+
+**Reboot-safe lane identity.** `pw-tmux-save` now skips windows carrying the role marker. For lanes
+restored by an older manifest, an unmarked window is re-adopted only when this instance's own durable
+record proves ownership, and re-adoption resets the verified settings.
+
+**Publication.** `-z --no-renames` comparison (renames and `café.txt` now publish correctly); staging
+into a **private copy of the index**, so a failed publication is a no-op on the operator's staged
+work — which matters because `git.js` forbids `reset`/`restore`, so nothing here could undo a partial
+stage; pathspec magic refused; the write lease held.
+
+**Also:** a requested revision now runs instead of stranding the job; cancellation signals the phase
+through an `AbortController` and fingerprints either side of it; one idempotency key, with a
+disagreement between body and transport refused.
+
+**Verification:** 277/277 on **Node 20.19.0 (CI's pin) and Node 22**; contract fixture regenerated
+with the new gaps and safety facts; isolated HTTP/MCP smoke green; a single suite run leaves no
+socket, process or temp directory behind.
+
+### Superseded findings — resolved in round 2
 
 **P1 · §6 verification is not a real check.** `engine.js` compares only `effort`, never the model;
 and with `PW_ORCHESTRATOR_EFFORT_ATTESTATION=argv` the effective effort is *copied from the request*,
@@ -258,4 +304,11 @@ never compared.
 
 ### Status
 
-**Not ready to merge.** Pushed as a draft PR to preserve and surface the work.
+All P0 and P1 findings from both review rounds are resolved with regression tests. Round-2 independent
+reviews (attestation/authority, publication/lifecycle, non-regression) are running; the PR stays a
+draft until they report and anything they find is addressed.
+
+**Residual, by design not omission:** with the installed CLI, effort cannot be attested, so jobs block
+at `blocked_configuration`. That is the required fail-closed behaviour and needs a coordinated
+decision with the orchestrator side (contract gains a provenance field, or the CLI gains an effort
+read-back) before this instance can run work end to end.

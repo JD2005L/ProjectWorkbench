@@ -319,6 +319,94 @@ gitTest('publish: pathspec magic is refused before it reaches git add', async ()
   }, { backendOptions: ATTESTING });
 });
 
+gitTest('publish: commits under an explicit identity, with no ambient git config at all', async () => {
+  // Root cause of an intermittent failure found by independent verification in a fresh clone:
+  // publication inherited whatever git identity happened to exist on the host. A service account
+  // routinely has none — as do CI runners and fresh containers — and `git commit` then fails with
+  // "Please tell me who you are". Publication reported "the commit failed" and pushed nothing, so
+  // the symptom was a repository with one commit where two were expected.
+  //
+  // GIT_CONFIG_GLOBAL/GIT_CONFIG_SYSTEM pointed at /dev/null is the deterministic way to say "this
+  // host has no configured identity" — it does not depend on the machine the test runs on.
+  const saved = {
+    global: process.env.GIT_CONFIG_GLOBAL,
+    system: process.env.GIT_CONFIG_SYSTEM,
+    name: process.env.GIT_AUTHOR_NAME,
+    email: process.env.GIT_AUTHOR_EMAIL,
+    cname: process.env.GIT_COMMITTER_NAME,
+    cemail: process.env.GIT_COMMITTER_EMAIL,
+  };
+  process.env.GIT_CONFIG_GLOBAL = '/dev/null';
+  process.env.GIT_CONFIG_SYSTEM = '/dev/null';
+  delete process.env.GIT_AUTHOR_NAME;
+  delete process.env.GIT_AUTHOR_EMAIL;
+  delete process.env.GIT_COMMITTER_NAME;
+  delete process.env.GIT_COMMITTER_EMAIL;
+
+  try {
+    await withEngine(async ({ engine, repoDir }) => {
+      const { jobId, approval } = await driveToGate(engine);
+      fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+      await engine.approveStage({
+        token: APPROVER, jobId,
+        body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+        idempotencyKey: 'a1',
+      });
+
+      const record = await engine.publish({
+        token: SUBMITTER, jobId,
+        request: {
+          job_id: jobId, branch: 'orch/identity', commit_message: 'fix: expiry',
+          intended_files: ['src.js'], open_pull_request: false, approval_id: approval.approval_id,
+        },
+        idempotencyKey: 'p1', correlationId: 'c',
+      });
+
+      assert.equal(record.pushed, true, record.failure_reason ?? 'publication must not need an ambient identity');
+      assert.equal(record.remote_sha_verified, true);
+
+      // Exactly one new commit, made under the configured identity rather than a host's.
+      const count = (await execFileAsync('git', ['rev-list', '--count', 'HEAD'], { cwd: repoDir })).stdout.trim();
+      assert.equal(count, '2');
+      const author = (await execFileAsync('git', ['log', '-1', '--format=%an <%ae>'], { cwd: repoDir })).stdout.trim();
+      assert.match(author, /ProjectWorkbench Orchestrator <orchestrator@.*\.invalid>/);
+    }, { backendOptions: ATTESTING });
+  } finally {
+    for (const [key, value] of [
+      ['GIT_CONFIG_GLOBAL', saved.global], ['GIT_CONFIG_SYSTEM', saved.system],
+      ['GIT_AUTHOR_NAME', saved.name], ['GIT_AUTHOR_EMAIL', saved.email],
+      ['GIT_COMMITTER_NAME', saved.cname], ['GIT_COMMITTER_EMAIL', saved.cemail],
+    ]) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+});
+
+gitTest('publish: a failed commit says why, rather than reporting a bare failure', async () => {
+  await withEngine(async ({ engine, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+    // An empty commit message is refused by git, standing in for any commit-step failure.
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: '   .   ', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+    if (!record.pushed) {
+      assert.ok(record.failure_reason, 'a failed publication must carry a reason');
+    }
+  }, { backendOptions: ATTESTING });
+});
+
 gitTest('publish: publication holds the project write lease while it runs', async () => {
   await withEngine(async ({ engine, store, repo, config }) => {
     const { jobId, approval } = await driveToGate(engine);
