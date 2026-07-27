@@ -165,8 +165,12 @@ async function withSessions(fn) {
     await fn({ sessions, backend, store, config });
   } finally {
     await store.close();
-    // Tear the private server down, so a run leaves no tmux process behind.
+    // kill-server stops the server but leaves the socket file behind; teardown must leave no tmux
+    // artefact at all, so the socket is unlinked too — as `orch-session.test.mjs` already does.
     await execFileAsync('tmux', ['-L', socket, 'kill-server']).catch(() => {});
+    for (const base of [process.env.TMUX_TMPDIR, '/tmp'].filter(Boolean)) {
+      fs.rmSync(path.join(base, `tmux-${process.getuid?.() ?? 0}`, socket), { force: true });
+    }
     fs.rmSync(dir, { recursive: true, force: true });
   }
 }
