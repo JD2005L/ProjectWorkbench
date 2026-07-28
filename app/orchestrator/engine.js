@@ -851,6 +851,10 @@ export class OrchestrationEngine {
         rate_limited: JobStatus.BLOCKED_RATE_LIMIT,
         usage_limited: JobStatus.BLOCKED_USAGE_LIMIT,
         unavailable: JobStatus.BLOCKED_CONNECTIVITY,
+        // The launch was refused before it started: this host cannot run the CLI as the
+        // unprivileged account it is configured to use. Nothing about the project or the job is
+        // wrong, and a retry changes nothing until an operator fixes the configuration.
+        privilege_drop_failed: JobStatus.BLOCKED_CONFIGURATION,
         timeout: JobStatus.BLOCKED_PROJECT_STATE,
         process_died: JobStatus.BLOCKED_PROJECT_STATE,
         malformed_output: JobStatus.BLOCKED_VERIFICATION,

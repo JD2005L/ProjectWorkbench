@@ -14,10 +14,16 @@ import { ClaudeCodeBackend, classifyBackendFailure } from '../app/orchestrator/r
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { HealthState, AuthMethod, PhaseClass, Effort } from '../app/orchestrator/contract.js';
 
+// Container mode, explicitly. Every assertion below describes a launch with nothing in front of the
+// CLI, which is exactly what container mode must keep doing: the container already runs as the
+// unprivileged user, so there is nothing to drop. Host mode puts `sudo -n -H -u <user> --` in front
+// of the same argv and is covered on its own terms in orch-privilege.test.mjs — leaving this file's
+// mode implicit would have made this suite a test of whoever happened to run it.
 const CONFIG = loadOrchestratorConfig({
   PW_ORCHESTRATOR_ENABLED: 'true',
   PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
   PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+  PW_DEPLOY_MODE: 'container',
 });
 
 /** A recorded init event — the authoritative report of what a session is actually running. */

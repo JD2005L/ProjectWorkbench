@@ -92,6 +92,8 @@ defaults. A deployment with different conventions is *configured*, never patched
 | `PW_ORCHESTRATOR_TMUX_PREFIX` | `pw_` | tmux session prefix |
 | `PW_ORCHESTRATOR_DISPLAY_PREFIX` | `pvibot-orchestrator-` | CLI display-name prefix |
 | `PW_ORCHESTRATOR_TMUX_SOCKET` | _(empty)_ | Alternate tmux server; used by tests |
+| `PW_ORCHESTRATOR_TMUX_USER` | `admin` | Host mode only: the unprivileged account the lane **and every coding phase** run as. Validated at startup — a missing, malformed or superuser value stops the instance booting. See [§1.5](#15-host-mode-runs-the-cli-as-an-unprivileged-account) |
+| `PW_ORCHESTRATOR_SUDO_BIN` | _(auto)_ | Absolute path to the privilege-drop helper. Left unset, `/usr/bin/sudo` then `/bin/sudo` are tried and vetted; never resolved through `PATH` |
 | `PW_ORCHESTRATOR_CLAUDE_BIN` | `claude` | Coding CLI executable. Must be an **absolute path to the real binary** for launch enforcement — not the PW wrapper on `PATH`, which rewrites argv |
 | `PW_ORCHESTRATOR_GIT_BIN` / `_GH_BIN` | `git` / `gh` | Git and GitHub CLI |
 | `PW_ORCHESTRATOR_MAX_BODY_BYTES` | `1048576` | Request body ceiling |
@@ -106,6 +108,42 @@ defaults. A deployment with different conventions is *configured*, never patched
 
 The subsystem reuses the dashboard's existing `PW_WORKSPACES` for the workspace root, so there is
 one source of truth for where project checkouts live.
+
+### 1.5 Host mode runs the CLI as an unprivileged account
+
+A host-mode deployment runs the dashboard as root — it binds a privileged port and manages other
+users' terminals — while every project terminal runs as `PW_ORCHESTRATOR_TMUX_USER`. The coding CLI
+runs as that account too, and this is not a detail:
+
+* **A subscription sign-in is a file in that account's home directory.** A root process cannot see
+  it, so a directly-launched CLI reports itself signed out and `/health` publishes
+  `state: down, method: unknown` while the subscription is perfectly healthy.
+* **A phase writes into a workspace the human terminal owns.** Run as root it would leave
+  root-owned files in the working tree and in `.git`, which the operator's own terminal then cannot
+  write.
+
+So in host mode every launch — the auth probe, the fingerprint's `--version` and `--help`,
+verification, and the phase itself — goes through a fixed argv with no shell:
+
+```
+/usr/bin/sudo -n -H -u <PW_ORCHESTRATOR_TMUX_USER> -- <PW_ORCHESTRATOR_CLAUDE_BIN> …
+```
+
+`-n` so a sudoers policy that would prompt fails immediately instead of hanging until the phase
+deadline, and `-H` so `HOME` is the account's whatever `env_reset` is set to. `USER`, `LOGNAME` and
+`HOME` are also set explicitly, and every API-billing variable is stripped, so the launch is correct
+on a host whose sudoers has `env_reset` disabled.
+
+This adds nothing to the trust chain. The helper is taken from an absolute path and must be a
+root-owned setuid binary that is not group- or world-writable; `PW_ORCHESTRATOR_CLAUDE_BIN` must be
+absolute in host mode, so neither `PATH` nor sudo's `secure_path` chooses the program; and the
+fingerprint continues to realpath, stat, ELF-check and SHA-256 **the CLI** — never the helper.
+
+It fails closed. A missing, malformed or superuser account, an account that resolves to uid or gid
+0, one absent from the passwd database or without an absolute home, or an unusable helper, all
+refuse the launch outright: the failure is reported as `privilege_drop_failed`, jobs reach
+`blocked_configuration`, and there is deliberately no path that falls back to running as root.
+Container mode has nothing to drop and is unchanged.
 
 ---
 

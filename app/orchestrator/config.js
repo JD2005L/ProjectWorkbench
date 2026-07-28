@@ -15,6 +15,7 @@
 import path from 'path';
 import { PATTERNS } from './contract.js';
 import { parseModelAliases } from './attestation.js';
+import { validateDropUser } from './runner/privilege.js';
 
 /**
  * Parse the alias map, telling the operator when their configuration produced nothing.
@@ -109,6 +110,20 @@ export function loadOrchestratorConfig(env = process.env) {
 
   const dataDir = str(env.PW_ORCHESTRATOR_DATA_DIR, '/var/lib/project-workbench/orchestrator');
 
+  // Host-mode deployments run the dashboard as root but every terminal — and every coding phase —
+  // as this account. Validated at load rather than at first launch: a malformed or superuser value
+  // must stop the instance from booting, not surface as a failed job hours later. Container mode
+  // has nothing to drop and is not constrained.
+  const deployMode = String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
+  const tmuxUser = str(env.PW_ORCHESTRATOR_TMUX_USER, 'admin');
+  if (enabled && deployMode === 'host') {
+    try {
+      validateDropUser(tmuxUser);
+    } catch (err) {
+      throw new Error(`PW_ORCHESTRATOR_TMUX_USER is not usable in host mode: ${err.message}`);
+    }
+  }
+
   return Object.freeze({
     enabled,
     instanceId: instanceIdRaw || null,
@@ -151,11 +166,16 @@ export function loadOrchestratorConfig(env = process.env) {
     // human terminals actually use. Overriding it is how the test suite stays out of the live
     // namespace entirely; defaulting it to empty would silently create a second, parallel server.
     tmuxSocket: str(env.PW_ORCHESTRATOR_TMUX_SOCKET, str(env.PW_TMUX_SOCKET, '')),
-    // Host-mode deployments run the dashboard as root but every terminal as `admin`. The lane must
-    // drop the same way, or it creates a root-owned session the dashboard cannot see or reap, and
-    // writes root-owned files into a workspace whose human terminal runs as admin.
-    deployMode: String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host',
-    tmuxUser: str(env.PW_ORCHESTRATOR_TMUX_USER, 'admin'),
+    // Host-mode deployments run the dashboard as root but every terminal as `admin`. The lane and
+    // the coding CLI must both drop the same way, or the lane is a root-owned session the dashboard
+    // cannot see or reap, and the CLI reads root's (absent) subscription sign-in while writing
+    // root-owned files into a workspace whose human terminal runs as admin.
+    deployMode,
+    tmuxUser,
+    // The privilege-drop helper, pinned to an absolute path. Left empty, the dropper looks in the
+    // two standard locations and vets what it finds; it is never resolved through PATH, because a
+    // PATH lookup would let the environment choose the program that runs as root.
+    sudoExecutable: str(env.PW_ORCHESTRATOR_SUDO_BIN, ''),
 
     // ---- coding backend ----
     backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, 'claude'),

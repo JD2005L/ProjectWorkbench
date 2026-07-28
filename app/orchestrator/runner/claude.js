@@ -31,6 +31,7 @@ import {
 import { redactText } from '../redact.js';
 import { buildAttestation } from '../attestation.js';
 import { FingerprintCache } from './fingerprint.js';
+import { privilegeDropperFor } from './privilege.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -67,6 +68,10 @@ const FORBIDDEN_ENV = [
  * is worth retrying automatically.
  */
 export function classifyBackendFailure(err) {
+  // A launch that could not drop privilege never started, and it is an operator fault rather than a
+  // backend one. Checked first: the refusal carries no exit code or signal, so every later rule
+  // would fall through to `phase_failed` and hide a configuration problem inside a phase failure.
+  if (err?.kind === 'privilege_drop_failed') return 'privilege_drop_failed';
   if (err?.code === 'ENOENT') return 'unavailable';
   // An abort is a deliberate cancellation, and must be checked BEFORE the kill/SIGTERM cases —
   // aborting execFile terminates the child with SIGTERM, which would otherwise read as a timeout
@@ -82,14 +87,22 @@ export function classifyBackendFailure(err) {
 }
 
 export class ClaudeCodeBackend {
-  constructor({ config, exec = execFileAsync, clock = () => new Date(), fingerprints = null } = {}) {
+  constructor({ config, exec = execFileAsync, clock = () => new Date(), fingerprints = null, privilege = null } = {}) {
     this.config = config;
-    this.exec = exec;
     this.clock = clock;
     this.name = CodingBackend.CLAUDE_CODE;
+    // In host mode the dashboard runs as root and the CLI must not. Wrapping the exec seam — rather
+    // than each of the four launch sites — is deliberate: the drop then applies to the auth probe,
+    // the fingerprint's `--version` and `--help`, verification and the phase itself by construction,
+    // and a launch added later cannot forget it. Container mode wraps to a passthrough.
+    this.privilege = privilege ?? privilegeDropperFor(config, { forbiddenEnv: FORBIDDEN_ENV });
+    this.exec = this.privilege.wrap(exec);
     // Cached per binary identity, so the ~1s hash of a 275 MB binary happens once and any change
-    // to the file misses the cache rather than being trusted.
-    this.fingerprints = fingerprints ?? new FingerprintCache({ exec });
+    // to the file misses the cache rather than being trusted. It fingerprints the *configured*
+    // file — realpath, stat, ELF header and SHA-256 are all taken here, as root, on the CLI itself.
+    // Only the `--version`/`--help` launches go through the drop, and they name the resolved
+    // realpath, so nothing about the identity check binds to sudo.
+    this.fingerprints = fingerprints ?? new FingerprintCache({ exec: this.exec });
   }
 
   /** Fingerprint the configured CLI, for enforcement claims and for health reporting. */
@@ -170,13 +183,19 @@ export class ClaudeCodeBackend {
       }));
     } catch (err) {
       const kind = classifyBackendFailure(err);
+      // The drop failure carries its own operator-facing message — which account, which helper, what
+      // was wrong with it. Reporting it as "could not report its authentication status" is what made
+      // the live symptom (backend down, method unknown) unactionable in the first place.
+      const privilegeDetail = kind === 'privilege_drop_failed'
+        ? `the coding CLI could not be run as the unprivileged account: ${String(err?.message ?? '').slice(0, 200)}`
+        : null;
       return {
         ...base,
         state: HealthState.DOWN,
         method: AuthMethod.UNKNOWN,
-        detail: kind === 'unavailable'
+        detail: privilegeDetail ?? (kind === 'unavailable'
           ? 'the coding CLI is not installed on this instance'
-          : 'the coding CLI could not report its authentication status',
+          : 'the coding CLI could not report its authentication status'),
         // Inconclusive: not a positive finding of API billing, so it must not override the session's
         // own report either way.
         auth_mode: null,
