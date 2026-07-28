@@ -666,6 +666,10 @@ test("the helper's own refusal is a configuration fault, not a failed phase", as
     'sudo: a password is required',
     'sudo: unknown user admin',
     'sudo: unable to execute /usr/local/bin/claude: No such file or directory',
+    // The likeliest misconfiguration of all: a wrong PW_ORCHESTRATOR_CLAUDE_BIN. sudo reports it,
+    // so the ENOENT that used to reach `unavailable` never arrives on this path.
+    'sudo: /usr/local/bin/clade: command not found',
+    'sudo: sorry, you are not allowed to preserve the environment',
   ]) {
     const { backend } = backendWith({
       script: () => Object.assign(new Error('Command failed'), { code: 1, stderr: `${message}\n`, stdout: '' }),

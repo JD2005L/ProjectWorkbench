@@ -250,7 +250,10 @@ const SUDO_REFUSAL = new RegExp([
   '^sudo: (sorry, )?(you |user )',
   '^sudo: unable to (execute|change to runas|set runas|stat|open|initialize|resolve uid)',
   '^sudo: (parse error|syntax error)',
-  '^sudo: .*(is not allowed to|not permitted|no such file or directory)',
+  // A misconfigured `PW_ORCHESTRATOR_CLAUDE_BIN` is the likeliest fault of all, and sudo reports it
+  // rather than the kernel — so the ENOENT that used to reach `unavailable` never arrives, and
+  // without this the operator is sent to look at the project instead of at the path they set.
+  '^sudo: .*(command not found|is not allowed to|not permitted|no such file or directory)',
 ].join('|'), 'i');
 
 /**
@@ -455,7 +458,8 @@ export class PrivilegeDropper {
       // appends argv of its own.
       throw new PrivilegeDropError(
         PrivilegeFailure.EXECUTABLE_NOT_ABSOLUTE,
-        'the coding CLI must be configured as an absolute path before it can be run as the unprivileged account',
+        'PW_ORCHESTRATOR_CLAUDE_BIN must be an absolute path to the real coding CLI before it can be '
+        + 'run as the unprivileged account: a bare name would be resolved through PATH',
       );
     }
 
@@ -514,18 +518,33 @@ export class PrivilegeDropper {
     const { pid } = child;
     const deadline = Date.now() + graceMs;
 
-    // The tree as it stands *now*, while the helper is still there to be asked. After sudo dies its
-    // children are reparented to init and there is no way back to them — which is how an earlier
-    // version came to SIGKILL the helper, orphan a CLI that was ignoring SIGTERM, and then report
-    // the launch terminated. The descendants are what has to be confirmed dead; the helper is only
-    // the handle on them.
-    const tracked = [pid, ...await descendantsOf(pid)];
+    // What has to be confirmed dead is what was *launched*, not the helper — killing the helper
+    // alone is what reparents a CLI that ignores SIGTERM to init and then calls it terminated.
+    //
+    // Accumulated rather than snapshotted, and re-read on every round. This function is first
+    // entered after `execFile` has already delivered its own SIGTERM, so by the time a single
+    // /proc scan finishes the direct child can already be gone and its own children reparented to
+    // init — enumerated once, the tree came back as just the helper and a live grandchild was
+    // reported dead. Re-reading also catches anything spawned during the grace.
+    const tracked = new Set([pid]);
+    const rescan = async () => {
+      for (const descendant of await descendantsOf(pid)) tracked.add(descendant);
+      // Reparented children are no longer reachable from `pid`, so anything already known is
+      // followed on its own account.
+      for (const known of [...tracked]) {
+        if (known === pid) continue;
+        for (const descendant of await descendantsOf(known)) tracked.add(descendant);
+      }
+    };
+    await rescan();
 
     // `child.exitCode` is re-checked each round, not only on entry: once Node has reaped the child
     // the pid means nothing, and signalling it would reach whatever the kernel handed it to next.
-    const survivors = () => (child.exitCode === null && child.signalCode === null
-      ? tracked.filter((candidate) => stillRunning(candidate))
-      : tracked.slice(1).filter((candidate) => stillRunning(candidate)));
+    const survivors = () => [...tracked]
+      // Once Node has reaped the child, its pid means nothing and signalling it would reach
+      // whatever the kernel hands that number to next.
+      .filter((candidate) => candidate !== pid || (child.exitCode === null && child.signalCode === null))
+      .filter((candidate) => stillRunning(candidate));
 
     const send = (signal, pids) => {
       for (const target of pids) {
@@ -538,15 +557,20 @@ export class PrivilegeDropper {
     // SIGTERM to the helper only: sudo relays it, and the CLI gets to exit cleanly.
     send('SIGTERM', [pid]);
     while (Date.now() < deadline) {
+      await rescan();
       if (survivors().length === 0) return true;
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
 
     // Out of grace. Everything that was launched, not just the helper — killing the helper alone is
     // what creates the orphan.
+    await rescan();
     send('SIGKILL', survivors());
     for (let i = 0; i < 20; i++) {
-      if (survivors().length === 0) return true;
+      await rescan();
+      const left = survivors();
+      if (left.length === 0) return true;
+      send('SIGKILL', left);
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
     // Said plainly rather than assumed. Something is still running, and the caller is entitled to
@@ -612,7 +636,9 @@ export class PrivilegeDropper {
       } catch (err) {
         // Await the death of what was launched before telling the caller it stopped. Nothing else
         // in the system can do this: by the time the error reaches the engine, the handle is gone.
-        if (child) await this.ensureTerminated(child);
+        // The verdict is carried on the error rather than dropped: a cancellation that could not
+        // be carried out must not be indistinguishable from one that was.
+        if (child) err.terminationConfirmed = await this.ensureTerminated(child);
 
         const refusal = this.helperFailure(err, plan);
         if (refusal) throw refusal;
@@ -621,7 +647,9 @@ export class PrivilegeDropper {
         // a cancellation reported as a process failure blocks a job that was deliberately stopped.
         // If the caller cancelled, the cancellation is what happened.
         if (options.signal?.aborted && err?.name !== 'AbortError') {
-          throw Object.assign(new Error('the launch was cancelled'), { name: 'AbortError', kind: 'cancelled' });
+          throw Object.assign(new Error('the launch was cancelled'), {
+            name: 'AbortError', kind: 'cancelled', terminationConfirmed: err?.terminationConfirmed,
+          });
         }
         throw err;
       }

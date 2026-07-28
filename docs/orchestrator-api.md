@@ -134,6 +134,10 @@ deadline. The runas target is the **uid** the account resolved to, not the name:
 name through NSS at launch time, and a directory change that repointed the name at uid 0 in between
 would be obeyed.
 
+Two things the sudoers policy must therefore allow: running as the configured account **without a
+password**, and `--preserve-env=<list>`. A policy that refuses either fails the launch closed with
+sudo's own message, reported as `privilege_drop_failed` rather than as a broken phase.
+
 The child's environment is sudo's `env_reset` — `HOME`, `USER`, `LOGNAME` and `SHELL` from the
 target's passwd entry, `PATH` from sudoers' vetted `secure_path` — plus a short list of names
 carried across explicitly: proxy settings, CA bundle locations and locale. **Names, not values.**

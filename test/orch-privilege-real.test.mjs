@@ -263,6 +263,31 @@ test('a command that ignores SIGTERM is killed, not orphaned and called dead', a
   assert.equal(confirmed, true, 'and termination was reported as confirmed only because it was');
 });
 
+test('a tool subprocess that outlives the CLI is killed too, not left writing to the workspace', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // The shape a `Bash` tool leaves behind: the CLI exits on SIGTERM and something it started —
+  // a build, a test run — does not, and is reparented to init. Enumerating the tree once was not
+  // enough, because by the time a single /proc scan finished the parent had already gone and the
+  // grandchild was no longer reachable from it; the launch was then reported terminated with the
+  // grandchild still running and still writing. The tree is re-read on every round instead.
+  const marker = `933.${process.pid % 100000}`;
+  const dropper = realDropper();
+  const invocation = await dropper.invocation(
+    '/bin/sh',
+    ['-c', `/bin/sh -c "trap '' TERM; exec ${TOOLS.sleep} ${marker}" & exec ${TOOLS.sleep} 934.5`],
+    {},
+  );
+  const running = execFileAsync(invocation.file, invocation.argv, { ...invocation.options, timeout: 60_000 });
+  running.catch(() => {});
+
+  await waitFor(async () => await pgrepCount(marker) > 0, 10_000, 'the tool subprocess never started');
+
+  const confirmed = await dropper.ensureTerminated(running.child, { graceMs: 1_500 });
+
+  assert.equal(await pgrepCount(marker), 0, 'a tool subprocess was orphaned and left running');
+  assert.equal(confirmed, true);
+});
+
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `918.${process.pid}`;
