@@ -25,7 +25,7 @@ import {
   validateDropUser, resolveDropUser, resolveSudo, privilegeDropperFor,
 } from '../app/orchestrator/runner/privilege.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
-import { probeBinaryFingerprint } from '../app/orchestrator/runner/fingerprint.js';
+import { probeBinaryFingerprint, FingerprintCache, FingerprintFailure } from '../app/orchestrator/runner/fingerprint.js';
 import { HealthState, AuthMethod, PhaseClass, Effort } from '../app/orchestrator/contract.js';
 
 const CLI = '/usr/local/bin/claude';
@@ -51,6 +51,39 @@ const PASSWD = 'admin:x:1000:1000:admin:/home/admin:/bin/bash\n';
 /** A stat of a genuine sudo: regular file, root-owned, setuid, not writable by anyone else. */
 const GOOD_SUDO = { isFile: () => true, uid: 0, mode: 0o104755 };
 
+/** A stat of a genuine `env`: root-owned and unwritable, but not setuid — it needs no privilege. */
+const GOOD_ENV = { isFile: () => true, uid: 0, mode: 0o100755 };
+
+const REAL_HELPERS = Object.freeze({ '/usr/bin/sudo': GOOD_SUDO, '/usr/bin/env': GOOD_ENV });
+
+/**
+ * Take a recorded launch apart into what actually runs.
+ *
+ * A dropped launch is `sudo … -- env -i -- NAME=value … /abs/cli …`, so the program, its argv and
+ * the environment the child will really see are all positions in one array. Reading them back out
+ * here keeps every assertion about the thing it is named after rather than about an offset.
+ */
+function launched(call) {
+  if (call.file !== '/usr/bin/sudo') {
+    return { helper: null, program: call.file, argv: [...call.args], env: call.options?.env ?? {} };
+  }
+  const args = call.args;
+  const rest = args.slice(args.indexOf('--', args.indexOf('-i')) + 1);
+  const programAt = rest.findIndex((arg) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg));
+  const env = Object.fromEntries(rest.slice(0, programAt).map((assignment) => {
+    const at = assignment.indexOf('=');
+    return [assignment.slice(0, at), assignment.slice(at + 1)];
+  }));
+  return {
+    helper: call.file,
+    runas: args[3],
+    envHelper: args[5],
+    program: rest[programAt],
+    argv: rest.slice(programAt + 1),
+    env,
+  };
+}
+
 function fakeStat(byPath) {
   return async (candidate) => {
     const info = byPath[candidate];
@@ -71,7 +104,7 @@ function fakeStat(byPath) {
  */
 function dropper({
   deployMode = 'host', user = 'admin', sudoExecutable = '',
-  passwd = PASSWD, stats = { '/usr/bin/sudo': GOOD_SUDO }, currentUid = 0,
+  passwd = PASSWD, stats = REAL_HELPERS, currentUid = 0,
   forbiddenEnv = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK'],
 } = {}) {
   const lookups = [];
@@ -129,7 +162,7 @@ function backendWith({ config = HOST_CONFIG, privilege = null, script = null } =
       // The service is root, so a launch with nothing in front of it inherits root's HOME whatever
       // the caller passed — reading it from the injected environment would make this a test of
       // whoever runs the suite. Only a dropped launch has an environment of its own.
-      const home = file === '/usr/bin/sudo' ? (options.env?.HOME ?? '/root') : '/root';
+      const home = file === '/usr/bin/sudo' ? (launched({ file, args, options }).env.HOME ?? '/root') : '/root';
       // Only the account that actually signed in has the OAuth store.
       return home === '/home/admin'
         ? { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max', version: '2.1.220' }), stderr: '' }
@@ -174,9 +207,12 @@ test('host mode runs the auth probe as the unprivileged account, and the subscri
 
   const health = await backend.probeAuth();
 
-  assert.equal(calls[0].file, '/usr/bin/sudo');
-  assert.deepEqual(calls[0].args, ['-n', '-H', '-u', 'admin', '--', CLI, 'auth', 'status']);
-  assert.equal(calls[0].options.env.HOME, '/home/admin');
+  const launch = launched(calls[0]);
+  assert.equal(launch.helper, '/usr/bin/sudo');
+  assert.deepEqual(calls[0].args.slice(0, 7), ['-n', '-H', '-u', '#1000', '--', '/usr/bin/env', '-i']);
+  assert.equal(launch.program, CLI);
+  assert.deepEqual(launch.argv, ['auth', 'status']);
+  assert.equal(launch.env.HOME, '/home/admin');
   assert.equal(health.state, HealthState.OK);
   assert.equal(health.method, AuthMethod.SUBSCRIPTION_OAUTH);
   assert.equal(health.account_label, 'Claude Max');
@@ -186,22 +222,84 @@ test('host mode runs the auth probe as the unprivileged account, and the subscri
 // every launch, not just the probe
 // ---------------------------------------------------------------------------
 
-test('the phase, the verification and the fingerprint all launch through the drop', async () => {
-  const { backend, calls } = backendWith();
+/**
+ * A file the kernel would load: ELF64, little-endian, version 1, ET_EXEC.
+ *
+ * The fingerprint refuses a script or an unloadable file *before* it launches anything, so a test
+ * that points at a path which is not a real binary silently asserts nothing about launching — which
+ * is exactly what an earlier version of the test below did, using this host's `/usr/local/bin/claude`
+ * wrapper and passing on a launch count of zero.
+ */
+async function fakeCli(dir) {
+  const header = Buffer.alloc(64);
+  Buffer.from([0x7f, 0x45, 0x4c, 0x46, 2, 1, 1]).copy(header, 0);
+  header.writeUInt16LE(2, 16);
+  const binary = path.join(dir, 'claude.exe');
+  await fsp.writeFile(binary, header);
+  return { binary, sha256: crypto.createHash('sha256').update(header).digest('hex') };
+}
 
-  await backend.fingerprint().catch(() => {});
+test('the phase, the verification and the fingerprint all launch through the drop', async (t) => {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pw-priv-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const { binary } = await fakeCli(dir);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: binary, PW_DEPLOY_MODE: 'host', PW_ORCHESTRATOR_TMUX_USER: 'admin',
+  });
+  const { backend, calls } = backendWith({ config });
+
+  const fingerprint = await backend.fingerprint();
+  const fingerprintLaunches = calls.length;
   await backend.runPhase(PHASE);
   await backend.verifyConfiguration({
     requested: { model_alias: 'sonnet', effort: Effort.HIGH },
     cwd: PHASE.cwd,
   }).catch(() => {});
 
-  assert.ok(calls.length >= 3, 'every path launched something');
+  // Stated as counts, so the loop below cannot be satisfied by the paths that are easy to launch.
+  assert.equal(fingerprint.ok, true, 'the fingerprint really ran; it did not bail before launching');
+  assert.equal(fingerprintLaunches, 2, '--version and --help both launched');
+  assert.ok(calls.length >= 5, 'the probe, the phase and the verification launched too');
   for (const call of calls) {
-    assert.equal(call.file, '/usr/bin/sudo', 'no launch bypasses the drop');
-    assert.deepEqual(call.args.slice(0, 5), ['-n', '-H', '-u', 'admin', '--']);
-    assert.ok(path.isAbsolute(call.args[5]), 'the program is named absolutely, never through PATH');
+    const launch = launched(call);
+    assert.equal(launch.helper, '/usr/bin/sudo', 'no launch bypasses the drop');
+    assert.deepEqual(call.args.slice(0, 5), ['-n', '-H', '-u', '#1000', '--']);
+    assert.equal(launch.program, binary, 'the program is the configured CLI, named absolutely');
   }
+});
+
+test('the fingerprint cache the backend builds for itself is the dropped one', async (t) => {
+  // Regression on the wiring, not the mechanism. `fingerprints` used to be injectable, and a caller
+  // that supplied its own cache got one holding an undropped exec — a seam straight past the
+  // control, taken by nothing but tests.
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pw-priv-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const { binary } = await fakeCli(dir);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: binary, PW_DEPLOY_MODE: 'host', PW_ORCHESTRATOR_TMUX_USER: 'admin',
+  });
+  const { backend, calls } = backendWith({ config });
+  await backend.fingerprint();
+  assert.ok(calls.length > 0, 'the cache the backend built for itself launched something');
+  assert.ok(calls.every((call) => call.file === '/usr/bin/sudo'), 'and launched it through the drop');
+
+  // A caller offering its own, undropped cache is ignored: the parameter no longer exists.
+  const smuggled = [];
+  const undropped = new FingerprintCache({
+    exec: async (file, args) => {
+      smuggled.push({ file, args });
+      return { stdout: args.includes('--version') ? '2.1.220 (Claude Code)' : '  --effort <level>\n', stderr: '' };
+    },
+  });
+  const injected = new ClaudeCodeBackend({
+    config, exec: async () => ({ stdout: '', stderr: '' }), privilege: dropper(), fingerprints: undropped,
+  });
+  await injected.fingerprint();
+  assert.equal(smuggled.length, 0, 'the injected cache never ran');
 });
 
 test('the CLI argv is passed through unchanged behind the drop', async () => {
@@ -209,8 +307,7 @@ test('the CLI argv is passed through unchanged behind the drop', async () => {
 
   await backend.runPhase(PHASE);
 
-  const launch = calls.at(-1);
-  const cliArgv = launch.args.slice(6);
+  const cliArgv = launched(calls.at(-1)).argv;
   assert.deepEqual(cliArgv, backend.buildPhaseArgv(PHASE));
   assert.ok(cliArgv.includes('--model') && cliArgv.includes('sonnet'));
   assert.ok(cliArgv.includes('--effort') && cliArgv.includes('high'));
@@ -228,6 +325,9 @@ test('cwd, timeout, buffer limit and the abort signal survive the drop', async (
   assert.equal(launch.options.timeout, 4_242);
   assert.equal(launch.options.maxBuffer, 32 * 1024 * 1024);
   assert.equal(launch.options.signal, controller.signal, 'cancellation still reaches the child');
+  // Deliberately attached: a detached launch measurably survived an abort in the first
+  // milliseconds, where an attached one did not.
+  assert.equal(launch.options.detached, undefined, 'the launch stays in this process group');
 });
 
 // ---------------------------------------------------------------------------
@@ -246,12 +346,15 @@ test('the child gets the account it runs as, and no route back to API billing', 
     },
   });
 
-  assert.equal(invocation.options.env.HOME, '/home/admin');
-  assert.equal(invocation.options.env.USER, 'admin');
-  assert.equal(invocation.options.env.LOGNAME, 'admin');
-  assert.equal(invocation.options.env.PATH, '/usr/bin', 'unrelated variables are left alone');
+  // What the child will really see: `env -i` discards everything else, so these assignments are
+  // the environment, not a hopeful copy of one.
+  const childEnv = launched({ file: invocation.file, args: invocation.argv, options: invocation.options }).env;
+  assert.equal(childEnv.HOME, '/home/admin');
+  assert.equal(childEnv.USER, 'admin');
+  assert.equal(childEnv.LOGNAME, 'admin');
+  assert.equal(childEnv.PATH, '/usr/bin', 'unrelated variables are left alone');
   for (const key of ['ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK', 'SUDO_USER']) {
-    assert.equal(key in invocation.options.env, false, `${key} must not reach the child`);
+    assert.equal(key in childEnv, false, `${key} must not reach the child`);
   }
 });
 
@@ -260,7 +363,7 @@ test('a caller cannot smuggle billing variables in through the phase environment
   try {
     const { backend, calls } = backendWith();
     await backend.runPhase(PHASE);
-    assert.equal('ANTHROPIC_API_KEY' in calls.at(-1).options.env, false);
+    assert.equal('ANTHROPIC_API_KEY' in launched(calls.at(-1)).env, false);
   } finally {
     delete process.env.ANTHROPIC_API_KEY;
   }
@@ -300,7 +403,10 @@ test('the fingerprint hashes the configured CLI and launches its realpath, never
   assert.deepEqual(fingerprint.capabilities['--effort'].values, ['low', 'high']);
   for (const launch of launches) {
     assert.equal(launch.file, '/usr/bin/sudo');
-    assert.equal(launch.args[5], await fsp.realpath(binary), 'the fingerprinted file is the one that ran');
+    assert.equal(
+      launched({ ...launch, options: {} }).program, await fsp.realpath(binary),
+      'the fingerprinted file is the one that ran',
+    );
   }
 
   // And the pin still refuses a substituted binary, drop or no drop.
@@ -383,14 +489,37 @@ test('an account that resolves to a superuser id, or to no id at all, is refused
   const absent = dropper({ passwd: '' });
   await assert.rejects(absent.plan(), (err) => err.failure === PrivilegeFailure.USER_UNRESOLVABLE);
 
-  const noGetent = dropper({ passwd: Object.assign(new Error('ENOENT'), { code: 'ENOENT' }) });
-  await assert.rejects(noGetent.plan(), (err) => err.failure === PrivilegeFailure.USER_UNRESOLVABLE);
+  // `getent` exits 2 for "no such key" — an answer, and a permanent one.
+  const noSuchKey = dropper({ passwd: Object.assign(new Error('no such key'), { code: 2 }) });
+  await assert.rejects(noSuchKey.plan(), (err) => err.failure === PrivilegeFailure.USER_UNRESOLVABLE);
 
   const noHome = dropper({ passwd: 'admin:x:1000:1000:admin::/bin/bash\n' });
   await assert.rejects(noHome.plan(), (err) => err.failure === PrivilegeFailure.USER_HOME_INVALID);
 
   const relativeHome = dropper({ passwd: 'admin:x:1000:1000:admin:home/admin:/bin/bash\n' });
   await assert.rejects(relativeHome.plan(), (err) => err.failure === PrivilegeFailure.USER_HOME_INVALID);
+});
+
+test('a passwd entry that is not seven plain fields, or is answered twice, is refused', async () => {
+  // A GECOS carrying a colon — expressible through a directory — shifts every later index, and
+  // `fields[5]` then holds part of the comment. Refused rather than parsed harder.
+  const shifted = dropper({ passwd: 'admin:x:1000:1000:Admin User: Ops:/home/admin:/bin/bash\n' });
+  await assert.rejects(shifted.plan(), (err) => err.failure === PrivilegeFailure.USER_UNRESOLVABLE);
+
+  // Two sources answered and they need not agree on the uid; picking the first picks at random.
+  const ambiguous = dropper({
+    passwd: 'admin:x:1000:1000:admin:/home/admin:/bin/bash\nadmin:x:4242:4242:ldap:/home/admin:/bin/sh\n',
+  });
+  await assert.rejects(ambiguous.plan(), (err) => err.failure === PrivilegeFailure.USER_UNRESOLVABLE);
+});
+
+test('the runas target is the uid that was validated, not the name that resolved to it', async () => {
+  // sudo re-resolves a name through NSS at exec time, and the plan is held for the lifetime of the
+  // process. A directory change repointing the name at uid 0 in between would have been obeyed,
+  // with every log line still saying the launch was unprivileged.
+  const invocation = await dropper().invocation(CLI, ['auth', 'status'], {});
+  assert.deepEqual(invocation.argv.slice(0, 5), ['-n', '-H', '-u', '#1000', '--']);
+  assert.equal(invocation.argv.includes('admin'), false);
 });
 
 test('a passwd entry for a different account is never mistaken for the answer', async () => {
@@ -448,12 +577,114 @@ test('a host that cannot drop privilege runs nothing, rather than running as roo
   assert.equal(calls.length, 0, 'not one launch escaped as root');
 });
 
+test('the backend built the way the service builds it drops by default', async (t) => {
+  // No injected privilege collaborator: exactly `new ClaudeCodeBackend({ config })`, as index.js
+  // does it. The account is one that exists nowhere, so the assertion is the same on every host —
+  // and what it proves is that the default construction goes through the drop machinery at all,
+  // rather than launching whatever the caller asked for.
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pw-priv-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  // A real loadable binary, so the fingerprint reaches its launch instead of refusing the file
+  // first — pointing at this host's `claude` would make the assertion below depend on whether that
+  // path happens to hold the PW wrapper.
+  const { binary } = await fakeCli(dir);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: binary, PW_DEPLOY_MODE: 'host',
+    PW_ORCHESTRATOR_TMUX_USER: 'pwnosuchaccount',
+  });
+  const calls = [];
+  const backend = new ClaudeCodeBackend({
+    config,
+    exec: async (file, args) => { calls.push({ file, args }); return { stdout: '{}', stderr: '' }; },
+  });
+
+  assert.equal(backend.privilege.deployMode, 'host');
+  assert.equal(backend.privilege.user, 'pwnosuchaccount');
+
+  const health = await backend.probeAuth();
+  assert.equal(health.state, HealthState.DOWN);
+  assert.match(health.detail, /could not be run as the unprivileged account/);
+
+  const phase = await backend.runPhase(PHASE);
+  assert.equal(phase.failure_kind, 'privilege_drop_failed');
+
+  const fingerprint = await backend.fingerprint();
+  assert.equal(fingerprint.ok, false);
+  // Not `version_unavailable`: the binary was never asked, and telling an operator their CLI is
+  // broken when their account is missing sends them to look at the wrong thing entirely.
+  assert.equal(fingerprint.failure, FingerprintFailure.PRIVILEGE_DROP_FAILED);
+  assert.match(fingerprint.detail, /unprivileged account/);
+
+  assert.equal(calls.length, 0, 'not one launch escaped');
+});
+
 test('a failed drop stays failed rather than being re-probed until it succeeds', async () => {
   const instance = dropper({ passwd: '' });
   await assert.rejects(instance.plan());
   await assert.rejects(instance.plan());
   await assert.rejects(instance.invocation(CLI, ['auth', 'status']));
   assert.equal(instance._lookups.length, 1, 'the refusal is decided once and held');
+});
+
+test('a lookup that failed decided nothing, and is asked again', async () => {
+  // The account is not refused here — the directory did not answer. Holding that for the life of
+  // the process takes the coding backend down over one unanswered query, on exactly the
+  // LDAP-joined host this module uses getent to support. Asking again cannot produce a root
+  // launch: the outcomes are still refuse, or drop to the account that has been validated.
+  let attempts = 0;
+  const flaky = new PrivilegeDropper({
+    deployMode: 'host',
+    user: 'admin',
+    exec: async () => {
+      attempts += 1;
+      if (attempts === 1) throw Object.assign(new Error('timed out'), { killed: true });
+      return { stdout: PASSWD, stderr: '' };
+    },
+    stat: fakeStat(REAL_HELPERS),
+    currentUid: () => 0,
+  });
+
+  await assert.rejects(flaky.plan(), (err) => err.failure === PrivilegeFailure.USER_LOOKUP_FAILED && err.transient === true);
+  const plan = await flaky.plan();
+  assert.equal(plan.mode, 'sudo', 'the second attempt got an answer');
+  assert.equal(attempts, 2);
+
+  // A refusal, by contrast, is decided once — asking again is how a flapping probe eventually
+  // lets something through.
+  const refused = dropper({ passwd: 'admin:x:0:0:root:/root:/bin/sh\n' });
+  await assert.rejects(refused.plan(), (err) => err.transient === false);
+  await assert.rejects(refused.plan());
+  assert.equal(refused._lookups.length, 1);
+});
+
+test("the helper's own refusal is a configuration fault, not a failed phase", async () => {
+  // `sudo: a password is required` is sudo declining to run anything — no phase happened. Reported
+  // as a phase failure it reads as "the phase did not complete", which sends an operator to look
+  // at the project instead of at the sudoers policy.
+  for (const message of [
+    'sudo: a password is required',
+    'sudo: unknown user admin',
+    'sudo: unable to execute /usr/local/bin/claude: No such file or directory',
+  ]) {
+    const { backend } = backendWith({
+      script: () => Object.assign(new Error('Command failed'), { code: 1, stderr: `${message}\n`, stdout: '' }),
+    });
+
+    const phase = await backend.runPhase(PHASE);
+    assert.equal(phase.failure_kind, 'privilege_drop_failed', message);
+
+    const health = await backend.probeAuth();
+    assert.equal(health.state, HealthState.DOWN);
+    assert.match(health.detail, /unprivileged account/);
+  }
+
+  // The CLI's own stderr is not mistaken for the helper's.
+  const { backend: normal } = backendWith({
+    script: () => Object.assign(new Error('Command failed'), { code: 1, stderr: 'Error: something went wrong in the session\n' }),
+  });
+  assert.equal((await normal.runPhase(PHASE)).failure_kind, 'phase_failed');
 });
 
 test('the failure is classified as a configuration fault, not as a failed phase', () => {
@@ -484,11 +715,83 @@ test('a host-mode process that is already the target account does not need a hel
   // Not a fallback to root: the ids must be equal, and the account is validated and resolved first.
   const instance = dropper({ currentUid: 1000, stats: {} });
   const plan = await instance.plan();
-  assert.equal(plan.mode, 'direct');
+  assert.equal(plan.mode, 'no_drop');
   assert.equal(plan.reason, 'already_target_user');
 
   const asRoot = dropper({ currentUid: 0, stats: {} });
   await assert.rejects(asRoot.plan(), (err) => err.failure === PrivilegeFailure.SUDO_UNRESOLVABLE);
+});
+
+test('being the target account does not exempt a launch from any other host-mode control', async () => {
+  // The case that made this necessary: `sudo -u admin node server.js`, with no -H, is uid 1000 with
+  // `HOME=/root`. Returning the caller's launch untouched here meant the CLI read root's home and
+  // resolved a bare `claude` through PATH — the very bug this module exists to fix, reported as a
+  // success because the uid happened to match.
+  const instance = dropper({ currentUid: 1000, stats: {} });
+
+  const invocation = await instance.invocation('/usr/local/bin/claude', ['auth', 'status'], {
+    env: { HOME: '/root', USER: 'root', ANTHROPIC_API_KEY: 'sk-survives-nothing' },
+  });
+  assert.equal(invocation.file, '/usr/local/bin/claude', 'no helper is needed');
+  assert.equal(invocation.options.env.HOME, '/home/admin', 'the environment is still corrected');
+  assert.equal(invocation.options.env.USER, 'admin');
+  assert.equal('ANTHROPIC_API_KEY' in invocation.options.env, false, 'billing variables are still stripped');
+
+  await assert.rejects(
+    instance.invocation('claude', ['auth', 'status'], {}),
+    (err) => err.failure === PrivilegeFailure.EXECUTABLE_NOT_ABSOLUTE,
+    'a PATH-resolved CLI is still refused',
+  );
+});
+
+test('the dropper defaults to the mode that requires a drop, and refuses one it does not know', async () => {
+  // A safety-critical default must fail towards the control. Constructed with nothing at all, the
+  // dropper is host-mode — so it refuses for want of an account rather than launching as root.
+  await assert.rejects(new PrivilegeDropper({}).plan(), (err) => err.failure === PrivilegeFailure.USER_MISSING);
+  // A configuration object with no mode is not read as "container, nothing to do".
+  assert.equal(privilegeDropperFor({ tmuxUser: 'admin' }).deployMode, 'host');
+  assert.equal(privilegeDropperFor({}).deployMode, 'host');
+  for (const mode of ['Host', 'HOST', 'hosts', 'docker', '', null]) {
+    await assert.rejects(
+      dropper({ deployMode: mode }).plan(),
+      (err) => err.failure === PrivilegeFailure.UNKNOWN_DEPLOY_MODE,
+      `expected ${JSON.stringify(mode)} to be refused rather than guessed at`,
+    );
+  }
+});
+
+test('the environment scrub covers the families the CLI actually reads, not a fixed list', async () => {
+  const { backend, calls } = backendWith();
+  const smuggled = {
+    // Substitutes the billing identity while still passing the claude.ai/firstParty check.
+    CLAUDE_CODE_OAUTH_TOKEN: 'sk-ant-oat-nope',
+    // Repoints the whole credential and settings directory; a settings file carries its own env.
+    CLAUDE_CONFIG_DIR: '/tmp/attacker',
+    // Overrides the two settings the attestation is about — effort has no read-back at all.
+    CLAUDE_EFFORT: 'low',
+    MAX_THINKING_TOKENS: '1',
+    ANTHROPIC_MODEL: 'claude-3-haiku',
+    ANTHROPIC_SMALL_FAST_MODEL: 'claude-3-haiku',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-3-haiku',
+    // A name this build has never heard of. The prefix rule is the point: the list is a race.
+    ANTHROPIC_SOMETHING_INVENTED_LATER: 'x',
+    CLAUDE_CODE_SKIP_BEDROCK_AUTH: '1',
+  };
+  for (const [key, value] of Object.entries(smuggled)) process.env[key] = value;
+  process.env.HTTPS_PROXY = 'http://proxy.internal:3128';
+  try {
+    await backend.runPhase(PHASE);
+    const env = launched(calls.at(-1)).env;
+    for (const key of Object.keys(smuggled)) {
+      assert.equal(key in env, false, `${key} must not reach the child`);
+    }
+    // Connectivity, not billing. Removing it would break a legitimate proxied install and stop
+    // nothing an operator who can set it could not do more directly.
+    assert.equal(env.HTTPS_PROXY, 'http://proxy.internal:3128');
+  } finally {
+    for (const key of Object.keys(smuggled)) delete process.env[key];
+    delete process.env.HTTPS_PROXY;
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -514,6 +817,7 @@ test('a prompt full of shell metacharacters is one argv element, because there i
   assert.equal(args.filter((a) => a === prompt).length, 1);
   assert.equal(args.indexOf('--'), 4, 'sudo option parsing ends before the program name');
   assert.ok(args.indexOf(prompt) > args.indexOf('--'), 'the prompt cannot be read as a sudo option');
+  assert.deepEqual(launched(calls.at(-1)).argv.filter((a) => a === prompt), [prompt]);
 });
 
 // ---------------------------------------------------------------------------

@@ -126,23 +126,49 @@ So in host mode every launch — the auth probe, the fingerprint's `--version` a
 verification, and the phase itself — goes through a fixed argv with no shell:
 
 ```
-/usr/bin/sudo -n -H -u <PW_ORCHESTRATOR_TMUX_USER> -- <PW_ORCHESTRATOR_CLAUDE_BIN> …
+/usr/bin/sudo -n -H -u '#<uid>' -- /usr/bin/env -i -- HOME=… USER=… … <PW_ORCHESTRATOR_CLAUDE_BIN> …
 ```
 
 `-n` so a sudoers policy that would prompt fails immediately instead of hanging until the phase
-deadline, and `-H` so `HOME` is the account's whatever `env_reset` is set to. `USER`, `LOGNAME` and
-`HOME` are also set explicitly, and every API-billing variable is stripped, so the launch is correct
-on a host whose sudoers has `env_reset` disabled.
+deadline. The runas target is the **uid** the account resolved to, not the name: sudo re-resolves a
+name through NSS at launch time, and a directory change that repointed the name at uid 0 in between
+would be obeyed.
 
-This adds nothing to the trust chain. The helper is taken from an absolute path and must be a
-root-owned setuid binary that is not group- or world-writable; `PW_ORCHESTRATOR_CLAUDE_BIN` must be
-absolute in host mode, so neither `PATH` nor sudo's `secure_path` chooses the program; and the
-fingerprint continues to realpath, stat, ELF-check and SHA-256 **the CLI** — never the helper.
+`env -i` is there because sudo does not carry an environment through — `env_reset` replaces it with a
+minimal set of its own, and `--preserve-env` needs a `setenv` grant this service cannot assume.
+Without it, host mode and container mode launch the same CLI in materially different environments:
+proxy settings, CA bundle, locale and everything else inherited simply vanish. Passing the
+environment explicitly also makes the API-billing scrub something that actually runs, rather than
+something sudo's defaults happen to imply. `HOME`, `USER` and `LOGNAME` come from the account's
+passwd entry.
+
+Cancellation is confirmed rather than assumed. `execFile` rejects the moment it *calls* kill, which
+with a helper in front left a cancelled phase still running — the job recorded as stopped while the
+agent kept editing. A cancelled or timed-out launch is now signalled, watched, and escalated to
+`SIGKILL` after a bounded grace, and the caller is not told the phase stopped until it has.
+
+This adds nothing to the trust chain. Both helpers are taken from absolute paths, never `PATH`:
+`sudo` must be a root-owned setuid binary that is not group- or world-writable, and `env` must be a
+root-owned file nobody else can rewrite (it needs no privilege — by the time it runs, privilege has
+already been dropped). `PW_ORCHESTRATOR_CLAUDE_BIN` must be absolute in host mode, so neither `PATH`
+nor sudo's `secure_path` chooses the program; and the fingerprint continues to realpath, stat,
+ELF-check and SHA-256 **the CLI** — never a helper.
 
 It fails closed. A missing, malformed or superuser account, an account that resolves to uid or gid
-0, one absent from the passwd database or without an absolute home, or an unusable helper, all
-refuse the launch outright: the failure is reported as `privilege_drop_failed`, jobs reach
-`blocked_configuration`, and there is deliberately no path that falls back to running as root.
+0, one absent from the passwd database, one answered by two different passwd entries, one whose
+entry is not seven plain fields, one without an absolute home, an unusable helper, or the helper
+refusing the launch at runtime (`sudo: a password is required`) — all refuse the launch outright:
+the failure is reported as `privilege_drop_failed`, jobs reach `blocked_configuration`, and there is
+deliberately no path that falls back to running as root. The one exception is a process that is
+*already* the configured account, which needs no helper — and is still held to every other rule:
+the account is validated and resolved, the CLI must still be absolute, and the environment is still
+corrected and scrubbed.
+
+A lookup that *failed* is treated differently from an account that was *refused*. A refusal is
+decided once and held, because a re-probed refusal is how a flapping check eventually lets something
+through; a passwd query that timed out decided nothing and is asked again, so one unanswered
+directory request does not disable the coding backend for the life of the process.
+
 Container mode has nothing to drop and is unchanged.
 
 ---

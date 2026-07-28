@@ -116,11 +116,17 @@ export function loadOrchestratorConfig(env = process.env) {
   // has nothing to drop and is not constrained.
   const deployMode = String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
   const tmuxUser = str(env.PW_ORCHESTRATOR_TMUX_USER, 'admin');
+  const sudoExecutable = str(env.PW_ORCHESTRATOR_SUDO_BIN, '');
   if (enabled && deployMode === 'host') {
     try {
       validateDropUser(tmuxUser);
     } catch (err) {
       throw new Error(`PW_ORCHESTRATOR_TMUX_USER is not usable in host mode: ${err.message}`);
+    }
+    // Checked here as well as at launch: a relative helper path booted happily and then failed on
+    // the first job, which is the slowest possible way to learn about a typo.
+    if (sudoExecutable && !path.isAbsolute(sudoExecutable)) {
+      throw new Error('PW_ORCHESTRATOR_SUDO_BIN must be an absolute path');
     }
   }
 
@@ -175,7 +181,7 @@ export function loadOrchestratorConfig(env = process.env) {
     // The privilege-drop helper, pinned to an absolute path. Left empty, the dropper looks in the
     // two standard locations and vets what it finds; it is never resolved through PATH, because a
     // PATH lookup would let the environment choose the program that runs as root.
-    sudoExecutable: str(env.PW_ORCHESTRATOR_SUDO_BIN, ''),
+    sudoExecutable,
 
     // ---- coding backend ----
     backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, 'claude'),

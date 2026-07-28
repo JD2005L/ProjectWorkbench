@@ -54,11 +54,39 @@ const PERMISSION_MODE_BY_PHASE = Object.freeze({
   [PhaseClass.MECHANICAL_CORRECTION]: 'acceptEdits',
 });
 
-/** Environment variables that would move inference off the subscription and onto API billing. */
+/**
+ * Environment variables that would move inference off the subscription, change the identity it is
+ * billed to, or quietly override a setting this service claims to have enforced.
+ *
+ * The list was originally the API-billing escape hatches alone, which left three other routes to
+ * the same place. `CLAUDE_CODE_OAUTH_TOKEN` substitutes the billing identity while still passing
+ * the `claude.ai` + `firstParty` check; `CLAUDE_CONFIG_DIR` repoints the whole credential and
+ * settings directory, and a settings file carries its own `env` block and `apiKeyHelper`; and
+ * `CLAUDE_EFFORT` / `ANTHROPIC_MODEL` override exactly the two settings the attestation is about —
+ * effort being the one with no runtime read-back at all, so an override there is undetectable
+ * afterwards.
+ */
 const FORBIDDEN_ENV = [
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
   'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'AWS_BEARER_TOKEN_BEDROCK',
+  'CLAUDE_CODE_SKIP_BEDROCK_AUTH', 'CLAUDE_CODE_SKIP_VERTEX_AUTH',
+  'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR',
+  'CLAUDE_EFFORT', 'MAX_THINKING_TOKENS',
 ];
+
+/**
+ * Whole families the CLI reads, removed by prefix.
+ *
+ * Enumerating `ANTHROPIC_*` names is a race this side cannot win — `ANTHROPIC_DEFAULT_OPUS_MODEL`
+ * and `ANTHROPIC_SMALL_FAST_MODEL` are both live in the shipped binary and were both absent from a
+ * list that looked complete. Nothing named `ANTHROPIC_*` has any business reaching a launch whose
+ * whole purpose is to be subscription-backed and attested.
+ *
+ * `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` are deliberately NOT removed: they are how a legitimate
+ * deployment reaches the network at all, and removing them would break those installs while
+ * stopping nothing an operator with the ability to set them could not do more directly.
+ */
+const FORBIDDEN_ENV_PREFIXES = ['ANTHROPIC_'];
 
 /**
  * Classify a process failure into a distinct kind, so each can reach its own safe state.
@@ -87,7 +115,7 @@ export function classifyBackendFailure(err) {
 }
 
 export class ClaudeCodeBackend {
-  constructor({ config, exec = execFileAsync, clock = () => new Date(), fingerprints = null, privilege = null } = {}) {
+  constructor({ config, exec = execFileAsync, clock = () => new Date(), privilege = null } = {}) {
     this.config = config;
     this.clock = clock;
     this.name = CodingBackend.CLAUDE_CODE;
@@ -95,14 +123,21 @@ export class ClaudeCodeBackend {
     // than each of the four launch sites — is deliberate: the drop then applies to the auth probe,
     // the fingerprint's `--version` and `--help`, verification and the phase itself by construction,
     // and a launch added later cannot forget it. Container mode wraps to a passthrough.
-    this.privilege = privilege ?? privilegeDropperFor(config, { forbiddenEnv: FORBIDDEN_ENV });
+    this.privilege = privilege ?? privilegeDropperFor(config, {
+      forbiddenEnv: FORBIDDEN_ENV, forbiddenEnvPrefixes: FORBIDDEN_ENV_PREFIXES,
+    });
     this.exec = this.privilege.wrap(exec);
     // Cached per binary identity, so the ~1s hash of a 275 MB binary happens once and any change
     // to the file misses the cache rather than being trusted. It fingerprints the *configured*
     // file — realpath, stat, ELF header and SHA-256 are all taken here, as root, on the CLI itself.
     // Only the `--version`/`--help` launches go through the drop, and they name the resolved
     // realpath, so nothing about the identity check binds to sudo.
-    this.fingerprints = fingerprints ?? new FingerprintCache({ exec: this.exec });
+    //
+    // Constructed here and not injectable. It was, and a caller that supplied its own cache got one
+    // holding an *undropped* exec — a documented seam straight past the control, taken by nothing
+    // but tests, which is the worst combination: the tests then proved something the service does
+    // not do.
+    this.fingerprints = new FingerprintCache({ exec: this.exec });
   }
 
   /** Fingerprint the configured CLI, for enforcement claims and for health reporting. */
@@ -158,6 +193,9 @@ export class ClaudeCodeBackend {
   phaseEnv() {
     const env = { ...process.env };
     for (const key of FORBIDDEN_ENV) delete env[key];
+    for (const key of Object.keys(env)) {
+      if (FORBIDDEN_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) delete env[key];
+    }
     return env;
   }
 

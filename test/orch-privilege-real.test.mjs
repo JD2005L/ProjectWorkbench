@@ -92,8 +92,29 @@ function skipUnlessCapable(t) {
   return true;
 }
 
+/**
+ * Some of these scenarios can only *discriminate* when the drop actually changes the identity.
+ *
+ * Run by the target account itself, "the child runs as the target account" is true even with the
+ * drop removed entirely — verified by removing it: three of the four process assertions still
+ * passed, including the one about root-owned artifacts, whose `chown` is itself skipped off-root.
+ * A test that cannot fail is not evidence, so those skip with the reason rather than reporting a
+ * pass. The environment scrub is exempt: it discriminates whoever runs the suite.
+ */
+function skipUnlessDropChangesIdentity(t) {
+  if (!skipUnlessCapable(t)) return false;
+  if (capability.callerUid === capability.target.uid) {
+    t.skip(
+      `this assertion cannot fail when the suite already runs as '${capability.target.name}' `
+      + '— run it as root, or set PW_TEST_DROP_USER to a different account',
+    );
+    return false;
+  }
+  return true;
+}
+
 test('the child process really runs as the configured account', async (t) => {
-  if (!skipUnlessCapable(t)) return;
+  if (!skipUnlessDropChangesIdentity(t)) return;
   const exec = realDropper().wrap(execFileAsync);
 
   const { stdout: uid } = await exec(TOOLS.id, ['-u'], { timeout: 15_000 });
@@ -105,7 +126,7 @@ test('the child process really runs as the configured account', async (t) => {
 });
 
 test('the child sees the account home, so the subscription sign-in is where it expects', async (t) => {
-  if (!skipUnlessCapable(t)) return;
+  if (!skipUnlessDropChangesIdentity(t)) return;
   const exec = realDropper().wrap(execFileAsync);
 
   const read = async (name) => (await exec(TOOLS.printenv, [name], { timeout: 15_000 })).stdout.trim();
@@ -131,7 +152,7 @@ test('no API-billing variable survives into the real child', async (t) => {
 });
 
 test('a bounded phase writing into a workspace leaves no root-owned artifact', async (t) => {
-  if (!skipUnlessCapable(t)) return;
+  if (!skipUnlessDropChangesIdentity(t)) return;
   const exec = realDropper().wrap(execFileAsync);
   const workspace = await fsp.mkdtemp(path.join(os.tmpdir(), 'pw-privdrop-ws-'));
   t.after(() => fsp.rm(workspace, { recursive: true, force: true }));
@@ -155,15 +176,15 @@ test('a bounded phase writing into a workspace leaves no root-owned artifact', a
 test('cancelling a real phase kills the process behind sudo', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `917.${process.pid}`;
-  const invocation = await realDropper().invocation(TOOLS.sleep, [marker], {});
+  // Through `wrap`, which is the path the backend takes — the invocation alone would leave out the
+  // part that makes the promise settle only once the thing it launched is actually gone.
+  const exec = realDropper().wrap(execFileAsync);
   const controller = new AbortController();
 
-  const running = execFileAsync(invocation.file, invocation.argv, {
-    ...invocation.options, signal: controller.signal, timeout: 60_000,
-  });
+  const running = exec(TOOLS.sleep, [marker], { signal: controller.signal, timeout: 60_000 });
 
   // Wait for the real child to exist before cancelling; aborting before the spawn completes would
-  // prove nothing about signal relay.
+  // prove nothing about signal relay. The matcher is anchored, so this cannot be satisfied by sudo.
   await waitFor(async () => await pgrepCount(marker) > 0, 10_000, 'the sleep never started');
 
   controller.abort();
@@ -171,26 +192,58 @@ test('cancelling a real phase kills the process behind sudo', async (t) => {
   assert.ok(err, 'the cancelled launch rejected');
   assert.equal(classifyBackendFailure(err), 'cancelled');
 
-  await waitFor(async () => await pgrepCount(marker) === 0, 10_000, 'the process behind sudo outlived its cancellation');
+  // No grace period here, deliberately: by the time the caller is told the phase stopped, it has.
+  assert.equal(await pgrepCount(marker), 0, 'the process was still running when the caller was told it had stopped');
+});
+
+test('a cancellation racing the launch does not leave the CLI running', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // The window that made this necessary. `execFile` rejects the moment it *calls* kill, and with
+  // sudo in front an abort landing in the first few milliseconds left both sudo and the command
+  // alive — the job recorded cancelled while the agent kept editing. Reproduced at 5 ms as a normal
+  // user and at 12 ms as root, so the delays are swept rather than guessed at.
+  const exec = realDropper().wrap(execFileAsync);
+
+  for (const delay of [0, 1, 3, 5, 8, 12, 20, 40]) {
+    // One decimal point: `sleep` must actually accept the interval, or the process under test
+    // exits immediately and the assertion below passes for the wrong reason.
+    const marker = `${900 + delay}.${process.pid % 100000}`;
+    const controller = new AbortController();
+    const running = exec(TOOLS.sleep, [marker], { signal: controller.signal, timeout: 60_000 });
+    await new Promise((resolve) => setTimeout(resolve, delay));
+    controller.abort();
+
+    const err = await running.then(() => null, (e) => e);
+    assert.ok(err, `the launch aborted at ${delay}ms rejected`);
+    assert.equal(classifyBackendFailure(err), 'cancelled', `aborting at ${delay}ms reads as a cancellation`);
+    assert.equal(await pgrepCount(marker), 0, `a launch aborted at ${delay}ms was left running`);
+  }
 });
 
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `918.${process.pid}`;
-  const invocation = await realDropper().invocation(TOOLS.sleep, [marker], {});
+  const exec = realDropper().wrap(execFileAsync);
 
-  const err = await execFileAsync(invocation.file, invocation.argv, { ...invocation.options, timeout: 1_000 })
-    .then(() => null, (e) => e);
+  const err = await exec(TOOLS.sleep, [marker], { timeout: 1_000 }).then(() => null, (e) => e);
 
   assert.ok(err, 'the launch did not outlive its deadline');
   assert.equal(classifyBackendFailure(err), 'timeout');
-  await waitFor(async () => await pgrepCount(marker) === 0, 10_000, 'the process behind sudo outlived its deadline');
+  assert.equal(await pgrepCount(marker), 0, 'the process behind sudo outlived its deadline');
 });
 
-/** How many processes carry this marker in their argv. `pgrep` exits 1 when there are none. */
+/**
+ * How many *actual* sleeps carry this marker — not how many command lines mention it.
+ *
+ * `-x` anchors the match to the whole command line. Without it, `pgrep -f "sleep <marker>"` also
+ * matches `sudo -n -H -u #1000 -- /usr/bin/env -i -- … /usr/bin/sleep <marker>`, so both the
+ * precondition ("it started") and the postcondition ("it died") could be satisfied by sudo alone,
+ * with the process under test never existing. Verified: loose matched 4 processes here, anchored
+ * matched 1.
+ */
 async function pgrepCount(marker) {
   try {
-    const { stdout } = await execFileAsync(TOOLS.pgrep, ['-f', `sleep ${marker}`], { timeout: 10_000 });
+    const { stdout } = await execFileAsync(TOOLS.pgrep, ['-x', '-f', `${TOOLS.sleep} ${marker}`], { timeout: 10_000 });
     return stdout.split('\n').filter(Boolean).length;
   } catch {
     return 0;

@@ -98,6 +98,10 @@ export const FingerprintFailure = Object.freeze({
   UNREADABLE: 'unreadable',
   VERSION_UNAVAILABLE: 'version_unavailable',
   HELP_UNAVAILABLE: 'help_unavailable',
+  // The binary was never asked. In host mode the probe launches through a privilege drop, and a
+  // drop that cannot be made is an operator's configuration fault — reporting it as "the CLI did
+  // not report a version" sends them to look at the wrong thing entirely.
+  PRIVILEGE_DROP_FAILED: 'privilege_drop_failed',
   PINNED_MISMATCH: 'pinned_mismatch',
 });
 
@@ -216,7 +220,16 @@ export async function probeBinaryFingerprint({
   try {
     const { stdout } = await exec(realpath, ['--version'], { timeout: timeoutMs });
     version = String(stdout).trim().slice(0, 200);
-  } catch {
+  } catch (err) {
+    if (err?.kind === 'privilege_drop_failed') {
+      return {
+        ok: false,
+        failure: FingerprintFailure.PRIVILEGE_DROP_FAILED,
+        detail: `the coding CLI could not be run as the unprivileged account: ${String(err.message ?? '').slice(0, 200)}`,
+        realpath,
+        sha256,
+      };
+    }
     return { ok: false, failure: FingerprintFailure.VERSION_UNAVAILABLE, detail: 'the coding CLI did not report a version', realpath, sha256 };
   }
 
@@ -268,11 +281,30 @@ async function hashFile(filePath) {
 export class FingerprintCache {
   constructor({ exec, ttlMs = 15 * 60 * 1_000 } = {}) {
     this._entries = new Map();
+    this._inFlight = new Map();
     this._exec = exec;
     this.ttlMs = ttlMs;
   }
 
-  async get({ executable, options, expectedSha256 = null }) {
+  async get(request) {
+    // Concurrent verifications of the same binary asked the same question N times over: N hashes of
+    // a 275 MB file and, now that the probe launches through a privilege drop, 2N helper processes
+    // as well. Callers that arrive while an answer is being computed wait for that answer instead.
+    // Keyed on the request, so a different binary or a different pin is never served this one.
+    const key = JSON.stringify([request.executable, [...(request.options ?? [])].sort(), request.expectedSha256 ?? null]);
+    const pending = this._inFlight.get(key);
+    if (pending) return pending;
+
+    const attempt = this._get(request);
+    this._inFlight.set(key, attempt);
+    try {
+      return await attempt;
+    } finally {
+      if (this._inFlight.get(key) === attempt) this._inFlight.delete(key);
+    }
+  }
+
+  async _get({ executable, options, expectedSha256 = null }) {
     // A pinned deployment never serves from cache. Identity is not content: an in-place write that
     // preserves inode, size and mtime (trivial with `touch -r`) collides with the key, and the pin
     // is the one control designed to catch exactly that substitution. Re-hashing costs ~1s and is
