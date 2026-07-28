@@ -29,10 +29,27 @@ const execFileAsync = promisify(execFile);
 
 const FORBIDDEN_ENV = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK'];
 
+/**
+ * The tools the scenarios below drive. Named absolutely — this file asserts things about launching
+ * programs at fixed paths, so resolving them through PATH would be testing something else — and
+ * checked up front, so a host missing one skips with a reason instead of failing on an ENOENT that
+ * says nothing about the privilege drop.
+ */
+const TOOLS = Object.freeze({
+  sudo: '/usr/bin/sudo',
+  id: '/usr/bin/id',
+  printenv: '/usr/bin/printenv',
+  env: '/usr/bin/env',
+  touch: '/usr/bin/touch',
+  sleep: '/usr/bin/sleep',
+  pgrep: '/usr/bin/pgrep',
+});
+
 /** Whether this host can actually be asked, resolved once for the whole file. */
 const capability = await (async () => {
   if (process.platform !== 'linux') return { ok: false, why: 'not a POSIX host with sudo semantics' };
-  if (!fs.existsSync('/usr/bin/sudo')) return { ok: false, why: 'no /usr/bin/sudo' };
+  const missing = Object.values(TOOLS).filter((tool) => !fs.existsSync(tool));
+  if (missing.length) return { ok: false, why: `this host has no ${missing.join(', ')}` };
   const me = os.userInfo();
   const name = process.env.PW_TEST_DROP_USER || (me.uid === 0 ? 'admin' : me.username);
 
@@ -44,7 +61,7 @@ const capability = await (async () => {
   }
   try {
     // -n, so a policy that would prompt fails here rather than hanging the suite.
-    await execFileAsync('/usr/bin/sudo', ['-n', '-H', '-u', target.name, '--', '/usr/bin/id', '-u'], { timeout: 15_000 });
+    await execFileAsync(TOOLS.sudo, ['-n', '-H', '-u', target.name, '--', TOOLS.id, '-u'], { timeout: 15_000 });
   } catch {
     return { ok: false, why: `sudo will not run non-interactively as '${target.name}' on this host` };
   }
@@ -79,8 +96,8 @@ test('the child process really runs as the configured account', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const exec = realDropper().wrap(execFileAsync);
 
-  const { stdout: uid } = await exec('/usr/bin/id', ['-u'], { timeout: 15_000 });
-  const { stdout: gid } = await exec('/usr/bin/id', ['-g'], { timeout: 15_000 });
+  const { stdout: uid } = await exec(TOOLS.id, ['-u'], { timeout: 15_000 });
+  const { stdout: gid } = await exec(TOOLS.id, ['-g'], { timeout: 15_000 });
 
   assert.equal(Number(uid.trim()), capability.target.uid, 'effective uid is the unprivileged account');
   assert.equal(Number(gid.trim()), capability.target.gid);
@@ -91,7 +108,7 @@ test('the child sees the account home, so the subscription sign-in is where it e
   if (!skipUnlessCapable(t)) return;
   const exec = realDropper().wrap(execFileAsync);
 
-  const read = async (name) => (await exec('/usr/bin/printenv', [name], { timeout: 15_000 })).stdout.trim();
+  const read = async (name) => (await exec(TOOLS.printenv, [name], { timeout: 15_000 })).stdout.trim();
 
   assert.equal(await read('HOME'), capability.target.home);
   assert.equal(await read('USER'), capability.target.name);
@@ -102,7 +119,7 @@ test('no API-billing variable survives into the real child', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const exec = realDropper().wrap(execFileAsync);
 
-  const { stdout } = await exec('/usr/bin/env', [], {
+  const { stdout } = await exec(TOOLS.env, [], {
     timeout: 15_000,
     env: { ...process.env, ANTHROPIC_API_KEY: 'sk-must-not-survive', CLAUDE_CODE_USE_BEDROCK: '1' },
   });
@@ -122,7 +139,7 @@ test('a bounded phase writing into a workspace leaves no root-owned artifact', a
   if (capability.callerUid === 0) await fsp.chown(workspace, capability.target.uid, capability.target.gid);
 
   // A stand-in for the phase: a real child, with the workspace as its cwd, creating a real file.
-  await exec('/usr/bin/touch', ['artifact.txt'], { cwd: workspace, timeout: 15_000 });
+  await exec(TOOLS.touch, ['artifact.txt'], { cwd: workspace, timeout: 15_000 });
 
   const created = await fsp.stat(path.join(workspace, 'artifact.txt'));
   assert.equal(created.uid, capability.target.uid, 'the artifact belongs to the unprivileged account');
@@ -138,7 +155,7 @@ test('a bounded phase writing into a workspace leaves no root-owned artifact', a
 test('cancelling a real phase kills the process behind sudo', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `917.${process.pid}`;
-  const invocation = await realDropper().invocation('/usr/bin/sleep', [marker], {});
+  const invocation = await realDropper().invocation(TOOLS.sleep, [marker], {});
   const controller = new AbortController();
 
   const running = execFileAsync(invocation.file, invocation.argv, {
@@ -160,7 +177,7 @@ test('cancelling a real phase kills the process behind sudo', async (t) => {
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `918.${process.pid}`;
-  const invocation = await realDropper().invocation('/usr/bin/sleep', [marker], {});
+  const invocation = await realDropper().invocation(TOOLS.sleep, [marker], {});
 
   const err = await execFileAsync(invocation.file, invocation.argv, { ...invocation.options, timeout: 1_000 })
     .then(() => null, (e) => e);
@@ -173,7 +190,7 @@ test('a deadline behind sudo terminates the real process and reads as a timeout'
 /** How many processes carry this marker in their argv. `pgrep` exits 1 when there are none. */
 async function pgrepCount(marker) {
   try {
-    const { stdout } = await execFileAsync('/usr/bin/pgrep', ['-f', `sleep ${marker}`], { timeout: 10_000 });
+    const { stdout } = await execFileAsync(TOOLS.pgrep, ['-f', `sleep ${marker}`], { timeout: 10_000 });
     return stdout.split('\n').filter(Boolean).length;
   } catch {
     return 0;

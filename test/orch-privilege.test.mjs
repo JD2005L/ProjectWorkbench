@@ -126,7 +126,10 @@ function backendWith({ config = HOST_CONFIG, privilege = null, script = null } =
       };
     }
     if (args.includes('auth') && args.includes('status')) {
-      const home = options.env?.HOME ?? '/root';
+      // The service is root, so a launch with nothing in front of it inherits root's HOME whatever
+      // the caller passed — reading it from the injected environment would make this a test of
+      // whoever runs the suite. Only a dropped launch has an environment of its own.
+      const home = file === '/usr/bin/sudo' ? (options.env?.HOME ?? '/root') : '/root';
       // Only the account that actually signed in has the OAuth store.
       return home === '/home/admin'
         ? { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max', version: '2.1.220' }), stderr: '' }
@@ -156,17 +159,14 @@ test('regression: launching the CLI directly from a root service reports the sub
   const { backend, calls } = backendWith({
     config: CONTAINER_CONFIG,
     privilege: dropper({ deployMode: 'container' }),
-    script: ({ args, options }) => (args.includes('auth') && args.includes('status')
-      // A root process: HOME is /root whatever the caller passed.
-      ? { stdout: JSON.stringify({ loggedIn: (options.env?.HOME ?? '/root') === '/home/admin' }), stderr: '' }
-      : null),
   });
 
   const health = await backend.probeAuth();
 
   assert.equal(calls[0].file, CLI, 'the direct path puts nothing in front of the CLI');
-  assert.equal(health.state, HealthState.DOWN);
-  assert.equal(health.method, AuthMethod.UNKNOWN);
+  assert.equal(health.state, HealthState.DOWN, 'the subscription is invisible to the process that asked');
+  assert.match(health.detail, /signed out/);
+  assert.equal(health.auth_mode, null);
 });
 
 test('host mode runs the auth probe as the unprivileged account, and the subscription is visible', async () => {
