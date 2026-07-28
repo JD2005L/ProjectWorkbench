@@ -220,6 +220,49 @@ test('a cancellation racing the launch does not leave the CLI running', async (t
   }
 });
 
+test('the service environment does not reach the world-readable command line', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // `/proc/<pid>/cmdline` is mode 0444 — every local user can read it — while
+  // `/proc/<pid>/environ`, where sudo carries the preserved values, is 0400. An earlier version of
+  // this module composed the child's environment as `env -i -- NAME=value …` arguments, which
+  // published the whole service environment (service tokens, directory credentials) to anyone on
+  // the box for the length of every phase.
+  const secret = `svc-tok-MUST-NOT-APPEAR-${process.pid}`;
+  const marker = `931.${process.pid % 100000}`;
+  const dropper = realDropper();
+  const invocation = await dropper.invocation(TOOLS.sleep, [marker], {
+    env: { ...process.env, PW_TEST_FAKE_TOKEN: secret },
+  });
+  const running = execFileAsync(invocation.file, invocation.argv, { ...invocation.options, timeout: 30_000 });
+  running.catch(() => {});
+  t.after(() => dropper.ensureTerminated(running.child, { graceMs: 2_000 }));
+
+  await waitFor(async () => await pgrepCount(marker) > 0, 10_000, 'the sleep never started');
+
+  const cmdline = (await fsp.readFile(`/proc/${running.child.pid}/cmdline`, 'utf8')).replaceAll('\0', ' ');
+  assert.equal(cmdline.includes(secret), false, 'a service-environment value reached /proc/<pid>/cmdline');
+  assert.match(cmdline, /--preserve-env=/, 'the names, and only the names, are on the command line');
+});
+
+test('a command that ignores SIGTERM is killed, not orphaned and called dead', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // The helper relays SIGTERM; a CLI that ignores it survives the grace. Killing only the helper
+  // then reparents that process to init — unattributable, still writing to the workspace — while
+  // the caller is told the phase stopped. What has to be confirmed dead is what was launched.
+  const marker = `932.${process.pid % 100000}`;
+  const dropper = realDropper();
+  const invocation = await dropper.invocation('/bin/sh', ['-c', `trap '' TERM; exec ${TOOLS.sleep} ${marker}`], {});
+  const running = execFileAsync(invocation.file, invocation.argv, { ...invocation.options, timeout: 60_000 });
+  running.catch(() => {});
+
+  await waitFor(async () => await pgrepCount(marker) > 0, 10_000, 'the stubborn command never started');
+
+  const confirmed = await dropper.ensureTerminated(running.child, { graceMs: 1_500 });
+
+  assert.equal(await pgrepCount(marker), 0, 'the command that ignored SIGTERM was left running');
+  assert.equal(confirmed, true, 'and termination was reported as confirmed only because it was');
+});
+
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `918.${process.pid}`;

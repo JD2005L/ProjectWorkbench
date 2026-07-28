@@ -68,19 +68,15 @@ function launched(call) {
     return { helper: null, program: call.file, argv: [...call.args], env: call.options?.env ?? {} };
   }
   const args = call.args;
-  const rest = args.slice(args.indexOf('--', args.indexOf('-i')) + 1);
-  const programAt = rest.findIndex((arg) => !/^[A-Za-z_][A-Za-z0-9_]*=/.test(arg));
-  const env = Object.fromEntries(rest.slice(0, programAt).map((assignment) => {
-    const at = assignment.indexOf('=');
-    return [assignment.slice(0, at), assignment.slice(at + 1)];
-  }));
+  const rest = args.slice(args.indexOf('--') + 1);
   return {
     helper: call.file,
     runas: args[3],
-    envHelper: args[5],
-    program: rest[programAt],
-    argv: rest.slice(programAt + 1),
-    env,
+    preserved: (args.find((arg) => arg.startsWith('--preserve-env=')) ?? '').replace('--preserve-env=', '').split(',').filter(Boolean),
+    program: rest[0],
+    argv: rest.slice(1),
+    // The values travel in sudo's own environment, never in argv.
+    env: call.options?.env ?? {},
   };
 }
 
@@ -104,7 +100,7 @@ function fakeStat(byPath) {
  */
 function dropper({
   deployMode = 'host', user = 'admin', sudoExecutable = '',
-  passwd = PASSWD, stats = REAL_HELPERS, currentUid = 0,
+  passwd = PASSWD, stats = REAL_HELPERS, currentUid = 0, currentGid = null,
   forbiddenEnv = ['ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'CLAUDE_CODE_USE_BEDROCK'],
 } = {}) {
   const lookups = [];
@@ -116,6 +112,7 @@ function dropper({
   const instance = new PrivilegeDropper({
     deployMode, user, sudoExecutable, forbiddenEnv,
     exec, stat: fakeStat(stats), currentUid: () => currentUid,
+    currentGid: () => currentGid,
   });
   instance._lookups = lookups;
   return instance;
@@ -209,7 +206,9 @@ test('host mode runs the auth probe as the unprivileged account, and the subscri
 
   const launch = launched(calls[0]);
   assert.equal(launch.helper, '/usr/bin/sudo');
-  assert.deepEqual(calls[0].args.slice(0, 7), ['-n', '-H', '-u', '#1000', '--', '/usr/bin/env', '-i']);
+  assert.deepEqual(calls[0].args.slice(0, 4), ['-n', '-H', '-u', '#1000']);
+  assert.match(calls[0].args[4], /^--preserve-env=/);
+  assert.equal(calls[0].args[5], '--');
   assert.equal(launch.program, CLI);
   assert.deepEqual(launch.argv, ['auth', 'status']);
   assert.equal(launch.env.HOME, '/home/admin');
@@ -265,7 +264,7 @@ test('the phase, the verification and the fingerprint all launch through the dro
   for (const call of calls) {
     const launch = launched(call);
     assert.equal(launch.helper, '/usr/bin/sudo', 'no launch bypasses the drop');
-    assert.deepEqual(call.args.slice(0, 5), ['-n', '-H', '-u', '#1000', '--']);
+    assert.deepEqual(call.args.slice(0, 4), ['-n', '-H', '-u', '#1000']);
     assert.equal(launch.program, binary, 'the program is the configured CLI, named absolutely');
   }
 });
@@ -518,7 +517,7 @@ test('the runas target is the uid that was validated, not the name that resolved
   // process. A directory change repointing the name at uid 0 in between would have been obeyed,
   // with every log line still saying the launch was unprivileged.
   const invocation = await dropper().invocation(CLI, ['auth', 'status'], {});
-  assert.deepEqual(invocation.argv.slice(0, 5), ['-n', '-H', '-u', '#1000', '--']);
+  assert.deepEqual(invocation.argv.slice(0, 4), ['-n', '-H', '-u', '#1000']);
   assert.equal(invocation.argv.includes('admin'), false);
 });
 
@@ -680,11 +679,70 @@ test("the helper's own refusal is a configuration fault, not a failed phase", as
     assert.match(health.detail, /unprivileged account/);
   }
 
-  // The CLI's own stderr is not mistaken for the helper's.
-  const { backend: normal } = backendWith({
-    script: () => Object.assign(new Error('Command failed'), { code: 1, stderr: 'Error: something went wrong in the session\n' }),
+  // And the CLI's own stderr is not mistaken for the helper's. The middle case is the one that
+  // matters: real sudo prints that warning on every invocation on a host whose /etc/hosts does not
+  // name it, so a looser match turned every failed phase into a configuration fault and sent the
+  // operator to read the sudoers policy. The last is the agent choosing its own failure label.
+  for (const stderr of [
+    'Error: something went wrong in the session\n',
+    'sudo: unable to resolve host build-01: Name or service not known\nError: the tests failed\n',
+    'the agent ran a command and printed:\nsudo: a password is required\n',
+  ]) {
+    const { backend: normal } = backendWith({
+      script: () => Object.assign(new Error('Command failed'), { code: 1, stderr }),
+    });
+    assert.equal(
+      (await normal.runPhase(PHASE)).failure_kind, 'phase_failed',
+      `misread as a privilege fault: ${JSON.stringify(stderr.slice(0, 40))}`,
+    );
+  }
+
+  // A refusal exit code is required too: sudo refuses with 1, 126 or 127, never 0.
+  const { backend: oddCode } = backendWith({
+    script: () => Object.assign(new Error('Command failed'), { code: 3, stderr: 'sudo: a password is required\n' }),
   });
-  assert.equal((await normal.runPhase(PHASE)).failure_kind, 'phase_failed');
+  assert.equal((await oddCode.runPhase(PHASE)).failure_kind, 'phase_failed');
+});
+
+test('the environment crosses by name, never as arguments', async () => {
+  // The regression this exists for: composing the child's environment as `env -i -- NAME=value …`
+  // put the service's entire environment — service tokens included — into /proc/<pid>/cmdline,
+  // which is world-readable, for the whole length of a phase. sudo carries the values in its own
+  // environment instead, which is owner-only; only the names appear in argv.
+  process.env.PW_ORCHESTRATOR_FAKE_TOKEN = 'svc-tok-MUST-NOT-APPEAR';
+  process.env.HTTPS_PROXY = 'http://proxy.internal:3128';
+  try {
+    const { backend, calls } = backendWith();
+    await backend.runPhase(PHASE);
+    const call = calls.at(-1);
+
+    assert.equal(
+      call.args.some((arg) => arg.includes('svc-tok-MUST-NOT-APPEAR')), false,
+      'a service token reached the command line',
+    );
+    assert.equal(
+      call.args.some((arg) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(arg)), false,
+      'no environment value is passed as an argument',
+    );
+    const launch = launched(call);
+    assert.ok(launch.preserved.includes('HTTPS_PROXY'), 'the names a deployment needs do cross');
+    assert.equal(launch.preserved.includes('PW_ORCHESTRATOR_FAKE_TOKEN'), false);
+    assert.equal(launch.env.HTTPS_PROXY, 'http://proxy.internal:3128', 'and their values travel in the environment');
+  } finally {
+    delete process.env.PW_ORCHESTRATOR_FAKE_TOKEN;
+    delete process.env.HTTPS_PROXY;
+  }
+});
+
+test('being the account means both ids, not just the uid', async () => {
+  // A process running as the account but in another primary group creates files the account's own
+  // terminal may not be able to write — half of what this module exists to prevent.
+  const wrongGroup = dropper({ currentUid: 1000, currentGid: 27 });
+  const plan = await wrongGroup.plan();
+  assert.equal(plan.mode, 'sudo', 'the helper decides the identity when the group differs');
+
+  const exact = dropper({ currentUid: 1000, currentGid: 1000, stats: {} });
+  assert.equal((await exact.plan()).mode, 'no_drop');
 });
 
 test('the failure is classified as a configuration fault, not as a failed phase', () => {
@@ -760,6 +818,37 @@ test('the dropper defaults to the mode that requires a drop, and refuses one it 
   }
 });
 
+test('no loader variable reaches the child, because it would run inside the attested binary', async () => {
+  // The regression this exists for was introduced by the fix above it. While the launch relied on
+  // sudo's `env_reset`, `LD_PRELOAD` was stripped for free; naming the environment explicitly —
+  // which is what made the scrub real — turned it into a variable this service would deliberately
+  // re-apply. A preloaded constructor runs inside the process whose SHA-256 was just checked, so
+  // the pin, the ELF check and the wrapper check all become statements about a file rather than
+  // about the behaviour that ran. Verified against real processes: with the environment named,
+  // `LD_PRELOAD=…/pre.so` did execute in the child.
+  const loaders = {
+    LD_PRELOAD: '/tmp/evil.so',
+    LD_LIBRARY_PATH: '/tmp/evil',
+    LD_AUDIT: '/tmp/audit.so',
+    DYLD_INSERT_LIBRARIES: '/tmp/evil.dylib',
+    NODE_OPTIONS: '--require /tmp/evil.js',
+    BUN_INSPECT: '1',
+  };
+  for (const [key, value] of Object.entries(loaders)) process.env[key] = value;
+  try {
+    const { backend, calls } = backendWith();
+    await backend.runPhase(PHASE);
+    const env = launched(calls.at(-1)).env;
+    for (const key of Object.keys(loaders)) {
+      assert.equal(key in env, false, `${key} would execute inside the attested binary`);
+    }
+    // The argv itself, not only the decoded environment: this is what the loader would read.
+    assert.equal(calls.at(-1).args.some((arg) => /^(LD_|DYLD_)/.test(arg)), false);
+  } finally {
+    for (const key of Object.keys(loaders)) delete process.env[key];
+  }
+});
+
 test('the environment scrub covers the families the CLI actually reads, not a fixed list', async () => {
   const { backend, calls } = backendWith();
   const smuggled = {
@@ -815,7 +904,7 @@ test('a prompt full of shell metacharacters is one argv element, because there i
 
   const args = calls.at(-1).args;
   assert.equal(args.filter((a) => a === prompt).length, 1);
-  assert.equal(args.indexOf('--'), 4, 'sudo option parsing ends before the program name');
+  assert.equal(args.indexOf('--'), 5, 'sudo option parsing ends before the program name');
   assert.ok(args.indexOf(prompt) > args.indexOf('--'), 'the prompt cannot be read as a sudo option');
   assert.deepEqual(launched(calls.at(-1)).argv.filter((a) => a === prompt), [prompt]);
 });

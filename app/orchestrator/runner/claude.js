@@ -55,6 +55,22 @@ const PERMISSION_MODE_BY_PHASE = Object.freeze({
 });
 
 /**
+ * Code injected into the process *before* its own `main` runs.
+ *
+ * This is the one class that defeats every identity control at once. `LD_PRELOAD` loads an
+ * attacker's constructor into the address space of the binary that was just realpath'd, ELF-checked
+ * and matched against its pinned SHA-256 — so the file that was hashed is not the behaviour that
+ * runs, and the attestation says "enforced" about a program that is no longer the program.
+ * `LD_AUDIT` and `LD_LIBRARY_PATH` reach the same place through the loader; `NODE_OPTIONS` reaches
+ * it through `--require`.
+ *
+ * These were stripped for free while the launch relied on sudo's `env_reset`. Naming the
+ * environment explicitly — which is what makes the scrub real rather than implied — turned them
+ * back into variables this service would deliberately re-apply, so they are named here.
+ */
+const FORBIDDEN_ENV_INJECTION = ['NODE_OPTIONS', 'NODE_REPL_EXTERNAL_MODULE', 'BUN_INSPECT', 'BUN_INSPECT_CONNECT_TO'];
+
+/**
  * Environment variables that would move inference off the subscription, change the identity it is
  * billed to, or quietly override a setting this service claims to have enforced.
  *
@@ -72,6 +88,7 @@ const FORBIDDEN_ENV = [
   'CLAUDE_CODE_SKIP_BEDROCK_AUTH', 'CLAUDE_CODE_SKIP_VERTEX_AUTH',
   'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR',
   'CLAUDE_EFFORT', 'MAX_THINKING_TOKENS',
+  ...FORBIDDEN_ENV_INJECTION,
 ];
 
 /**
@@ -80,13 +97,18 @@ const FORBIDDEN_ENV = [
  * Enumerating `ANTHROPIC_*` names is a race this side cannot win — `ANTHROPIC_DEFAULT_OPUS_MODEL`
  * and `ANTHROPIC_SMALL_FAST_MODEL` are both live in the shipped binary and were both absent from a
  * list that looked complete. Nothing named `ANTHROPIC_*` has any business reaching a launch whose
- * whole purpose is to be subscription-backed and attested.
+ * whole purpose is to be subscription-backed and attested. `LD_*` and `DYLD_*` are the loader
+ * families described above, removed wholesale for the same reason: the interesting ones are the
+ * ones nobody thought to list.
  *
- * `HTTPS_PROXY` and `NODE_EXTRA_CA_CERTS` are deliberately NOT removed: they are how a legitimate
- * deployment reaches the network at all, and removing them would break those installs while
- * stopping nothing an operator with the ability to set them could not do more directly.
+ * `HTTPS_PROXY`, its lowercase form and `NODE_EXTRA_CA_CERTS` are deliberately NOT removed, and the
+ * reason is compatibility rather than safety: they are how a proxied deployment reaches the network
+ * at all, and there is nowhere else to set them once the child's environment is composed here. They
+ * *are* a route to redirecting and intercepting inference — that is stated plainly in
+ * docs/orchestrator-api.md as a limitation rather than implied to be harmless. A deployment that
+ * does not need them should not set them on the service.
  */
-const FORBIDDEN_ENV_PREFIXES = ['ANTHROPIC_'];
+const FORBIDDEN_ENV_PREFIXES = ['ANTHROPIC_', 'LD_', 'DYLD_'];
 
 /**
  * Classify a process failure into a distinct kind, so each can reach its own safe state.
@@ -112,6 +134,20 @@ export function classifyBackendFailure(err) {
   if (/usage limit|rate limit|429|too many requests|quota/.test(text)) return 'rate_limited';
   if (/invalid api key|please run \/login|oauth|not (logged|signed) in|authentication/.test(text)) return 'auth_expired';
   return 'phase_failed';
+}
+
+/**
+ * The most informative line a failed launch left behind.
+ *
+ * `execFile`'s own message is `Command failed: <the entire argv>`; the interesting part is in
+ * stderr, and it is the *last* line of it — a stack or a usage block ends with the thing that went
+ * wrong. Falls back to the message with the argv preamble stripped.
+ */
+function lastMeaningfulLine(err) {
+  const lines = String(err?.stderr ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length) return lines[lines.length - 1].slice(0, 200);
+  const message = String(err?.message ?? '').split('\n')[0];
+  return message.replace(/^Command failed: \S+(\s+\S+)*?(?=\s|$)/, 'the launch failed').slice(0, 200);
 }
 
 export class ClaudeCodeBackend {
@@ -452,9 +488,12 @@ export class ClaudeCodeBackend {
         session_id: null,
         model: null,
         permission_mode: permissionMode,
-        // Bounded hard: an execFile failure message is `Command failed: <full argv>` followed by
-        // stderr, and redaction is pattern-based — a secret in an unusual shape would survive.
-        summary: redactText(String(err?.message ?? 'the phase failed').split('\n')[0].slice(0, 200), { maxLength: 200 }),
+        // The CLI's own last word, not `execFile`'s. Its message is `Command failed: <full argv>`,
+        // which with a privilege-drop prefix in front is entirely preamble — the actual failure fell
+        // off the end of the 200 characters, and the argv went into the durable job record in its
+        // place. Bounded hard either way: redaction is pattern-based, so a secret in an unusual
+        // shape would survive it.
+        summary: redactText(lastMeaningfulLine(err) || 'the phase failed', { maxLength: 200 }),
         turns_used: 0,
         max_turns_reached: false,
       };

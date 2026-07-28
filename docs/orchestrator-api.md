@@ -126,7 +126,7 @@ So in host mode every launch — the auth probe, the fingerprint's `--version` a
 verification, and the phase itself — goes through a fixed argv with no shell:
 
 ```
-/usr/bin/sudo -n -H -u '#<uid>' -- /usr/bin/env -i -- HOME=… USER=… … <PW_ORCHESTRATOR_CLAUDE_BIN> …
+/usr/bin/sudo -n -H -u '#<uid>' --preserve-env=HTTPS_PROXY,… -- <PW_ORCHESTRATOR_CLAUDE_BIN> …
 ```
 
 `-n` so a sudoers policy that would prompt fails immediately instead of hanging until the phase
@@ -134,13 +134,27 @@ deadline. The runas target is the **uid** the account resolved to, not the name:
 name through NSS at launch time, and a directory change that repointed the name at uid 0 in between
 would be obeyed.
 
-`env -i` is there because sudo does not carry an environment through — `env_reset` replaces it with a
-minimal set of its own, and `--preserve-env` needs a `setenv` grant this service cannot assume.
-Without it, host mode and container mode launch the same CLI in materially different environments:
-proxy settings, CA bundle, locale and everything else inherited simply vanish. Passing the
-environment explicitly also makes the API-billing scrub something that actually runs, rather than
-something sudo's defaults happen to imply. `HOME`, `USER` and `LOGNAME` come from the account's
-passwd entry.
+The child's environment is sudo's `env_reset` — `HOME`, `USER`, `LOGNAME` and `SHELL` from the
+target's passwd entry, `PATH` from sudoers' vetted `secure_path` — plus a short list of names
+carried across explicitly: proxy settings, CA bundle locations and locale. **Names, not values.**
+The values travel in sudo's own environment, which lives in `/proc/<pid>/environ` (mode 0400);
+naming them as `NAME=value` arguments would publish the service's entire environment — service
+tokens included — through `/proc/<pid>/cmdline`, which is mode 0444 and readable by every local
+user for the whole length of a phase. Nothing outside that list crosses, so a variable a deployment
+genuinely needs is added to it deliberately rather than inherited by accident.
+
+The scrub still runs over what this service composes, and covers two families beyond the
+API-billing switches: `LD_*`/`DYLD_*` and `NODE_OPTIONS` load code *inside* the process whose
+SHA-256 was just checked — which would make the pin a statement about a file rather than about the
+behaviour that ran — and the model/effort overrides (`ANTHROPIC_*`, `CLAUDE_EFFORT`,
+`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`) would change the very settings §4 attests.
+
+**A known limitation, stated rather than implied:** the preserved list contains `HTTPS_PROXY` and
+`NODE_EXTRA_CA_CERTS`. Together they are a route to redirecting inference through an endpoint of the
+operator's choosing and making the CLI trust its certificate — the same class of control as
+`ANTHROPIC_BASE_URL`, which *is* removed. The difference is compatibility, not safety: a proxied
+deployment has nowhere else to set them. A deployment that does not need them should not set them on
+the service.
 
 Cancellation is confirmed rather than assumed. `execFile` rejects the moment it *calls* kill, which
 with a helper in front left a cancelled phase still running — the job recorded as stopped while the

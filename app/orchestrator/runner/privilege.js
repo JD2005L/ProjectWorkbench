@@ -20,12 +20,20 @@
 // What it does NOT do is weaken the identity of the thing being launched. The drop is a prefix in
 // front of a fixed argv:
 //
-//     /usr/bin/sudo -n -H -u admin -- /abs/path/to/claude.exe --model … --effort …
+//     /usr/bin/sudo -n -H -u '#1000' --preserve-env=HTTPS_PROXY,… -- /abs/claude.exe --model …
 //
 // `sudo` is looked up at an absolute path and checked to be a root-owned setuid binary that is not
-// group- or world-writable; the CLI is required to be an absolute path so neither `sudo`'s
-// `secure_path` nor the caller's PATH chooses the program; and the argv is built by the backend, not
-// by a caller. Fingerprinting continues to hash, stat and ELF-check *the CLI*, never `sudo`.
+// group- or world-writable — never resolved through PATH. The CLI is required to be an absolute
+// path so neither PATH nor sudo's `secure_path` chooses the program, and the argv is built by the
+// backend, not by a caller. Fingerprinting continues to hash, stat and ELF-check *the CLI*, never
+// the helper.
+//
+// The child's environment comes from sudo's `env_reset` — built from the target's passwd entry,
+// with PATH from sudoers' vetted `secure_path` — plus the short list of names in `PRESERVED_ENV`.
+// Names, not values: an earlier version composed the environment as `env -i -- NAME=value …`
+// arguments, which put the service's entire environment into `/proc/<pid>/cmdline`, world-readable
+// for the length of every phase. `/proc/<pid>/environ`, where sudo carries the preserved values, is
+// owner-only.
 
 import fsp from 'fs/promises';
 import path from 'path';
@@ -53,8 +61,6 @@ export const PrivilegeFailure = Object.freeze({
   UNKNOWN_DEPLOY_MODE: 'unknown_deploy_mode',
   USER_LOOKUP_FAILED: 'user_lookup_failed',
   HELPER_REFUSED: 'helper_refused',
-  ENV_UNRESOLVABLE: 'env_unresolvable',
-  ENV_UNSAFE: 'env_unsafe',
   USER_MISSING: 'user_missing',
   USER_MALFORMED: 'user_malformed',
   USER_IS_ROOT: 'user_is_root',
@@ -197,17 +203,55 @@ export async function resolveDropUser(user, { exec = execFileAsync, getentExecut
 /** Candidate locations for sudo when the operator has not configured one. */
 const SUDO_CANDIDATES = Object.freeze(['/usr/bin/sudo', '/bin/sudo']);
 
-/** Candidate locations for `env`, which sets the child's environment exactly. */
-const ENV_CANDIDATES = Object.freeze(['/usr/bin/env', '/bin/env']);
-
 /**
- * Environment names that can be set through `env` at all.
+ * A plain environment name.
  *
- * A name containing `=` cannot be expressed in a `NAME=value` argument, and one beginning with `-`
- * would be read as an option. Neither occurs in a real environment; both are refused rather than
- * quietly mangled into something else.
+ * Used to keep the composed environment expressible: a name containing `=` or beginning with `-`
+ * does not occur in a real environment and cannot be handled unambiguously anywhere downstream.
  */
 const ENV_NAME = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+/**
+ * The variables carried across the drop, by name.
+ *
+ * sudo's `env_reset` builds the child's environment from the target's passwd entry — which is the
+ * right default, and is why `PATH` comes from sudoers' vetted `secure_path` rather than from
+ * whatever the service inherited. But it also means the launch would lose the handful of variables a
+ * deployment genuinely needs, so those are named here and preserved by name.
+ *
+ * Names, never values: `--preserve-env=<list>` carries the *values* through sudo's own environment,
+ * where they stay in `/proc/<pid>/environ` (mode 0400). An earlier version of this module composed
+ * the environment as `env -i -- NAME=value …` arguments instead, which put the entire service
+ * environment — service tokens, directory credentials, everything — into `/proc/<pid>/cmdline`,
+ * which is mode 0444 and readable by every local user for the whole length of a phase. That is a
+ * strictly worse place to keep a secret than the one it replaced.
+ *
+ * The list is deliberately short and contains nothing secret: connectivity, trust anchors and
+ * locale. Anything not here does not cross.
+ */
+const PRESERVED_ENV = Object.freeze([
+  'HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy',
+  'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+  'NODE_EXTRA_CA_CERTS', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+  'LANG', 'LC_ALL', 'LC_CTYPE', 'TZ',
+]);
+
+/**
+ * sudo declining to run anything, as distinct from sudo mentioning itself.
+ *
+ * Deliberately narrow, and deliberately excluding `unable to resolve host`, which is a warning sudo
+ * prints on every invocation on a host whose `/etc/hosts` does not name it — a benign line that a
+ * looser match turned into "this instance cannot drop privilege".
+ */
+const SUDO_REFUSAL = new RegExp([
+  '^sudo: a (password|terminal) is required',
+  '^sudo: no tty present',
+  '^sudo: unknown user',
+  '^sudo: (sorry, )?(you |user )',
+  '^sudo: unable to (execute|change to runas|set runas|stat|open|initialize|resolve uid)',
+  '^sudo: (parse error|syntax error)',
+  '^sudo: .*(is not allowed to|not permitted|no such file or directory)',
+].join('|'), 'i');
 
 /**
  * Resolve and vet the privilege-drop helper.
@@ -259,48 +303,6 @@ export async function resolveSudo(configured, { stat = fsp.stat } = {}) {
 }
 
 /**
- * Resolve and vet `env`, which is how the child's environment is made deterministic.
- *
- * `sudo` does not pass an environment through — `env_reset` replaces it with a minimal set built
- * from the target's passwd entry, and `--preserve-env` needs a `setenv` grant this service cannot
- * assume. So the launch names `env` explicitly and hands it the exact variables to set. Without
- * this, host mode and container mode launch the CLI in materially different environments: proxy
- * settings, CA bundles, locale and every other inherited variable simply vanish, and this module's
- * own scrub becomes something that never runs.
- *
- * It is not setuid and does not need to be — by the time it runs, privilege has already been
- * dropped. What it must be is a root-owned file nobody else can rewrite.
- */
-export async function resolveEnvHelper(configured, { stat = fsp.stat } = {}) {
-  const candidates = configured ? [String(configured)] : ENV_CANDIDATES;
-  if (configured && !path.isAbsolute(String(configured))) {
-    throw new PrivilegeDropError(PrivilegeFailure.ENV_UNSAFE, 'the env helper must be an absolute path');
-  }
-
-  for (const candidate of candidates) {
-    let info;
-    try {
-      info = await stat(candidate);
-    } catch {
-      continue;
-    }
-    if (!info.isFile()) continue;
-    if (info.uid !== 0 || (info.mode & 0o022) !== 0) {
-      throw new PrivilegeDropError(
-        PrivilegeFailure.ENV_UNSAFE,
-        `${candidate} is not a root-owned, unwritable file and must not be trusted to launch the coding CLI`,
-      );
-    }
-    return candidate;
-  }
-
-  throw new PrivilegeDropError(
-    PrivilegeFailure.ENV_UNRESOLVABLE,
-    'no usable env binary was found, so the coding CLI cannot be given a determinate environment',
-  );
-}
-
-/**
  * Decides, once, how a Claude subprocess is launched — and then builds every invocation.
  *
  * The plan is resolved lazily and memoised, including its failure: a host whose configuration
@@ -322,10 +324,9 @@ export class PrivilegeDropper {
     // Injected so the decision is deterministic under test and does not depend on who happens to
     // be running the suite.
     currentUid = () => (typeof process.getuid === 'function' ? process.getuid() : null),
+    currentGid = () => (typeof process.getgid === 'function' ? process.getgid() : null),
     resolveUser = resolveDropUser,
     resolveHelper = resolveSudo,
-    resolveEnvHelper: resolveEnv = resolveEnvHelper,
-    envExecutable = '',
     // How long a cancelled or timed-out launch is given to actually die before it is killed
     // outright. Bounded, and awaited: a caller that has been told the phase stopped must not still
     // have an agent writing to the workspace behind it.
@@ -339,10 +340,9 @@ export class PrivilegeDropper {
     this.exec = exec;
     this.stat = stat;
     this.currentUid = currentUid;
+    this.currentGid = currentGid;
     this.resolveUser = resolveUser;
     this.resolveHelper = resolveHelper;
-    this.resolveEnvHelper = resolveEnv;
-    this.envExecutable = envExecutable;
     this.terminationGraceMs = terminationGraceMs;
     this._plan = null;
   }
@@ -394,13 +394,16 @@ export class PrivilegeDropper {
     const target = await this.resolveUser(this.user, { exec: this.exec });
 
     const uid = this.currentUid();
-    if (uid !== null && uid === target.uid) {
+    const gid = this.currentGid();
+    // Both ids, not just the uid: a process running as the account but in another primary group
+    // creates files the account's own terminal may not be able to write, which is half of what this
+    // module exists to prevent. If either differs, the helper decides the identity.
+    if (uid !== null && uid === target.uid && (gid === null || gid === target.gid)) {
       return Object.freeze({ mode: 'no_drop', reason: 'already_target_user', target });
     }
 
     const sudo = await this.resolveHelper(this.sudoExecutable, { stat: this.stat });
-    const envHelper = await this.resolveEnvHelper(this.envExecutable, { stat: this.stat });
-    return Object.freeze({ mode: 'sudo', sudo, env: envHelper, target });
+    return Object.freeze({ mode: 'sudo', sudo, target });
   }
 
   /** The environment the CLI is launched with, corrected for the account it now runs as. */
@@ -416,6 +419,10 @@ export class PrivilegeDropper {
     // release must not be trusted merely because nobody has enumerated it yet.
     for (const key of Object.keys(next)) {
       if (this.forbiddenEnvPrefixes.some((prefix) => key.startsWith(prefix))) delete next[key];
+      // A name that cannot be expressed as `NAME=value` is dropped here rather than only in the
+      // sudo branch, so the dropped and the already-the-account launches compose the same
+      // environment instead of nearly the same one.
+      else if (!ENV_NAME.test(key)) delete next[key];
     }
     // sudo's own `env_reset` sets these from the target's passwd entry, and `-H` forces HOME. They
     // are set here as well so the launch is correct on a host whose sudoers has env_reset disabled —
@@ -437,8 +444,8 @@ export class PrivilegeDropper {
    * Exposed separately from `wrap` so a test can assert the exact argv and environment without
    * spawning anything.
    */
-  async invocation(file, argv, options = {}) {
-    const plan = await this.plan();
+  async invocation(file, argv, options = {}, resolved = null) {
+    const plan = resolved ?? await this.plan();
     if (plan.mode === 'passthrough') return { file, argv: [...argv], options: { ...options } };
 
     if (!file || !path.isAbsolute(String(file))) {
@@ -470,19 +477,15 @@ export class PrivilegeDropper {
         // process: a directory change that repointed the name at uid 0 in between would have been
         // obeyed, and every log line would still have said the launch was unprivileged.
         `#${plan.target.uid}`,
+        // Names only. The values travel in sudo's own environment, which is owner-readable; naming
+        // them as `NAME=value` arguments instead would publish the service's whole environment to
+        // every local user through /proc/<pid>/cmdline, which is world-readable.
+        `--preserve-env=${PRESERVED_ENV.join(',')}`,
         '--',
-        // `env -i` because sudo does not carry an environment through: `env_reset` replaces it with
-        // a minimal set of its own, so the environment this service composed — proxy settings, CA
-        // bundle, locale, and the scrub above — reached the CLI in container mode and vanished in
-        // host mode. Passing it explicitly makes the two modes launch the same program in the same
-        // environment, and makes the scrub something that actually runs rather than something
-        // sudo's defaults happen to imply.
-        plan.env, '-i', '--',
-        ...envAssignments(childEnv),
         String(file), ...argv,
       ],
-      // The environment of `sudo` itself, not of the CLI: `env -i` discards it. Passed scrubbed
-      // anyway so nothing sensitive is handed to the helper either.
+      // sudo's own environment, and the channel the preserved names travel in. Scrubbed, so the
+      // helper is handed nothing the CLI is not allowed to see either.
       //
       // Deliberately NOT `detached`. Putting the launch in its own session looked like the way to
       // let a cancel reach the whole tree, and measurably made cancellation worse: aborting 8ms
@@ -511,34 +514,43 @@ export class PrivilegeDropper {
     const { pid } = child;
     const deadline = Date.now() + graceMs;
 
-    const alive = () => {
-      try {
-        process.kill(pid, 0);
-        return true;
-      } catch (err) {
-        // ESRCH: gone. EPERM: still there, and not ours to signal — which is itself an answer, and
-        // the honest one is "still running", not "assume it stopped".
-        return err?.code === 'EPERM';
+    // The tree as it stands *now*, while the helper is still there to be asked. After sudo dies its
+    // children are reparented to init and there is no way back to them — which is how an earlier
+    // version came to SIGKILL the helper, orphan a CLI that was ignoring SIGTERM, and then report
+    // the launch terminated. The descendants are what has to be confirmed dead; the helper is only
+    // the handle on them.
+    const tracked = [pid, ...await descendantsOf(pid)];
+
+    // `child.exitCode` is re-checked each round, not only on entry: once Node has reaped the child
+    // the pid means nothing, and signalling it would reach whatever the kernel handed it to next.
+    const survivors = () => (child.exitCode === null && child.signalCode === null
+      ? tracked.filter((candidate) => stillRunning(candidate))
+      : tracked.slice(1).filter((candidate) => stillRunning(candidate)));
+
+    const send = (signal, pids) => {
+      for (const target of pids) {
+        try {
+          process.kill(target, signal);
+        } catch { /* already gone, or not ours to signal */ }
       }
     };
-    const send = (signal) => {
-      try {
-        process.kill(pid, signal);
-      } catch { /* already gone, or not ours to signal */ }
-    };
 
-    send('SIGTERM');
+    // SIGTERM to the helper only: sudo relays it, and the CLI gets to exit cleanly.
+    send('SIGTERM', [pid]);
     while (Date.now() < deadline) {
-      if (!alive()) return true;
+      if (survivors().length === 0) return true;
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
-    send('SIGKILL');
-    // A short, bounded confirmation. Reporting "terminated" without looking is the habit this
-    // whole function exists to break.
+
+    // Out of grace. Everything that was launched, not just the helper — killing the helper alone is
+    // what creates the orphan.
+    send('SIGKILL', survivors());
     for (let i = 0; i < 20; i++) {
-      if (!alive()) return true;
+      if (survivors().length === 0) return true;
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
+    // Said plainly rather than assumed. Something is still running, and the caller is entitled to
+    // know that its cancellation was not carried out.
     return false;
   }
 
@@ -552,12 +564,29 @@ export class PrivilegeDropper {
    */
   helperFailure(err, plan) {
     if (plan?.mode !== 'sudo') return null;
-    const stderr = String(err?.stderr ?? '');
-    const line = /^sudo:.*$/m.exec(stderr);
-    if (!line) return null;
+    // sudo refuses *before* it execs anything, so its refusal is the first thing on the stream.
+    // Matching anywhere in stderr meant the agent's own output decided the classification: a Bash
+    // tool that ran sudo, or a host whose `/etc/hosts` makes real sudo print
+    // `sudo: unable to resolve host …` as a warning on every single invocation, turned every failed
+    // phase into a configuration fault and sent the operator to read the sudoers policy.
+    // The *leading* block of `sudo:` lines, not merely the first one: on a host whose /etc/hosts
+    // does not name it, real sudo prints `sudo: unable to resolve host …` as a warning ahead of its
+    // actual refusal, so looking only at the first line traded a false positive for a false
+    // negative on exactly the same hosts. The block ends at the first line that is not sudo's,
+    // because sudo has said everything it is going to say before it execs anything.
+    const leading = [];
+    for (const line of String(err?.stderr ?? '').split('\n')) {
+      if (line.trim() === '') continue;
+      if (!line.startsWith('sudo:')) break;
+      leading.push(line);
+    }
+    const first = leading.find((line) => SUDO_REFUSAL.test(line));
+    if (!first) return null;
+    // And it has to be a refusal exit: 1 for policy, 126/127 for a command sudo could not run.
+    if (![1, 126, 127].includes(err?.code)) return null;
     return new PrivilegeDropError(
       PrivilegeFailure.HELPER_REFUSED,
-      `the privilege-drop helper refused the launch: ${line[0].slice(0, 200)}`,
+      `the privilege-drop helper refused the launch: ${first.slice(0, 200)}`,
     );
   }
 
@@ -569,8 +598,10 @@ export class PrivilegeDropper {
    */
   wrap(exec) {
     return async (file, argv, options = {}) => {
+      // Resolved once and threaded through, so the plan that built the argv is the same plan the
+      // failure is interpreted against.
       const plan = await this.plan();
-      const invocation = await this.invocation(file, argv, options);
+      const invocation = await this.invocation(file, argv, options, plan);
       const running = exec(invocation.file, invocation.argv, invocation.options);
       // `promisify(execFile)` exposes the child on the promise. Absent — an injected runner in a
       // test, say — there is nothing to reap and nothing to wait for.
@@ -598,16 +629,58 @@ export class PrivilegeDropper {
   }
 }
 
+/** Whether a pid is still there. EPERM means "there, and not ours to signal" — still there. */
+function stillRunning(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === 'EPERM';
+  }
+}
+
 /**
- * The environment as `NAME=value` arguments to `env`.
+ * Every process descended from `pid`, read from /proc.
  *
- * Names that cannot be expressed this way are dropped rather than mangled — an environment does not
- * contain them, and a variable that cannot be set exactly is better absent than approximated.
+ * Used to know what a cancellation actually has to kill. A tool the agent started — a build, a test
+ * run, a `git` — is a grandchild, survives a SIGTERM aimed at its parent, and goes on writing to the
+ * workspace while the engine samples it to decide whether the working tree was preserved.
+ *
+ * Returns `[]` on a system without /proc rather than throwing: the caller then does what it did
+ * before, which is signal the helper and confirm what it can.
  */
-export function envAssignments(env) {
-  return Object.entries(env ?? {})
-    .filter(([name, value]) => ENV_NAME.test(name) && value !== undefined && value !== null && !String(value).includes('\0'))
-    .map(([name, value]) => `${name}=${value}`);
+async function descendantsOf(pid) {
+  let entries;
+  try {
+    entries = await fsp.readdir('/proc');
+  } catch {
+    return [];
+  }
+
+  const children = new Map();
+  await Promise.all(entries.filter((entry) => /^\d+$/.test(entry)).map(async (entry) => {
+    try {
+      const stat = await fsp.readFile(`/proc/${entry}/stat`, 'utf8');
+      // The comm field is parenthesised and may contain spaces and parentheses of its own, so the
+      // fields are read from after the LAST ')': state, then ppid.
+      const after = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
+      const ppid = Number(after[1]);
+      if (!Number.isInteger(ppid)) return;
+      if (!children.has(ppid)) children.set(ppid, []);
+      children.get(ppid).push(Number(entry));
+    } catch { /* the process ended while we were reading it */ }
+  }));
+
+  const found = [];
+  const queue = [pid];
+  while (queue.length) {
+    for (const child of children.get(queue.shift()) ?? []) {
+      if (found.includes(child)) continue;
+      found.push(child);
+      queue.push(child);
+    }
+  }
+  return found;
 }
 
 /** Build the dropper this deployment's configuration calls for. */
