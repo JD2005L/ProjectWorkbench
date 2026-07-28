@@ -106,7 +106,7 @@ cp -a "$SRC_DIR/app/." "$APP_DIR/"
 # own copy — without this the documented entry point simply does not exist on a deployed instance.
 if [ -d "$SRC_DIR/bin" ]; then
   mkdir -p "$PW_INSTALL_DIR/bin"
-  cp -a "$SRC_DIR/bin/." "$INSTALL_DIR/bin/"
+  cp -a "$SRC_DIR/bin/." "$PW_INSTALL_DIR/bin/"
   chmod +x "$PW_INSTALL_DIR"/bin/* 2>/dev/null || true
 fi
 # AGENTS.md is served unauthenticated at /agents.md so external automation
