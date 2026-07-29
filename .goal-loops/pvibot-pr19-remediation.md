@@ -354,4 +354,3 @@ format and ordering checks, both passing).
    interception-risk-for-compatibility trade-off from the original PR #19 work, unchanged here.
 4. Two unrelated, unattributed processes observed on the shared container at verification time (see
    above) — not from this codebase, left untouched, and not this session's to clean up.
-
