@@ -1517,6 +1517,19 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railKeys.has-pins .pkey:not(.pinned):not(.current):not(.lit):not(.working){opacity:.5;filter:saturate(.5) brightness(.82)}
 .railKeys.has-pins .pkey:not(.pinned):hover{opacity:1;filter:none}
 .pkey.pinned.lit{border-color:#a16207;box-shadow:0 6px 18px -8px rgba(0,0,0,.95),0 0 16px -3px rgba(251,191,36,.6)}
+/* Which project am I actually in? Answered by geometry, not by colour.
+   Colour is the crowded channel here: pins claim the hue-filled monogram and the lean-out, attention
+   claims amber, and at the collapsed 64px width all that survived of "current" was a 3px edge sitting
+   among other coloured 3px edges — so every emphasised key looked equally emphasised. The active key
+   instead squares off and runs into the workspace, the way a tab joins its panel. Nothing else in the
+   rail uses the right-hand edge, it reads at 64px, and it composes: a project that is both active and
+   asking for attention keeps its amber and still shows which one you are standing in.
+   Placed after the pinned/lit rules deliberately — those set border-color, and the merge needs the
+   right-hand border gone whatever else the key is. */
+.pkey.current{border-radius:0;border-right-color:transparent}
+.pkey.current .pk-edge{top:0;bottom:0;width:5px;border-radius:0}
+.pkey.current::after{content:'';position:absolute;top:-1px;bottom:-1px;left:100%;width:16px;background:linear-gradient(180deg,#10233f,#0b1830);border-top:1px solid #2f65b0;border-bottom:1px solid #2f65b0;pointer-events:none}
+.pkey.current.lit::after{background:linear-gradient(180deg,#221a06,#140f03);border-color:#a16207}
 .pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2}
 .pkey:hover .pk-pin{opacity:.55}
 .pk-pin:hover{opacity:1;background:rgba(255,255,255,.07)}

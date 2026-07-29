@@ -8,6 +8,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history, because the release guard in test/release-version.test.mjs has to ask what
+          # this branch changed relative to its base. The default shallow checkout has no base branch
+          # and no merge base, so the guard would skip — and a check that skips in the one place it
+          # is meant to gate is not a check.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: '20'
