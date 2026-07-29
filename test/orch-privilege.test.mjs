@@ -444,7 +444,7 @@ test('a configured account that is missing, superuser or malformed is refused', 
   assert.throws(() => validateDropUser('root'), (err) => err.failure === PrivilegeFailure.USER_IS_ROOT);
   for (const hostile of [
     '-u', '--preserve-env', 'ad min', 'admin;id', 'admin\nroot', 'admin$(id)', '../../etc/passwd',
-    'Admin', 'admin!', '0', 'a'.repeat(64), 'admin ', 'ADMIN', 'admin$',
+    'Admin', 'admin!', '0', 'a'.repeat(64), 'admin\u0000', 'ADMIN', 'admin$',
   ]) {
     assert.throws(
       () => validateDropUser(hostile),

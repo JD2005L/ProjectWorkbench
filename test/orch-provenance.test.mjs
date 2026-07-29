@@ -411,7 +411,7 @@ test('provenance: a nonce outside the contract alphabet is treated as unbound', 
     'nonce with spaces 0123456789ab',       // whitespace
     'nonce:with:colons:0123456789ab',       // an identifier, but not a nonce
     'nonce/with/slashes/0123456789',
-    'nonce with-a-nul-0123456789',
+    'nonce\u0000with-a-nul-0123456789',
   ]) {
     const result = build({ binding: { ...BINDING, verification_nonce: nonce } });
     assert.equal(result.settings_attestation, null, `a ${JSON.stringify(nonce)} nonce must not be attested`);

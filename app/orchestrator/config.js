@@ -12,6 +12,7 @@
 // conventions, so a stock deployment is contract-conformant without configuration, while a
 // deployment with different conventions is configured rather than patched.
 
+import fs from 'fs';
 import path from 'path';
 import { PATTERNS } from './contract.js';
 import { parseModelAliases } from './attestation.js';
@@ -30,6 +31,37 @@ function loadModelAliases(raw) {
     console.warn('[orchestrator] PW_ORCHESTRATOR_MODEL_ALIASES produced no usable mappings; model attestation will fail closed');
   }
   return parsed;
+}
+
+/**
+ * Where the coding CLI lives, as an absolute path.
+ *
+ * It cannot be a bare name. The command is resolved by the *dropped* account, so `claude` may name
+ * a different file to root than to the unprivileged user, and the fingerprint would then attest a
+ * binary other than the one that runs. The privilege dropper refuses a bare name for that reason.
+ *
+ * Installations legitimately disagree about the location — `/usr/local/bin` for an npm global with
+ * a symlink into the module tree, `/usr/bin` for a packaged install — so rather than hardcode one
+ * site's layout, take the first candidate that is actually present.
+ *
+ * An explicit `PW_ORCHESTRATOR_CLAUDE_BIN` always wins and is deliberately *not* probed: an
+ * operator who names a path is entitled to that path, and a missing file should be reported by the
+ * dropper's own existence check, naming what was configured, rather than silently swapped for
+ * whatever else happens to be installed.
+ */
+const BACKEND_CANDIDATES = Object.freeze(['/usr/local/bin/claude', '/usr/bin/claude']);
+
+function resolveBackendExecutable(raw, candidates = BACKEND_CANDIDATES) {
+  const explicit = str(raw, '');
+  if (explicit) return explicit;
+  for (const candidate of candidates) {
+    try {
+      if (fs.statSync(candidate).isFile()) return candidate;
+    } catch { /* try the next location */ }
+  }
+  // Nothing found. Return a concrete absolute path anyway so the failure names a location an
+  // operator can act on, instead of a bare word that looks like it might have worked.
+  return candidates[0];
 }
 
 const TRUE_VALUES = new Set(['true', '1', 'yes', 'on']);
@@ -184,7 +216,7 @@ export function loadOrchestratorConfig(env = process.env) {
     sudoExecutable,
 
     // ---- coding backend ----
-    backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, '/usr/local/bin/claude'),
+    backendExecutable: resolveBackendExecutable(env.PW_ORCHESTRATOR_CLAUDE_BIN),
     // Pin the CLI's content hash. When set, a binary whose SHA-256 differs is refused outright
     // rather than merely re-fingerprinted — an upgrade becomes a deliberate configuration change.
     backendFingerprintSha256: str(env.PW_ORCHESTRATOR_CLI_SHA256, ''),

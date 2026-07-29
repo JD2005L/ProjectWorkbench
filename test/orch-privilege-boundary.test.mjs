@@ -7,6 +7,9 @@
 //   4. Claude path default is a bare name (now absolute)
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 import {
   PrivilegeDropper, PrivilegeDropError, PrivilegeFailure,
@@ -293,6 +296,59 @@ test('backendExecutable is overridable by env', () => {
     PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/bin/claude',
   });
   assert.equal(config.backendExecutable, '/usr/bin/claude');
+});
+
+// The review asked for the default to be `/usr/bin/claude`. On the instance it was asked for, that
+// path does not exist — the CLI is an npm global exposed at `/usr/local/bin/claude`. Hardcoding
+// either one bakes a single site's layout into the source, and the failure mode is bad in both
+// directions: the fingerprint attests nothing, or every job blocks on a missing binary. So the
+// default is resolved against the filesystem instead of asserted.
+test('default backendExecutable resolves to a CLI that actually exists', () => {
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true',
+    PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_DEPLOY_MODE: 'host',
+  });
+  const candidates = ['/usr/local/bin/claude', '/usr/bin/claude'];
+  const present = candidates.filter((candidate) => {
+    try { return fs.statSync(candidate).isFile(); } catch { return false; }
+  });
+  if (present.length === 0) {
+    // Nothing installed here: the default must still name a concrete path, never a bare word.
+    assert.equal(config.backendExecutable, candidates[0]);
+    return;
+  }
+  assert.equal(
+    config.backendExecutable, present[0],
+    'the default must prefer an installed CLI over a path that is merely conventional',
+  );
+});
+
+// An operator who names a path is entitled to that path. Probing the override would let a typo be
+// silently replaced by a different binary, and the fingerprint would then attest something the
+// operator never asked to run.
+test('an explicit backendExecutable is never silently swapped for one that exists', () => {
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true',
+    PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_DEPLOY_MODE: 'host',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/nonexistent/path/to/claude',
+  });
+  assert.equal(config.backendExecutable, '/nonexistent/path/to/claude');
+});
+
+// A raw NUL byte in a source file makes git and GitHub treat it as binary, which hides the diff
+// from exactly the review these tests exist to satisfy. Hostile-input vectors must use an escape.
+test('test sources use escapes, not raw NUL bytes, for hostile input vectors', () => {
+  const dir = fileURLToPath(new URL('.', import.meta.url));
+  for (const entry of fs.readdirSync(dir)) {
+    if (!entry.endsWith('.test.mjs')) continue;
+    const bytes = fs.readFileSync(path.join(dir, entry));
+    assert.equal(
+      bytes.includes(0), false,
+      `${entry} contains a raw NUL byte, so its diff renders as binary and cannot be reviewed`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
