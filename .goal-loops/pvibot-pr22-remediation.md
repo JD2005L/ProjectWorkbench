@@ -42,6 +42,39 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 | 4 | $PW_INSTALL_DIR/bin copy fix + functional installer test preserved | PASS | `install.sh:108-109` unchanged (`$PW_INSTALL_DIR/bin`); `test/install-sh.test.mjs` 5/5 green, untouched |
 | 5 | Focused tests, bash -n, full npm test, git diff --check all green; conventional commit, no push | PASS | see final verification log below |
 
+## Follow-up: rename-bypass gap (found by independent review of commit `0c40077`)
+
+**Finding.** `isDeployable()` classifies by filename, but the diff feeding it (`git diff --name-only`)
+only prints the *destination* path when Git's rename detection fires — the default since Git 2.9, and
+confirmed active in this sandbox with no explicit `diff.renames` config. A content-identical
+`git mv install.sh installer-renamed.sh` is exactly the case Git is most confident is a rename, so it
+collapses to a single `installer-renamed.sh` entry: the deployable source name never appears in the
+diff, the file is invisible to the guard, and a change that ships (an installer rename, or worse, a
+rename bundled with a behavioural edit) sails past with `app/VERSION` untouched. Same shape for
+`app/server.js` renamed out of `app/` to `server-renamed.js`.
+
+**Fix.** Extracted the diff-listing call into `changedFiles(repoDir, fromRef, toRef)` and added
+`--no-renames`, which turns every rename back into an independent delete + add pair so both endpoints
+surface and get classified on their own. The real guard test (`release: a change to deployable release
+content carries a release bump with it`) now calls this same helper — one implementation, not a
+parallel one that only the test exercises.
+
+**New test:** `REGRESSION: a rename cannot smuggle deployable content past the guard`. Builds a throwaway
+temp git repo (`fs.mkdtempSync` + `git init`), commits a baseline (`install.sh`, `app/server.js`,
+`app/leftover.js`, `app/VERSION`, `docs/plan.md`, `test/foo.test.mjs`, `.github/workflows/ci.yml`), then
+a second commit that: renames `install.sh` → `installer-renamed.sh` (out of deployable, exact-name rule),
+renames `app/server.js` → `server-renamed.js` (out of deployable, out of `app/`), deletes
+`app/leftover.js` (delete-of-deployable coverage), renames `docs/plan.md` → `app/plan.js` (rename-*in*-to
+deployable coverage), and renames `test/foo.test.mjs` → `test/bar.test.mjs` plus
+`.github/workflows/ci.yml` → `.github/workflows/ci2.yml` (non-deployable stays non-deployable across a
+rename) — all without touching `app/VERSION`. Asserts the classified-deployable set contains both
+`install.sh` and `app/server.js` (the vanishing source names), still contains `app/leftover.js` (delete)
+and `app/plan.js` (rename-in), and never contains the test/CI renames on either side.
+
+No `app/VERSION` bump accompanies this follow-up — only `test/release-version.test.mjs` (the guard
+itself) changed, after the already-bumped release commit `0c40077`, so there is no new deployable content
+to cover.
+
 ## Log
 
 - Confirmed worktree HEAD = `35cbe1e` (PR #22 head) exactly, clean tree, correct branch `pvibot/pr22-fixes`.
@@ -66,3 +99,35 @@ Status legend: `PASS` (independently verified) · `FAIL` · `—` (not yet attem
 - `git diff --check`: clean (exit 0), no whitespace errors.
 - Full suite (`cd app && npm test`, Node 22.23.2, `node --test ../test/*.test.mjs`): 341 tests, 327 pass, 14 fail — **verified pre-existing**: stashed both changed files, reran on the untouched PR-#22-head tree, got the identical 340 tests / 326 pass / 14 fail (one extra test is the new classifier unit test added by this loop, all else identical). Same 14 test names fail before and after. Root cause: `app/node_modules` has no `express` installed in this sandbox, so tests that spawn `server.js` (drawer/outbox, orchestrator smoke, cockpit-rail, base-path smoke) fail with `ERR_MODULE_NOT_FOUND` — an environment/dependency gap unrelated to install.sh or the release guard, out of scope for this remediation. Stash was popped back immediately after the comparison run.
 - Final full-suite run with this loop's changes applied: 341 tests, 327 pass, 14 fail (same set as baseline).
+- **Follow-up (rename-bypass fix, after independent review of `0c40077`):**
+  - Reproduced the bug empirically in a scratch temp repo: default `git diff --name-only` on a
+    `git mv install.sh installer-renamed.sh` + `git mv app/server.js server-renamed.js` prints only
+    `installer-renamed.sh` / `server-renamed.js`; `git diff --name-status` shows `R100` for both. Local
+    and global `diff.renames` are both unset, so this is Git's built-in default, not sandbox config —
+    the same bypass exists anywhere this guard runs.
+  - Extracted `changedFiles(repoDir, fromRef, toRef)`, initially a straight port of the existing (buggy)
+    plain `--name-only` call, and added the new `REGRESSION: a rename cannot smuggle deployable content
+    past the guard` test calling it. RED, before any fix (`cd app && node --test
+    ../test/release-version.test.mjs`):
+    ```
+    not ok 3 - REGRESSION: a rename cannot smuggle deployable content past the guard
+      error: 'a rename out of install.sh must still surface the deployable source name'
+      code: 'ERR_ASSERTION'
+      expected: true
+      actual: false
+    # tests 4 / pass 3 / fail 1
+    ```
+  - Fix: added `--no-renames` to `changedFiles()`, and rewired the real guard test to call the same
+    helper (previously it had its own separate inline `git('diff', '--name-only', ...)`). GREEN
+    (`cd app && node --test ../test/release-version.test.mjs`): `# tests 4 / pass 4 / fail 0`.
+  - Focused (`cd app && node --test ../test/release-version.test.mjs ../test/install-sh.test.mjs`):
+    `# tests 9 / pass 9 / fail 0`.
+  - `bash -n install.sh`: OK. `git diff --check`: clean (exit 0).
+  - `npm ci` (in `app/`): installed 68 packages including `express`, previously missing in this sandbox —
+    this explains all 14 "pre-existing" full-suite failures logged above, which turn out to have been
+    whole-file module-load failures (Node's test runner reports a file that throws on import as one
+    failing test rather than expanding its subtests), not real regressions.
+  - Full suite after `npm ci` (`cd app && npm test`): **`# tests 367 / pass 367 / fail 0`** — fully
+    green, no failures of any kind.
+  - `app/VERSION` left at `1.26.0729.2057` (unchanged) — only the guard test changed in this follow-up.
+  - `git status` before commit: only `test/release-version.test.mjs` modified; tree otherwise clean.
