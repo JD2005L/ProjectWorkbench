@@ -18,6 +18,14 @@
 //
 // The mutator therefore runs against a FRESH list and must locate its own record
 // by identity rather than closing over one loaded earlier.
+//
+// The same class of bug exists one layer up: a caller that commits a user
+// mutation and THEN fires off a detached credential side effect (resync a
+// project's git credential helper, prune a renamed user's old credential
+// directory) has serialized the write but not the effect. Two concurrent
+// mutations can commit in order A-then-B and still run those effects in
+// either order, so update() accepts an optional `effect` that runs inside the
+// SAME tail, after a successful save — see the update() doc comment below.
 
 export function createUserStore({ load, save }) {
   if (typeof load !== 'function' || typeof save !== 'function') {
@@ -28,7 +36,14 @@ export function createUserStore({ load, save }) {
   // settle; a rejection is absorbed here so one failure cannot wedge the queue.
   let tail = Promise.resolve();
 
-  function update(mutate) {
+  // `effect`, when given, runs AFTER a successful save but BEFORE the next
+  // queued update's `load()` — i.e. inside the very same serialized tail as
+  // the users.json write. That is what makes it safe for a caller to put a
+  // credential-side-effect (git config resync, a stale credential-tree prune)
+  // in there: two concurrent mutations can no longer commit users.json in one
+  // order and run their derived-state effects in the other, because the next
+  // mutation literally cannot start until this one's effect has finished.
+  function update(mutate, effect) {
     const run = tail.then(async () => {
       const users = await load();
       const outcome = await mutate(users);
@@ -36,6 +51,7 @@ export function createUserStore({ load, save }) {
       // or the value was already correct) so we do not rewrite the file.
       if (outcome === false) return { changed: false, result: outcome };
       await save(users);
+      if (effect) await effect(users, outcome);
       return { changed: true, result: outcome };
     });
     tail = run.then(() => {}, () => {});

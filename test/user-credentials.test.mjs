@@ -325,7 +325,7 @@ test('ensureUserCredentials delegates to the helper exactly when a drop is requi
   await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('a failing helper rejects so the caller can fall back to the shared login', async () => {
+test('a failing helper rejects rather than resolving with unusable credentials', async () => {
   await assert.rejects(ensureUserCredentials({
     fsp, base: '/tmp/nope', username: 'u', owner: { uid: 1 }, currentUid: 0,
     runJob: async () => { throw new Error('setpriv: Operation not permitted'); },

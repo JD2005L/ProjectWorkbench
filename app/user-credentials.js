@@ -373,9 +373,11 @@ export function spawnCredentialJob({ spawn, argv, job, timeoutMs = 20000 }) {
 // ---------------------------------------------------------------------------
 
 // Create/refresh a user's credential material. Resolves to
-// { configDir, envFile, seeded, fingerprint }; REJECTS when the material cannot
-// be placed, so the caller can fall back to the shared login rather than
-// pointing an agent at a directory it cannot read.
+// { configDir, envFile, seeded, fingerprint }; REJECTS when the material
+// cannot be placed. The caller (server.js's credentialContext) treats that as
+// a hard failure and refuses to launch, rather than pointing an agent at a
+// directory it cannot read — or silently falling back to the shared login,
+// which would be the same silent identity swap this module exists to avoid.
 export async function ensureUserCredentials({
   fsp,
   base,

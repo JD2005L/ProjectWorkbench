@@ -143,3 +143,78 @@ test('createUserStore refuses to be built without load and save', () => {
   assert.throws(() => createUserStore({}), /requires load and save/);
   assert.throws(() => createUserStore({ load: () => {} }), /requires load and save/);
 });
+
+// ---------------------------------------------------------------------------
+// AC3: the credential side-effect lifecycle must be serialized WITH the
+// users.json commit, not detached from it. A caller (e.g. the user-rename
+// route) needs to run a git-credential resync / prune after a successful
+// mutation, and that side effect must be ordered exactly like the commits
+// are — otherwise a slow effect for an earlier commit can overwrite a later
+// commit's derived state (the credential file, a stamped fingerprint, ...).
+// ---------------------------------------------------------------------------
+
+test('update() runs an effect after a successful save, inside the same serialized tail', async () => {
+  const disk = fakeDisk([{ username: 'a', n: 0 }]);
+  const store = createUserStore(disk);
+  const order = [];
+  await store.update((users) => { users[0].n = 1; order.push('mutate'); }, async () => { order.push('effect'); });
+  assert.deepEqual(order, ['mutate', 'effect']);
+});
+
+test('the effect is skipped when the mutator reports nothing to persist', async () => {
+  const disk = fakeDisk([{ username: 'a' }]);
+  const store = createUserStore(disk);
+  let ran = false;
+  await store.update(() => false, async () => { ran = true; });
+  assert.equal(ran, false, 'an effect must not run for a no-op mutation');
+});
+
+test('effect() receives the freshly-saved users and the mutator outcome', async () => {
+  const disk = fakeDisk([{ username: 'a' }]);
+  const store = createUserStore(disk);
+  let seenUsers, seenOutcome;
+  await store.update(
+    (users) => { const rec = users[0]; rec.role = 'admin'; return rec; },
+    async (users, outcome) => { seenUsers = users; seenOutcome = outcome; },
+  );
+  assert.equal(seenUsers[0].role, 'admin');
+  assert.equal(seenOutcome.role, 'admin');
+});
+
+test('REGRESSION: a slow effect for a delayed-but-earlier commit A must not clobber a later commit B\'s effect', async () => {
+  const disk = fakeDisk([{ username: 'owner', token: '' }]);
+  const store = createUserStore(disk);
+  // Models a derived store outside users.json (e.g. a project's git credential
+  // file) that both commits' side effects write into.
+  const derived = { token: '' };
+
+  const A = store.update(
+    (users) => { users[0].token = 'TOKEN_A'; return users[0]; },
+    async (users) => {
+      // The slow step: A's own commit was fast, but resyncing its derived
+      // state (a git config write, a credential-helper round trip) is not.
+      await new Promise((r) => setTimeout(r, 30));
+      derived.token = users.find((u) => u.username === 'owner').token;
+    },
+  );
+  // B is queued right behind A — this is the "newer update" arriving while A
+  // is still in flight, exactly like two admin requests racing.
+  const B = store.update(
+    (users) => { users[0].token = 'TOKEN_B'; return users[0]; },
+    async (users) => { derived.token = users.find((u) => u.username === 'owner').token; },
+  );
+
+  await Promise.all([A, B]);
+  assert.equal(disk.state.users[0].token, 'TOKEN_B', 'users.json must hold the newer commit');
+  assert.equal(derived.token, 'TOKEN_B', 'the derived state must reflect the newer commit, not whichever effect happened to finish last');
+});
+
+test('an effect that throws surfaces to the caller but does not wedge the queue', async () => {
+  const disk = fakeDisk([{ username: 'a' }]);
+  const store = createUserStore(disk);
+  await assert.rejects(store.update((users) => users[0], async () => { throw new Error('resync failed'); }), /resync failed/);
+  // users.json was already committed before the effect ran — the caller can
+  // decide how to surface that partial state; the queue itself must survive.
+  await store.updateUser('a', (rec) => { rec.role = 'admin'; });
+  assert.equal(disk.state.users[0].role, 'admin');
+});

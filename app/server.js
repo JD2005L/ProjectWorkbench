@@ -209,25 +209,50 @@ async function pruneUserCredentialTrees(users){
 // non-secret `env` KEY=VALUE entries; `shellArgs` is the pane shell's argv tail;
 // `key` is the credential fingerprint stamped on the session (see CRED_KEY_OPTION).
 const DEFAULT_SHELL_ARGS = ['--noprofile','--norc'];
+// Resolve the project's credential owner, or `null` for the two cases where
+// shared credentials are the INTENDED behaviour: the feature is off, or the
+// project intentionally has no primaryUser. Every other failure — the users
+// store cannot be read, the primaryUser doesn't resolve to a record, the
+// owner's GitHub token cannot be decrypted — THROWS. It must never be
+// swallowed into a `null` here, because the only caller-visible difference
+// between "no owner" and "owner resolution failed" is whether the session
+// launches under the shared identity, and AC1 is exactly that a failure must
+// never do that silently (or warning-only).
 async function projectCredentialOwner(project){
  if(!PER_USER_CLAUDE || !project?.primaryUser) return null;
- let users = []; try { users = await loadUsers(); } catch { return null; }
+ const users = await loadUsers();
  const u = users.find(x => x.username === project.primaryUser);
- if(!u) return null;
- let ghToken = '';
- if(u.ghToken){ try { ghToken = decrypt(u.ghToken) || ''; } catch { ghToken = ''; } }
+ if(!u) throw new Error(`primaryUser "${project.primaryUser}" does not exist in users.json`);
+ const ghToken = u.ghToken ? (decrypt(u.ghToken) || '') : '';
  return { username: u.username, ghToken };
 }
 // The fingerprint a project SHOULD be running on, computed without creating or
-// touching anything — cheap enough for the status poll.
+// touching anything — cheap enough for the status poll. Propagates the same
+// failures as projectCredentialOwner(); callers that are read-only status
+// polls (not launches) decide separately how to surface that.
 async function desiredCredentialKey(project){
  const owner = await projectCredentialOwner(project);
  if(!owner) return CREDENTIALS_OFF;
  return credentialFingerprint({ username: owner.username, configDir: userClaudeDir(owner.username), ghToken: owner.ghToken });
 }
+// What a session should launch with. THROWS — never falls back to the shared
+// login — when the feature is on, the project has a primaryUser, and that
+// owner's credentials cannot be resolved or materialized for any reason
+// (unreadable users store, undecryptable token, missing owner record, a
+// failing privilege-dropped helper). A working shared session that nobody
+// asked for is not an acceptable substitute for a broken private one: it is
+// exactly the silent identity swap this feature must not perform. Callers
+// (ensureTmuxSession / newTmuxWindow) are already wrapped by route-level
+// try/catch, so this failure reaches the operator as a real error instead of
+// vanishing into a console.warn.
 async function credentialContext(project){
  const off = { tokens: [], shellArgs: DEFAULT_SHELL_ARGS, key: CREDENTIALS_OFF };
- const owner = await projectCredentialOwner(project);
+ let owner;
+ try {
+  owner = await projectCredentialOwner(project);
+ } catch(e){
+  throw new Error(`[per-user-claude] project "${project?.name || '?'}" cannot resolve its credential owner (primaryUser "${project?.primaryUser || ''}"): ${e?.message || e}. Refusing to fall back to the shared Claude/GitHub login.`);
+ }
  if(!owner) return off;
  try {
   const cred = await ensureUserCredentials({
@@ -241,13 +266,7 @@ async function credentialContext(project){
    key: cred.fingerprint,
   };
  } catch(e){
-  // Fall back to the shared login rather than pointing an agent at a config dir
-  // it cannot read: a working shared session beats a broken private one. The
-  // session then reports as credential-stale, so the misconfiguration surfaces
-  // instead of silently doing nothing (which is how the host-mode ownership bug
-  // stayed invisible).
-  console.warn(`[per-user-claude] ${project?.name || '?'}: using the shared login — ${e?.message || e}`);
-  return off;
+  throw new Error(`[per-user-claude] project "${project.name}" (owner "${owner.username}") credential materialization failed: ${e?.message || e}. Refusing to fall back to the shared Claude/GitHub login.`);
  }
 }
 
@@ -905,12 +924,26 @@ async function stampSessionCredKey(sess,key){
 }
 // Is this project's live session running on credentials other than the ones it
 // would get today? Costs nothing (and touches no tmux) while the feature is off.
+// This is a READ-ONLY status poll across every project, not a launch path, so a
+// broken project's credential owner (e.g. a dangling primaryUser) must not
+// throw and 500 the whole /api/projects/status response for every other
+// project too. But it must also never silently report "not stale" when it
+// cannot tell — that would just move AC1's silent-shared-fallback failure
+// mode into the status poll instead of removing it. So an unresolvable owner
+// is reported stale (visible, actionable) rather than swallowed either way.
 async function credentialsStale(p){
  if(!PER_USER_CLAUDE) return false;
  const sess = tmuxSession(p.name);
  try { await tmux(['has-session','-t',sess]); } catch { return false; }
- const [desiredKey, stampedKey] = await Promise.all([desiredCredentialKey(p), readSessionCredKey(sess)]);
- return sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey, stampedKey }).stale;
+ const [desired, stampedKey] = await Promise.all([
+  desiredCredentialKey(p).then(key => ({ ok:true, key })).catch(e => ({ ok:false, e })),
+  readSessionCredKey(sess),
+ ]);
+ if(!desired.ok){
+  console.warn(`[per-user-claude] ${p?.name || '?'}: cannot determine desired credential state — reporting stale: ${desired.e?.message || desired.e}`);
+  return true;
+ }
+ return sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: desired.key, stampedKey }).stale;
 }
 async function ensureTmuxSession(p){
  const sess = tmuxSession(p.name);
@@ -2675,7 +2708,36 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
   // Validate and mutate inside one transaction: the last-admin guard and the
   // username-uniqueness guard are only meaningful against the list we then save.
-  let failure = null, before = null, after = null, freshUsers = null;
+  let failure = null, before = null, after = null, oldUsername = null, renamed = false;
+  // Everything a rename/token-change implies beyond users.json runs as an
+  // `effect` — INSIDE the same serialized tail as the commit (see
+  // app/user-store.js) — so two concurrent updates can never commit users.json
+  // in one order and apply their derived (git credential file, credential-tree)
+  // side effects in the other (AC3). A rename additionally has to (AC2):
+  //   - repoint every project.primaryUser that named the old username,
+  //   - resync git credentials for every project the (possibly renamed) owner
+  //     now has, from the freshly committed user list,
+  //   - actively remove the OLD credential-tree namespace, rather than
+  //     leaving it for the next boot/delete prune to (maybe) get to.
+  const effect = async (freshUsers) => {
+   if(!renamed && newToken === undefined) return;
+   try {
+    await withProjectsLock(async () => {
+     const projects = await loadProjects();
+     let changed = false;
+     if(renamed){
+      for(const p of projects){ if(p.primaryUser === oldUsername){ p.primaryUser = after.username; changed = true; } }
+      if(changed) await saveProjects(projects);
+     }
+     for(const p of projects){
+      if(p.primaryUser === after.username) await syncProjectCredentials(p, freshUsers);
+     }
+    });
+    if(renamed) await pruneUserCredentialTrees(freshUsers);
+   } catch(e){
+    throw new Error(`user "${after.username}" was updated in users.json, but syncing dependent project/credential state failed: ${e?.message || e}. users.json reflects the change; retry this request to reattempt the sync, or reconcile project git credentials and the per-user credential tree manually.`);
+   }
+  };
   await userStore.update((users)=>{
    const u = users.find(x => x.username === target);
    if(!u){ failure = { status:404, error:`User "${target}" not found` }; return false; }
@@ -2692,21 +2754,18 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
     failure = { status:409, error:'Refusing to demote the last admin (you would lock yourself out)' }; return false;
    }
    before = { username: u.username, role: u.role, projects: u.projects };
+   oldUsername = u.username;
+   renamed = newUsername !== undefined && newUsername !== u.username;
    if(newUsername !== undefined) u.username = newUsername;
    if(newRole !== undefined) u.role = newRole;
    if(newProjects !== undefined) u.projects = projectsResolved;
    if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
    if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
-   after = u; freshUsers = users;
-  });
+   after = u;
+   return u;
+  }, effect);
   if(failure) return res.status(failure.status).json({ ok:false, error: failure.error });
-  if(newToken !== undefined){
-   const projects = await loadProjects();
-   for(const p of projects){
-    if(p.primaryUser === after.username) await syncProjectCredentials(p, freshUsers);
-   }
-  }
-  await audit('user_update', { target, before, after: { username: after.username, role: after.role, projects: after.projects, hasToken: !!after.ghToken } }, req);
+  await audit('user_update', { target, before, after: { username: after.username, role: after.role, projects: after.projects, hasToken: !!after.ghToken }, renamed }, req);
   res.json({ ok:true, user: safeUserShape(after) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
@@ -2732,40 +2791,66 @@ app.post(BASE + '/api/users/:username/password', requireAdmin, async (req,res) =
 app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
-  let failure = null, removed = null, remainingUsers = null;
-  await userStore.update((users)=>{
-   const i = users.findIndex(u => u.username === target);
+  // Phase 1: validate against a current snapshot WITHOUT mutating anything.
+  // The identity itself is only removed in phase 3, once every dependent piece
+  // of state has actually been revoked — see the phase-2 comment for why.
+  const users = await loadUsers();
+  const victim = users.find(u => u.username === target);
+  if(!victim) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  if(isAdmin(victim) && countAdmins(users) <= 1){
+   return res.status(409).json({ ok:false, error:'Refusing to delete the last admin (you would lock yourself out)' });
+  }
+  const remainingUsers = users.filter(u => u.username !== target);
+
+  // Phase 2: revoke project references, git credentials, the per-user
+  // credential tree, and sessions — BEFORE the irreversible identity removal,
+  // and with failures propagating rather than being swallowed. If any of this
+  // fails, the request aborts here: users.json is untouched, so the operation
+  // is safely retryable (this is the primary cleanup contract; boot-time
+  // pruning of orphaned credential trees remains defense in depth only, for
+  // trees orphaned some other way, e.g. a service-down window or an
+  // out-of-band edit of users.json).
+  try {
+   // Run every fallible step BEFORE persisting anything, so a later failure
+   // (e.g. the credential-tree prune) cannot leave projects.json half-revoked
+   // while the account still exists. syncProjectCredentials is given the
+   // project as if its reference were already cleared (remainingUsers already
+   // excludes the victim either way), so this is safe to repeat on a retry.
+   const projectsBeforeCleanup = await loadProjects();
+   for(const p of projectsBeforeCleanup){
+    if(p.primaryUser === target) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers);
+   }
+   await pruneUserCredentialTrees(remainingUsers);
+   const sessions = await loadSessions();
+   const kept = sessions.filter(s => s.userId !== victim.id);
+   const sessionsChanged = kept.length !== sessions.length;
+
+   // Every fallible step above succeeded — only now commit the reference
+   // removal and session purge.
+   await withProjectsLock(async () => {
+    const fresh = await loadProjects();
+    let changed = false;
+    for(const p of fresh){ if(p.primaryUser === target){ delete p.primaryUser; changed = true; } }
+    if(changed) await saveProjects(fresh);
+   });
+   if(sessionsChanged){ sessionsCache = kept; await saveSessions(); }
+  } catch(e){
+   return res.status(500).json({ ok:false, error:
+    `could not fully revoke "${target}"'s project references, git credentials, credential tree, or sessions, so the account was NOT deleted — retry once the underlying issue is fixed: ${e?.message || e}` });
+  }
+
+  // Phase 3: the irreversible step. Re-validated inside the transaction in
+  // case admin/role state changed concurrently while phase 2 was running.
+  let failure = null;
+  await userStore.update((fresh)=>{
+   const i = fresh.findIndex(u => u.username === target);
    if(i < 0){ failure = { status:404, error:`User "${target}" not found` }; return false; }
-   if(isAdmin(users[i]) && countAdmins(users) <= 1){
+   if(isAdmin(fresh[i]) && countAdmins(fresh) <= 1){
     failure = { status:409, error:'Refusing to delete the last admin (you would lock yourself out)' }; return false;
    }
-   [removed] = users.splice(i, 1);
-   remainingUsers = users;
+   fresh.splice(i, 1);
   });
   if(failure) return res.status(failure.status).json({ ok:false, error: failure.error });
-  // Revoke any on-disk git credentials this user seeded: for every project that
-  // named them primaryUser, drop the reference and re-sync (the user is already
-  // gone from `users`, so syncProjectCredentials takes the clear path — removes
-  // the 0600 cred file and unsets the local helper). Otherwise the deleted
-  // account's token would keep authenticating git in those workspaces.
-  try {
-   const projects = await loadProjects();
-   let changed = false;
-   for(const p of projects){
-    if(p.primaryUser === target){ delete p.primaryUser; await syncProjectCredentials(p, remainingUsers); changed = true; }
-   }
-   if(changed) await saveProjects(projects);
-  } catch {}
-  // Remove the deleted account's per-user credential tree: their Claude OAuth
-  // login and GitHub token would otherwise stay readable on disk indefinitely.
-  // Runs as the terminal account, like every other write into that tree.
-  try { await pruneUserCredentialTrees(remainingUsers); }
-  catch(e){ console.warn(`[per-user-claude] credential prune after deleting ${target} failed: ${e?.message || e}`); }
-  try {
-   const sessions = await loadSessions();
-   const remaining = sessions.filter(s => s.userId !== removed.id);
-   if(remaining.length !== sessions.length){ sessionsCache = remaining; await saveSessions(); }
-  } catch {}
   await audit('user_delete', { target }, req);
   res.json({ ok:true });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }

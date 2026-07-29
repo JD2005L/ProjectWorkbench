@@ -19,8 +19,14 @@ that project's terminal launches with the owner's private credential context:
 - **Copilot** — the owner's stored GitHub token is injected as `GH_TOKEN`
   (Copilot authenticates via the GitHub CLI), so Copilot runs as that user.
 
-If the feature is off, the project has no `primaryUser`, or the owner isn't in
-`users.json`, the terminal falls back to the shared login — nothing breaks.
+If the feature is off, or the project intentionally has no `primaryUser`, the
+terminal falls back to the shared login — nothing breaks. But if the feature is
+on and the project HAS a `primaryUser`, that owner's credentials are mandatory:
+a `primaryUser` that doesn't resolve to a user record, a users store that
+cannot be read, an undecryptable GitHub token, or a failing credential helper
+all **fail the session launch** with an actionable error rather than silently
+handing the terminal the shared identity. See "Fail-closed, not fail-open"
+below.
 
 ## Enabling
 
@@ -120,10 +126,26 @@ pane is already unprivileged there. Deriving ownership from that flag is what
 made an earlier version of this feature silently inert on every host-mode
 instance.
 
-If ownership cannot be established, PW logs a warning and falls back to the
-**shared** login rather than pointing an agent at a directory it cannot use. The
-session then reports as credential-stale (below), so the misconfiguration is
-visible instead of silent.
+## Fail-closed, not fail-open
+
+An earlier version of this feature fell back to the shared login whenever
+anything about the owner's credentials couldn't be resolved — an unreadable
+`users.json`, an undecryptable `ghToken`, a `primaryUser` that no longer names a
+real user, a privilege-dropped helper that failed — logging only a
+`console.warn`. That is a silent identity swap: a project configured to run on
+its owner's seat would quietly run on the shared box login instead, with
+nothing in the UI to say so.
+
+When `PW_PER_USER_CLAUDE` is on and a project has a `primaryUser`, all of the
+above now **fail the launch** (`ensureTmuxSession` / `newTmuxWindow` reject, and
+the route returns a non-2xx response with an actionable message) instead of
+falling back. Shared credentials remain available only for the two cases where
+that is the actual intent: the feature is off, or the project genuinely has no
+`primaryUser`. The read-only status poll (`credentialsStale`, feeding
+`GET /api/projects/status`) is the one exception: it never throws, because one
+project with an unresolvable owner must not take down status reporting for
+every other project — instead it reports that project `credentialsStale: true`,
+which is still visible/actionable rather than silently "fine".
 
 ## Directory naming
 
@@ -166,10 +188,16 @@ to the helper on stdin.
 
 ## Removing stale credentials
 
-Deleting a user removes their credential tree, so a departed account's Claude
-OAuth login and GitHub token do not linger on disk. The same sweep runs once at
-startup, catching trees orphaned while the service was down or by an out-of-band
-edit of `users.json`.
+`DELETE /api/users/:username` revokes, in order, every project reference,
+git credential, and the credential tree BEFORE removing the account itself —
+the identity removal is deliberately the LAST, irreversible step. If any of
+that cleanup fails (a locked file, an unusable `PW_USER_CRED_BASE`, ...), the
+account is NOT deleted and the request reports an error rather than an
+unqualified success: the failure leaves a safely retryable state instead of an
+orphaned credential tree with no owner left to clean it up. The same sweep also
+runs once at startup, catching trees orphaned some OTHER way — while the
+service was down, or by an out-of-band edit of `users.json` — but that boot
+sweep is defense in depth, not the primary cleanup contract.
 
 The prune runs as the pane account, like every other write into that tree, and is
 deliberately conservative: it only removes a directory whose name is a canonical
@@ -206,10 +234,25 @@ up mixed; recycling is what makes it uniform.
   user's credential dir on disk. Keeping the token out of argv narrows the
   exposure — it is no longer readable from a process listing or
   `tmux list-panes` — but it does not close this gap.
-- **Changing `PW_USER_CRED_BASE` or a username strands the old tree.** Directory
-  names are derived from the username, so a rename creates a fresh (empty)
-  credential dir and the owner logs in again. The old tree is removed by the
-  next prune.
+- **A rename creates a fresh (empty) credential dir; the owner logs in again.**
+  Directory names are derived from the username, so the OAuth login itself
+  does not carry over to the new name. Renaming a user (`PATCH
+  /api/users/:username` with a new `username`) DOES actively: repoint every
+  `project.primaryUser` that named the old username, resync those projects'
+  git credential helpers from the freshly committed user record, and prune the
+  OLD credential-tree directory in the same request — it does not wait for the
+  next boot or delete. Only `PW_USER_CRED_BASE` changing out from under a
+  stable username is a passive-prune-only case (an operator relocating the
+  base, not a normal product action).
+- **A rename's project/credential sync is not itself retried on failure.** If
+  the sync step (project reference update, git resync, tree prune) fails after
+  `users.json` has already committed the rename, the request returns a non-2xx
+  error naming the affected projects, but simply re-sending the identical PATCH
+  is a no-op for the username (already renamed) and will not re-attempt the
+  sync. An operator must reconcile the named projects manually in that case —
+  a consequence of there being no cross-file transaction across `users.json`,
+  `projects.json`, and the credential tree (see the code-level note on
+  `userStore.update`'s `effect` parameter in `app/user-store.js`).
 - **Credentials are the owner's, not the actor's.** Anyone with access to a
   project uses the `primaryUser`'s account/quota, because terminals are one
   shared session per project.
