@@ -1,13 +1,23 @@
 #!/usr/bin/env bash
 set -euo pipefail
 name="$1"
-json=/opt/project-workbench/projects.json
+# PW_REGISTRY_PATH override matches app/isolation.js's own env var (same
+# file, same name) so this script and the dashboard can never disagree about
+# which registry is authoritative; unset falls back to the canonical path.
+json="${PW_REGISTRY_PATH:-/opt/project-workbench/projects.json}"
 [[ -f "$json" ]] || { echo "[project-terminal-start] $json not found" >&2; exit 1; }
 path=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .path // empty' "$json")
 port=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .port // empty' "$json")
 repo=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .repo // empty' "$json")
+primary_user=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .primaryUser // empty' "$json")
 [[ -n "$path" ]] || { echo "[project-terminal-start] no .path in projects.json for '$name'" >&2; exit 1; }
 [[ -n "$port" ]] || { echo "[project-terminal-start] no .port in projects.json for '$name'" >&2; exit 1; }
+# Isolates every tmux call onto a private socket for tests (see
+# test/project-terminal-start.test.mjs); unset (the default, always true in
+# production) means the normal per-user default socket, byte-identical to
+# before this variable existed. Mirrors app/server.js's own PW_TMUX_SOCKET.
+tmux_sock_args=()
+[[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
 mkdir -p "$path"
 real_path=$(readlink -f "$path")
 chown -R admin:admin "$real_path" 2>/dev/null || true
@@ -47,21 +57,62 @@ with open(tmp,'w') as f: json.dump(data,f,indent=2)
 os.replace(tmp, conf)
 PY
 session="pw_${name//[^A-Za-z0-9_]/_}"
-tab_env='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
+
+# Per-user Claude/GitHub credentials (opt-in via PW_PER_USER_CLAUDE). Resolved
+# by app/project-terminal-credentials.mjs, which enforces the EXACT SAME
+# fail-closed contract as app/server.js's credentialContext(): when the
+# feature is on and this project has a primaryUser, that owner's credentials
+# are mandatory. Any failure (an unreadable users store, a primaryUser that
+# doesn't resolve to a record, an undecryptable token, a failing credential
+# helper) must stop this script HERE, before tmux/ttyd start — never fall
+# back to the shared login. The helper itself decides when shared credentials
+# are the intended answer (feature off, or no primaryUser); this script does
+# not duplicate that decision.
+node_bin=$(command -v node || echo /usr/bin/node)
+app_dir="${PW_APP_DIR:-/opt/project-workbench/app}"
+if ! cred_json=$("$node_bin" "$app_dir/project-terminal-credentials.mjs" "$name" "$primary_user"); then
+  cred_err=$(printf '%s' "$cred_json" | jq -r '.error // empty' 2>/dev/null || true)
+  echo "[project-terminal-start] per-user credential resolution failed for '$name' (owner '$primary_user'): ${cred_err:-$cred_json}" >&2
+  exit 1
+fi
+cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir // empty')
+cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile // empty')
+cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint // empty')
+
+base_tab_env="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+if [[ -n "$cred_config_dir" ]]; then
+  printf -v quoted_cfg '%q' "CLAUDE_CONFIG_DIR=$cred_config_dir"
+  if [[ -n "$cred_env_file" ]]; then
+    printf -v quoted_rcfile '%q' "$cred_env_file"
+    tab_env="$base_tab_env $quoted_cfg bash --noprofile --rcfile $quoted_rcfile"
+  else
+    tab_env="$base_tab_env $quoted_cfg bash --noprofile --norc"
+  fi
+else
+  tab_env="$base_tab_env bash --noprofile --norc"
+fi
+
 # Create the project tmux session once. Future browser sessions reattach to the same shell/process state.
-if ! tmux has-session -t "$session" 2>/dev/null; then
-  tmux -u new-session -d -s "$session" -c "$real_path" "$tab_env"
-  tmux send-keys -t "$session" "printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' '$real_path' '$claude_path' '$session'" C-m
+if ! tmux "${tmux_sock_args[@]}" has-session -t "$session" 2>/dev/null; then
+  tmux "${tmux_sock_args[@]}" -u new-session -d -s "$session" -c "$real_path" "$tab_env"
+  # Stamp the same non-secret fingerprint app/server.js stamps on sessions it
+  # creates (@pw_cred_key), so GET /api/projects/status's staleness check
+  # (credentialsStale) treats a session started here identically to one
+  # started via the dashboard — see app/user-credentials.js.
+  if [[ -n "$cred_key" ]]; then
+    tmux "${tmux_sock_args[@]}" set-option -t "$session" @pw_cred_key "$cred_key" 2>/dev/null || true
+  fi
+  tmux "${tmux_sock_args[@]}" send-keys -t "$session" "printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' '$real_path' '$claude_path' '$session'" C-m
   # Auto-spawn tab templates flagged autoStart. The cmd is typed into the
   # new window via send-keys so the shell stays alive after it exits.
   while IFS=$'\t' read -r tab_name tab_cmd; do
     [[ -z "$tab_name" ]] && continue
-    tmux new-window -t "$session" -c "$real_path" -n "$tab_name" "$tab_env" || continue
+    tmux "${tmux_sock_args[@]}" new-window -t "$session" -c "$real_path" -n "$tab_name" "$tab_env" || continue
     if [[ -n "$tab_cmd" ]]; then
-      tmux send-keys -t "$session:$tab_name" "$tab_cmd" C-m
+      tmux "${tmux_sock_args[@]}" send-keys -t "$session:$tab_name" "$tab_cmd" C-m
     fi
   done < <(jq -r --arg n "$name" '.[] | select(.name==$n) | .tabs // [] | .[] | select(.autoStart==true) | "\(.name)\t\(.cmd // "")"' "$json")
-  tmux select-window -t "$session:0" 2>/dev/null || true
+  tmux "${tmux_sock_args[@]}" select-window -t "$session:0" 2>/dev/null || true
 fi
 exec /usr/bin/ttyd \
   --interface 127.0.0.1 \
@@ -75,4 +126,4 @@ exec /usr/bin/ttyd \
   --client-option letterSpacing=0 \
   --client-option disableLeaveAlert=true \
   --check-origin \
-  tmux -u new-session -A -s "$session" -c "$real_path" "$tab_env"
+  tmux "${tmux_sock_args[@]}" -u new-session -A -s "$session" -c "$real_path" "$tab_env"

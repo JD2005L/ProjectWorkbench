@@ -1,6 +1,9 @@
 # PR #20 security/lifecycle remediation
 
 **Branch:** `pvibot/pr20-fixes` · **Base:** PR head `71d4805ce461fb904e868b5e1135425ad365dd6d`
+**Round 1 commit:** `941ebe7` (AC1-AC8 below). **Round 2 (this section's addendum):** follow-up
+fixing two production blockers an independent acceptance review found in round 1's own
+completion notes, plus a test-methodology correction it also flagged.
 
 **End state.** The per-user Claude/GitHub credential feature (opt-in via `PW_PER_USER_CLAUDE`)
 fails closed instead of silently degrading to shared credentials; renaming or deleting a user
@@ -112,3 +115,110 @@ Status legend: `PASS` (independently re-run and green) · `FAIL` · `—` (not y
   socket cleaned up afterward.
 - `app/VERSION` bumped to `1.26.0729.2130` per the repo's release-bump convention
   (`test/release-version.test.mjs`).
+
+---
+
+## Round 2: two production blockers + a test-methodology fix (independent acceptance review)
+
+### Blocker 1 — `scripts/project-terminal-start` bypassed the fail-closed contract entirely
+
+Round 1's AC1 fix only covered sessions `app/server.js` creates directly (`ensureTmuxSession` /
+`newTmuxWindow` / recycle). The HOST-MODE, systemd-launched INITIAL terminal
+(`project-terminal@.service` → `scripts/project-terminal-start`) never called into that logic at
+all — with `PW_PER_USER_CLAUDE=true` it always used the shared login, silently, for the very first
+session of every project. Fixed by extracting the shared decision logic out of `server.js` into
+three small modules so a SECOND entrypoint can enforce the identical contract without duplicating
+it (drift risk is exactly how this class of bug happens):
+
+- `app/project-owner.js` — `resolveProjectCredentialOwner()`, extracted pure from `server.js`'s
+  `projectCredentialOwner()`.
+- `app/secret-crypto.js` — `makeSecretCrypto()`, extracted from `server.js`'s inline AES-256-GCM
+  `encrypt`/`decrypt`.
+- `app/users-file.js` — `loadUsersFile()`, extracted from `server.js`'s `loadUsers()`.
+- `app/project-terminal-credentials.mjs` — new CLI, same stdin/stdout-JSON protocol shape as the
+  existing `credential-writer.mjs`, reusing `ensureUserCredentials`/`terminal-owner.js` verbatim (no
+  new privilege-drop mechanism). Prints `{"shared":true}` for the two intended shared-login cases,
+  materialized-context JSON on success, or `{"ok":false,"error":...}` + nonzero exit on any other
+  failure.
+- `scripts/project-terminal-start` now calls that CLI before tmux/ttyd start, aborts on nonzero exit
+  (before any session exists), builds `tab_env` with `CLAUDE_CONFIG_DIR`/`--rcfile` when a real
+  owner resolved, and stamps `@pw_cred_key` on the session so `credentialsStale` treats it
+  identically to a dashboard-created one. Added `PW_TMUX_SOCKET`/`PW_REGISTRY_PATH`/`PW_APP_DIR` env
+  overrides (all no-ops when unset) purely so the real script can be tested against a real, privately
+  socketed tmux server without ever touching the shared default socket or the production registry.
+
+RED→GREEN: `test/project-owner.test.mjs`, `test/secret-crypto.test.mjs`, `test/users-file.test.mjs`,
+`test/project-terminal-credentials.test.mjs` (7 tests against the real CLI as a child process),
+`test/project-terminal-start.test.mjs` (7 tests against the REAL bash script + a REAL, isolated tmux
+server — enabled/valid-owner, disabled, no-owner, dangling-owner, corrupt-store, corrupt-token,
+materialization-failure, no-secret-in-output).
+
+### Blocker 2 — rename reconciliation was not retryable
+
+Round 1 documented (rather than fixed) that a rename whose post-commit effect failed could not be
+recovered without a manual file edit, because retrying the identical PATCH found the username
+already changed and treated it as a no-op. Fixed with a durable `pendingCredentialSync:
+{fromUsername, toUsername}` marker recorded on the user record inside the SAME commit as the
+rename:
+
+- The PATCH mutator sets/extends the marker (chaining through an unfinished PRIOR rename's original
+  `fromUsername` if one exists) and carries it forward on a no-op retry.
+- The effect reconciles via a new `reconcileRenameCredentials()` (shared by the PATCH effect, a new
+  `POST /api/users/:username/reconcile` recovery endpoint, and `DELETE`), then clears the marker.
+- **No mistaken takeover**: `reconcileRenameCredentials()` refuses (leaves the marker pending) if the
+  OLD username is now held by a *different* current user — proceeding would hand that person's
+  projects or credential tree to the renamed account.
+- `DELETE` now also revokes a lingering OLD-name project reference left by an unfinished rename,
+  guarded by the same no-takeover check.
+- `pendingCredentialSync` surfaced on `GET /api/users` so a stuck reconciliation is visible, not a
+  hidden file-only state.
+
+**Self-caught bug during implementation:** the first version of the effect cleared the marker via a
+second `userStore.updateUser()` call from INSIDE the effect itself — which re-enters the store's own
+serialization tail (the effect is already running as part of it) and deadlocks. Caught by a
+timeout-guarded regression test (`test/user-store.test.mjs`) before it ever reached the full test
+run silently. Fixed by giving `effect` a third `resave()` argument that persists a follow-up mutation
+to the in-memory array directly, without re-queuing — see `app/user-store.js`.
+
+RED→GREEN: 7 new tests in `test/user-lifecycle.test.mjs` (visibility, retry-after-failure at each of
+the three effect stages — project-reference reassignment, git-credential resync, credential-tree
+prune — the explicit recovery endpoint, no-mistaken-takeover, and DELETE sweeping a lingering
+old-name reference) + 1 in `test/user-store.test.mjs` (the deadlock regression).
+
+### Test-methodology fix — the concurrent-token-order test
+
+The prior version accepted "either A or B" as the final token and used a mutating "verification"
+PATCH as its consistency check — which could itself paper over a real divergence between two
+racing requests. Replaced with a test that (a) asserts token B (the one fired second) specifically
+and deterministically — proven reliable across repeated runs because `update()`'s effect is
+serialized on the same tail as the commit, so the second request's entire pipeline cannot even
+start until the first's has fully finished — and (b) verifies by independently decrypting
+`users.json`'s own ciphertext off disk and reading the credential file directly, with no write in
+the check itself. The exact "delayed-A-must-not-clobber-newer-B" ordering claim remains proven with
+a fully controlled clock at the unit level in `test/user-store.test.mjs`.
+
+### Round 2 verification evidence
+
+- Focused security suite (13 files incl. all round-2 additions): **146/146 pass**.
+- Full suite (`cd app && npm test`): **491/491 pass**, 0 failures (round 1 was 453/453; round 2 added
+  38 new tests across 6 new files + extensions to 2 existing ones).
+- Second production-shaped root-to-admin probe: dashboard spawned as uid 0 again, this time ALSO
+  exercising a rename (`alice` → `alicia`) through the live HTTP API while running as root —
+  `pendingCredentialSync: false` in the response, `alicia`'s new credential dir created and owned by
+  `admin:admin` on the next recycle, `alice`'s old namespace actively pruned, `/api/projects/status`
+  correctly reporting `credentialsStale: true` in between (session env baked at creation, as
+  documented) and `false` again after a reconciling recycle. Cleaned up afterward; production
+  instance at `/opt/project-workbench/app/server.js` (pid unrelated, untouched) verified unaffected
+  throughout.
+- `app/VERSION` bumped again to `1.26.0729.2217` (round 2 is a second substantive change to `app/`
+  since the round-1 bump).
+
+### Remaining out-of-scope observation (not requested, not fixed)
+
+`ensureTmuxSession()` in `app/server.js` calls `credentialContext(p)` — which can now throw — BEFORE
+checking whether the session already exists. For an EXISTING session (e.g. a container-mode boot
+loop reattaching after a dashboard restart), a currently-broken credential owner would block ttyd
+from reattaching to a session that is otherwise running fine, since a live session's env is fixed at
+creation and doesn't need fresh credentials at all. This is a real latent gap introduced by round
+1's fail-closed fix, but it is not either of the two named blockers and was not fixed here to avoid
+further scope expansion; flagging it explicitly rather than leaving it silently undiscovered.

@@ -38,6 +38,18 @@ PW_PER_USER_CLAUDE=true
 PW_USER_CRED_BASE=/home/admin/pw-users
 ```
 
+**Host mode:** this env var (and any of the others above, if overridden from
+their defaults) must be set on BOTH `project-workbench.service` (the
+dashboard) AND `project-terminal@.service` (the per-project terminal), e.g.
+via `systemctl edit <unit>`. Each systemd unit has its own environment — they
+do not inherit from each other — and the per-project terminal's INITIAL,
+systemd-launched session (`scripts/project-terminal-start`, which
+`project-terminal@.service` runs) resolves credentials independently via
+`app/project-terminal-credentials.mjs`, enforcing the identical fail-closed
+contract described above. Sessions the dashboard itself creates or recreates
+(a new project, a new tab, `POST /api/term/:project/recycle`) go through
+`app/server.js` instead and only need the dashboard's own environment.
+
 Then, per owner (one time): open a project you own and run `claude` — complete
 the login in the browser. The **Settings → Users & Roles** table shows a
 **Claude** column: `✓ signed in` once you've done it, `not yet` until then.
@@ -205,6 +217,42 @@ encoding **and** which contains this feature's own layout (a `claude/` directory
 or a `session-env.sh`). `PW_USER_CRED_BASE` is operator-configurable, so a
 misconfiguration must not turn the sweep into an arbitrary delete.
 
+## Renaming a user is retryable
+
+`PATCH /api/users/:username` with a new `username` repoints every
+`project.primaryUser` that named the old one, resyncs those projects' git
+credentials, and prunes the old credential-tree namespace — all as one
+`effect` on the SAME serialized commit as the username change itself (see
+`app/user-store.js`'s `update(mutate, effect)`).
+
+If that reconciliation fails partway (a locked `projects.json`, a read-only
+`.git`, an unusable credential base, ...), `users.json` already committed the
+new username, but the record is marked with a `pendingCredentialSync:
+{fromUsername, toUsername}` — surfaced as `pendingCredentialSync: true` on
+`GET /api/users` so it's visible, not a hidden file-only state. Recovering
+from it needs no manual file edits:
+
+- **retry the identical PATCH** (or any other edit to the same user, or a
+  literal no-op) — the marker is carried forward and the reconciliation is
+  re-attempted regardless of whether this particular request changes the
+  username again, or
+- **`POST /api/users/:username/reconcile`** — finishes a pending
+  reconciliation without reconstructing the original rename request at all;
+  a no-op (`{"ok":true,"pending":false}`) if nothing is pending.
+
+Every step (project-reference reassignment, git resync, credential-tree
+prune) is safe to repeat, so retrying after a partial failure never double-
+applies anything.
+
+**No mistaken takeover.** If the OLD username is claimed by a *different*
+account by the time reconciliation runs (someone created a new user reusing
+the vacated name), reconciliation refuses — reassigning that name's projects
+or pruning its credential tree would hand the new account's projects or
+credentials to the renamed one. The marker stays pending until an admin
+resolves the naming conflict. `DELETE /api/users/:username` applies the same
+guard: deleting a user with an unfinished rename also revokes the lingering
+OLD-name project reference, unless that name has since been reclaimed.
+
 ## Changing credentials on a running session
 
 A pane inherits its environment when it is created, so enabling
@@ -244,32 +292,36 @@ up mixed; recycling is what makes it uniform.
   next boot or delete. Only `PW_USER_CRED_BASE` changing out from under a
   stable username is a passive-prune-only case (an operator relocating the
   base, not a normal product action).
-- **A rename's project/credential sync is not itself retried on failure.** If
-  the sync step (project reference update, git resync, tree prune) fails after
-  `users.json` has already committed the rename, the request returns a non-2xx
-  error naming the affected projects, but simply re-sending the identical PATCH
-  is a no-op for the username (already renamed) and will not re-attempt the
-  sync. An operator must reconcile the named projects manually in that case —
-  a consequence of there being no cross-file transaction across `users.json`,
-  `projects.json`, and the credential tree (see the code-level note on
-  `userStore.update`'s `effect` parameter in `app/user-store.js`).
+- **A rename's project/credential sync IS retried on failure.** See
+  "Renaming a user is retryable" above — a `pendingCredentialSync` marker
+  survives a partial failure, and either resending the request or
+  `POST /api/users/:username/reconcile` finishes it, with no manual file
+  edits. There is still no cross-file TRANSACTION across `users.json`,
+  `projects.json`, and the credential tree (a flat-file store cannot offer
+  one) — what this buys instead is that the reconciliation is fully
+  idempotent, so retrying it is always safe and eventually completes it.
 - **Credentials are the owner's, not the actor's.** Anyone with access to a
   project uses the `primaryUser`'s account/quota, because terminals are one
   shared session per project.
 - **Seats.** Each owner needs their own Claude seat (Enterprise/Max/Pro) and, for
   Copilot, their own GitHub Copilot licence.
 - Specialised spawn paths (`ensureProjectTmuxSession` / PVIKPBot) are not wired
-  for per-user creds; only the standard project terminals and manually-opened
-  tabs are.
+  for per-user creds; only the standard project terminals (both the
+  dashboard-created path AND the host-mode systemd-launched initial terminal,
+  `scripts/project-terminal-start`) and manually-opened tabs are.
 
 ## Implementation
 
 - `app/credential-writer.mjs` — the privilege-dropped helper that performs every
   write into the credential tree. Reads a JSON job on stdin, writes a JSON result
-  on stdout.
+  on stdout. Shared by both entrypoints below — neither one duplicates its logic.
 - `app/user-store.js` — serialized, re-reading read-modify-write for
   `users.json`, so a slow request cannot write a stale whole-file snapshot back
-  over a concurrent role change, token rotation, or deletion.
+  over a concurrent role change, token rotation, or deletion. Its `update()`
+  also accepts an `effect(users, outcome)` hook that runs inside the SAME
+  serialized tail as the commit, so a caller's derived-state side effects
+  (git credential resync, credential-tree prune) cannot commit in one order
+  and apply in another.
 - `app/terminal-owner.js` — which OS account owns pane-visible files
   (`terminalOwnerPlan`, `parsePasswdEntry`, `resolveTerminalOwner`). Also exports
   `HOST_TERMINAL_USER`, which `server.js`'s `tmux()` uses for its
@@ -277,15 +329,35 @@ up mixed; recycling is what makes it uniform.
 - `app/user-credentials.js` — creating and owning the credential material
   (`ensureUserCredentials`), the non-secret session stamp
   (`credentialFingerprint`), and the drift decision (`sessionCredentialState`).
+- `app/project-owner.js`, `app/secret-crypto.js`, `app/users-file.js` — the
+  owner-resolution decision, the AES-256-GCM token encryption, and the
+  users.json reader, each extracted into its own small module so BOTH
+  entrypoints below use the identical implementation rather than two that
+  could drift apart.
 - `app/server.js` — `credentialContext(project)` returns the extra `env` tokens,
   the pane shell argv, and the fingerprint; it is used by `ensureTmuxSession` and
   `newTmuxWindow`. `credentialsStale(p)` feeds `GET /api/projects/status`;
   `POST /api/term/:project/recycle` performs the explicit reconciliation.
   Sign-in status is exposed via `GET /api/users` (`claudeSignedIn`,
   `perUserClaude`).
+- `app/project-terminal-credentials.mjs` — the SAME resolution, for the
+  host-mode systemd-launched initial terminal. Invoked by
+  `scripts/project-terminal-start` (`project-terminal@.service`, which runs as
+  `admin`, not root) before tmux/ttyd start; prints one JSON object to stdout
+  (`{"shared":true}` for the two intended shared-login cases, or
+  `{"configDir":...,"envFile":...,"fingerprint":...}` on success) and exits
+  nonzero with `{"ok":false,"error":...}` on any other failure. The script
+  stamps the returned fingerprint on the session (`@pw_cred_key`) exactly like
+  `app/server.js` does, so `credentialsStale` treats sessions from either
+  entrypoint identically.
 
 Tests: `test/terminal-owner.test.mjs` (ownership resolution, passwd validation,
 hostile account names), `test/user-credentials.test.mjs` (injective encoding,
 planted-symlink regressions, privilege-drop planning, stdin token delivery,
-pruning safety, drift detection) and `test/user-store.test.mjs` (the stale
-snapshot and lost-update races).
+pruning safety, drift detection), `test/user-store.test.mjs` (the stale
+snapshot and lost-update races, plus the `effect` hook's ordering guarantee),
+`test/project-owner.test.mjs`, `test/secret-crypto.test.mjs`,
+`test/users-file.test.mjs` (the three shared modules), and
+`test/project-terminal-credentials.test.mjs` /
+`test/project-terminal-start.test.mjs` (the host-mode entrypoint, the latter
+against the real script and a real, privately-socketed tmux server).

@@ -51,7 +51,15 @@ export function createUserStore({ load, save }) {
       // or the value was already correct) so we do not rewrite the file.
       if (outcome === false) return { changed: false, result: outcome };
       await save(users);
-      if (effect) await effect(users, outcome);
+      // `resave` lets the effect persist a follow-up mutation to the SAME
+      // in-memory `users` (e.g. "clear the marker I set once reconciliation
+      // actually succeeded") without calling update()/updateUser() again.
+      // Re-entering update() from inside an effect would chain onto `tail`,
+      // which by then already points at THIS call's own `run` — a
+      // self-deadlock, since the inner call could never settle before the
+      // outer one does. resave() writes directly, bypassing the queue,
+      // which is safe here: we already hold the only slot in it.
+      if (effect) await effect(users, outcome, () => save(users));
       return { changed: true, result: outcome };
     });
     tail = run.then(() => {}, () => {});

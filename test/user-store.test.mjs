@@ -218,3 +218,34 @@ test('an effect that throws surfaces to the caller but does not wedge the queue'
   await store.updateUser('a', (rec) => { rec.role = 'admin'; });
   assert.equal(disk.state.users[0].role, 'admin');
 });
+
+// REGRESSION: a real caller needs to clear a marker it set earlier in the
+// SAME mutation (e.g. "reconciliation succeeded, stop tracking it as
+// pending") once its effect finishes. The naive way to do that is to call
+// store.update()/updateUser() again from inside the effect — but that
+// re-enters `update()`, which chains onto the SAME `tail` the currently-
+// running effect is part of, so the inner call can never settle until the
+// outer one does: a self-deadlock. update() must give the effect a way to
+// persist a follow-up change WITHOUT re-entering the tail queue.
+test('REGRESSION: an effect can persist a follow-up change to the same record without deadlocking on its own tail', async () => {
+  const disk = fakeDisk([{ username: 'a', pending: true }]);
+  const store = createUserStore(disk);
+
+  const DEADLOCK_TIMEOUT = 2000;
+  const run = store.update(
+    (users) => users[0],
+    async (users, outcome, resave) => {
+      delete outcome.pending;
+      await resave();
+    },
+  );
+  const timeout = new Promise((_, reject) => setTimeout(() => reject(new Error('DEADLOCK: update() with an effect that resaves never settled')), DEADLOCK_TIMEOUT));
+  await Promise.race([run, timeout]);
+
+  assert.equal(disk.state.users[0].pending, undefined, 'the follow-up resave must actually have persisted');
+  assert.equal(disk.state.saves, 2, 'one save for the mutation, one for the effect\'s resave');
+
+  // The queue itself must still be alive afterward.
+  await store.updateUser('a', (rec) => { rec.role = 'admin'; });
+  assert.equal(disk.state.users[0].role, 'admin');
+});

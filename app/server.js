@@ -9,13 +9,15 @@ import { RELEASE_VERSION } from './version.js';
 import { resolveIsolation } from './isolation.js';
 import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
-import { normalizeUserRecord } from './users-compat.js';
 import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
 import { HOST_TERMINAL_USER, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF } from './user-credentials.js';
 import { createUserStore } from './user-store.js';
+import { makeSecretCrypto } from './secret-crypto.js';
+import { resolveProjectCredentialOwner } from './project-owner.js';
+import { loadUsersFile } from './users-file.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 
@@ -221,10 +223,11 @@ const DEFAULT_SHELL_ARGS = ['--noprofile','--norc'];
 async function projectCredentialOwner(project){
  if(!PER_USER_CLAUDE || !project?.primaryUser) return null;
  const users = await loadUsers();
- const u = users.find(x => x.username === project.primaryUser);
- if(!u) throw new Error(`primaryUser "${project.primaryUser}" does not exist in users.json`);
- const ghToken = u.ghToken ? (decrypt(u.ghToken) || '') : '';
- return { username: u.username, ghToken };
+ // Delegates to app/project-owner.js so this dashboard path and
+ // app/project-terminal-credentials.mjs (the host-mode systemd terminal
+ // startup path) enforce the identical fail-closed contract — one
+ // implementation, not two that could drift.
+ return resolveProjectCredentialOwner({ perUserEnabled: PER_USER_CLAUDE, project, users, decrypt });
 }
 // The fingerprint a project SHOULD be running on, computed without creating or
 // touching anything — cheap enough for the status poll. Propagates the same
@@ -353,10 +356,9 @@ async function verifyPassword(plain, stored){
 
 // Legacy GOA `isAdmin` records are mapped to canonical role/projects/id shape
 // (and the obsolete flag dropped) by normalizeUserRecord — see app/users-compat.js.
-async function loadUsers(){
- try { const raw = await fs.readFile(usersPath,'utf8'); const data = JSON.parse(raw); return (Array.isArray(data?.users) ? data.users : []).map(normalizeUserRecord); }
- catch(e){ if(e.code === 'ENOENT') return []; throw e; }
-}
+// Shared with app/project-terminal-credentials.mjs (see app/users-file.js) so
+// both entrypoints read users.json identically.
+async function loadUsers(){ return loadUsersFile(usersPath); }
 async function saveUsers(users){
  await fs.mkdir(path.dirname(usersPath),{recursive:true});
  await fs.writeFile(usersPath, JSON.stringify({ users }, null, 2)+'\n');
@@ -626,39 +628,11 @@ function slug(s){ return String(s ?? '').replace(/[^A-Za-z0-9._-]/g,'_').slice(0
 function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
 
 // ── Deploy Centre credential encryption (AES-256-GCM) ───────────────────────
-let _encKey = null;
-function getEncryptionKey() {
- if (_encKey) return _encKey;
- try {
-  const hex = fsSync.readFileSync(SECRET_KEY_PATH, 'utf8').trim();
-  _encKey = Buffer.from(hex, 'hex');
-  if (_encKey.length !== 32) throw new Error('Key must be 32 bytes');
-  return _encKey;
- } catch (e) {
-  throw new Error('Encryption key not found at ' + SECRET_KEY_PATH + ': ' + e.message);
- }
-}
-function encrypt(plaintext) {
- if (!plaintext) return '';
- const key = getEncryptionKey();
- const iv = crypto.randomBytes(12);
- const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
- const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
- const tag = cipher.getAuthTag();
- return 'enc:' + Buffer.concat([iv, tag, enc]).toString('base64');
-}
-function decrypt(ciphertext) {
- if (!ciphertext) return '';
- if (!ciphertext.startsWith('enc:')) return ciphertext;
- const key = getEncryptionKey();
- const buf = Buffer.from(ciphertext.slice(4), 'base64');
- const iv = buf.subarray(0, 12);
- const tag = buf.subarray(12, 28);
- const enc = buf.subarray(28);
- const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
- decipher.setAuthTag(tag);
- return decipher.update(enc, null, 'utf8') + decipher.final('utf8');
-}
+// Shared with app/project-terminal-credentials.mjs (see app/secret-crypto.js)
+// so the host-mode terminal-startup path decrypts a user's GitHub token with
+// the exact same implementation, not a second hand-copied one that could
+// silently drift from it.
+const { encrypt, decrypt } = makeSecretCrypto({ secretKeyPath: SECRET_KEY_PATH });
 
 // ─── Deploy Centre helpers ──────────────────────────────────────────────────
 async function loadDeployConfig(){ try { return JSON.parse(await fs.readFile(deployConfigPath,'utf8')); } catch { return {}; } }
@@ -2639,7 +2613,10 @@ app.get(BASE + '/api/auth/check', async (req,res) => {
 // Last-admin guard prevents accidental lockout.
 // ============================================================================
 function safeUserShape(u){
- const out = { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+ const out = { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null,
+  // Surfaced so a stuck rename reconciliation (see reconcileRenameCredentials)
+  // is visible to an admin rather than a hidden users.json-only field.
+  pendingCredentialSync: !!u.pendingCredentialSync };
  if(DEPLOY_CENTRE) out.hasDeployPassword = !!u.deployPassword;
  return out;
 }
@@ -2698,6 +2675,38 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
+// Finish a rename's outstanding project-reference + credential-tree
+// reconciliation. Used by the PATCH effect below (on the request that
+// started — or is retrying — a rename), by the explicit recovery endpoint
+// (POST /api/users/:username/reconcile), and by DELETE (to sweep a lingering
+// old-name reference an unfinished rename left behind). Every step here is
+// idempotent: it has to be, since any caller may be retrying after a partial
+// prior failure.
+//
+// Refuses — rather than reassigning or pruning — when `fromUsername` is now
+// held by a DIFFERENT current user than `userId`. That means the old
+// identity was reclaimed by someone else in the meantime: blindly proceeding
+// would hand that person's projects, or their (unrelated) credential tree at
+// the same path, to the renamed account. This is the one case reconciliation
+// cannot make progress on by itself — it stays pending until an admin
+// resolves the naming conflict (e.g. by renaming one of the two accounts).
+async function reconcileRenameCredentials({ userId, fromUsername, toUsername }){
+ const currentUsers = await loadUsers();
+ const claimant = currentUsers.find(u => u.username === fromUsername);
+ if(claimant && claimant.id !== userId){
+  throw new Error(`cannot reconcile: username "${fromUsername}" is now held by a different account — resolve the naming conflict before retrying`);
+ }
+ await withProjectsLock(async () => {
+  const projects = await loadProjects();
+  let changed = false;
+  for(const p of projects){ if(p.primaryUser === fromUsername){ p.primaryUser = toUsername; changed = true; } }
+  if(changed) await saveProjects(projects);
+ });
+ const projects = await loadProjects();
+ for(const p of projects){ if(p.primaryUser === toUsername) await syncProjectCredentials(p, currentUsers); }
+ await pruneUserCredentialTrees(currentUsers);
+}
+
 app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
@@ -2708,7 +2717,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
   // Validate and mutate inside one transaction: the last-admin guard and the
   // username-uniqueness guard are only meaningful against the list we then save.
-  let failure = null, before = null, after = null, oldUsername = null, renamed = false;
+  let failure = null, before = null, after = null, pending = null, tokenChanged = false;
   // Everything a rename/token-change implies beyond users.json runs as an
   // `effect` — INSIDE the same serialized tail as the commit (see
   // app/user-store.js) — so two concurrent updates can never commit users.json
@@ -2719,23 +2728,28 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   //     now has, from the freshly committed user list,
   //   - actively remove the OLD credential-tree namespace, rather than
   //     leaving it for the next boot/delete prune to (maybe) get to.
-  const effect = async (freshUsers) => {
-   if(!renamed && newToken === undefined) return;
+  // If that fails, `pending` (recorded on the user record as
+  // pendingCredentialSync, set inside the mutator below) survives the
+  // failure durably, so a RETRY — the identical request, a no-op edit, or the
+  // explicit POST .../reconcile endpoint — can finish the job without an
+  // admin editing files by hand.
+  const effect = async (freshUsers, outcome, resave) => {
+   if(!pending && !tokenChanged) return;
    try {
-    await withProjectsLock(async () => {
+    if(pending){
+     await reconcileRenameCredentials({ userId: outcome.id, fromUsername: pending.fromUsername, toUsername: pending.toUsername });
+     // Clear the marker via resave(), NOT another userStore call: we are
+     // still inside this same update()'s effect, and calling update()/
+     // updateUser() again here would re-enter the store's own serialization
+     // tail and deadlock against ourselves (see app/user-store.js).
+     delete outcome.pendingCredentialSync;
+     await resave();
+    } else {
      const projects = await loadProjects();
-     let changed = false;
-     if(renamed){
-      for(const p of projects){ if(p.primaryUser === oldUsername){ p.primaryUser = after.username; changed = true; } }
-      if(changed) await saveProjects(projects);
-     }
-     for(const p of projects){
-      if(p.primaryUser === after.username) await syncProjectCredentials(p, freshUsers);
-     }
-    });
-    if(renamed) await pruneUserCredentialTrees(freshUsers);
+     for(const p of projects){ if(p.primaryUser === outcome.username) await syncProjectCredentials(p, freshUsers); }
+    }
    } catch(e){
-    throw new Error(`user "${after.username}" was updated in users.json, but syncing dependent project/credential state failed: ${e?.message || e}. users.json reflects the change; retry this request to reattempt the sync, or reconcile project git credentials and the per-user credential tree manually.`);
+    throw new Error(`user "${after.username}" was updated in users.json, but syncing dependent project/credential state failed: ${e?.message || e}. users.json reflects the change${pending ? ' and a pending reconciliation marker was recorded' : ''}; retry this request${pending ? `, or POST ${BASE}/api/users/${encodeURIComponent(after.username)}/reconcile,` : ''} once the underlying issue is resolved.`);
    }
   };
   await userStore.update((users)=>{
@@ -2754,19 +2768,47 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
     failure = { status:409, error:'Refusing to demote the last admin (you would lock yourself out)' }; return false;
    }
    before = { username: u.username, role: u.role, projects: u.projects };
-   oldUsername = u.username;
-   renamed = newUsername !== undefined && newUsername !== u.username;
+   const isNewRename = newUsername !== undefined && newUsername !== u.username;
    if(newUsername !== undefined) u.username = newUsername;
    if(newRole !== undefined) u.role = newRole;
    if(newProjects !== undefined) u.projects = projectsResolved;
    if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
    if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
+   if(isNewRename){
+    // Chain from any UNFINISHED prior rename's original fromUsername, so
+    // renaming again before the first reconciliation ever succeeded still
+    // collapses to one reconciliation (old1 -> old2 -> new), not two.
+    u.pendingCredentialSync = { fromUsername: u.pendingCredentialSync?.fromUsername || before.username, toUsername: u.username };
+   }
+   // else: leave any existing u.pendingCredentialSync untouched — a retry
+   // with no new rename in THIS request body still carries forward whatever
+   // reconciliation was left unfinished, so the effect below can complete it.
+   pending = u.pendingCredentialSync || null;
+   tokenChanged = newToken !== undefined;
    after = u;
    return u;
   }, effect);
   if(failure) return res.status(failure.status).json({ ok:false, error: failure.error });
-  await audit('user_update', { target, before, after: { username: after.username, role: after.role, projects: after.projects, hasToken: !!after.ghToken }, renamed }, req);
+  await audit('user_update', { target, before, after: { username: after.username, role: after.role, projects: after.projects, hasToken: !!after.ghToken }, pendingCredentialSync: !!pending }, req);
   res.json({ ok:true, user: safeUserShape(after) });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+// Explicit recovery for a rename whose reconciliation is stuck (surfaced via
+// GET /api/users' pendingCredentialSync) — lets an admin retry it without
+// having to reconstruct and resend the original rename request.
+app.post(BASE + '/api/users/:username/reconcile', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const users = await loadUsers();
+  const u = users.find(x => x.username === target);
+  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  if(!u.pendingCredentialSync) return res.json({ ok:true, pending:false });
+  await reconcileRenameCredentials({ userId: u.id, fromUsername: u.pendingCredentialSync.fromUsername, toUsername: u.pendingCredentialSync.toUsername });
+  const updated = await userStore.updateUser((x) => x.id === u.id, (rec)=>{ delete rec.pendingCredentialSync; });
+  if(updated.result === false) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  await audit('user_reconcile', { target }, req);
+  res.json({ ok:true, pending:false, reconciled:true });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
@@ -2801,6 +2843,14 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
    return res.status(409).json({ ok:false, error:'Refusing to delete the last admin (you would lock yourself out)' });
   }
   const remainingUsers = users.filter(u => u.username !== target);
+  // An unfinished rename (see reconcileRenameCredentials) can leave a project
+  // still pointing at the OLD username while this record already carries the
+  // CURRENT one. Deleting the identity must revoke that reference too — but
+  // only if the old name has not since been reclaimed by a different
+  // account, which now legitimately owns whatever it names.
+  const oldName = victim.pendingCredentialSync?.fromUsername;
+  const oldNameStillOurs = oldName && !remainingUsers.some(u => u.username === oldName);
+  const namesToClear = new Set([target, ...(oldNameStillOurs ? [oldName] : [])]);
 
   // Phase 2: revoke project references, git credentials, the per-user
   // credential tree, and sessions — BEFORE the irreversible identity removal,
@@ -2818,7 +2868,7 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
    // excludes the victim either way), so this is safe to repeat on a retry.
    const projectsBeforeCleanup = await loadProjects();
    for(const p of projectsBeforeCleanup){
-    if(p.primaryUser === target) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers);
+    if(namesToClear.has(p.primaryUser)) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers);
    }
    await pruneUserCredentialTrees(remainingUsers);
    const sessions = await loadSessions();
@@ -2830,7 +2880,7 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
    await withProjectsLock(async () => {
     const fresh = await loadProjects();
     let changed = false;
-    for(const p of fresh){ if(p.primaryUser === target){ delete p.primaryUser; changed = true; } }
+    for(const p of fresh){ if(namesToClear.has(p.primaryUser)){ delete p.primaryUser; changed = true; } }
     if(changed) await saveProjects(fresh);
    });
    if(sessionsChanged){ sessionsCache = kept; await saveSessions(); }

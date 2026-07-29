@@ -288,16 +288,35 @@ test('REGRESSION: a rename + token change together must resync EVERY owned proje
   });
 });
 
-test('REGRESSION: concurrent token updates never leave the derived git credential file diverged from users.json', { timeout: 30000 }, async () => {
-  // The exact ordering proof (a slow effect for an EARLIER commit must not
-  // clobber a later commit's effect) is deterministic only with a controlled
-  // clock, which test/user-store.test.mjs exercises directly against
-  // createUserStore. Real concurrent HTTP requests can't be forced into a
-  // specific relative order without a test-only hook, so this route-level
-  // test asserts the weaker-but-fully-deterministic invariant instead: after
-  // two racing PATCHes settle, whatever users.json ends up holding is EXACTLY
-  // what the derived git credential file holds too — no stale snapshot,
-  // regardless of which request happened to "win".
+// Inverse of encryptToken() above — lets a test independently confirm what a
+// user's ghToken in users.json actually decrypts to, using nothing but the
+// on-disk ciphertext and the instance's own secret key. This is READ-ONLY:
+// unlike a "verification write" (re-issuing a mutating PATCH to see if it
+// still succeeds), decrypting a value can't itself change or paper over the
+// state being checked.
+function decryptToken(secretKeyHex, ciphertext) {
+  const key = Buffer.from(secretKeyHex, 'hex');
+  const buf = Buffer.from(ciphertext.slice(4), 'base64'); // strip 'enc:'
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(12, 28);
+  const enc = buf.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return decipher.update(enc, null, 'utf8') + decipher.final('utf8');
+}
+
+test('REGRESSION: two racing token updates deterministically leave the NEWER one (B) in both users.json and the derived credential file', { timeout: 30000 }, async () => {
+  // update()'s effect runs inside the SAME serialized tail as the commit
+  // (app/user-store.js), so whichever request's handler calls
+  // userStore.update() SECOND cannot even start its own commit until the
+  // FIRST request's entire commit+effect has finished — there is no window
+  // for the two to interleave. Firing A then B back-to-back (same tick, no
+  // await between) without awaiting A first reliably reproduces "A is still
+  // the one in flight when B arrives", i.e. exactly the scenario a
+  // stale-snapshot bug would get wrong; empirically 30/30 locally. This is
+  // the ordering claim itself; the exact "delayed A must not clobber B"
+  // mechanism is proven with a fully controlled clock in
+  // test/user-store.test.mjs.
   const port = 3907;
   const inst = makeInstance(port);
   const proj = seedProject(inst, 'demo', { git: true });
@@ -308,20 +327,23 @@ test('REGRESSION: concurrent token updates never leave the derived git credentia
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ghToken }),
     }).then((r) => r.json());
 
-    const [a, b] = await Promise.all([patch('ghp_A'), patch('ghp_B')]);
+    const pA = patch('ghp_A');
+    const pB = patch('ghp_B'); // fired immediately after, NOT awaited between
+    const [a, b] = await Promise.all([pA, pB]);
     assert.ok(a.ok && b.ok, JSON.stringify({ a, b }));
 
-    const finalUsers = await getUsers(base);
-    const alice = finalUsers.find((u) => u.username === 'alice');
-    assert.ok(alice.hasToken);
-    const fileToken = readGhTokenFromCredFile(proj);
-    assert.ok(fileToken === 'ghp_A' || fileToken === 'ghp_B', `unexpected token in credential file: ${fileToken}`);
+    // Independent verification #1: decrypt users.json's OWN ciphertext directly
+    // off disk — no HTTP round-trip, no route logic involved in the check.
+    const onDisk = JSON.parse(fs.readFileSync(inst.env.PW_USERS_PATH, 'utf8'));
+    const aliceRecord = onDisk.users.find((u) => u.username === 'alice');
+    const usersJsonToken = decryptToken(inst.secretKey, aliceRecord.ghToken);
+    assert.equal(usersJsonToken, 'ghp_B', 'users.json must hold the NEWER commit');
 
-    // Confirm the file matches users.json's OWN idea of the current token by
-    // re-running the identical mutation (a no-op resync) and diffing before/after.
-    const resynced = await patch(fileToken);
-    assert.equal(resynced.ok, true);
-    assert.equal(readGhTokenFromCredFile(proj), fileToken, 'a no-op resync to the same token must be idempotent — proves the file was already consistent, not accidentally correct');
+    // Independent verification #2: read the derived git credential file
+    // directly — no mutating "check" (a resync PATCH) that could itself
+    // paper over a divergence between the two.
+    const fileToken = readGhTokenFromCredFile(proj);
+    assert.equal(fileToken, 'ghp_B', 'the derived credential file must match — not whichever effect happened to run last in real time');
   });
 });
 
@@ -514,4 +536,211 @@ test('SECURITY: the fail-closed credential path never catches a failure back int
 test('SECURITY: PER_USER_CLAUDE remains default-off', () => {
   const src = fs.readFileSync(path.join(appDir, 'server.js'), 'utf8');
   assert.match(src, /PW_PER_USER_CLAUDE \|\| ''/, 'an unset env var must resolve to falsy, not an opt-out default');
+});
+
+// ---------------------------------------------------------------------------
+// Blocker #2 (independent acceptance review): rename reconciliation must be
+// retryable. A partial failure after users.json commits the new username
+// must leave a durable, idempotent trail so the SAME request (or an explicit
+// recovery request) can finish project.primaryUser updates, credential
+// resync, and old-tree pruning — without an admin editing files by hand.
+// ---------------------------------------------------------------------------
+
+function patchUser(base, username, bodyObj) {
+  return fetch(`${base}/api/users/${encodeURIComponent(username)}`, {
+    method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(bodyObj),
+  }).then((r) => r.json());
+}
+function reconcileUser(base, username) {
+  return fetch(`${base}/api/users/${encodeURIComponent(username)}/reconcile`, { method: 'POST' }).then((r) => r.json());
+}
+async function getUsersRaw(base) {
+  const body = await (await fetch(`${base}/api/users`)).json();
+  return body.users;
+}
+
+test('pendingCredentialSync is surfaced via GET /api/users so an admin can see it needs attention', { timeout: 30000 }, async () => {
+  const port = 3908;
+  const inst = makeInstance(port);
+  const proj = seedProject(inst, 'demo');
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7819, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  await withServer(inst, port, async (base) => {
+    let users = await getUsersRaw(base);
+    assert.equal(users[0].pendingCredentialSync, false);
+
+    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    try {
+      const patch = await patchUser(base, 'alice', { username: 'alicia' });
+      assert.equal(patch.ok, false);
+    } finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+
+    users = await getUsersRaw(base);
+    assert.equal(users.find((u) => u.username === 'alicia').pendingCredentialSync, true, 'a stuck reconciliation must be visible, not a hidden file-only state');
+  });
+});
+
+test('REGRESSION: retrying the IDENTICAL rename PATCH finishes reconciliation after the project-reference stage failed', { timeout: 30000 }, async () => {
+  const port = 3909;
+  const inst = makeInstance(port);
+  const proj = seedProject(inst, 'demo', { git: true });
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7820, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*', ghToken: encryptToken(inst.secretKey, 'ghp_x') }]);
+  await withServer(inst, port, async (base) => {
+    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444); // saveProjects() will fail: EACCES
+    try {
+      const first = await patchUser(base, 'alice', { username: 'alicia' });
+      assert.equal(first.ok, false, 'a project-reference-reassignment failure must not be reported as success');
+    } finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+
+    // users.json already committed the rename (the identity change is not
+    // rolled back); the project reference must NOT have moved yet.
+    assert.equal((await getUsersRaw(base)).some((u) => u.username === 'alicia'), true);
+    assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, 'alice');
+
+    // Retry with the identical body — a no-op rename this time (already
+    // renamed), but the persisted pendingCredentialSync marker must still
+    // drive the reconciliation through to completion.
+    const retry = await patchUser(base, 'alicia', { username: 'alicia' });
+    assert.equal(retry.ok, true, JSON.stringify(retry));
+    assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, 'alicia');
+    assert.equal(readGhTokenFromCredFile(proj), 'ghp_x');
+    assert.equal((await getUsersRaw(base)).find((u) => u.username === 'alicia').pendingCredentialSync, false);
+  });
+});
+
+test('REGRESSION: retrying finishes reconciliation after the git-credential-resync stage failed', { timeout: 30000 }, async () => {
+  const port = 3910;
+  const inst = makeInstance(port);
+  const proj = seedProject(inst, 'demo', { git: true });
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7821, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*', ghToken: encryptToken(inst.secretKey, 'ghp_x') }]);
+  const gitDir = path.join(proj, '.git');
+  await withServer(inst, port, async (base) => {
+    fs.chmodSync(gitDir, 0o555); // creating .pw-credentials inside will fail: EACCES
+    try {
+      const first = await patchUser(base, 'alice', { username: 'alicia' });
+      assert.equal(first.ok, false);
+    } finally { fs.chmodSync(gitDir, 0o755); }
+
+    assert.equal(readGhTokenFromCredFile(proj), null, 'the resync must not have happened yet');
+
+    const retry = await patchUser(base, 'alicia', { username: 'alicia' });
+    assert.equal(retry.ok, true, JSON.stringify(retry));
+    assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, 'alicia');
+    assert.equal(readGhTokenFromCredFile(proj), 'ghp_x');
+  });
+});
+
+test('REGRESSION: retrying finishes reconciliation after the credential-tree-prune stage failed', { timeout: 30000 }, async () => {
+  const port = 3911;
+  const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true' });
+  writeProjects(inst, []);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  const credDir = path.join(inst.env.PW_USER_CRED_BASE, 'alice', 'claude');
+  fs.mkdirSync(credDir, { recursive: true });
+  fs.writeFileSync(path.join(credDir, '.claude.json'), '{}');
+  await withServer(inst, port, async (base) => {
+    fs.rmSync(inst.env.PW_USER_CRED_BASE, { recursive: true, force: true });
+    fs.writeFileSync(inst.env.PW_USER_CRED_BASE, 'not a directory'); // pruneUserCredentialTrees will throw
+    try {
+      const first = await patchUser(base, 'alice', { username: 'alicia' });
+      assert.equal(first.ok, false);
+    } finally { fs.rmSync(inst.env.PW_USER_CRED_BASE, { force: true }); }
+
+    const retry = await patchUser(base, 'alicia', { username: 'alicia' });
+    assert.equal(retry.ok, true, JSON.stringify(retry));
+    assert.equal((await getUsersRaw(base)).find((u) => u.username === 'alicia').pendingCredentialSync, false);
+  });
+});
+
+test('REGRESSION: the explicit recovery endpoint finishes a stuck reconciliation without resending the rename', { timeout: 30000 }, async () => {
+  const port = 3912;
+  const inst = makeInstance(port);
+  const proj = seedProject(inst, 'demo', { git: true });
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7822, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*', ghToken: encryptToken(inst.secretKey, 'ghp_x') }]);
+  await withServer(inst, port, async (base) => {
+    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
+    finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+
+    const recovered = await reconcileUser(base, 'alicia');
+    assert.equal(recovered.ok, true, JSON.stringify(recovered));
+    assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, 'alicia');
+
+    // Idempotent: nothing pending now, so calling it again is a harmless no-op.
+    const again = await reconcileUser(base, 'alicia');
+    assert.equal(again.ok, true);
+    assert.equal(again.pending, false);
+  });
+});
+
+test('REGRESSION: no mistaken takeover — reconciliation refuses when the old username has been reclaimed by a different account', { timeout: 30000 }, async () => {
+  const port = 3913;
+  const inst = makeInstance(port);
+  const projAlicia = seedProject(inst, 'aliciaProj', { git: true });
+  const projNewAlice = seedProject(inst, 'newAliceProj', { git: true });
+  writeProjects(inst, [
+    { name: 'aliciaProj', path: projAlicia, port: 7823, primaryUser: 'alice' },
+    { name: 'newAliceProj', path: projNewAlice, port: 7824 },
+  ]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  await withServer(inst, port, async (base) => {
+    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
+    finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+    // aliciaProj still points at "alice" (unreconciled) at this point.
+
+    // A brand new, DIFFERENT person takes the now-vacant username "alice" and
+    // is deliberately given ownership of a different project.
+    const created = await fetch(`${base}/api/users`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'alice', role: 'developer', password: 'aB1!aB1!aB1!', projects: '*' }),
+    }).then((r) => r.json());
+    assert.equal(created.ok, true);
+    await withProjectsLockTestHelper(inst, 'newAliceProj', 'alice');
+
+    // Retrying alicia's reconciliation must refuse — reassigning
+    // aliciaProj's project reference (or pruning "alice"'s credential
+    // namespace) now would hijack the NEW alice's identity/projects.
+    const attempt = await patchUser(base, 'alicia', { username: 'alicia' });
+    assert.equal(attempt.ok, false, 'must not silently claim success while an unresolved naming conflict exists');
+    assert.match(attempt.error, /alice/i);
+
+    const cfg = await readProjectsConfig(base);
+    assert.equal(cfg.projects.find((p) => p.name === 'aliciaProj').primaryUser, 'alice', 'must not have been reassigned to alicia — that would take over nothing (still says "alice")');
+    assert.equal(cfg.projects.find((p) => p.name === 'newAliceProj').primaryUser, 'alice', 'the NEW alice\'s own project must be completely untouched');
+  });
+});
+
+// Writes projects.json directly (bypassing HTTP) to assign a primaryUser,
+// used only to set up the "both names exist" fixture above without needing
+// a dedicated route round-trip.
+async function withProjectsLockTestHelper(inst, projectName, primaryUser) {
+  const projects = JSON.parse(fs.readFileSync(inst.env.PW_REGISTRY_PATH, 'utf8'));
+  for (const p of projects) if (p.name === projectName) p.primaryUser = primaryUser;
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify(projects, null, 2));
+}
+
+test('REGRESSION: deleting a user with an unfinished rename also revokes the lingering OLD-name project reference', { timeout: 30000 }, async () => {
+  const port = 3914;
+  const inst = makeInstance(port);
+  const proj = seedProject(inst, 'demo', { git: true });
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7825, primaryUser: 'alice' }]);
+  writeUsers(inst, [
+    { id: 'u-alice', username: 'alice', role: 'developer', projects: '*', ghToken: encryptToken(inst.secretKey, 'ghp_x') },
+    { id: 'u-admin', username: 'admin0', role: 'admin', projects: '*' },
+  ]);
+  await withServer(inst, port, async (base) => {
+    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
+    finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+    // demo.primaryUser is still "alice" (the rename never finished reconciling).
+
+    const del = await fetch(`${base}/api/users/alicia`, { method: 'DELETE' }).then((r) => r.json());
+    assert.equal(del.ok, true, JSON.stringify(del));
+    assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, '',
+      'the reference under the OLD name must be revoked too, not just one under the current name');
+  });
 });
