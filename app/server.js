@@ -14,7 +14,8 @@ import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
 import { HOST_TERMINAL_USER, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF } from './user-credentials.js';
+import { createUserStore } from './user-store.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 
@@ -183,6 +184,27 @@ async function terminalOwner(){
  terminalOwnerCache = owner;
  return owner;
 }
+// Credential-tree work is NEVER done by this root process: the tree lives under
+// an account every terminal shares, so a root write there is a symlink attack
+// away from being a local root escalation. We drop to that account and run
+// app/credential-writer.mjs, handing it the job (token included) on stdin so it
+// never reaches a command line. See app/user-credentials.js for the full note.
+const CREDENTIAL_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), 'credential-writer.mjs');
+function runCredentialJob(job, plan){
+ const argv = credentialDropArgv({ owner: plan.owner, execPath: process.execPath, helperPath: CREDENTIAL_HELPER });
+ return spawnCredentialJob({ spawn, argv, job });
+}
+// Drop credential trees that no longer belong to a current user. Called after a
+// deletion and once at boot, so a tree orphaned while the service was down (or
+// by an out-of-band edit of users.json) does not linger with a live token in it.
+async function pruneUserCredentialTrees(users){
+ if(!PER_USER_CLAUDE) return { removed: [] };
+ const list = users || await loadUsers();
+ return pruneCredentials({
+  fsp: fs, base: USER_CRED_BASE, keep: list.map(u => u.username).filter(Boolean),
+  owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
+ });
+}
 // What a project's tmux session should be launched with. `tokens` are extra
 // non-secret `env` KEY=VALUE entries; `shellArgs` is the pane shell's argv tail;
 // `key` is the credential fingerprint stamped on the session (see CRED_KEY_OPTION).
@@ -210,7 +232,8 @@ async function credentialContext(project){
  try {
   const cred = await ensureUserCredentials({
    fsp: fs, base: USER_CRED_BASE, username: owner.username,
-   ghToken: owner.ghToken, sharedClaudeJson, owner: await terminalOwner(),
+   ghToken: owner.ghToken, sharedClaudeJson,
+   owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
   });
   return {
    tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir],
@@ -320,6 +343,13 @@ async function saveUsers(users){
  await fs.writeFile(usersPath, JSON.stringify({ users }, null, 2)+'\n');
  await fs.chmod(usersPath, 0o600).catch(()=>{});
 }
+
+// Every user mutation goes through here. It re-reads the file after any slow
+// await (directory bind, password hash) and serializes concurrent updates, so a
+// long-running request can no longer write a stale whole-file snapshot back over
+// somebody else's role change, token rotation, or deletion. Same intent as
+// withProjectsLock below, plus the re-read. See app/user-store.js.
+const userStore = createUserStore({ load: loadUsers, save: saveUsers });
 
 // ---- LDAP (ldap mode) --------------------------------------------------------
 // Simple bind over TLS via ldapwhoami (no native deps). The DC cert is validated
@@ -2508,8 +2538,9 @@ app.post(BASE + '/api/auth/login', async (req,res) => {
   if(!u){ await audit('login_fail', { reason:'invalid', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
   const sid = await createSession(u.id);
   setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
-  // Record lastLoginAt opportunistically (best-effort; re-load so we mutate the persisted record).
-  try { const list = await loadUsers(); const rec = list.find(x => x.id === u.id); if(rec){ rec.lastLoginAt = new Date().toISOString(); await saveUsers(list); } } catch {}
+  // Record lastLoginAt opportunistically (best-effort; the store re-reads so this
+  // cannot revert a change made while the directory bind above was in flight).
+  try { await userStore.updateUser(x => x.id === u.id, (rec)=>{ rec.lastLoginAt = new Date().toISOString(); }); } catch {}
   req.user = u;
   await audit('login_ok', { username }, req);
   res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
@@ -2621,8 +2652,14 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   if(passwordHash) rec.passwordHash = passwordHash;
   if(ghToken) rec.ghToken = encrypt(ghToken);
   if(deployPassword) rec.deployPassword = encrypt(deployPassword);
-  users.push(rec);
-  await saveUsers(users);
+  // Re-check uniqueness inside the transaction: the hash above is deliberately
+  // slow, which is exactly long enough for a concurrent create to land.
+  let conflict = false;
+  await userStore.update((fresh)=>{
+   if(fresh.some(u => u.username === username)){ conflict = true; return false; }
+   fresh.push(rec);
+  });
+  if(conflict) return res.status(409).json({ ok:false, error:`User "${username}" already exists` });
   await audit('user_create', { username, role, projects, hasToken: !!ghToken }, req);
   res.json({ ok:true, user: safeUserShape(rec) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
@@ -2631,41 +2668,46 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
 app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
-  const users = await loadUsers();
-  const u = users.find(x => x.username === target);
-  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
   const newUsername = req.body?.username !== undefined ? String(req.body.username).trim() : undefined;
   const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
   const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
   const newToken = req.body?.ghToken !== undefined ? String(req.body.ghToken || '').trim() : undefined;
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
-  if(newUsername !== undefined){
-   if(!validNewUsername(newUsername)) return res.status(400).json({ ok:false, error:'Invalid username' });
-   if(newUsername !== u.username && users.some(x => x.username === newUsername)) return res.status(409).json({ ok:false, error:`Username "${newUsername}" already exists` });
-  }
-  if(newRole !== undefined && !ROLES.includes(newRole)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
-  let projectsResolved = u.projects;
-  if(newProjects !== undefined){
-   try { projectsResolved = normalizeProjects(newProjects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
-  }
-  if(newRole !== undefined && newRole !== 'admin' && u.role === 'admin' && countAdmins(users) <= 1){
-   return res.status(409).json({ ok:false, error:'Refusing to demote the last admin (you would lock yourself out)' });
-  }
-  const before = { username: u.username, role: u.role, projects: u.projects };
-  if(newUsername !== undefined) u.username = newUsername;
-  if(newRole !== undefined) u.role = newRole;
-  if(newProjects !== undefined) u.projects = projectsResolved;
-  if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
-  if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
-  await saveUsers(users);
+  // Validate and mutate inside one transaction: the last-admin guard and the
+  // username-uniqueness guard are only meaningful against the list we then save.
+  let failure = null, before = null, after = null, freshUsers = null;
+  await userStore.update((users)=>{
+   const u = users.find(x => x.username === target);
+   if(!u){ failure = { status:404, error:`User "${target}" not found` }; return false; }
+   if(newUsername !== undefined){
+    if(!validNewUsername(newUsername)){ failure = { status:400, error:'Invalid username' }; return false; }
+    if(newUsername !== u.username && users.some(x => x.username === newUsername)){ failure = { status:409, error:`Username "${newUsername}" already exists` }; return false; }
+   }
+   if(newRole !== undefined && !ROLES.includes(newRole)){ failure = { status:400, error:`role must be one of: ${ROLES.join(', ')}` }; return false; }
+   let projectsResolved = u.projects;
+   if(newProjects !== undefined){
+    try { projectsResolved = normalizeProjects(newProjects); } catch(e){ failure = { status:400, error: e.message }; return false; }
+   }
+   if(newRole !== undefined && newRole !== 'admin' && u.role === 'admin' && countAdmins(users) <= 1){
+    failure = { status:409, error:'Refusing to demote the last admin (you would lock yourself out)' }; return false;
+   }
+   before = { username: u.username, role: u.role, projects: u.projects };
+   if(newUsername !== undefined) u.username = newUsername;
+   if(newRole !== undefined) u.role = newRole;
+   if(newProjects !== undefined) u.projects = projectsResolved;
+   if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
+   if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
+   after = u; freshUsers = users;
+  });
+  if(failure) return res.status(failure.status).json({ ok:false, error: failure.error });
   if(newToken !== undefined){
    const projects = await loadProjects();
    for(const p of projects){
-    if(p.primaryUser === u.username) await syncProjectCredentials(p, users);
+    if(p.primaryUser === after.username) await syncProjectCredentials(p, freshUsers);
    }
   }
-  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken } }, req);
-  res.json({ ok:true, user: safeUserShape(u) });
+  await audit('user_update', { target, before, after: { username: after.username, role: after.role, projects: after.projects, hasToken: !!after.ghToken } }, req);
+  res.json({ ok:true, user: safeUserShape(after) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
@@ -2676,10 +2718,12 @@ app.post(BASE + '/api/users/:username/password', requireAdmin, async (req,res) =
   const password = String(req.body?.password || '');
   if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   const users = await loadUsers();
-  const u = users.find(x => x.username === target);
-  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
-  u.passwordHash = await hashPassword(password);
-  await saveUsers(users);
+  if(!users.some(x => x.username === target)) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  // Hash before opening the transaction — it is slow by design, and holding the
+  // store across it would serialize every other user write behind it.
+  const passwordHash = await hashPassword(password);
+  const updated = await userStore.updateUser(target, (rec)=>{ rec.passwordHash = passwordHash; });
+  if(updated.result === false) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
   await audit('user_password_change', { target }, req);
   res.json({ ok:true });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
@@ -2688,14 +2732,17 @@ app.post(BASE + '/api/users/:username/password', requireAdmin, async (req,res) =
 app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
-  const users = await loadUsers();
-  const i = users.findIndex(u => u.username === target);
-  if(i < 0) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
-  if(isAdmin(users[i]) && countAdmins(users) <= 1){
-   return res.status(409).json({ ok:false, error:'Refusing to delete the last admin (you would lock yourself out)' });
-  }
-  const [removed] = users.splice(i, 1);
-  await saveUsers(users);
+  let failure = null, removed = null, remainingUsers = null;
+  await userStore.update((users)=>{
+   const i = users.findIndex(u => u.username === target);
+   if(i < 0){ failure = { status:404, error:`User "${target}" not found` }; return false; }
+   if(isAdmin(users[i]) && countAdmins(users) <= 1){
+    failure = { status:409, error:'Refusing to delete the last admin (you would lock yourself out)' }; return false;
+   }
+   [removed] = users.splice(i, 1);
+   remainingUsers = users;
+  });
+  if(failure) return res.status(failure.status).json({ ok:false, error: failure.error });
   // Revoke any on-disk git credentials this user seeded: for every project that
   // named them primaryUser, drop the reference and re-sync (the user is already
   // gone from `users`, so syncProjectCredentials takes the clear path — removes
@@ -2705,10 +2752,15 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
    const projects = await loadProjects();
    let changed = false;
    for(const p of projects){
-    if(p.primaryUser === target){ delete p.primaryUser; await syncProjectCredentials(p, users); changed = true; }
+    if(p.primaryUser === target){ delete p.primaryUser; await syncProjectCredentials(p, remainingUsers); changed = true; }
    }
    if(changed) await saveProjects(projects);
   } catch {}
+  // Remove the deleted account's per-user credential tree: their Claude OAuth
+  // login and GitHub token would otherwise stay readable on disk indefinitely.
+  // Runs as the terminal account, like every other write into that tree.
+  try { await pruneUserCredentialTrees(remainingUsers); }
+  catch(e){ console.warn(`[per-user-claude] credential prune after deleting ${target} failed: ${e?.message || e}`); }
   try {
    const sessions = await loadSessions();
    const remaining = sessions.filter(s => s.userId !== removed.id);
@@ -2921,8 +2973,12 @@ if(DEPLOY_CENTRE){
   }
   const effectivePassword = decision.password;
   // Persist a freshly-entered password if the user opted in (encrypted at rest).
-  if(decision.save && currentUser){
-   try { currentUser.deployPassword = encrypt(submitted); await saveUsers(users); }
+  // Re-resolve the record inside the store: `users` above was read before the
+  // directory bind and is now potentially stale.
+  if(decision.save){
+   try {
+    await userStore.updateUser(req.user?.username, (rec)=>{ rec.deployPassword = encrypt(submitted); });
+   }
    catch(e){ /* non-fatal: the deploy still proceeds if saving fails */ }
   }
   const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
@@ -2991,6 +3047,11 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const srv = app.listen(PORT,'127.0.0.1',()=>{
  console.log(`dashboard listening on 127.0.0.1:${PORT}`);
  console.log(`[deploy-mode] ${DEPLOY_MODE}`);
+ if(!ISOLATED && PER_USER_CLAUDE){
+  pruneUserCredentialTrees()
+   .then(r => { if(r.removed?.length) console.log(`[per-user-claude] pruned ${r.removed.length} orphaned credential tree(s)`); })
+   .catch(e => console.warn(`[per-user-claude] boot credential prune failed: ${e?.message || e}`));
+ }
  if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
  if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
  sweepOrphanTmuxSessions();

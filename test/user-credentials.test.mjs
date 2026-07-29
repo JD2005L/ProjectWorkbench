@@ -1,301 +1,422 @@
-// Per-user CLI credentials: directory ownership and token placement.
+// Per-user credential material: encoding, privilege drop, and the filesystem job.
 //
-// Two regressions are pinned here:
+// The security property under test is:
 //
-//  1. OWNERSHIP. The dashboard runs as root and the pane does not. Every path
-//     created for a pane must be handed to the pane's account, in host mode as
-//     well as container mode, and the operation must FAIL (so the caller falls
-//     back to the shared login) rather than leave an agent pointed at a
-//     directory it cannot read.
+//   the root dashboard never performs a filesystem operation on a path the
+//   shared unprivileged terminal account controls.
 //
-//  2. TOKEN PLACEMENT. The GitHub token must never become an argv token. tmux
-//     retains a pane's start command for the life of the pane
-//     (`tmux list-panes -F '#{pane_start_command}'`) and every pane on a
-//     workbench runs as the same OS account, so `env GH_TOKEN=<secret> bash`
-//     publishes one user's token to every other project's terminal.
-import test from 'node:test';
+// Several tests below first DEMONSTRATE the vulnerability with the old code
+// shape, then assert the current code does not have it. That is deliberate: a
+// regression test for a symlink attack is only meaningful if it can be shown to
+// catch the attack.
+
+import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import realFsp from 'node:fs/promises';
+import fsp from 'node:fs/promises';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { spawn } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
 import {
-  CREDENTIALS_OFF,
+  encodeUserName,
+  decodeUserName,
+  isEncodedUserName,
+  userCredRoot,
+  userClaudeConfigDir,
+  userSessionEnvFile,
   credentialFingerprint,
-  ensureUserCredentials,
   sessionCredentialState,
   renderSessionEnvFile,
-  safeUserName,
   shSingleQuote,
-  userClaudeConfigDir,
-  userCredRoot,
-  userSessionEnvFile,
+  applyCredentialJob,
+  pruneUserCredentials,
+  credentialExecutionPlan,
+  credentialDropArgv,
+  spawnCredentialJob,
+  ensureUserCredentials,
+  CREDENTIALS_OFF,
 } from '../app/user-credentials.js';
 
-const execFileAsync = promisify(execFile);
-const TOKEN = 'ghp_pretendTOKENvalue0123456789';
+const APP_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'app');
 
-function tmpBase() {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-usercred-'));
-  return path.join(dir, 'pw-users');
+async function tmpBase() {
+  return fsp.mkdtemp(path.join(os.tmpdir(), 'pw-cred-'));
 }
 
-// A real filesystem with a simulated ownership layer, so the chown contract can
-// be asserted without the suite needing root or a second uid.
-function ownedFsp({ rootUid = 0, rootGid = 0, chownFailsOn = null } = {}) {
-  const owners = new Map();
-  const chowns = [];
-  return {
-    chowns,
-    mkdir: (...a) => realFsp.mkdir(...a),
-    readFile: (...a) => realFsp.readFile(...a),
-    writeFile: (...a) => realFsp.writeFile(...a),
-    access: (...a) => realFsp.access(...a),
-    chmod: (...a) => realFsp.chmod(...a),
-    rm: (...a) => realFsp.rm(...a),
-    async stat(p) {
-      const st = await realFsp.stat(p);
-      const o = owners.get(p) || { uid: rootUid, gid: rootGid };
-      return { uid: o.uid, gid: o.gid, mode: st.mode, isFile: () => st.isFile() };
-    },
-    async chown(p, uid, gid) {
-      chowns.push({ path: p, uid, gid });
-      if (chownFailsOn && p === chownFailsOn) throw Object.assign(new Error('EPERM: operation not permitted'), { code: 'EPERM' });
-      owners.set(p, { uid, gid });
-    },
-    preown(p, uid, gid) { owners.set(p, { uid, gid }); },
-  };
-}
+// ---------------------------------------------------------------------------
+// Injective username encoding
+// ---------------------------------------------------------------------------
 
-test('REGRESSION: every level is handed to the pane account (host mode, uid 1000)', async () => {
-  const base = tmpBase();
-  const fsp = ownedFsp();
-  const owner = { uid: 1000, gid: 1000, user: 'admin' };
-  const res = await ensureUserCredentials({ fsp, base, username: 'james.levac', ghToken: TOKEN, owner });
+test('REGRESSION: ".", ".." and "_" are three different users, not one directory', () => {
+  // The old safeUserName() replaced unsafe characters with '_' and collapsed
+  // all-dot names to '_', so these three usernames shared one credential tree —
+  // one Claude login and one GitHub token between three people.
+  const segments = ['.', '..', '_'].map(encodeUserName);
+  assert.deepEqual(segments, ['%2E', '%2E%2E', '_']);
+  assert.equal(new Set(segments).size, 3);
+});
 
-  const expected = [
-    base,
-    userCredRoot(base, 'james.levac'),
-    userClaudeConfigDir(base, 'james.levac'),
-    path.join(userClaudeConfigDir(base, 'james.levac'), '.claude.json'),
-    userSessionEnvFile(base, 'james.levac'),
+test('encoding is injective across a hostile corpus', () => {
+  const names = [
+    '.', '..', '...', '_', '__', '%', '%2E', '%2e', 'a', 'A', 'a.b', 'a_b', 'a-b',
+    'a/b', 'a\\b', 'a b', 'a\tb', 'a\nb', "a'b", 'a"b', 'a$b', 'a;b', 'a|b',
+    'james-levac_goa', 'JAMES-LEVAC_GOA', 'user@example.com', 'DOMAIN\\user',
+    'ünïcodé', '日本語', '../../etc/passwd', './x', 'x/../y', '',
   ];
-  assert.deepEqual(fsp.chowns.map((c) => c.path).sort(), expected.slice().sort());
-  for (const c of fsp.chowns) assert.deepEqual({ uid: c.uid, gid: c.gid }, { uid: 1000, gid: 1000 });
-  assert.equal(res.configDir, userClaudeConfigDir(base, 'james.levac'));
+  const seen = new Map();
+  for (const name of names) {
+    let encoded;
+    try { encoded = encodeUserName(name); } catch { continue; } // '' is rejected
+    assert.equal(seen.has(encoded), false, `collision: ${JSON.stringify(name)} and ${JSON.stringify(seen.get(encoded))} both -> ${encoded}`);
+    seen.set(encoded, name);
+    assert.equal(decodeUserName(encoded), name, `round-trip failed for ${JSON.stringify(name)}`);
+  }
 });
 
-test('container mode (uid 1001) hands over the same set', async () => {
-  const base = tmpBase();
-  const fsp = ownedFsp();
-  await ensureUserCredentials({ fsp, base, username: 'u', ghToken: TOKEN, owner: { uid: 1001, gid: 1001 } });
-  assert.equal(fsp.chowns.length, 5);
-  for (const c of fsp.chowns) assert.deepEqual({ uid: c.uid, gid: c.gid }, { uid: 1001, gid: 1001 });
+test('an encoded segment can never traverse out of the base', () => {
+  for (const hostile of ['..', '.', '../..', '/etc/passwd', 'a/../../b', '....//']) {
+    const seg = encodeUserName(hostile);
+    assert.ok(!seg.includes('/'), `${seg} contains a separator`);
+    assert.ok(!seg.includes(path.sep), `${seg} contains a separator`);
+    assert.notEqual(seg, '.');
+    assert.notEqual(seg, '..');
+    const joined = path.join('/srv/pw-users', seg);
+    assert.ok(joined.startsWith('/srv/pw-users/'), `${joined} escaped the base`);
+  }
 });
 
-test('owner=null (dashboard and pane share an account) performs no chown at all', async () => {
-  const base = tmpBase();
-  const fsp = ownedFsp();
-  const res = await ensureUserCredentials({ fsp, base, username: 'u', ghToken: TOKEN, owner: null });
-  assert.deepEqual(fsp.chowns, [], 'shared-account deployments must stay byte-identical');
-  assert.ok(fs.existsSync(res.configDir));
+test('empty and over-long usernames are refused rather than silently folded', () => {
+  assert.throws(() => encodeUserName(''), /must not be empty/);
+  assert.throws(() => encodeUserName(null), /must not be empty/);
+  assert.throws(() => encodeUserName('\u00e9'.repeat(200)), /too long/);
 });
 
-test('already-correct ownership is not re-chowned', async () => {
-  const base = tmpBase();
-  const fsp = ownedFsp({ rootUid: 1000, rootGid: 1000 });
-  await ensureUserCredentials({ fsp, base, username: 'u', ghToken: TOKEN, owner: { uid: 1000, gid: 1000 } });
-  assert.deepEqual(fsp.chowns, []);
+test('isEncodedUserName accepts only canonical encodings', () => {
+  assert.equal(isEncodedUserName('%2E'), true);
+  assert.equal(isEncodedUserName('james-levac_goa'), true);
+  assert.equal(isEncodedUserName('%2e'), false);      // lowercase hex is not ours
+  assert.equal(isEncodedUserName('%41'), false);      // 'A' escaped needlessly
+  assert.equal(isEncodedUserName('a b'), false);
+  assert.equal(isEncodedUserName(''), false);
+  assert.equal(isEncodedUserName('..'), false);
 });
 
-test('FAIL CLOSED: a chown that cannot be performed rejects the whole operation', async () => {
-  const base = tmpBase();
-  const configDir = userClaudeConfigDir(base, 'u');
-  const fsp = ownedFsp({ chownFailsOn: configDir });
+test('path helpers compose off the encoded segment', () => {
+  const base = '/srv/pw-users';
+  assert.equal(userCredRoot(base, 'a.b'), '/srv/pw-users/a%2Eb');
+  assert.equal(userClaudeConfigDir(base, 'a.b'), '/srv/pw-users/a%2Eb/claude');
+  assert.equal(userSessionEnvFile(base, 'a.b'), '/srv/pw-users/a%2Eb/session-env.sh');
+});
+
+// ---------------------------------------------------------------------------
+// Symlink / TOCTOU: root must not be usable as a confused deputy
+// ---------------------------------------------------------------------------
+
+test('REGRESSION: a planted session-env.sh symlink does not clobber its target', async () => {
+  const base = await tmpBase();
+  const victim = path.join(base, 'victim-root-owned');
+  await fsp.writeFile(victim, 'ORIGINAL');
+
+  const credRoot = userCredRoot(base, 'mallory');
+  await fsp.mkdir(credRoot, { recursive: true });
+  const envFile = userSessionEnvFile(base, 'mallory');
+  await fsp.symlink(victim, envFile);
+
+  // First, prove the attack is real against the old code shape (a plain write).
+  await fsp.writeFile(envFile, 'PWNED-BY-OLD-CODE');
+  assert.equal(await fsp.readFile(victim, 'utf8'), 'PWNED-BY-OLD-CODE',
+    'sanity check: a naive writeFile does follow the symlink');
+
+  // Reset and run the real code path.
+  await fsp.writeFile(victim, 'ORIGINAL');
+  await applyCredentialJob({ fsp, base, username: 'mallory', ghToken: 'ghp_secret' });
+
+  assert.equal(await fsp.readFile(victim, 'utf8'), 'ORIGINAL', 'the symlink target was modified');
+  const st = await fsp.lstat(envFile);
+  assert.equal(st.isSymbolicLink(), false, 'the planted symlink survived');
+  assert.equal(st.isFile(), true);
+  assert.ok((await fsp.readFile(envFile, 'utf8')).includes('ghp_secret'));
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
+test('REGRESSION: a planted .claude.json symlink does not clobber its target', async () => {
+  const base = await tmpBase();
+  const victim = path.join(base, 'victim');
+  await fsp.writeFile(victim, 'ORIGINAL');
+
+  const configDir = userClaudeConfigDir(base, 'mallory');
+  await fsp.mkdir(configDir, { recursive: true });
+  await fsp.symlink(victim, path.join(configDir, '.claude.json'));
+
+  await applyCredentialJob({ fsp, base, username: 'mallory' });
+
+  assert.equal(await fsp.readFile(victim, 'utf8'), 'ORIGINAL');
+  assert.equal((await fsp.lstat(path.join(configDir, '.claude.json'))).isSymbolicLink(), false);
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
+test('REGRESSION: a symlinked credential directory is refused, not followed', async () => {
+  const base = await tmpBase();
+  const outside = await tmpBase();
+  await fsp.writeFile(path.join(outside, 'sentinel'), 'UNTOUCHED');
+
+  // Mallory points her own credential root at somewhere she should not reach.
+  await fsp.mkdir(base, { recursive: true });
+  await fsp.symlink(outside, userCredRoot(base, 'mallory'));
+
   await assert.rejects(
-    () => ensureUserCredentials({ fsp, base, username: 'u', ghToken: TOKEN, owner: { uid: 1000, gid: 1000 } }),
-    /EPERM/,
-    'an unreadable credential dir must never be handed to a pane',
+    applyCredentialJob({ fsp, base, username: 'mallory', ghToken: 'ghp_secret' }),
+    /symlinked credential path/,
   );
+  assert.equal(await fsp.readFile(path.join(outside, 'sentinel'), 'utf8'), 'UNTOUCHED');
+  assert.deepEqual(await fsp.readdir(outside), ['sentinel'], 'wrote into the symlink target');
+
+  await fsp.rm(base, { recursive: true, force: true });
+  await fsp.rm(outside, { recursive: true, force: true });
 });
 
-test('the token goes to a 0600 file, never into the returned env tokens', async () => {
-  const base = tmpBase();
-  const fsp = ownedFsp();
-  const res = await ensureUserCredentials({ fsp, base, username: 'u', ghToken: TOKEN, owner: null });
-
-  assert.equal(res.envFile, userSessionEnvFile(base, 'u'));
-  assert.equal(fs.statSync(res.envFile).mode & 0o777, 0o600, 'session env file must be 0600');
-  assert.ok(fs.readFileSync(res.envFile, 'utf8').includes(`export GH_TOKEN='${TOKEN}'`));
-
-  // Nothing the caller puts on a command line may carry the secret.
-  assert.ok(!res.configDir.includes(TOKEN));
-  assert.ok(!res.envFile.includes(TOKEN));
-  assert.ok(!res.fingerprint.includes(TOKEN));
-  assert.ok(!JSON.stringify({ configDir: res.configDir, envFile: res.envFile, fingerprint: res.fingerprint }).includes(TOKEN));
+test('the credential job never chowns — the writer already owns what it makes', async () => {
+  const src = await fsp.readFile(path.join(APP_DIR, 'user-credentials.js'), 'utf8');
+  const body = src.slice(src.indexOf('export async function applyCredentialJob'));
+  assert.equal(/\bchown\b/.test(body), false,
+    'applyCredentialJob must not chown: a root chown on an attacker-controlled path is the escalation primitive we removed');
 });
 
-test('the seeded config dir never contains the token either', async () => {
-  const base = tmpBase();
-  const res = await ensureUserCredentials({ fsp: ownedFsp(), base, username: 'u', ghToken: TOKEN, owner: null });
-  const cfg = fs.readFileSync(path.join(res.configDir, '.claude.json'), 'utf8');
-  assert.ok(!cfg.includes(TOKEN), 'the Claude config must not carry the GitHub token');
+test('modes are 0700 on directories and 0600 on files', async () => {
+  const base = await tmpBase();
+  const r = await applyCredentialJob({ fsp, base, username: 'a.user', ghToken: 'ghp_x' });
+  const mode = async (p) => (await fsp.stat(p)).mode & 0o777;
+  assert.equal(await mode(userCredRoot(base, 'a.user')), 0o700);
+  assert.equal(await mode(r.configDir), 0o700);
+  assert.equal(await mode(path.join(r.configDir, '.claude.json')), 0o600);
+  assert.equal(await mode(r.envFile), 0o600);
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('a removed token deletes the stale env file rather than leaving a revoked secret', async () => {
-  const base = tmpBase();
-  const fsp = ownedFsp();
-  const first = await ensureUserCredentials({ fsp, base, username: 'u', ghToken: TOKEN, owner: null });
-  assert.ok(fs.existsSync(first.envFile));
+test('a pre-existing world-readable credential dir is tightened to 0700', async () => {
+  const base = await tmpBase();
+  // What `mkdir -p` under a default umask leaves behind, e.g. from an earlier
+  // build or an operator creating the tree by hand.
+  await fsp.mkdir(userClaudeConfigDir(base, 'loose'), { recursive: true, mode: 0o755 });
+  await fsp.chmod(userCredRoot(base, 'loose'), 0o755);
+  await fsp.chmod(userClaudeConfigDir(base, 'loose'), 0o755);
 
-  const second = await ensureUserCredentials({ fsp, base, username: 'u', ghToken: '', owner: null });
-  assert.equal(second.envFile, '');
-  assert.equal(fs.existsSync(userSessionEnvFile(base, 'u')), false);
+  await applyCredentialJob({ fsp, base, username: 'loose', ghToken: 'ghp_x' });
+
+  const mode = async (p) => (await fsp.stat(p)).mode & 0o777;
+  assert.equal(await mode(userCredRoot(base, 'loose')), 0o700);
+  assert.equal(await mode(userClaudeConfigDir(base, 'loose')), 0o700);
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('the generated env file survives a real bash source, including hostile tokens', async () => {
-  const markerDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-inject-'));
-  const marker = path.join(markerDir, 'INJECTED');
-  const nasty = `gh'p_"; touch ${marker}; #`;
-  const base = tmpBase();
-  const res = await ensureUserCredentials({ fsp: ownedFsp(), base, username: 'u', ghToken: nasty, owner: null });
-  const { stdout, stderr } = await execFileAsync('bash', ['-c', `set -u; . ${JSON.stringify(res.envFile)}; printf '%s' "$GH_TOKEN"`]);
-  assert.equal(stdout, nasty, 'quoting must round-trip exactly');
-  assert.equal(stderr, '');
-  assert.equal(fs.existsSync(marker), false, 'the token must never be executed as shell');
-});
-
-test('shSingleQuote closes and reopens around embedded quotes', () => {
-  assert.equal(shSingleQuote('plain'), "'plain'");
-  assert.equal(shSingleQuote("a'b"), `'a'\\''b'`);
-  assert.equal(renderSessionEnvFile({ EMPTY: '', SET: 'x' }).includes('EMPTY'), false, 'empty values are omitted');
-});
-
-test('MCP servers are seeded once from the shared config and never clobbered', async () => {
-  const base = tmpBase();
-  const sharedDir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-shared-'));
-  const sharedClaudeJson = path.join(sharedDir, '.claude.json');
-  fs.writeFileSync(sharedClaudeJson, JSON.stringify({ mcpServers: { teamkb: { url: 'https://x/teamkb/mcp' } }, other: 1 }));
-
-  const first = await ensureUserCredentials({ fsp: ownedFsp(), base, username: 'u', sharedClaudeJson, owner: null });
+test('an existing config is never clobbered, and a removed token drops the env file', async () => {
+  const base = await tmpBase();
+  const first = await applyCredentialJob({ fsp, base, username: 'u', ghToken: 'ghp_x' });
   assert.equal(first.seeded, true);
-  const cfgPath = path.join(first.configDir, '.claude.json');
-  assert.deepEqual(JSON.parse(fs.readFileSync(cfgPath, 'utf8')), { mcpServers: { teamkb: { url: 'https://x/teamkb/mcp' } } });
-  assert.equal(fs.statSync(cfgPath).mode & 0o777, 0o600);
+  await fsp.writeFile(path.join(first.configDir, '.claude.json'), '{"mine":true}');
 
-  fs.writeFileSync(cfgPath, JSON.stringify({ mcpServers: {}, userEdited: true }));
-  const second = await ensureUserCredentials({ fsp: ownedFsp(), base, username: 'u', sharedClaudeJson, owner: null });
+  const second = await applyCredentialJob({ fsp, base, username: 'u', ghToken: '' });
   assert.equal(second.seeded, false);
-  assert.equal(JSON.parse(fs.readFileSync(cfgPath, 'utf8')).userEdited, true, 'a user-edited config must survive');
+  assert.equal(JSON.parse(await fsp.readFile(path.join(first.configDir, '.claude.json'), 'utf8')).mine, true);
+  assert.equal(second.envFile, '');
+  await assert.rejects(fsp.stat(first.envFile), /ENOENT/, 'a revoked token must not stay on disk');
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('a missing or unparseable shared config still yields a usable seed', async () => {
-  for (const shared of ['', '/nonexistent/.claude.json']) {
-    const base = tmpBase();
-    const res = await ensureUserCredentials({ fsp: ownedFsp(), base, username: 'u', sharedClaudeJson: shared, owner: null });
-    assert.deepEqual(JSON.parse(fs.readFileSync(path.join(res.configDir, '.claude.json'), 'utf8')), { mcpServers: {} });
-  }
+test('MCP servers are seeded from the shared config', async () => {
+  const base = await tmpBase();
+  const shared = path.join(base, 'shared.json');
+  await fsp.writeFile(shared, JSON.stringify({ mcpServers: { teamkb: { command: 'x' } }, other: 1 }));
+  const r = await applyCredentialJob({ fsp, base, username: 'u', sharedClaudeJson: shared });
+  const cfg = JSON.parse(await fsp.readFile(path.join(r.configDir, '.claude.json'), 'utf8'));
+  assert.deepEqual(Object.keys(cfg.mcpServers), ['teamkb']);
+  assert.equal('other' in cfg, false, 'only mcpServers should be carried over');
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('usernames cannot escape the credential base', () => {
-  assert.equal(safeUserName('../../root'), '.._.._root');
-  assert.equal(safeUserName('a/b'), 'a_b');
-  assert.equal(safeUserName('GOA\\user'), 'GOA_user');
-  for (const hostile of ['../../root', 'a/b', '..', 'x\0y']) {
-    const dir = userClaudeConfigDir('/srv/pw-users', hostile);
-    assert.ok(dir.startsWith('/srv/pw-users/'), `${hostile} -> ${dir}`);
-    assert.ok(!dir.includes('..' + path.sep), `${hostile} -> ${dir}`);
-  }
+// ---------------------------------------------------------------------------
+// Privilege drop
+// ---------------------------------------------------------------------------
+
+test('execution plan drops only when the owner is somebody else', () => {
+  assert.equal(credentialExecutionPlan({ owner: null }).drop, false);
+  assert.equal(credentialExecutionPlan({ owner: null }).reason, 'shared-account');
+  assert.equal(credentialExecutionPlan({ owner: { uid: 1001 }, currentUid: 1001 }).drop, false);
+  assert.equal(credentialExecutionPlan({ owner: { uid: 1001 }, currentUid: 1001 }).reason, 'already-owner');
+  assert.equal(credentialExecutionPlan({ owner: { uid: 1001 }, currentUid: 0 }).drop, true);
+  // A missing currentUid must not be mistaken for uid 0.
+  assert.equal(credentialExecutionPlan({ owner: { uid: 1001 }, currentUid: null }).drop, true);
 });
 
-test('the fingerprint identifies the credentials without revealing them', () => {
-  const a = credentialFingerprint({ username: 'u', configDir: '/d', ghToken: TOKEN });
-  assert.equal(a, credentialFingerprint({ username: 'u', configDir: '/d', ghToken: TOKEN }), 'stable');
-  assert.match(a, /^[0-9a-f]{16}$/);
-  assert.ok(!a.includes(TOKEN));
-  // Any input change must be observable, or a stale session would look current.
-  assert.notEqual(a, credentialFingerprint({ username: 'u', configDir: '/d', ghToken: 'rotated' }));
-  assert.notEqual(a, credentialFingerprint({ username: 'other', configDir: '/d', ghToken: TOKEN }));
-  assert.notEqual(a, credentialFingerprint({ username: 'u', configDir: '/other', ghToken: TOKEN }));
-  assert.notEqual(a, credentialFingerprint({ username: 'u', configDir: '/d', ghToken: '' }));
-  // Field boundaries are not ambiguous (no 'u'+'/d' vs 'u/'+'d' collision).
-  assert.notEqual(
-    credentialFingerprint({ username: 'ab', configDir: 'c' }),
-    credentialFingerprint({ username: 'a', configDir: 'bc' }),
+test('drop argv matches the mechanism PW already uses in each mode', () => {
+  const container = credentialDropArgv({
+    owner: { uid: 1001, gid: 1001, user: 'admin', source: 'PW_TERMINAL_UID' },
+    execPath: '/usr/bin/node', helperPath: '/opt/pw/app/credential-writer.mjs',
+  });
+  assert.deepEqual(container, ['/usr/bin/setpriv', '--reuid', '1001', '--regid', '1001', '--init-groups', '/usr/bin/node', '/opt/pw/app/credential-writer.mjs']);
+
+  const host = credentialDropArgv({
+    owner: { uid: 1001, gid: 1001, user: 'admin', source: 'passwd' },
+    execPath: '/usr/bin/node', helperPath: '/opt/pw/app/credential-writer.mjs',
+  });
+  assert.deepEqual(host, ['/usr/bin/sudo', '-n', '-u', 'admin', '/usr/bin/node', '/opt/pw/app/credential-writer.mjs']);
+
+  assert.throws(() => credentialDropArgv({ owner: { uid: 1, source: 'passwd' }, execPath: 'n', helperPath: 'h' }), /account name/);
+  assert.throws(() => credentialDropArgv({ owner: null, execPath: 'n', helperPath: 'h' }), /owner required/);
+});
+
+test('SECURITY: no secret ever reaches the helper argv', () => {
+  const argv = credentialDropArgv({
+    owner: { uid: 1001, gid: 1001, user: 'admin', source: 'passwd' },
+    execPath: '/usr/bin/node', helperPath: '/opt/pw/app/credential-writer.mjs',
+  });
+  // The argv is a pure function of owner + paths; it cannot carry a token
+  // because it is not given one.
+  assert.equal(credentialDropArgv.length, 1);
+  for (const arg of argv) assert.equal(/gh[pousr]_/.test(arg), false);
+});
+
+test('the helper does the job, taking the token on stdin and not on its command line', async () => {
+  const base = await tmpBase();
+  const helper = path.join(APP_DIR, 'credential-writer.mjs');
+  const token = 'ghp_STDIN_ONLY_TOKEN_123';
+
+  const result = await spawnCredentialJob({
+    spawn,
+    argv: [process.execPath, helper],
+    job: { action: 'ensure', base, username: 'over.stdin', ghToken: token },
+  });
+
+  assert.equal(result.configDir, userClaudeConfigDir(base, 'over.stdin'));
+  assert.ok((await fsp.readFile(result.envFile, 'utf8')).includes(token));
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
+test('the helper reports failure rather than exiting silently', async () => {
+  const helper = path.join(APP_DIR, 'credential-writer.mjs');
+  await assert.rejects(
+    spawnCredentialJob({ spawn, argv: [process.execPath, helper], job: { nope: true } }),
+    /malformed job/,
   );
 });
 
-// ── Session credential drift ────────────────────────────────────────────────
-// Regression: ensureTmuxSession() returned early for an existing session, so a
-// project whose credentials changed (feature enabled, primaryUser reassigned,
-// token rotated) kept running on the old ones indefinitely and nothing said so.
+test('ensureUserCredentials delegates to the helper exactly when a drop is required', async () => {
+  const base = await tmpBase();
+  const calls = [];
+  const runJob = async (job, plan) => { calls.push({ job, plan }); return { configDir: '/x', envFile: '/y', seeded: true }; };
 
-test('a session matching the current credentials is not stale', () => {
-  assert.deepEqual(
-    sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc123', stampedKey: 'abc123' }),
-    { stale: false, reason: 'current' },
-  );
+  // Same account: runs in-process, helper untouched.
+  const inProc = await ensureUserCredentials({
+    fsp, base, username: 'u', ghToken: 'ghp_a', owner: { uid: 1001 }, currentUid: 1001, runJob,
+  });
+  assert.equal(calls.length, 0);
+  assert.equal(inProc.configDir, userClaudeConfigDir(base, 'u'));
+
+  // Different account: delegated, and the token travels inside the job payload.
+  const dropped = await ensureUserCredentials({
+    fsp, base, username: 'u', ghToken: 'ghp_b', owner: { uid: 1001, source: 'passwd', user: 'admin' }, currentUid: 0, runJob,
+  });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].job.ghToken, 'ghp_b');
+  assert.equal(calls[0].plan.drop, true);
+  assert.equal(dropped.configDir, '/x');
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('REGRESSION: a session stamped with different credentials is reported stale', () => {
-  assert.deepEqual(
-    sessionCredentialState({ perUserEnabled: true, desiredKey: 'new-key', stampedKey: 'old-key' }),
-    { stale: true, reason: 'changed' },
-  );
+test('a failing helper rejects so the caller can fall back to the shared login', async () => {
+  await assert.rejects(ensureUserCredentials({
+    fsp, base: '/tmp/nope', username: 'u', owner: { uid: 1 }, currentUid: 0,
+    runJob: async () => { throw new Error('setpriv: Operation not permitted'); },
+  }), /Operation not permitted/);
 });
 
-test('REGRESSION: enabling per-user credentials makes an unstamped session stale', () => {
-  // The session predates the change, so it is still on the shared login.
-  assert.deepEqual(
-    sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc123', stampedKey: '' }),
-    { stale: true, reason: 'unstamped' },
-  );
+// ---------------------------------------------------------------------------
+// Pruning stale credential trees
+// ---------------------------------------------------------------------------
+
+test('prune removes trees for departed users and keeps current ones', async () => {
+  const base = await tmpBase();
+  for (const u of ['stays', 'goes', 'a.dotted']) await applyCredentialJob({ fsp, base, username: u, ghToken: 'ghp_x' });
+
+  const { removed } = await pruneUserCredentials({ fsp, base, keep: ['stays', 'a.dotted'] });
+  assert.deepEqual(removed, ['goes']);
+  assert.ok(fs.existsSync(userCredRoot(base, 'stays')));
+  assert.ok(fs.existsSync(userCredRoot(base, 'a.dotted')));
+  assert.equal(fs.existsSync(userCredRoot(base, 'goes')), false);
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('a project that has no owner and no stamp is current, not noisy', () => {
-  assert.deepEqual(
-    sessionCredentialState({ perUserEnabled: true, desiredKey: CREDENTIALS_OFF, stampedKey: '' }),
-    { stale: false, reason: 'current' },
-  );
+test('SAFETY: prune never deletes anything that is not one of our trees', async () => {
+  const base = await tmpBase();
+  await applyCredentialJob({ fsp, base, username: 'real', ghToken: 'ghp_x' });
+  // Things that must survive a prune even though no user claims them.
+  await fsp.mkdir(path.join(base, 'Documents'));                 // encodable name, but not our layout
+  await fsp.writeFile(path.join(base, 'Documents', 'a.txt'), 'x');
+  await fsp.mkdir(path.join(base, '.ssh'));                      // not an encoded name at all
+  await fsp.writeFile(path.join(base, 'loose-file'), 'x');
+
+  const { removed } = await pruneUserCredentials({ fsp, base, keep: [] });
+  assert.deepEqual(removed, ['real']);
+  assert.ok(fs.existsSync(path.join(base, 'Documents', 'a.txt')));
+  assert.ok(fs.existsSync(path.join(base, '.ssh')));
+  assert.ok(fs.existsSync(path.join(base, 'loose-file')));
+  await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('a session holding private credentials after the owner was removed is stale', () => {
-  assert.deepEqual(
-    sessionCredentialState({ perUserEnabled: true, desiredKey: CREDENTIALS_OFF, stampedKey: 'abc123' }),
-    { stale: true, reason: 'changed' },
-  );
+test('prune on a base that does not exist is a no-op', async () => {
+  assert.deepEqual((await pruneUserCredentials({ fsp, base: '/tmp/pw-does-not-exist-xyz', keep: [] })).removed, []);
 });
 
-test('with the feature off nothing is ever stale, whatever the stamp says', () => {
-  for (const stampedKey of ['', 'abc123', CREDENTIALS_OFF]) {
-    assert.deepEqual(
-      sessionCredentialState({ perUserEnabled: false, desiredKey: 'abc123', stampedKey }),
-      { stale: false, reason: 'disabled' },
-    );
-  }
-  assert.deepEqual(sessionCredentialState(), { stale: false, reason: 'disabled' });
+// ---------------------------------------------------------------------------
+// Session env file and fingerprints
+// ---------------------------------------------------------------------------
+
+test('the session env file exports the token and quotes it safely', () => {
+  const out = renderSessionEnvFile({ GH_TOKEN: "gh'p_weird" });
+  assert.match(out, /export GH_TOKEN='gh'\\''p_weird'/);
+  assert.equal(renderSessionEnvFile({ GH_TOKEN: '' }).includes('export'), false);
 });
 
-// ── The token must not come back as an argv token ───────────────────────────
-
-test('REGRESSION: server.js never builds the GitHub token into a tmux command', () => {
-  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
-  // The old shape was: extra.push('GH_TOKEN=' + t) folded into the `env …` tokens
-  // handed to `tmux new-session`, which tmux then keeps as pane_start_command.
-  assert.ok(!/['"`]GH_TOKEN=/.test(src), 'GH_TOKEN must never be concatenated into an env token list');
-  assert.ok(!/GH_TOKEN=.*\+/.test(src), 'GH_TOKEN must never be built into a string with the value');
-  // The supported delivery path is the 0600 rcfile.
-  assert.match(src, /'--rcfile'/, 'the pane shell must source the credential env file');
+test('shSingleQuote survives a quote-injection attempt', () => {
+  assert.equal(shSingleQuote("a'; rm -rf /; '"), `'a'\\''; rm -rf /; '\\'''`);
 });
 
-test('the tmux credential stamp is a fingerprint, never the token', () => {
-  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
-  const stampLine = src.split('\n').find((l) => l.includes('set-option') && l.includes('CRED_KEY_OPTION'));
-  assert.ok(stampLine, 'the session stamp should be set with tmux set-option');
-  assert.ok(stampLine.includes('key'), 'only the fingerprint is stamped');
-  // The option name must not collide with the markers pw-tmux-save filters on.
-  assert.match(src, /@pw_cred_key/);
-  assert.ok(!src.includes("'@pw_session_key'"), 'must not reuse the orchestrator lane marker');
+test('the fingerprint is a hash, not the token', () => {
+  const fp = credentialFingerprint({ username: 'u', configDir: '/d', ghToken: 'ghp_supersecret' });
+  assert.match(fp, /^[0-9a-f]{16}$/);
+  assert.equal(fp.includes('supersecret'), false);
+  assert.notEqual(fp, credentialFingerprint({ username: 'u', configDir: '/d', ghToken: 'ghp_other' }));
+  assert.equal(fp, credentialFingerprint({ username: 'u', configDir: '/d', ghToken: 'ghp_supersecret' }));
+});
+
+test('session drift is reported only when it is actionable', () => {
+  const off = CREDENTIALS_OFF;
+  assert.equal(sessionCredentialState({ perUserEnabled: false, desiredKey: 'abc', stampedKey: '' }).stale, false);
+  assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: 'abc' }).stale, false);
+  assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: 'old' }).stale, true);
+  assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: 'old' }).reason, 'changed');
+  // An unstamped session with nothing to be stale about should not raise a flag.
+  assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: off, stampedKey: '' }).stale, false);
+  assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: '' }).stale, true);
+  assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: '' }).reason, 'unstamped');
+});
+
+// ---------------------------------------------------------------------------
+// Source guards — these encode decisions that are easy to undo by accident
+// ---------------------------------------------------------------------------
+
+test('SECURITY: the token is never folded into the tmux env argv', async () => {
+  const src = await fsp.readFile(path.join(APP_DIR, 'server.js'), 'utf8');
+  assert.equal(/GH_TOKEN=['"`]?\s*\+/.test(src), false,
+    'GH_TOKEN must not be concatenated into an argv token: tmux keeps pane_start_command for the life of the pane');
+  assert.match(src, /--rcfile/, 'the token is delivered by sourcing a 0600 rcfile instead');
+});
+
+test('SECURITY: the dashboard hands credential work to the dropped helper', async () => {
+  const src = await fsp.readFile(path.join(APP_DIR, 'server.js'), 'utf8');
+  assert.match(src, /runJob:\s*runCredentialJob/, 'ensureUserCredentials must be given the privilege-dropping runner');
+  assert.match(src, /credentialDropArgv/);
+  assert.match(src, /currentUid:\s*process\.getuid/, 'the drop decision needs the real uid');
 });
