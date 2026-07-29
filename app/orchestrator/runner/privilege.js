@@ -519,6 +519,16 @@ export class PrivilegeDropper {
     // keeps that window from being a blind spot: whatever this last saw is handed to
     // `ensureTerminated` as a starting point, not rediscovered from a pid that may already be gone.
     const tracked = child ? new Set([child.pid]) : null;
+    // Counts *completed* observations of the live tree, not timer firings — incremented as the last
+    // step of a tick, after that tick's accumulate-and-prune has actually finished. This is the
+    // evidence `ensureTerminated` is told about below: whether the tree was ever looked at, even
+    // once, while the launch was still alive. Polling itself is a sampling process and cannot prove a
+    // negative — an adversary need only fork and detach faster than whatever interval is chosen, and
+    // `DESCENDANT_POLL_MS` is exactly such an interval. What it CAN prove is the specific, narrower
+    // claim this counter exists for: "the launch failed before a single look ever happened", which is
+    // a fact about elapsed wall-clock time, not a guess. See `ensureTerminated` for how that claim is
+    // used, and the module doc for why a shorter interval would not be a fix.
+    let liveTicks = 0;
     const poller = tracked ? setInterval(() => {
       (async () => {
         for (const known of [...tracked]) {
@@ -534,6 +544,7 @@ export class PrivilegeDropper {
         for (const known of [...tracked]) {
           if (!stillRunning(known)) tracked.delete(known);
         }
+        liveTicks += 1;
       })().catch(() => {});
     }, DESCENDANT_POLL_MS) : null;
     if (typeof poller?.unref === 'function') poller.unref();
@@ -545,7 +556,7 @@ export class PrivilegeDropper {
       // Await the death of what was launched before telling the caller it stopped. The verdict is
       // carried on the error rather than dropped: a cancellation that could not be carried out must
       // not be indistinguishable from one that was.
-      if (child) err.terminationConfirmed = await this.ensureTerminated(child, { tracked });
+      if (child) err.terminationConfirmed = await this.ensureTerminated(child, { tracked, liveTicks });
 
       const refusal = this.helperFailure(err, plan);
       if (refusal) throw refusal;
@@ -641,7 +652,7 @@ export class PrivilegeDropper {
    * that `execFile`'s own `timeout`/`signal` handling has already reparented to init is no longer
    * reachable from `pid` at all, seeded or not — the seed is what still remembers it).
    */
-  async ensureTerminated(child, { graceMs = this.terminationGraceMs, poll = 50, tracked: seed = null } = {}) {
+  async ensureTerminated(child, { graceMs = this.terminationGraceMs, poll = 50, tracked: seed = null, liveTicks = 0 } = {}) {
     const pid = child?.pid ?? null;
     // True in the ordinary case, not the exceptional one: this normally runs only after the launch
     // has already failed, by which point Node has already recorded the direct child's exit. That
@@ -652,6 +663,26 @@ export class PrivilegeDropper {
     // would stop looking for it right when it matters most.
     const pidAlreadyGone = !pid || child.exitCode !== null || child.signalCode !== null;
     if (pidAlreadyGone && (!seed || seed.size === 0)) return true;
+
+    // Sampling cannot prove a negative, and pretending otherwise is exactly the gap an independent
+    // review found: `execFile`'s own `timeout`/`signal` handling can kill the direct child before
+    // `_execTracked`'s poller has ever completed a single tick — a launch shorter than
+    // `DESCENDANT_POLL_MS` guarantees this, and it is not the only way to reach it. When that
+    // happens, the ONLY thing tracked here is the trivial seed of the top pid itself; there is
+    // nothing to distinguish "genuinely no descendants" from "a descendant this module never had a
+    // chance to see". Reported as unconfirmed regardless of what the tree looks like by the time
+    // anyone gets to look, because "by the time anyone gets to look" is exactly the window a
+    // fast-forking, self-detaching descendant has already escaped through. This is a documented
+    // limitation of a purely time-sampled tree, not a bug a shorter interval would fix — an adversary
+    // need only fork and detach faster than whatever interval is chosen. Closing it for good would
+    // need a kernel-level containment primitive (a dedicated PID namespace so the kernel itself kills
+    // every process in it when the namespace's own init dies, or a cgroup with `cgroup.kill`/
+    // `cgroup.procs`, which — unlike `/proc` ppid-chasing — tracks membership independently of
+    // reparenting) rather than anything this module can observe from outside. That is a materially
+    // larger, more platform-specific change than this fix, and is left as a known follow-up; being
+    // honest about the limit here is what lets the durable fence (`OrchestrationEngine._fenceLease`)
+    // stand in for it safely in the meantime.
+    const unproven = pidAlreadyGone && liveTicks === 0;
 
     const deadline = Date.now() + graceMs;
 
@@ -699,7 +730,9 @@ export class PrivilegeDropper {
     if (pid && !pidAlreadyGone) send('SIGTERM', [pid]);
     while (Date.now() < deadline) {
       await rescan();
-      if (survivors().length === 0) return true;
+      // Never `return true` outright: an empty survivor list proves nothing when `unproven`, since
+      // survivors were only ever going to be found among pids this module actually knew to look for.
+      if (survivors().length === 0) return !unproven;
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
 
@@ -710,7 +743,7 @@ export class PrivilegeDropper {
     for (let i = 0; i < 20; i++) {
       await rescan();
       const left = survivors();
-      if (left.length === 0) return true;
+      if (left.length === 0) return !unproven;
       send('SIGKILL', left);
       await new Promise((resolve) => setTimeout(resolve, poll));
     }

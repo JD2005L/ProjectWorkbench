@@ -344,6 +344,39 @@ test('wrap kills a setsid-detached, SIGTERM-ignoring descendant when the launch 
   assert.equal(await pgrepCount(marker), 0, 'a setsid-detached descendant survived the abort');
 });
 
+test('a timeout shorter than one poll interval cannot prove a fast descendant is dead, and must not claim it is', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // DESCENDANT_POLL_MS is 200ms. A 50ms timeout gives the poller zero chance to ever tick before the
+  // direct child dies — not a smaller version of the setsid tests above, but the specific proof that
+  // temporal sampling alone cannot rule out a descendant it never had a live look at. Reproduces the
+  // review's exact scenario: timeout shorter than the poll interval, with a fast setsid/SIGTERM-
+  // ignoring descendant.
+  const marker = `939.${process.pid % 100000}`;
+  const dropper = realDropper({ terminationGraceMs: 1_500 });
+  const wrapped = dropper.wrapCommand(execFileAsync);
+
+  // Whether or not the descendant actually survives is not what this test is about (that would make
+  // it a coin flip on process-creation latency) — the verdict must be conservative regardless. Still,
+  // clean up anything left running, on every exit from this test, not only the happy one.
+  t.after(async () => {
+    const survivor = (await execFileAsync(TOOLS.pgrep, ['-x', '-f', `${TOOLS.sleep} ${marker}`]).catch(() => ({ stdout: '' }))).stdout.trim();
+    if (survivor) { try { process.kill(Number(survivor), 'SIGKILL'); } catch { /* already gone */ } }
+  });
+
+  const running = wrapped(
+    TOOLS.sh,
+    ['-c', `${TOOLS.setsid} ${TOOLS.sh} -c 'trap "" TERM; exec ${TOOLS.sleep} ${marker}' </dev/null >/dev/null 2>&1 & exec ${TOOLS.sleep} 60`],
+    { timeout: 50 },
+  );
+  running.catch(() => {});
+
+  const err = await running.then(() => null, (e) => e);
+  assert.ok(err, 'the 50ms timeout must fail the launch');
+  assert.equal(err.terminationConfirmed, false,
+    'zero live polls of the tree occurred before the direct child died — this must read as unconfirmed, '
+    + 'never as confirmed, however the (necessarily incomplete) survivor search came out');
+});
+
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `918.${process.pid}`;

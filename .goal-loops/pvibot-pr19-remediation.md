@@ -8,13 +8,19 @@ out-of-scope-but-tracked and did not touch `TmuxAdapter` or the cancellation/lea
 
 | ID | Criterion | Status |
 | --- | --- | --- |
-| 1 | Every workspace-affecting subprocess, including `TmuxAdapter`, uses the same validated privilege-drop plan; no bare PATH-resolved `sudo -u name tmux` | pending |
-| 2 | `PrivilegeDropper.wrapCommand` tracks and kills the whole descendant tree on timeout/abort, like coding-CLI launches | pending |
-| 3 | Cancellation cannot default to confirmed when `cancelGraceMs` wins the race against termination confirmation | pending |
-| 4 | Unconfirmed termination persists `termination_confirmed:false`, blocks the job, and fences the project lease durably; explicit recovery path, never auto-cleared | pending |
-| 5 | Confirmed cancellation keeps current behaviour and releases its lease; contract/provenance compatibility preserved | pending |
-| 6 | Adversarial tests: timeout descendants, cancelGrace race, lease/fence behaviour, tmux production wiring | pending |
-| 7 | Self-review: PID reuse, deadlocks, lease expiry, systemd/container portability, secret leakage | pending |
+| 1 | Every workspace-affecting subprocess, including `TmuxAdapter`, uses the same validated privilege-drop plan; no bare PATH-resolved `sudo -u name tmux` | PASS |
+| 2 | `PrivilegeDropper.wrapCommand` tracks and kills the whole descendant tree on timeout/abort, like coding-CLI launches | PASS, with a documented residual limitation — see round 3 |
+| 3 | Cancellation cannot default to confirmed when `cancelGraceMs` wins the race against termination confirmation | PASS |
+| 4 | Unconfirmed termination persists `termination_confirmed:false`, blocks the job, and fences the project lease durably; explicit recovery path, never auto-cleared | PASS |
+| 5 | Confirmed cancellation keeps current behaviour and releases its lease; contract/provenance compatibility preserved | PASS |
+| 6 | Adversarial tests: timeout descendants, cancelGrace race, lease/fence behaviour, tmux production wiring | PASS |
+| 7 | Self-review: PID reuse, deadlocks, lease expiry, systemd/container portability, secret leakage | PASS |
+
+**Round 3 (this update).** An independent acceptance review of commit `f17c793` (round 2's result)
+found two more real gaps, both fixed below: `reconcileOnStart` still released leases on restart
+(criterion 4 was incomplete for the crash path specifically), and the descendant-tracking poller
+introduced in round 2 could itself be defeated by a launch faster than its own polling interval
+(criterion 2's fix was real but not complete). See "Round 3" below.
 
 ## Findings (pre-implementation reconnaissance)
 
@@ -219,4 +225,133 @@ exit point reached after `close()` actually runs.
   pass, **0 skipped**, 0 fail. Every real-process test — including the two new setsid-detached-
   descendant regressions and the pre-existing cancellation/environment/ownership suite — ran for
   real, not merely hermetically. No leaked processes and no stray root-owned files found afterward.
+
+## Round 3 — two more gaps an independent review found in commit f17c793
+
+### Gap A — `reconcileOnStart` still released leases; a restart is an unknown-termination case too
+
+Round 2 fixed the *in-process* unconfirmed-cancellation path (`cancelJob`) but left the *restart* path
+unchanged: `reconcileOnStart` unconditionally called `_releaseLease` for every job stranded in a
+`WORKSPACE_ACTIVE_STATE`. A crash is, if anything, a *stronger* unknown-termination case than a
+cancellation race — there is no live process left that could ever confirm a descendant tree is dead,
+only a durable record saying a job was mid-flight when the service stopped existing.
+
+* **RED.** Rewrote the existing `orch-engine.test.mjs` restart test to set up a REAL lease (via
+  `repo.acquireLease`, not a hand-set `lease_fencing_token` field) before simulating the crash, and
+  added three more: fence survives its own lease TTL, fence survives a genuine store close-and-reopen
+  (not just a second engine instance sharing the live store), and the fence blocks both a fresh job
+  submission and a revision request for the same project. All four failed against the old code
+  (`lease.fenced` was `undefined`; the lease was gone or freely re-acquirable).
+* **Fix.** `reconcileOnStart` now calls `_fenceLease` (the same method `cancelJob`'s unconfirmed
+  branch uses) instead of `_releaseLease`, and persists `termination_confirmed: false` in the same
+  transition. Nothing else about reconciliation changed — a stranded job still moves to
+  `blocked_project_state`; the difference is entirely in what happens to the resource behind it.
+* **GREEN.** All 5 tests in that section pass (the rewritten one plus 4 new); `orch-engine.test.mjs`
+  full file 73/73 (later, with round 3's other change, unaffected).
+* **Operational trade-off, stated plainly (also added to docs/orchestrator-api.md §3 and the Rollback
+  section, which had the identical stale "lease released" claim in a second place):** a routine
+  restart or deploy that catches a job mid-flight now blocks that project until an operator explicitly
+  clears the fence with the service stopped. This is deliberately less convenient than round 2's
+  behaviour and is the whole point of the fix — a restart proves nothing about whether a descendant
+  survived, so it must not be treated as though it does.
+* **Explicitly out of scope, and stated as such:** `reconcileOnStart` cannot do better than an
+  unconditional fence, because there is no live descendant list and no persisted per-launch pid to
+  check after a restart — that would need durable pid tracking across restarts, a materially larger
+  feature than reconciliation itself.
+
+### Gap B — the descendant poller can itself be beaten by a fast enough launch
+
+Round 2's fix (continuous `/proc` polling while a launch is alive, seeding `ensureTerminated`) is real
+but was not complete: if `execFile`'s own `timeout`/`signal` kills the direct child before the
+poller's first tick ever fires (a timeout shorter than `DESCENDANT_POLL_MS` guarantees this), or if a
+descendant forks and `setsid`-detaches in the gap between the last tick and the child's death,
+`ensureTerminated` had nothing to seed from beyond the (already-dead) top pid — and reported
+`terminationConfirmed: true` regardless, because an empty search against nothing worth searching is
+indistinguishable, by construction, from a genuinely empty tree.
+
+* **RED (real root → admin).** New adversarial test in `orch-privilege-real.test.mjs`: a
+  `setsid`/SIGTERM-trapping descendant forked immediately, with `timeout: 50` against a
+  `DESCENDANT_POLL_MS` of 200 — guaranteeing zero poll ticks before the direct child dies. Failed
+  against the round-2 code: `terminationConfirmed` was `true`. Confirmed via `pgrep` that the
+  descendant genuinely survived (a real leak, not merely a wrong flag) before cleaning it up.
+* **Deliberately not fixed by shrinking the interval.** As instructed, and because it would not
+  actually fix anything: an adversary only has to fork and detach faster than whatever interval is
+  chosen, at any interval. This is a structural property of sampling, not a tuning parameter.
+* **Fix chosen: conservative reporting, not containment.** `_execTracked` now counts *completed*
+  live-tree observations (`liveTicks`, incremented at the end of a tick's accumulate-and-prune, not
+  when the timer merely fires) and passes the count to `ensureTerminated`. When the direct pid is
+  already gone AND zero live ticks ever completed, the verdict is forced to `false` — win or lose,
+  regardless of what the (necessarily trivial) survivor search finds — because the only thing tracked
+  in that case is the seed's own already-dead top pid, which proves nothing about anything that may
+  have forked from it. An ordinary cancellation or timeout, with a normal phase budget and many poll
+  cycles behind it, is completely unaffected: `liveTicks > 0`, so the existing confirmed/unconfirmed
+  logic runs exactly as round 2 left it. Verified directly: the round-2 real-process suite (timeout
+  1000ms, abort variant, ample polling window) still reports `terminationConfirmed: true` after
+  everything is actually dead.
+  * **The alternative considered and not taken: kernel-level containment** — a dedicated PID
+    namespace (the kernel kills every process in it the moment the namespace's own init exits) or a
+    cgroup with `cgroup.kill`/`cgroup.procs` (tracks membership independently of reparenting, unlike
+    `/proc` ppid-chasing) would close this structurally rather than statistically. Not attempted:
+    materially larger in scope (namespace/cgroup delegation, container-runtime interaction, a new
+    dependency on kernel features not uniformly available across every host and container this
+    product targets) than this fix, and explicitly offered as an alternative rather than a
+    requirement. Documented in both `privilege.js` (at `ensureTerminated`) and
+    `docs/orchestrator-api.md` §1.5 as a known, disclosed limitation and a candidate follow-up, per
+    the instruction not to solve this silently.
+* **GREEN.** New test passes, as real root → admin. Full round-2 privilege suite (71/74, 3 skipped —
+  identity-required) unaffected.
+
+### Recovery script — re-verified, and one real gap found and fixed
+
+Re-checked against the four explicit properties asked for:
+
+* **No side-effect imports.** `index.js`'s only additions to the script are `MIGRATIONS`, a frozen
+  constant; `createOrchestratorSubsystem`/`buildSubsystem`/`mountOrchestrator` are functions the
+  script never calls, and are never called at module scope in `index.js` itself. Added a test
+  asserting this directly against the source (no call to any of the four bootstrap identifiers at
+  column 0), rather than relying only on "the suite hasn't hung yet".
+* **Refuses a running store.** Already covered in round 2 (`StoreLockedError` → exit 3, message names
+  the reason); re-confirmed still passing.
+* **Redacts output — found a real gap.** The script echoed the RAW `--reason`/`--by` arguments to its
+  own stdout after clearing a fence, even though `repo.clearFence` had already redacted them before
+  writing the durable record. A secret pasted into `--reason` by a hurried operator would therefore
+  reach the terminal (and anything that captured it) unredacted, even though the store itself was
+  clean. **RED**: new test pasting an `sk-…`-shaped value into `--reason` failed
+  (`stdout.includes(secret)` was `true`). **Fix**: the script now prints the *returned, already-
+  redacted* record from `clearFence` rather than the raw arguments. **GREEN**.
+* **Leaves an auditable durable record.** New test confirms the cleared record retains the *entire*
+  history, not just its ending: `fenced_at`/`fenced_by`/`fenced_reason` from the original fence
+  survive alongside the new `cleared_at`/`cleared_by`/`clear_reason` — an operator reading it later
+  sees who fenced it and why, and who cleared it and why, in one record.
+
+## Final verification, round 3
+
+App VERSION bumped `1.26.0729.1851` → `1.26.0729.2230` (forward, per `test/release-version.test.mjs`'s
+format and ordering checks, both passing).
+
+* **Full suite, as admin:** 450 pass, 3 skipped (identity-required), 0 fail. 453 total.
+* **Full suite, as real root, `PW_TEST_DROP_USER=admin`:** **453 pass, 0 skipped, 0 fail.** Every
+  real-process test, including both new round-3 regressions, ran for real.
+* **Process hygiene.** No process matching any marker this suite's own tests use (917, 918, 932, 933,
+  934, 937, 938, 939) was left running afterward. Two unrelated processes *were* found on the shared
+  container (markers `948.94305.3`, `951.123.1`, using `runuser`/detached-spawn shapes) — grepped the
+  entire repository (`grep -rn runuser`, excluding `node_modules`) and found no match anywhere: they
+  are not spawned by any file in this worktree's test suite or source, so they were left untouched
+  rather than killed, consistent with not taking destructive action on processes this session cannot
+  attribute to itself on a shared host.
+
+## Remaining limitations (stated, not fixed)
+
+1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no
+   persisted per-launch pid, survives a restart to check against. Durable pid tracking across
+   restarts would close this; out of scope here.
+2. **Polling-based descendant tracking cannot prove a negative in general** — only the specific,
+   provable case of "zero live observations ever happened" is caught. A descendant that forks in the
+   gap between the *last* poll tick and the direct child's death (as opposed to *before the first*
+   tick) remains a theoretical, unclosed gap; closing it needs kernel-level containment (PID
+   namespace or cgroup), not a polling adjustment.
+3. **`HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS`** remain preserved across the privilege drop, a stated
+   interception-risk-for-compatibility trade-off from the original PR #19 work, unchanged here.
+4. Two unrelated, unattributed processes observed on the shared container at verification time (see
+   above) — not from this codebase, left untouched, and not this session's to clean up.
 

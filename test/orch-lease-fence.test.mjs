@@ -181,6 +181,22 @@ test('fence: clearFence refuses when nothing is fenced — never a silent no-op'
 // service is not running (the store is closed before the script opens it), and the script's own
 // argument handling is what has to refuse a careless invocation.
 
+test('clear-fence script: importing index.js for MIGRATIONS has no side effects of its own', () => {
+  // The script pulls `MIGRATIONS` from `app/orchestrator/index.js`, which also exports
+  // `createOrchestratorSubsystem`/`mountOrchestrator` — functions the script never calls, and never
+  // functions the *import* itself runs. index.js's own doc comment states this is deliberate:
+  // "Constructed here rather than at import time so that a disabled instance never opens the store,
+  // never takes the lock, and never creates a directory." Checked directly against the source: every
+  // line at module scope (column 0 — not indented inside a function body) is only an `import`,
+  // `export`, or the `MIGRATIONS` constant's own declaration, never a call to any of this module's
+  // own bootstrap functions.
+  const source = fs.readFileSync(new URL('../app/orchestrator/index.js', import.meta.url), 'utf8');
+  const risky = /^(createOrchestratorSubsystem|buildSubsystem|mountOrchestrator|JournalStore\.open)\s*\(/;
+  const offendingLine = source.split('\n').find((line) => risky.test(line));
+  assert.equal(offendingLine, undefined,
+    `index.js must not call its own bootstrap functions at module scope, found: ${offendingLine}`);
+});
+
 /**
  * Every store here is opened with the SAME `MIGRATIONS` the live service applies (via
  * `createOrchestratorSubsystem`) — not an empty list. A store already migrated to schema v1 opened
@@ -295,6 +311,54 @@ test('clear-fence script: refuses to open the store while the service is still r
     } finally {
       await store.close();
     }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('clear-fence script: a secret pasted into --reason is redacted, in its own output and in the durable record', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-clearfence-'));
+  try {
+    const { env, resource } = await fenceViaJs(dir);
+    const secret = 'sk-liveTESTSECRETVALUEMUSTNOTAPPEAR1234567890';
+
+    const { stdout } = await execFileAsync(process.execPath, [
+      CLEAR_FENCE_SCRIPT, '--project', 'Demo',
+      '--reason', `verified clean, ref token=${secret}`, '--by', 'james', '--confirm',
+    ], { env, timeout: 15_000 });
+
+    assert.equal(stdout.includes(secret), false, 'the script\'s own stdout must not echo a raw secret back');
+    assert.match(stdout, /REDACTED/);
+
+    const lease = await readLease(env, resource);
+    assert.equal(JSON.stringify(lease).includes(secret), false, 'the durable record must not carry the raw secret either');
+    assert.match(lease.clear_reason, /REDACTED/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('clear-fence script: clearing leaves a full auditable record — who fenced it, who cleared it, and why, all still readable', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-clearfence-'));
+  try {
+    const { env, resource } = await fenceViaJs(dir);
+
+    await execFileAsync(process.execPath, [
+      CLEAR_FENCE_SCRIPT, '--project', 'Demo',
+      '--reason', 'verified no surviving descendant via ps -ef', '--by', 'james', '--confirm',
+    ], { env, timeout: 15_000 });
+
+    const lease = await readLease(env, resource);
+    // The clearing action is recorded...
+    assert.equal(lease.fenced, false);
+    assert.equal(lease.cleared_by, 'james');
+    assert.match(lease.clear_reason, /ps -ef/);
+    assert.ok(lease.cleared_at, 'the clearing must be timestamped');
+    // ...but so is the ORIGINAL fencing this cleared: an operator reading this record later must be
+    // able to see the whole story, not just its ending.
+    assert.equal(lease.fenced_by, 'job-1');
+    assert.match(lease.fenced_reason, /unconfirmed termination/);
+    assert.ok(lease.fenced_at, 'the original fencing must still be timestamped');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }

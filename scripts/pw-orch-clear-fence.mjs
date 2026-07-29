@@ -131,10 +131,14 @@ try {
       );
       exitCode = 0;
     } else {
-      await store.transact((tx, state) => {
-        repo.clearFence(tx, state, { resource, clearedBy: args.by, reason: args.reason });
-      });
-      process.stdout.write(`cleared by ${args.by}: ${args.reason}\n`);
+      // Echo what was actually stored, not the raw argument: `repo.clearFence` redacts credential-
+      // shaped content before writing, and the same value belongs on this command's own stdout —
+      // otherwise the durable record would be safe while the terminal that ran this command, and
+      // whatever captured its output, still held the raw secret.
+      const cleared = await store.transact((tx, state) => repo.clearFence(tx, state, {
+        resource, clearedBy: args.by, reason: args.reason,
+      }));
+      process.stdout.write(`cleared by ${cleared.cleared_by}: ${cleared.clear_reason}\n`);
       exitCode = 0;
     }
   }

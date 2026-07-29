@@ -1647,20 +1647,29 @@ export class OrchestrationEngine {
    * Reconcile jobs left mid-flight by a restart.
    *
    * A job recorded as `implementing` when the process died is in an unknown state: the phase may
-   * have completed, partly completed, or never started. It is moved to `blocked_project_state` with
-   * its lease released, rather than resumed — resuming would mean guessing, and the repository's
-   * actual condition is the only thing that can settle it.
+   * have completed, partly completed, or never started — and so may whatever it launched. A restart
+   * is an unknown-termination case in exactly the same sense an unconfirmed cancellation is: nothing
+   * in this process ever confirmed a descendant tree is dead, because the process that could have is
+   * the one that just crashed. It is moved to `blocked_project_state`, but the project's lease is
+   * *fenced*, not released — releasing it would let a later job start writing to a workspace a
+   * pre-crash descendant might still be editing. Only an explicit, evidenced `clearFence` (via
+   * `scripts/pw-orch-clear-fence.mjs`) takes it down; resuming would mean guessing, and so would
+   * assuming a restart is proof of anything.
    */
   async reconcileOnStart() {
     const stranded = this.repo.listJobs((j) => WORKSPACE_ACTIVE_STATES.has(j.status));
     for (const job of stranded) {
       // eslint-disable-next-line no-await-in-loop
-      await this._releaseLease(job.workbench_job_id);
+      await this._fenceLease(
+        job.workbench_job_id,
+        'the workbench restarted while this job held the workspace; termination cannot be confirmed after a crash',
+      );
       // eslint-disable-next-line no-await-in-loop
       await this._transition(job.workbench_job_id, JobStatus.BLOCKED_PROJECT_STATE, {
         message: 'the workbench restarted while this job held the workspace; its state is unknown',
-        detail: 'reconciled after a restart: the workspace state is unknown',
+        detail: 'reconciled after a restart: the workspace state is unknown, and the project is fenced pending operator review',
         eventType: EventType.BLOCKED,
+        patch: { termination_confirmed: false },
       }).catch(() => { /* a job that already moved on needs no reconciliation */ });
     }
     return stranded.length;

@@ -202,6 +202,31 @@ tree before a timeout or an abort reaches the caller: a check command that backg
 something of its own gets exactly the same tree-confirmation as a coding-CLI phase that starts a
 build or a test run, because both share the tracking, not just the drop.
 
+**A documented limitation, not a silent one: polling cannot prove a negative.** The tree is watched
+by periodically re-reading `/proc` while the launch is alive, not by a kernel-enforced guarantee. If
+`execFile`'s own `timeout` or `signal` handling kills the direct child before even one poll has
+completed — a launch shorter than the poll interval guarantees this, and it is not the only way to
+reach it — nothing has actually been observed, and an empty search afterward proves nothing: a
+descendant that forked and `setsid`-detached in that same window is structurally indistinguishable
+from one that never existed. Shortening the poll interval does not close this; it only raises the bar
+for an adversary that forks and detaches faster than whatever interval is chosen. So this is handled
+by being honest about it rather than by pretending a shorter interval is a proof: this specific case —
+the launch failed before the tree was ever looked at even once — is reported as **unconfirmed**,
+unconditionally, whatever the (necessarily incomplete) survivor search finds. That is what routes it
+to the durable project fence below rather than letting it round up to a false "confirmed". An
+ordinary cancellation, with a normal phase budget and many poll cycles behind it, is unaffected and
+still reports confirmed once everything it saw is actually dead.
+
+The durable fence is therefore standing in for a stronger guarantee this module does not attempt: a
+kernel-level containment primitive — a dedicated PID namespace, where the kernel itself kills every
+process in it the moment the namespace's own init exits, or a cgroup with `cgroup.kill`/
+`cgroup.procs`, which (unlike `/proc` ppid-chasing) tracks membership independently of reparenting —
+would close this structurally rather than statistically. That is a materially larger, more
+platform-specific undertaking than this fix (namespace/cgroup delegation, permission and container-
+runtime interaction, a new dependency on kernel features that may not be uniformly available across
+every host and container this product runs on) and is tracked as a known follow-up rather than
+attempted here.
+
 Container mode has nothing to drop and is unchanged.
 
 ---
@@ -279,8 +304,22 @@ Nothing clears a fence on a timer.
 **Crash safety.** State lives in an append-only write-ahead journal with a CRC per transaction. A
 torn final record is discarded as a crash; a bad record with good records after it is corruption, and
 the store refuses to open rather than silently losing durable evidence. On start, any job recorded as
-holding the workspace is moved to `blocked_project_state` with its lease released — reconciled
-against reality, never resumed on an assumption about what a dead process had finished.
+holding the workspace is moved to `blocked_project_state` — reconciled against reality, never resumed
+on an assumption about what a dead process had finished. Its project's write lease is **fenced**, not
+released: a restart is an unknown-termination case in exactly the same sense an unconfirmed
+cancellation is, since nothing in the new process ever confirmed the old one's descendants were dead,
+and releasing the lease would let a later job start writing to a workspace a pre-crash descendant
+might still be editing. **This means a routine restart that catches a job mid-flight now blocks that
+project until an operator explicitly clears the fence** (`scripts/pw-orch-clear-fence.mjs`, [§7](#7-operating-it))
+— a deliberate trade of operational convenience for never silently resuming into an unproven state.
+Deploy tooling that restarts the service should expect this and plan to check for stranded jobs.
+
+**A documented limitation, not a silent one, part two: `reconcileOnStart` cannot do better than
+"unconfirmed" for a crashed process.** Unlike an in-process cancellation, a restart has no live
+descendant list and no per-launch pid record to check at all — there is no live process left in
+memory to enumerate a tree from. So every job reconciled this way is unconditionally fenced, with no
+attempt to prove the tree actually survived; that would need durable pid tracking across a restart,
+which is a materially larger feature than reconciliation itself and is left as a known follow-up.
 
 **Human windows are never touched.** A window is the orchestrator's lane only if it carries the role
 marker this service set. A window merely *named* `orch_pvibot` is refused — including under
@@ -622,7 +661,10 @@ Migrations are append-only: never edit a released one.
    `$PW_ORCHESTRATOR_DATA_DIR` aside to start clean, keeping the old directory for forensics.
 
 In-flight jobs are safe across all of this: on the next start every job recorded as holding the
-workspace is reconciled to `blocked_project_state` with its lease released.
+workspace is reconciled to `blocked_project_state`, and its project's write lease is **fenced** (see
+[§3](#3-guarantees-worth-knowing-before-you-rely-on-them)) rather than released — so a rollback or
+upgrade that catches a job mid-flight will require clearing that fence
+(`scripts/pw-orch-clear-fence.mjs`) before the project can be worked again.
 
 ### Backup
 
