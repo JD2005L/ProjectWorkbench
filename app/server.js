@@ -11,7 +11,10 @@ import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
 import { normalizeUserRecord } from './users-compat.js';
 import { deployCss } from './deploy-css.js';
+import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
+import { HOST_TERMINAL_USER, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
+import { ensureUserCredentials, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF } from './user-credentials.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 
@@ -159,57 +162,70 @@ async function syncProjectCredentials(project, users){
 // project's terminal launches with CLAUDE_CONFIG_DIR pointed at that owner's
 // private config dir, so Claude runs on the owner's OWN login/seat. The first
 // `claude` run in the project triggers the owner's OAuth login into that dir;
-// it then persists. Copilot rides on the owner's GitHub token (GH_TOKEN).
-// NOTE: all sessions still run as one OS user (uid 1001) — this gives per-user
+// it then persists. Copilot rides on the owner's GitHub token (GH_TOKEN), which
+// is delivered through a 0600 rcfile — never argv (see user-credentials.js).
+// NOTE: all sessions still run as one OS user — this gives per-user
 // accountability/seat-usage, NOT hard OS isolation between users on the box.
-function safeUserName(u){ return String(u || '').replace(/[^A-Za-z0-9._-]/g, '_'); }
-function userClaudeConfigDir(username){ return path.join(USER_CRED_BASE, safeUserName(username), 'claude'); }
+function userClaudeDir(username){ return userClaudeConfigDir(USER_CRED_BASE, username); }
 async function userClaudeSignedIn(username){
- try { const st = await fs.stat(path.join(userClaudeConfigDir(username), '.credentials.json')); return st.isFile() && st.size > 0; }
+ try { const st = await fs.stat(path.join(userClaudeDir(username), '.credentials.json')); return st.isFile() && st.size > 0; }
  catch { return false; }
 }
-// The dashboard process runs as root, but agent panes may be dropped to
-// PW_TERMINAL_UID (see terminal-priv.js). A root-owned 0700 config dir would be
-// unreadable by that pane, so every per-user credential path we create is handed
-// to the terminal uid when the drop is active. No-op when it is not, which keeps
-// the shared-root deployment byte-identical to before.
-async function chownForTerminal(target){
- if(!TERMINAL_PRIV?.enabled) return;
- const uid = Number(TERMINAL_PRIV.uid), gid = Number(TERMINAL_PRIV.gid);
- if(!Number.isInteger(uid) || !Number.isInteger(gid)) return;
- await fs.chown(target, uid, gid).catch(()=>{});
+// The account agent panes run as. Resolved once and memoised — but ONLY on
+// success: a passwd lookup that merely failed (an unanswered directory query)
+// must not disable per-user credentials for the life of the process, whereas a
+// stable answer never changes underneath us.
+const passwdLookup = makePasswdLookup({ execFile: execFileAsync, readFile: fs.readFile });
+let terminalOwnerCache;
+async function terminalOwner(){
+ if(terminalOwnerCache !== undefined) return terminalOwnerCache;
+ const owner = await resolveTerminalOwner(process.env, passwdLookup);
+ terminalOwnerCache = owner;
+ return owner;
 }
-// Create (if needed) a user's Claude config dir and seed it with the managed MCP
-// servers taken from the shared config, so per-user Claude still gets team MCP.
-async function ensureUserClaudeDir(username){
- const dir = userClaudeConfigDir(username);
- await fs.mkdir(dir, { recursive: true, mode: 0o700 });
- // mkdir -p may have created the base and the per-user parent too; the pane needs
- // to traverse both to reach its config dir, so hand over every level we own.
- await chownForTerminal(USER_CRED_BASE);
- await chownForTerminal(path.dirname(dir));
- await chownForTerminal(dir);
- const cfgFile = path.join(dir, '.claude.json');
- try { await fs.access(cfgFile); }
- catch {
-  let mcpServers = {};
-  try { const shared = JSON.parse(await fs.readFile(sharedClaudeJson, 'utf8')); if(shared && typeof shared.mcpServers === 'object' && shared.mcpServers) mcpServers = shared.mcpServers; } catch {}
-  await fs.writeFile(cfgFile, JSON.stringify({ mcpServers }, null, 2) + '\n', { mode: 0o600 });
-  await chownForTerminal(cfgFile);
- }
- return dir;
-}
-// Extra `env` KEY=VALUE entries to prepend into a project's tmux session so it
-// uses the owner's credentials. Empty array = fall back to the shared login.
-async function credentialSessionEnv(project){
- const extra = [];
- if(!PER_USER_CLAUDE || !project?.primaryUser) return extra;
- let users = []; try { users = await loadUsers(); } catch {}
+// What a project's tmux session should be launched with. `tokens` are extra
+// non-secret `env` KEY=VALUE entries; `shellArgs` is the pane shell's argv tail;
+// `key` is the credential fingerprint stamped on the session (see CRED_KEY_OPTION).
+const DEFAULT_SHELL_ARGS = ['--noprofile','--norc'];
+async function projectCredentialOwner(project){
+ if(!PER_USER_CLAUDE || !project?.primaryUser) return null;
+ let users = []; try { users = await loadUsers(); } catch { return null; }
  const u = users.find(x => x.username === project.primaryUser);
- if(!u) return extra;
- try { const dir = await ensureUserClaudeDir(u.username); extra.push('CLAUDE_CONFIG_DIR=' + dir); } catch {}
- if(u.ghToken){ try { const t = decrypt(u.ghToken); if(t) extra.push('GH_TOKEN=' + t); } catch {} }
- return extra;
+ if(!u) return null;
+ let ghToken = '';
+ if(u.ghToken){ try { ghToken = decrypt(u.ghToken) || ''; } catch { ghToken = ''; } }
+ return { username: u.username, ghToken };
+}
+// The fingerprint a project SHOULD be running on, computed without creating or
+// touching anything — cheap enough for the status poll.
+async function desiredCredentialKey(project){
+ const owner = await projectCredentialOwner(project);
+ if(!owner) return CREDENTIALS_OFF;
+ return credentialFingerprint({ username: owner.username, configDir: userClaudeDir(owner.username), ghToken: owner.ghToken });
+}
+async function credentialContext(project){
+ const off = { tokens: [], shellArgs: DEFAULT_SHELL_ARGS, key: CREDENTIALS_OFF };
+ const owner = await projectCredentialOwner(project);
+ if(!owner) return off;
+ try {
+  const cred = await ensureUserCredentials({
+   fsp: fs, base: USER_CRED_BASE, username: owner.username,
+   ghToken: owner.ghToken, sharedClaudeJson, owner: await terminalOwner(),
+  });
+  return {
+   tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir],
+   shellArgs: cred.envFile ? ['--noprofile','--rcfile',cred.envFile] : DEFAULT_SHELL_ARGS,
+   key: cred.fingerprint,
+  };
+ } catch(e){
+  // Fall back to the shared login rather than pointing an agent at a config dir
+  // it cannot read: a working shared session beats a broken private one. The
+  // session then reports as credential-stale, so the misconfiguration surfaces
+  // instead of silently doing nothing (which is how the host-mode ownership bug
+  // stayed invisible).
+  console.warn(`[per-user-claude] ${project?.name || '?'}: using the shared login — ${e?.message || e}`);
+  return off;
+ }
 }
 
 // Serialize every projects.json read-modify-write transaction. Concurrent POSTs
@@ -752,7 +768,9 @@ async function stopPreviewUnit(name){
 }
 async function tmux(args,opts={}){
  if(DEPLOY_MODE === 'container') return execFileAsync('tmux',['-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
- return execFileAsync('sudo',['-u','admin','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+ // HOST_TERMINAL_USER (not a literal) so the account panes run as and the account
+ // per-user credential files are chowned to cannot drift apart — see terminal-owner.js.
+ return execFileAsync('sudo',['-u',HOST_TERMINAL_USER,'tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
 }
 function parseTmuxWindows(stdout){
  return String(stdout || '').split('\n').filter(Boolean).map(line=>{
@@ -840,21 +858,54 @@ const projectTerminals = new Map();
 // Unset PW_TERMINAL_UID (or host mode) => passthrough, byte-identical upstream.
 const TERMINAL_PRIV = resolveTerminalPriv(process.env);
 function agentEnvTokens(canonicalTokens){ return wrapAgentEnv(TERMINAL_PRIV, canonicalTokens); }
-const agentLoginDropArgv = agentLoginDrop(TERMINAL_PRIV);async function ensureTmuxSession(p){
+const agentLoginDropArgv = agentLoginDrop(TERMINAL_PRIV);
+// A live session's panes keep the environment they were created with, so
+// enabling PW_PER_USER_CLAUDE or reassigning a project's primaryUser cannot
+// retroactively re-key a running session. Stamp the credential fingerprint on
+// the session at creation so that drift is DETECTABLE, and let an operator
+// reconcile it deliberately (POST /api/term/:project/recycle) rather than
+// silently killing a session that may be holding running work.
+const CRED_KEY_OPTION = '@pw_cred_key';
+async function readSessionCredKey(sess){
+ try { const { stdout } = await tmux(['show-options','-t',sess,'-qv',CRED_KEY_OPTION]); return String(stdout || '').trim(); }
+ catch { return ''; }
+}
+async function stampSessionCredKey(sess,key){
+ await tmux(['set-option','-t',sess,CRED_KEY_OPTION,key]).catch(()=>{});
+}
+// Is this project's live session running on credentials other than the ones it
+// would get today? Costs nothing (and touches no tmux) while the feature is off.
+async function credentialsStale(p){
+ if(!PER_USER_CLAUDE) return false;
  const sess = tmuxSession(p.name);
- try { await tmux(['has-session','-t',sess]); return; } catch {}
+ try { await tmux(['has-session','-t',sess]); } catch { return false; }
+ const [desiredKey, stampedKey] = await Promise.all([desiredCredentialKey(p), readSessionCredKey(sess)]);
+ return sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey, stampedKey }).stale;
+}
+async function ensureTmuxSession(p){
+ const sess = tmuxSession(p.name);
+ const cred = await credentialContext(p);
+ let exists = true;
+ try { await tmux(['has-session','-t',sess]); } catch { exists = false; }
+ if(exists){
+  // Adopt the stamp on an unstamped session only when there is nothing to be
+  // stale about, so upgrading this build cannot mass-mark existing sessions.
+  if(cred.key === CREDENTIALS_OFF && !(await readSessionCredKey(sess))) await stampSessionCredKey(sess, cred.key);
+  return;
+ }
  const cwd = p.path || workspacePath(p.name);
  // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
  // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
  // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
- const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...(await credentialSessionEnv(p))]);
+ const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  const tabs = Array.isArray(p.tabs) ? p.tabs : [];
  const firstName = tabs[0]?.name || 'Base';
- await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash','--noprofile','--norc']);
+ await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash',...cred.shellArgs]);
+ await stampSessionCredKey(sess, cred.key);
  if(tabs[0]?.cmd?.trim()) await tmux(['send-keys','-t',`${sess}:${firstName}`,tabs[0].cmd.trim(),'C-m']);
  for(let i=1; i<tabs.length; i++){
   const t = tabs[i]; if(!t?.name) continue;
-  await tmux(['new-window','-t',sess,'-c',cwd,'-n',t.name,...env,'bash','--noprofile','--norc']);
+  await tmux(['new-window','-t',sess,'-c',cwd,'-n',t.name,...env,'bash',...cred.shellArgs]);
   if(t.cmd?.trim()){ await new Promise(r=>setTimeout(r,80)); await tmux(['send-keys','-t',`${sess}:${t.name}`,t.cmd.trim(),'C-m']); }
  }
  await tmux(['select-window','-t',`${sess}:0`]).catch(()=>{});
@@ -929,8 +980,12 @@ async function injectPvikpbotPrompt(p,prompt){
 }
 async function newTmuxWindow(p,name='new task',cmd=''){
  const safeName = String(name || 'new task').replace(/[\r\n\t]/g,' ').trim().slice(0,80) || 'new task';
- const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...(await credentialSessionEnv(p))]);
- await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...winEnv,'bash','--noprofile','--norc']);
+ // A new window gets today's credentials, which may differ from the ones the
+ // session was created with; that is why drift is reported per session and
+ // reconciled by recreating it, rather than left to accumulate silently.
+ const cred = await credentialContext(p);
+ const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
+ await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...winEnv,'bash',...cred.shellArgs]);
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
   await new Promise(r=>setTimeout(r,80));
@@ -1371,15 +1426,26 @@ const deployScript = `<script>
    const isProd=target==='prod';
    const opt=(card.querySelector('.deploy-option')||{}).value||'';
    if((isProd||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;
-   let password='';
-   if((typeof card!=='undefined'&&card&&card.dataset&&card.dataset.reauth==='1')||!window.__pwHasDeployPassword){
-    password=prompt('Enter your domain password for deployment (or store it in Settings > Users):');
-    if(password===null)return;
-   }
    btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   async function runDeploy(pw,save){
+    const bd={option:opt};
+    if(pw){bd.password=pw;if(save)bd.savePassword=true}
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
+    return r.json();
+   }
    try{
-    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});
-    const j=await r.json();
+    // Request first, exactly as the cockpit modal does: the server verifies the
+    // saved password itself and answers needPassword only when there is none or
+    // it no longer verifies. Prompting up-front here is what made a stored
+    // password useless on this page.
+    let j=await runDeploy('',false);
+    if(!j.ok&&j.needPassword){
+     const pw=prompt(j.error||'Enter your domain password for deployment:');
+     if(!pw){output.textContent='Deployment cancelled.';return}
+     const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
+     output.textContent='Running deployment script…';
+     j=await runDeploy(pw,save);
+    }
     if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');throw new Error(j.error||'deploy failed')}
     output.textContent='✅ SUCCESS ('+j.duration+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
     const vEl=card.querySelector('.current-version');
@@ -2026,7 +2092,7 @@ app.get(BASE + '/api/projects/status', requireAuth, async (req,res)=>{ try {
    await fs.writeFile(pendingMarkerPath(p), new Date().toISOString()+'\n').catch(()=>{});
    pend.pending = true; pend.since = new Date().toISOString();
   }
-  return { name: p.name, ...pend, bell: sig.bell, working: sig.working, pending: pend.pending || sig.bell };
+  return { name: p.name, ...pend, bell: sig.bell, working: sig.working, pending: pend.pending || sig.bell, credentialsStale: await credentialsStale(p) };
  }));
  res.json({ ok:true, projects: out });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
@@ -2108,6 +2174,20 @@ app.delete(BASE + '/api/term/:project/windows/:index', requireTerminalAccess, as
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
+// Explicit credential reconciliation. Panes inherit their environment at
+// creation, so a session started before PW_PER_USER_CLAUDE was enabled (or
+// before a project changed hands) keeps the old credentials until it is
+// recreated. That recreation is destructive — it discards every window's running
+// process — so it is never done implicitly: /api/projects/status reports
+// credentialsStale and an operator calls this.
+app.post(BASE + '/api/term/:project/recycle', requireTerminalAccess, async (req,res)=>{ try {
+ const p = await requireProject(req,res); if(!p) return;
+ await audit('session_recycle', { project: p.name, reason: 'credential reconciliation' }, req);
+ await tmux(['kill-session','-t',tmuxSession(p.name)]).catch(()=>{});
+ await ensureTmuxSession(p);
+ res.json({ ok:true, credentialsStale: await credentialsStale(p), windows: await listTmuxWindows(p.name) });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
 app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ await audit('terminal_open', { project: req.params.project }, req);
  const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); const projectJson = JSON.stringify(p.name).replace(/</g,'\\u003c');
  const railProjects = filterProjectsForUser(await loadProjects(), req.user);
@@ -2118,14 +2198,14 @@ app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ awai
  const cliTabsJson = JSON.stringify((_ws.enabledClis||[]).filter(k=>k in SUPPORTED_CLIS).map(k=>({label:SUPPORTED_CLIS[k].label,bin:SUPPORTED_CLIS[k].bin}))).replace(/</g,'\\u003c');
  await clearPending(p);
  let deployConfigured = false;
- let hasDeployPw = false;
  if(DEPLOY_CENTRE){
-  const [dCfg, users] = await Promise.all([loadDeployConfig(), loadUsers()]);
+  const dCfg = await loadDeployConfig();
   deployConfigured = hasDeployConfigFor(p.name, dCfg);
-  const currentUser = users.find(u => u.username === req.user?.username);
-  hasDeployPw = !!currentUser?.deployPassword;
  }
- const deployBits = DEPLOY_CENTRE && deployConfigured ? `<script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script>${deployModalHtml}${deployModalScript}` : '';
+ // No client-side "do we have a saved password?" hint: both deploy surfaces now
+ // request first and let the server answer needPassword, so a hint could only
+ // disagree with it.
+ const deployBits = DEPLOY_CENTRE && deployConfigured ? `${deployModalHtml}${deployModalScript}` : '';
  const [claudeVersion, updateStamp] = await Promise.all([getClaudeVersion(), getClaudeUpdateStamp()]);
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Workbench</title><style>${designTokensCss}${DEPLOY_CENTRE && deployConfigured ? deployCss : ''}${cockpitCss}${statusBarCss}${modalBaseCss}${previewCss}</style></head><body class="pw-cockpit"><div id="shell"><main id="stage"><div id="topBar"><span class="projChip" title="Current project: ${esc(p.name)}"><span class="pcMono" style="--h:${projHue(p.name)}">${esc(projMonogram(p.name))}</span><span class="pcName">${esc(p.name)}</span></span><div id="tabScroller" class="tabScroller"><button id="tabArrowL" class="tabArrow" type="button" aria-label="Scroll tabs left" tabindex="-1">‹</button><div id="tabStrip" class="tabStrip"></div><button id="tabArrowR" class="tabArrow" type="button" aria-label="Scroll tabs right" tabindex="-1">›</button></div><div class="tbActions"><button class="previewBtn" type="button" data-preview="${esc(p.name)}" title="Open live preview window"><span class="pbDot"></span>Preview</button><button id="fileBtn" type="button" title="Files — paste or drop into project"><span class="fileInfo">Files</span></button><button id="railBtn" class="railBtn" type="button" aria-label="Toggle project rail">☰</button></div></div><div id="tray"><div id="trayTabs" role="tablist" aria-label="Project files"><button id="trayTabInbox" class="trayTab" role="tab" aria-selected="true" aria-controls="trayInboxPanel" type="button">Inbox<span id="trayInboxCount" class="trayCount" hidden></span></button><button id="trayTabOutbox" class="trayTab" role="tab" aria-selected="false" aria-controls="trayOutboxPanel" tabindex="-1" type="button">Outbox<span id="trayOutboxCount" class="trayCount" hidden></span></button></div><div id="trayInboxPanel" class="trayPanel" role="tabpanel" aria-labelledby="trayTabInbox"><div id="drop" tabindex="0"><div>Paste/drop/select files here</div><div class="dropHint">PDF, txt, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status">Saved files go to <code>${esc(p.path)}/_inbox</code>. The path will be inserted into the terminal.</div><div id="preview"></div><div id="inboxHeader" class="inboxHeader"></div><div id="inboxList" class="inboxList"></div></div><div id="trayOutboxPanel" class="trayPanel" role="tabpanel" aria-labelledby="trayTabOutbox" hidden><div id="outboxHeader" class="inboxHeader"></div><div id="outboxList" class="inboxList"></div><div id="outboxStatus"></div></div><button class="close" id="close">Close</button></div><div id="trayShield" aria-hidden="true"></div><iframe id="term" allow="clipboard-write; clipboard-read" src="${BASE}/pty/${encodeURIComponent(p.name)}/"></iframe></main>${railHtml(railProjects, p.name, req.user, deployConfigured)}</div><script>const project=${projectJson};const tabPresets=${tabPresetsJson};let pwAuthRedirecting=false;window.pwAuthLost=function(){if(pwAuthRedirecting)return true;pwAuthRedirecting=true;location.href='${BASE}/login?next='+encodeURIComponent(location.pathname);return true};const cliTabs=${cliTabsJson};const tray=document.getElementById('tray'),drop=document.getElementById('drop'),file=document.getElementById('file'),status=document.getElementById('status'),preview=document.getElementById('preview'),inboxHeader=document.getElementById('inboxHeader'),inboxList=document.getElementById('inboxList'),frame=document.getElementById('term');let previewTimer=null;function pwRefitTerm(){try{var h=Math.round(frame.getBoundingClientRect().height);if(h<8)return;frame.style.maxHeight=(h-1)+'px';frame.getBoundingClientRect();requestAnimationFrame(function(){frame.style.maxHeight=''})}catch(e){}}frame.addEventListener('load',function(){setTimeout(pwRefitTerm,200);setTimeout(pwRefitTerm,700);setTimeout(pwRefitTerm,1500)});window.addEventListener('resize',function(){setTimeout(pwRefitTerm,80)});const hoverPanel=Object.assign(document.createElement('div'),{id:'pwHoverPreview'});document.body.appendChild(hoverPanel);function setStatus(t,bad=false){status.textContent=t;status.style.color=bad?'#fca5a5':'#bbf7d0'}function clearPreview(){preview.innerHTML='';document.body.classList.remove('has-preview');setStatus('');if(previewTimer){clearTimeout(previewTimer);previewTimer=null}}function showPreview(url,name,isImage){if(!url&&!name)return clearPreview();if(previewTimer){clearTimeout(previewTimer);previewTimer=null}document.body.classList.add('has-preview');const safeName=escHtml(name||'file');if(isImage&&url){preview.innerHTML='<div class="previewItem"><a href="'+url+'" target="_blank" rel="noopener"><img src="'+url+'" alt="'+safeName+'"></a><button class="previewClear" type="button" title="Clear preview">×</button></div>'}else{preview.innerHTML='<div class="previewItem"><div style="padding:18px;border:1px solid #334155;border-radius:8px;color:#cbd5e1;text-align:center;display:flex;align-items:center;justify-content:center;min-height:130px;word-break:break-all;background:#111827">'+safeName+'</div><button class="previewClear" type="button" title="Clear preview">×</button></div>'}preview.querySelector('.previewClear').onclick=clearPreview;previewTimer=setTimeout(closeTray,15000)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function refreshInbox(){try{const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const out=await r.json();if(!out?.ok){inboxHeader.innerHTML='';inboxList.innerHTML='';return}const files=out.files||[];setTrayCount(trayInboxCount,files.length);if(files.length===0){inboxHeader.innerHTML='<span>No saved files yet.</span>';inboxList.innerHTML='';return}inboxHeader.innerHTML='<span>'+files.length+' saved file'+(files.length===1?'':'s')+' — click a row to insert its path</span><button class="clear" type="button">Clear all</button>';inboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s inbox?'))return;await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{method:'DELETE'});refreshInbox()};inboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';row.title='Click to insert path: '+f.path;const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);row.innerHTML='<div class="thumb">'+(isImg?'<img src="'+f.url+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+'</div></div><button class="del" type="button" title="Delete">×</button>';row.onclick=ev=>{if(ev.target.closest('.del'))return;if(insertPath(f.path)){setStatus('Inserted:\\n'+f.path)}else{setStatus('Could not insert (no terminal focus)',true)}};row.onmouseenter=()=>{hoverPanel.innerHTML=isImg?'<img src="'+f.url+'">':'<div class="card">'+escHtml(f.name)+'<div class="meta">'+fmtSize(f.size)+'</div></div>';hoverPanel.style.display='block';const rct=row.getBoundingClientRect(),pw=hoverPanel.offsetWidth,ph=hoverPanel.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;let lf=rct.right+10;if(lf+pw>vw-8)lf=Math.max(8,rct.left-pw-10);let tp=rct.top-4;if(tp+ph>vh-8)tp=Math.max(8,vh-ph-8);if(tp<8)tp=8;hoverPanel.style.left=lf+'px';hoverPanel.style.top=tp+'px'};row.onmouseleave=()=>{hoverPanel.style.display='none'};row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();hoverPanel.style.display='none';await fetch('${BASE}/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(f.name),{method:'DELETE'});refreshInbox()};inboxList.appendChild(row)}}catch{}}const trayTabInbox=document.getElementById('trayTabInbox'),trayTabOutbox=document.getElementById('trayTabOutbox'),trayInboxPanel=document.getElementById('trayInboxPanel'),trayOutboxPanel=document.getElementById('trayOutboxPanel'),trayInboxCount=document.getElementById('trayInboxCount'),trayOutboxCount=document.getElementById('trayOutboxCount'),outboxHeader=document.getElementById('outboxHeader'),outboxList=document.getElementById('outboxList'),outboxStatus=document.getElementById('outboxStatus');function setTrayCount(el,n){el.textContent=String(n);el.hidden=!n}function setOutboxStatus(t,bad=false){outboxStatus.textContent=t||'';outboxStatus.style.color=bad?'#fca5a5':'#bbf7d0'}function selectTrayTab(which){const inbox=which==='inbox';trayTabInbox.setAttribute('aria-selected',inbox?'true':'false');trayTabOutbox.setAttribute('aria-selected',inbox?'false':'true');trayTabInbox.tabIndex=inbox?0:-1;trayTabOutbox.tabIndex=inbox?-1:0;trayInboxPanel.hidden=!inbox;trayOutboxPanel.hidden=inbox;tray.classList.toggle('tray-outbox',!inbox);if(inbox)refreshInbox();else refreshOutbox()}trayTabInbox.addEventListener('click',()=>selectTrayTab('inbox'));trayTabOutbox.addEventListener('click',()=>selectTrayTab('outbox'));document.getElementById('trayTabs').addEventListener('keydown',e=>{const k=e.key;let which=null;if(k==='Home')which='inbox';else if(k==='End')which='outbox';else if(k==='ArrowLeft'||k==='ArrowRight')which=trayOutboxPanel.hidden?'outbox':'inbox';else return;e.preventDefault();selectTrayTab(which);(which==='inbox'?trayTabInbox:trayTabOutbox).focus()});async function refreshOutbox(){try{if(!outboxList.childElementCount)outboxList.innerHTML='<div class="trayEmpty">Loading…</div>';const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{cache:'no-store'});if(r.status===401)return void window.pwAuthLost();const out=await r.json().catch(()=>null);if(!out||!out.ok){outboxHeader.innerHTML='';outboxList.innerHTML='<div class="trayEmpty">'+escHtml((out&&out.error)||('Could not load outbox (HTTP '+r.status+')'))+'</div>';return}const files=out.files||[];setTrayCount(trayOutboxCount,files.length);if(files.length===0){outboxHeader.innerHTML='<span>No files from the agent yet — anything it saves to _outbox appears here.</span>';outboxList.innerHTML='';return}outboxHeader.innerHTML='<span>'+files.length+' file'+(files.length===1?'':'s')+' from the agent — download or clean up</span><button class="clear" type="button">Clear all</button>';outboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s outbox?'))return;const rr=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{method:'DELETE'});const jj=await rr.json().catch(()=>null);setOutboxStatus(jj&&jj.ok?'Outbox cleared.':'Error: '+((jj&&jj.error)||('HTTP '+rr.status)),!(jj&&jj.ok));refreshOutbox()};outboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';const when=f.mtime?new Date(f.mtime).toLocaleString():'';row.innerHTML='<div class="thumb"><span>FILE</span></div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+(when?' · '+escHtml(when):'')+'</div></div><a class="dl" href="'+escHtml(f.url)+'" download>Download</a><button class="del" type="button" title="Delete">×</button>';row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();if(!confirm('Delete "'+f.name+'" from the outbox?'))return;const rr=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project)+'/file/'+encodeURIComponent(f.name),{method:'DELETE'});const jj=await rr.json().catch(()=>null);setOutboxStatus(jj&&jj.ok?'Deleted '+f.name:'Error: '+((jj&&jj.error)||('HTTP '+rr.status)),!(jj&&jj.ok));refreshOutbox()};outboxList.appendChild(row)}}catch(e){outboxHeader.innerHTML='';outboxList.innerHTML='<div class="trayEmpty">'+escHtml(e.message||String(e))+'</div>'}}function openTray(msg){document.body.classList.add('shade-open');setTimeout(()=>{if(trayOutboxPanel.hidden)drop.focus();else trayTabOutbox.focus()},50);if(msg)setStatus(msg);refreshInbox();refreshOutbox()}function closeTray(){document.body.classList.remove('shade-open');clearPreview();focusTerminal()}function focusTerminal(){try{const ta=frame.contentDocument?.querySelector('textarea.xterm-helper-textarea');if(ta){ta.focus();return}}catch{}try{frame.contentWindow?.focus()}catch{}}function toggleTray(){document.body.classList.contains('shade-open')?closeTray():openTray()}document.getElementById('fileBtn').onclick=toggleTray;document.getElementById('close').onclick=closeTray;document.getElementById('trayShield').onclick=closeTray;document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.classList.contains('shade-open'))closeTray()});function insertPath(path){try{if(frame.contentWindow.__pwSendToTerminal?.(path))return true}catch{}try{const ta=frame.contentDocument.querySelector('textarea.xterm-helper-textarea')||frame.contentDocument.querySelector('textarea');if(!ta)return false;ta.focus();const dt=new DataTransfer();dt.setData('text/plain',path);ta.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));return true}catch{return false}}function uploadStream(blob,name){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','${BASE}/api/upload-stream/'+encodeURIComponent(project)+'?filename='+encodeURIComponent(name||'upload.bin'));x.setRequestHeader('Content-Type','application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable)setStatus('Uploading '+(name||'file')+'… '+Math.round(e.loaded/e.total*100)+'% ('+fmtSize(e.loaded)+' / '+fmtSize(e.total)+')')};x.onerror=()=>reject(new Error('Network error during upload'));x.onabort=()=>reject(new Error('Upload cancelled'));x.onload=()=>{let j=null;try{j=JSON.parse(x.responseText)}catch{}if(x.status>=200&&x.status<300&&j&&j.ok)resolve(j);else reject(new Error((j&&j.error)||('Upload failed (HTTP '+x.status+')')))};x.send(blob)})}async function upload(blob,name='clipboard-file'){if(!blob)return setStatus('No file received.',true);selectTrayTab('inbox');let out;if(blob.size>8*1024*1024){out=await uploadStream(blob,name)}else{setStatus('Saving file...');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const res=await fetch('${BASE}/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name,mime:blob.type||'application/octet-stream',data})});out=await res.json().catch(()=>null);if(!res.ok||!out?.ok)throw new Error(out?.error||'Upload failed')}const ok=insertPath(out.path);try{await navigator.clipboard.writeText(out.path)}catch{}showPreview(out.url,name||'file',(blob.type||'').startsWith('image/'));setStatus('Saved and '+(ok?'inserted':'copied')+':\\n'+out.path);refreshInbox()}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name).catch(e=>setStatus(e.message||String(e),true));drop.addEventListener('dragover',e=>{e.preventDefault();drop.style.borderColor='#60a5fa'});drop.addEventListener('dragleave',()=>drop.style.borderColor='#64748b');/* drop handler removed — the window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads because e.preventDefault() stops the browser default but not other listeners. */window.addEventListener('paste',e=>{const items=[...(e.clipboardData?.items||[])];const item=items.find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();openTray('Saving pasted file...');upload(f,f?.name||'clipboard-file').catch(err=>setStatus(err.message||String(err),true))},true);let dragDepth=0;window.addEventListener('dragenter',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();dragDepth++;openTray('Drop files here to save them into _inbox.')}},true);window.addEventListener('dragover',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.style.borderColor='#60a5fa'}},true);window.addEventListener('dragleave',e=>{if(e.dataTransfer?.types?.includes('Files')){dragDepth=Math.max(0,dragDepth-1);if(dragDepth===0)drop.style.borderColor='#64748b'}},true);window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();dragDepth=0;drop.style.borderColor='#64748b';openTray();upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))}},true);window.addEventListener('message',e=>{const d=e.data;if(!d||typeof d!=='object')return;if(d.type==='pw-open-image-tray'){openTray(d.message||'Paste the file here.')}else if(d.type==='pw-paste-saved'){openTray();const base=(d.path||'').split('/').pop()||'file';showPreview(d.url,base,/\\.(png|jpe?g|webp|gif|bmp)$/i.test(base));setStatus('Saved and inserted:\\n'+d.path);refreshInbox()}else if(d.type==='pw-paste-error'){openTray();setStatus('Paste failed: '+d.error,true)}});const TAB_DEBUG=/[?&]tabdebug\b/.test(location.search)||localStorage.getItem('pwTabDebug')==='1';console.info('[pw-tabs] tab-attention diagnostics: window.__pwTabs = latest tmux window state; set localStorage.pwTabDebug=1 (or add ?tabdebug) then reload to trace bell flags every poll.'+(TAB_DEBUG?' [tracing ON]':''));const tabStrip=document.getElementById('tabStrip');const tabScroller=document.getElementById('tabScroller');const tabArrowL=document.getElementById('tabArrowL');const tabArrowR=document.getElementById('tabArrowR');function updateTabArrows(){const of=tabStrip.scrollWidth-tabStrip.clientWidth>1;tabScroller.classList.toggle('overflow',of);if(of){const mx=tabStrip.scrollWidth-tabStrip.clientWidth;tabArrowL.disabled=tabStrip.scrollLeft<=1;tabArrowR.disabled=tabStrip.scrollLeft>=mx-1}}function scrollTabs(dir){tabStrip.scrollBy({left:dir*Math.max(120,Math.round(tabStrip.clientWidth*0.6)),behavior:'smooth'})}tabArrowL.onclick=()=>scrollTabs(-1);tabArrowR.onclick=()=>scrollTabs(1);tabStrip.addEventListener('scroll',updateTabArrows,{passive:true});window.addEventListener('resize',updateTabArrows);const tabsBase='${BASE}/api/term/'+encodeURIComponent(project)+'/windows';let lastTabsKey='';let editingIdx=null;let editAfterRender=false;function startEdit(label,w){editingIdx=w.index;const original=label.textContent;label.contentEditable='true';label.classList.add('editing');label.focus();const sel=window.getSelection();const range=document.createRange();range.selectNodeContents(label);sel.removeAllRanges();sel.addRange(range);let done=false;const finish=async save=>{if(done)return;done=true;label.contentEditable='false';label.classList.remove('editing');label.removeEventListener('keydown',onKey);label.removeEventListener('blur',onBlur);const next=label.textContent.trim();editingIdx=null;if(save&&next&&next!==w.name){try{await fetch(tabsBase+'/'+w.index+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:next})})}catch{}lastTabsKey='';refreshTabs()}else if(!save){label.textContent=original}};const onKey=ev=>{if(ev.key==='Enter'){ev.preventDefault();finish(true)}else if(ev.key==='Escape'){ev.preventDefault();finish(false)}};const onBlur=()=>finish(true);label.addEventListener('keydown',onKey);label.addEventListener('blur',onBlur)}function closeTabMenu(){document.querySelector('.tabMenu')?.remove();document.removeEventListener('click',closeTabMenu,true);document.removeEventListener('keydown',tabMenuKey,true)}function tabMenuKey(e){if(e.key==='Escape')closeTabMenu()}${uniqueTabNameClientSrc}async function spawnTab(name,cmd){editAfterRender=!name;await fetch(tabsBase,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name||'new task',cmd:cmd||''})});lastTabsKey='';refreshTabs()}function openTabMenu(anchor,windows){closeTabMenu();const menu=document.createElement('div');menu.className='tabMenu';menu.addEventListener('click',e=>e.stopPropagation());const existing=new Set((windows||[]).map(w=>w.name));const usable=(tabPresets||[]).filter(t=>t&&t.name&&!existing.has(t.name));for(const t of usable){const item=document.createElement('button');item.type='button';item.className='tabMenuItem';item.innerHTML='<span class="ti-name">'+escHtml(t.name)+'</span>'+(t.cmd?'<span class="ti-cmd">'+escHtml(t.cmd)+'</span>':'');item.onclick=()=>{spawnTab(t.name,t.cmd||'');closeTabMenu()};menu.appendChild(item)}const cliUsable=(cliTabs||[]);const hasAbove=(tabPresets||[]).length>0;for(let i=0;i<cliUsable.length;i++){const c=cliUsable[i];const item=document.createElement('button');item.type='button';item.className='tabMenuItem'+(i===0&&hasAbove?' blank':'');item.innerHTML='<span class="ti-name">'+escHtml(c.label)+'</span><span class="ti-cmd">'+escHtml(c.bin)+'</span>';item.onclick=()=>{spawnTab(uniqueTabName(c.label,existing),c.bin);closeTabMenu()};menu.appendChild(item)}const blank=document.createElement('button');blank.type='button';blank.className='tabMenuItem blank';blank.innerHTML='<span class="ti-name">+ Blank tab</span><span class="ti-cmd">plain bash, name it after creation</span>';blank.onclick=()=>{spawnTab('','');closeTabMenu()};menu.appendChild(blank);document.body.appendChild(menu);const r=anchor.getBoundingClientRect();const mw=menu.offsetWidth||220;let lf=r.left;if(lf+mw>window.innerWidth-8)lf=Math.max(8,window.innerWidth-mw-8);menu.style.left=lf+'px';menu.style.top=(r.bottom+4)+'px';setTimeout(()=>{document.addEventListener('click',closeTabMenu,true);document.addEventListener('keydown',tabMenuKey,true)},0)}async function refreshTabs(){if(editingIdx!=null)return;try{const r=await fetch(tabsBase,{cache:'no-store'});if(r.status===401)return void window.pwAuthLost();const out=await r.json();if(!out?.ok){tabStrip.innerHTML='';lastTabsKey='';return}window.__pwTabs=out.windows;if(TAB_DEBUG)console.debug('[pw-tabs]',new Date().toLocaleTimeString(),(out.windows||[]).map(w=>'#'+w.index+' '+(w.name||'')+' active='+(w.active?1:0)+' bell='+(w.bell?1:0)).join('  |  '));const key=JSON.stringify(out.windows);if(key===lastTabsKey)return;lastTabsKey=key;renderTabs(out.windows)}catch{}}function renderTabs(windows){tabStrip.innerHTML='';for(const w of windows){const tab=document.createElement('div');const needsAttention=w.bell&&!w.active;if(needsAttention&&TAB_DEBUG)console.log('[pw-tabs] ATTENTION \u2192 #'+w.index+' '+(w.name||''));tab.className='tab'+(w.active?' active':'')+(needsAttention?' attention':'');tab.title=w.active?'Click name to rename':(needsAttention?'Finished — click to view':'Window '+w.index+': '+(w.name||''));if(w.working){const lv=document.createElement('span');lv.className='live';lv.title='Working…';tab.appendChild(lv)}const label=document.createElement('span');label.className='name';label.textContent=w.name||('#'+w.index);label.onclick=ev=>{if(!w.active)return;ev.stopPropagation();startEdit(label,w)};tab.appendChild(label);if(windows.length>1){const x=document.createElement('span');x.className='x';x.textContent='×';x.title='Close window';x.onclick=async ev=>{ev.stopPropagation();if(!confirm('Close window "'+(w.name||w.index)+'"? Any running process in it will be killed.'))return;await fetch(tabsBase+'/'+w.index,{method:'DELETE'});lastTabsKey='';refreshTabs()};tab.appendChild(x)}tab.onclick=async()=>{if(w.active)return;await fetch(tabsBase+'/'+w.index+'/select',{method:'POST'});lastTabsKey='';refreshTabs()};tabStrip.appendChild(tab)}const plus=document.createElement('button');plus.className='newTab';plus.textContent='+';plus.title='New tab';plus.onclick=ev=>{ev.stopPropagation();openTabMenu(plus,windows)};tabStrip.appendChild(plus);const _act=tabStrip.querySelector('.tab.active');if(_act)try{_act.scrollIntoView({inline:'nearest',block:'nearest'})}catch{}requestAnimationFrame(updateTabArrows);if(editAfterRender){editAfterRender=false;const ai=windows.find(w=>w.active);if(ai){const tabs=tabStrip.querySelectorAll('.tab');const i=windows.indexOf(ai);const lbl=tabs[i]?.querySelector('.name');if(lbl)startEdit(lbl,ai)}}}refreshTabs();setInterval(()=>{if(!document.hidden)refreshTabs()},2000);async function pwHeartbeat(){if(document.hidden)return;try{await fetch('${BASE}/api/projects/'+encodeURIComponent(project)+'/clear-pending',{method:'POST'})}catch{}}pwHeartbeat();setInterval(pwHeartbeat,10000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwHeartbeat()});</script>${railScript}${adminManage}${previewModalHtml}${previewScript}${deployBits}${footer}</body></html>`);
@@ -2778,13 +2858,10 @@ if(DEPLOY_CENTRE){
   const isAdmin = req.user?.role === 'admin';
   const projects = await loadProjects();
   const cfg = await loadDeployConfig();
-  const users = await loadUsers();
-  const currentUser = users.find(u => u.username === req.user?.username);
   const visibleProjects = filterProjectsForUser(projects, req.user);
   const cards = await Promise.all(visibleProjects.map(p => deployPageCard(p, cfg, isAdmin)));
   const noProjects = visibleProjects.length === 0 ? `<p class="muted">No projects configured. <a href="${BASE}/manage">Add a project</a> first.</p>` : '';
-  const hasDeployPw = !!currentUser?.deployPassword;
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
  });
 
  app.post(BASE + '/api/deploy/config', requireAdmin, async (req,res)=>{
@@ -2832,31 +2909,21 @@ if(DEPLOY_CENTRE){
   const submitted = req.body?.password || '';
   let storedPw = '';
   if(currentUser?.deployPassword){ try { storedPw = decrypt(currentUser.deployPassword); } catch { storedPw = ''; } }
-  // Password actually used for the deploy: a freshly-entered one wins, else the saved one.
-  let effectivePassword = submitted || storedPw;
-  if(tc.reauth){
-   // Verify the saved password first (no prompt); only ask the user when there is
-   // none or it no longer verifies (e.g. the domain password was changed).
-   const candidate = submitted || storedPw;
-   let reauthOk = false;
-   try { reauthOk = !!(candidate && await authenticate(req.user?.username, candidate)); } catch { reauthOk = false; }
-   if(!reauthOk){
-    const staleStored = !submitted && !!storedPw;
-    const noCreds = !submitted && !storedPw;
-    await audit('deploy_reauth_failed', { project, target, staleStored }, req);
-    return res.status(401).json({ ok:false, needPassword:true, staleStored,
-     error: staleStored
-      ? 'Your saved deployment password no longer verifies (it may have changed). Please enter your current domain password.'
-      : noCreds
-      ? 'Enter your domain password for deployment:'
-      : 'Re-authentication failed: your password did not verify.' });
-   }
-   effectivePassword = candidate;
-   // Persist a freshly-entered password if the user opted in (encrypted at rest).
-   if(submitted && req.body?.savePassword && currentUser){
-    try { currentUser.deployPassword = encrypt(submitted); await saveUsers(users); }
-    catch(e){ /* non-fatal: the deploy still proceeds if saving fails */ }
-   }
+  // Verify the saved password first (no prompt); the client only asks the user
+  // when the server answers needPassword. See app/deploy-reauth.js.
+  const decision = await resolveDeployReauth({
+   reauth: !!tc.reauth, submitted, stored: storedPw, savePassword: !!req.body?.savePassword,
+   verify: (pw) => authenticate(req.user?.username, pw),
+  });
+  if(!decision.ok){
+   await audit('deploy_reauth_failed', { project, target, staleStored: decision.staleStored }, req);
+   return res.status(401).json({ ok:false, needPassword:true, staleStored: decision.staleStored, error: decision.error });
+  }
+  const effectivePassword = decision.password;
+  // Persist a freshly-entered password if the user opted in (encrypted at rest).
+  if(decision.save && currentUser){
+   try { currentUser.deployPassword = encrypt(submitted); await saveUsers(users); }
+   catch(e){ /* non-fatal: the deploy still proceeds if saving fails */ }
   }
   const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
   let option = String(req.body?.option || '').trim();
