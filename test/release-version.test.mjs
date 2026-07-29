@@ -43,6 +43,19 @@ function git(...args) {
 }
 
 /**
+ * Whether a changed file is release content — part of what a deployed instance actually runs, so the
+ * release identifier is obligated to move when it changes. `app/` is copied wholesale to every
+ * instance. `install.sh` lives outside `app/` but is the root-level entry point that puts it there —
+ * a behavioural fix to it (e.g. which directory `bin/` lands in) changes what a fresh install runs,
+ * exactly like a change under `app/` would. Docs, tests and CI configuration never reach a live
+ * instance and carry no release of their own.
+ */
+function isDeployable(file) {
+  if (file === 'install.sh') return true;
+  return file.startsWith('app/') && file !== 'app/VERSION' && !file.startsWith('app/node_modules/');
+}
+
+/**
  * What this branch is being proposed against.
  *
  * `GITHUB_BASE_REF` is set on a pull request; a push to a branch has to fall back to `main`. Returns
@@ -82,7 +95,27 @@ test('release: the version this instance reports is a well-formed release identi
   }
 });
 
-test('release: a change to the deployable app carries a release bump with it', (t) => {
+test('release: the deployable-content classifier matches install.sh and app/, not docs/tests/CI', () => {
+  for (const file of ['install.sh', 'app/server.js', 'app/index.html', 'app/lib/foo.js']) {
+    assert.ok(isDeployable(file), `expected ${file} to be classified as deployable`);
+  }
+  for (const file of [
+    'app/VERSION',
+    'app/node_modules/foo/index.js',
+    'docs/orchestrator-api.md',
+    'test/install-sh.test.mjs',
+    'test/release-version.test.mjs',
+    '.github/workflows/ci.yml',
+    'README.md',
+    'DEPLOY.md',
+    'install-notes.md',
+    'bin/pw',
+  ]) {
+    assert.ok(!isDeployable(file), `expected ${file} to be classified as non-deployable`);
+  }
+});
+
+test('release: a change to deployable release content carries a release bump with it', (t) => {
   const base = baseRef();
   if (!base) {
     t.skip('no base branch in this checkout, so what changed cannot be established');
@@ -100,11 +133,7 @@ test('release: a change to the deployable app carries a release bump with it', (
 
   const changed = git('diff', '--name-only', `${mergeBase}...HEAD`).split('\n').filter(Boolean);
 
-  // `app/` is what gets copied to a live instance, so it is what the release identifier describes.
-  // Tests, docs and CI configuration are not deployed and do not need a release of their own.
-  const deployable = changed.filter((file) => file.startsWith('app/')
-    && file !== 'app/VERSION'
-    && !file.startsWith('app/node_modules/'));
+  const deployable = changed.filter(isDeployable);
   if (deployable.length === 0) return;
 
   // Compared by content against the base rather than by presence in the diff, so a bump that is
