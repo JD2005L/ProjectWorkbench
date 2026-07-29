@@ -187,6 +187,21 @@ decided once and held, because a re-probed refusal is how a flapping check event
 through; a passwd query that timed out decided nothing and is asked again, so one unanswered
 directory request does not disable the coding backend for the life of the process.
 
+The coding CLI is not the only launch this covers. `git.js`, `checks.js` and the tmux lane
+(`TmuxAdapter`) all run through the identical resolved plan — one `PrivilegeDropper` instance, shared
+rather than each resolving its own — so they cannot disagree about which uid a workspace-affecting
+command runs as. That matters specifically for the tmux lane: an earlier version built its own
+`sudo -u <name> tmux …`, both `sudo` and `tmux` resolved through PATH and keyed on the account *name*
+rather than the numeric uid pinned at boot. A name re-resolved through NSS at a different moment than
+everything else's pinned uid is how two commands touching the same project could end up as two
+different effective users — and, since tmux's default socket directory is keyed on the caller's real
+uid, addressing two different tmux socket namespaces without either side knowing it.
+
+Every launch through this plan — not only the CLI — also tracks and confirms its whole descendant
+tree before a timeout or an abort reaches the caller: a check command that backgrounds or `setsid`s
+something of its own gets exactly the same tree-confirmation as a coding-CLI phase that starts a
+build or a test run, because both share the tracking, not just the drop.
+
 Container mode has nothing to drop and is unchanged.
 
 ---
@@ -253,7 +268,13 @@ correctly instead of failing as a spurious mismatch.
 
 **Cancellation stops the work.** The running phase is signalled, not waited out, and the working-tree
 fingerprints are taken either side of that — so `working_tree_preserved` reflects what happened
-rather than racing a still-running writer.
+rather than racing a still-running writer. If the descendant tree cannot be *confirmed* dead within
+`PW_ORCHESTRATOR_CANCEL_GRACE_MS`, the job is never recorded as cancelled — a deadline that elapses
+before an answer arrives is unconfirmed, not a coin flip that happened to land on "fine". The job is
+blocked instead, `termination_confirmed: false` is persisted, and the project's write lease is
+**fenced**: held past its own expiry, refusing every later acquisition — including by the job that set
+it — until an operator clears it with `scripts/pw-orch-clear-fence.mjs` (see [§7](#7-operating-it)).
+Nothing clears a fence on a timer.
 
 **Crash safety.** State lives in an append-only write-ahead journal with a CRC per transaction. A
 torn final record is discarded as a crash; a bad record with good records after it is corruption, and
@@ -640,6 +661,27 @@ tmux list-windows -t pw_<Project> -F '#{window_name} #{@pw_role}'
 ```
 
 A window with an empty `@pw_role` is a human's and is never touched by this subsystem.
+
+### Clearing a fenced project
+
+A cancellation whose termination could not be confirmed within the grace period fences the project's
+write lease — every job for that project blocks at `blocked_project_state` until it is cleared. There
+is no automatic path: clearing a fence is exactly the claim "I have looked and nothing is still
+writing to this workspace", and only a human can make that claim.
+
+```bash
+# stop the service first — the durable store takes a single-writer lock, and this opens it directly
+sudo systemctl stop project-workbench
+
+node scripts/pw-orch-clear-fence.mjs --project <id>                 # status only, changes nothing
+
+# after checking for a surviving process in that project's workspace (ps -ef, or an OS-level scan
+# for the account the launch would have dropped to), clear it:
+node scripts/pw-orch-clear-fence.mjs --project <id> \
+  --reason "verified no surviving descendant via ps -ef" --by <you> --confirm
+
+sudo systemctl start project-workbench
+```
 
 ### MCP over stdio
 

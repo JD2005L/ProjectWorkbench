@@ -16,6 +16,7 @@ import {
   privilegeDropperFor,
 } from '../app/orchestrator/runner/privilege.js';
 import { ClaudeCodeBackend, classifyBackendFailure } from '../app/orchestrator/runner/claude.js';
+import { TmuxAdapter } from '../app/orchestrator/session.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { PhaseClass, Effort } from '../app/orchestrator/contract.js';
 
@@ -154,6 +155,146 @@ test('commandInvocation produces uid-dropped argv preventing root-owned artifact
   assert.ok(inv.argv.includes('#1001'), 'uid drop to 1001');
   // This is the control that prevents root-owned workspace artifacts
   assert.notEqual(inv.file, 'git', 'git must not run directly as root');
+});
+
+// ---------------------------------------------------------------------------
+// Round 2, blocker 1: TmuxAdapter must share the same validated privilege-drop plan
+// ---------------------------------------------------------------------------
+//
+// TmuxAdapter used to build its own `sudo -u <name> tmux …` invocation by hand: both `sudo` and
+// `tmux` resolved through PATH, keyed on the account *name* rather than the numeric uid the rest of
+// the system resolves once and pins. It must instead run through the identical
+// PrivilegeDropper.wrapCommand plan that git.js and checks.js already use — never a second,
+// independently-resolved drop that could in principle disagree with it and address a different
+// tmux socket namespace.
+
+test('TmuxAdapter routes through the shared privilege-drop plan in host mode, not a bare PATH sudo', async () => {
+  const dp = makeDropper({ deployMode: 'host', currentUid: 0 });
+  const calls = [];
+  const fakeExec = async (file, argv, options) => {
+    calls.push({ file, argv, options });
+    return { stdout: '', stderr: '' };
+  };
+  const tmux = new TmuxAdapter({ executable: 'tmux', exec: dp.wrapCommand(fakeExec) });
+
+  await tmux.raw(['list-windows', '-t', '=pw_Demo']);
+
+  assert.equal(calls.length, 1);
+  const call = calls[0];
+  // Must go through the vetted, absolute sudo helper — never a bare 'sudo' resolved through PATH.
+  assert.equal(call.file, '/usr/bin/sudo');
+  assert.notEqual(call.file, 'sudo');
+  // Must drop to the validated numeric uid, never the bare account name.
+  assert.ok(call.argv.includes('#1001'), 'drops to uid 1001, not the name');
+  assert.ok(!call.argv.some((a) => a === 'admin'), 'the account name never appears in argv');
+  assert.ok(call.argv.includes('tmux'), 'tmux itself is still the command run');
+});
+
+test('TmuxAdapter is unchanged in container mode', async () => {
+  const dp = makeDropper({ deployMode: 'container' });
+  const calls = [];
+  const fakeExec = async (file, argv, options) => {
+    calls.push({ file, argv, options });
+    return { stdout: '', stderr: '' };
+  };
+  const tmux = new TmuxAdapter({ executable: 'tmux', exec: dp.wrapCommand(fakeExec) });
+
+  await tmux.raw(['list-windows', '-t', '=pw_Demo']);
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].file, 'tmux');
+});
+
+test('TmuxAdapter shares the identical plan git/checks use — same dropper, same uid, one namespace', async () => {
+  const dp = makeDropper({ deployMode: 'host', currentUid: 0 });
+  const calls = [];
+  const fakeExec = async (file, argv, options) => {
+    calls.push({ file, argv, options });
+    return { stdout: '', stderr: '' };
+  };
+  const droppedExec = dp.wrapCommand(fakeExec);
+  const tmux = new TmuxAdapter({ executable: 'tmux', exec: droppedExec });
+
+  await droppedExec('git', ['status'], { cwd: '/workspace' });
+  await tmux.raw(['list-windows', '-t', '=pw_Demo']);
+
+  const [gitCall, tmuxCall] = calls;
+  const uidArg = (argv) => argv.find((a) => /^#\d+$/.test(a));
+  assert.equal(uidArg(gitCall.argv), uidArg(tmuxCall.argv), 'git and tmux must drop to the exact same uid');
+});
+
+// ---------------------------------------------------------------------------
+// Round 2, blocker 2: wrapCommand must track and confirm termination too
+// ---------------------------------------------------------------------------
+//
+// `wrap` (the coding-CLI path) already enumerates the whole descendant tree and confirms it dead
+// before letting a timeout or abort reach the caller. `wrapCommand` (git.js, checks.js) launched the
+// exact same shape of command — a check script can time out, or be aborted, having backgrounded or
+// setsid'd something of its own — but never called `ensureTerminated` at all, so that descendant was
+// simply left running with nothing left in the system able to say so.
+
+test('wrapCommand confirms termination of the tracked child on failure, exactly like wrap', async () => {
+  const dp = makeDropper({ deployMode: 'container' });
+  const fakeChild = { pid: 999999, exitCode: null, signalCode: null };
+  let seenChild = null;
+  dp.ensureTerminated = async (child) => {
+    seenChild = child;
+    return true;
+  };
+  const fakeExec = (file, argv, options) => {
+    const err = new Error('Command failed');
+    err.code = 124;
+    const promise = Promise.reject(err);
+    promise.child = fakeChild;
+    return promise;
+  };
+  const wrapped = dp.wrapCommand(fakeExec);
+
+  const err = await wrapped('some-check', [], {}).then(() => null, (e) => e);
+
+  assert.ok(err, 'the failed command must reject');
+  assert.equal(seenChild, fakeChild,
+    'wrapCommand must hand the tracked child to ensureTerminated, exactly like wrap does');
+  assert.equal(err.terminationConfirmed, true, 'the confirmed verdict must ride on the error');
+});
+
+test('wrapCommand reports an unconfirmed kill rather than hiding it, exactly like wrap', async () => {
+  const dp = makeDropper({ deployMode: 'container' });
+  const fakeChild = { pid: 999999, exitCode: null, signalCode: null };
+  dp.ensureTerminated = async () => false;
+  const fakeExec = (file, argv, options) => {
+    const err = new Error('Command failed');
+    err.code = 124;
+    const promise = Promise.reject(err);
+    promise.child = fakeChild;
+    return promise;
+  };
+  const wrapped = dp.wrapCommand(fakeExec);
+
+  const err = await wrapped('some-check', [], {}).then(() => null, (e) => e);
+
+  assert.ok(err);
+  assert.equal(err.terminationConfirmed, false);
+});
+
+test('production wiring: index.js constructs the tmux lane with the same droppedExec as checks/git, never its own dropper', () => {
+  // A hermetic unit test cannot exercise buildSubsystem end to end (it resolves a real sudo/passwd
+  // in host mode with no injection point), so this asserts the wiring the source actually commits
+  // to: TmuxAdapter must be built from the SAME `droppedExec` the CheckRunner receives, not a second
+  // `privilegeDropperFor(...)` call, and not the old `deployMode`/`user` constructor shape that let
+  // it resolve its own (unshared, PATH-based) drop.
+  const source = fs.readFileSync(new URL('../app/orchestrator/index.js', import.meta.url), 'utf8');
+  assert.match(
+    source, /new TmuxAdapter\(\{[^}]*exec:\s*droppedExec/,
+    'TmuxAdapter must be constructed with the shared droppedExec',
+  );
+  assert.doesNotMatch(
+    source, /new TmuxAdapter\(\{[^}]*deployMode/,
+    'TmuxAdapter must not resolve its own deployMode-keyed drop again',
+  );
+  // Exactly one PrivilegeDropper is built for the whole subsystem.
+  const dropperConstructions = source.match(/privilegeDropperFor\(/g) ?? [];
+  assert.equal(dropperConstructions.length, 1, 'there must be exactly one shared privilege-drop plan per subsystem');
 });
 
 // ---------------------------------------------------------------------------

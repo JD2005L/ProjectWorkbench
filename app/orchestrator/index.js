@@ -82,9 +82,9 @@ async function buildSubsystem({ config, store, workbenchVersion, audit }) {
   const droppedExec = commandDropper.wrapCommand(execFileAsync);
   const checkRunner = new CheckRunner({ config, repo, store, artifacts, exec: droppedExec });
   const backend = new ClaudeCodeBackend({ config });
-  const tmux = new TmuxAdapter({
-    socket: config.tmuxSocket, deployMode: config.deployMode, user: config.tmuxUser,
-  });
+  // The lane shares the identical dropper instance git/checks use — never a second, independently
+  // resolved drop that could disagree with it and address a different tmux socket namespace.
+  const tmux = new TmuxAdapter({ socket: config.tmuxSocket, exec: droppedExec });
   const sessionManager = new OrchestratorSessionManager({ config, store, repo, tmux, backend });
   const engine = new OrchestrationEngine({
     config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, audit,

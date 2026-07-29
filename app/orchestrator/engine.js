@@ -510,15 +510,8 @@ export class OrchestrationEngine {
     }
 
     // One writer per project. Everything from here to release is workspace-active.
-    const lease = await this._acquireLease(jobId, project.project_id);
-    if (!lease) {
-      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-        message: 'another job holds the write lease for this project',
-        detail: 'another job holds the write lease for this project',
-        eventType: EventType.BLOCKED,
-      });
-      return;
-    }
+    const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
+    if (!lease) return;
 
     // The lease TTL (default 5 minutes) is far shorter than a phase budget (default 30), so without
     // renewal it lapsed mid-implementation and a second job walked into the same checkout. The
@@ -729,15 +722,8 @@ export class OrchestrationEngine {
    * rescue it either.
    */
   async _runRevision(jobId, project, workspacePath) {
-    const lease = await this._acquireLease(jobId, project.project_id);
-    if (!lease) {
-      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-        message: 'another job holds the write lease for this project',
-        detail: 'another job holds the write lease for this project',
-        eventType: EventType.BLOCKED,
-      });
-      return;
-    }
+    const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
+    if (!lease) return;
     // The same renewal the main pipeline installs. Without it the lease (5 minutes by default)
     // lapsed inside a revision phase (30 minutes) and a second job walked into the same checkout.
     const renewal = setInterval(() => {
@@ -1477,35 +1463,47 @@ export class OrchestrationEngine {
     // whole phase budget while the agent carried on editing.
     this._aborts.get(jobId)?.abort();
 
-    // Bounded. An unbounded await here held the caller's request open for the entire remaining
-    // phase budget — up to half an hour — whenever a child ignored the signal. The job is recorded
-    // cancelled either way; a straggler finds `_cancelRequested` set and stops at its next boundary.
+    // Bounded, but the bound must never be mistaken for an answer. `inFlight.promise` is what
+    // eventually carries the real verdict (via `_terminationUnconfirmed`, set from the worker's own
+    // catch handler once `ensureTerminated` has actually run) — and that only happens once the
+    // promise settles. If the grace elapses first, nothing has settled, so nothing is known: that
+    // has to read as unconfirmed, not as a coin flip that happened to land on "fine". A straggler
+    // finds `_cancelRequested` set and stops at its next boundary regardless.
     const inFlight = this._running.get(jobId);
+    let settledInTime = !inFlight;
     if (inFlight) {
-      await Promise.race([
-        inFlight.promise.catch(() => {}),
-        new Promise((resolve) => { const t = setTimeout(resolve, this.config.cancelGraceMs); t.unref?.(); }),
+      const GRACE_ELAPSED = Symbol('cancel-grace-elapsed');
+      const outcome = await Promise.race([
+        inFlight.promise.then(() => 'settled', () => 'settled'),
+        new Promise((resolve) => { const t = setTimeout(() => resolve(GRACE_ELAPSED), this.config.cancelGraceMs); t.unref?.(); }),
       ]);
+      settledInTime = outcome !== GRACE_ELAPSED;
     }
 
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
     const preserved = workingTreePreserved(before, after);
-    const terminationConfirmed = !this._terminationUnconfirmed.has(jobId);
+    // Confirmed only when the worker's own promise actually settled inside the grace window AND it
+    // did not itself report an unconfirmed kill. Anything else — including "the deadline won the
+    // race and we simply do not know yet" — is unconfirmed, never rounded up to cancelled.
+    const terminationConfirmed = settledInTime && !this._terminationUnconfirmed.has(jobId);
 
-    await this._releaseLease(jobId);
     const current = this.repo.getJob(jobId);
     if (!TERMINAL_STATES.has(current.status)) {
       if (!terminationConfirmed) {
-        // Descendants may still be alive. Do NOT record as cancelled — block instead so the
-        // operator is alerted and can investigate. Recording cancelled while processes survive
-        // would let the engine take a working-tree snapshot around a live writer.
+        // Descendants may still be alive, or we simply do not yet know. The lease is fenced, not
+        // released: a plain release would let a later job acquire this project the moment the lease
+        // would otherwise have expired, exactly the window a live, unconfirmed writer needs to stay
+        // undetected in. Only an explicit, evidenced operator action (clearFence) takes the fence
+        // down — never a timer, and never this job settling late on its own.
+        await this._fenceLease(jobId, `cancellation could not confirm termination: ${request.reason}`);
         await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-          message: `cancellation could not confirm all descendant processes are dead`,
+          message: 'cancellation could not confirm all descendant processes are dead',
           detail: `cancelled: ${request.reason} (termination unconfirmed — descendants may still be running)`,
           eventType: EventType.BLOCKED,
-          patch: { working_tree_preserved: false },
+          patch: { working_tree_preserved: false, termination_confirmed: false },
         });
       } else {
+        await this._releaseLease(jobId);
         await this._transition(jobId, JobStatus.CANCELLED, {
           message: `cancelled: ${request.reason}`,
           detail: `cancelled: ${request.reason}`,
@@ -1515,7 +1513,7 @@ export class OrchestrationEngine {
       }
     }
     this._cancelRequested.delete(jobId);
-    this._terminationUnconfirmed.delete(jobId);
+    if (terminationConfirmed) this._terminationUnconfirmed.delete(jobId);
     this._auditEvent('orchestrator.job.cancelled', {
       workbench_job_id: jobId, working_tree_preserved: preserved, termination_confirmed: terminationConfirmed,
     });
@@ -1581,7 +1579,40 @@ export class OrchestrationEngine {
       this.repo.releaseLease(tx, state, { resource, owner: jobId, fencingToken: job.lease_fencing_token });
       const current = state.get(KIND.JOBS, jobId);
       this.repo.putJob(tx, { ...current, lease_fencing_token: null, updated_at: this.now() });
-    }).catch(() => { /* the lease was already taken over; nothing to release */ });
+    }).catch(() => { /* the lease was already taken over, or is fenced; nothing to release */ });
+  }
+
+  /**
+   * Durably fence the project this job holds the lease for, so no later job may acquire it until an
+   * operator clears the fence with evidence. A no-op if this job's lease has already lapsed and been
+   * taken over legitimately — there is nothing left for it to vouch for.
+   */
+  async _fenceLease(jobId, reason) {
+    const job = this.repo.getJob(jobId);
+    if (!job?.lease_fencing_token) return;
+    const resource = `project-write:${this.config.instanceId}:${job.project_id}`;
+    await this.store.transact((tx, state) => {
+      this.repo.fenceLease(tx, state, { resource, owner: jobId, fencingToken: job.lease_fencing_token, reason });
+    }).catch(() => { /* the lease was already taken over; nothing this job can fence */ });
+  }
+
+  /**
+   * Acquire the project's write lease, or block the job with the most honest reason available.
+   *
+   * Distinguishing "fenced" from "held by another job" matters to whoever reads the job's timeline:
+   * one is routine contention that clears on its own, the other needs an operator's evidenced
+   * decision before anything can write here again.
+   */
+  async _acquireLeaseOrBlock(jobId, projectId) {
+    const lease = await this._acquireLease(jobId, projectId);
+    if (lease) return lease;
+    const resource = `project-write:${this.config.instanceId}:${projectId}`;
+    const fenced = this.repo.getLease(resource)?.fenced;
+    const message = fenced
+      ? 'the project workspace is fenced pending operator review after a cancellation whose termination could not be confirmed'
+      : 'another job holds the write lease for this project';
+    await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, { message, detail: message, eventType: EventType.BLOCKED });
+    return null;
   }
 
   /**

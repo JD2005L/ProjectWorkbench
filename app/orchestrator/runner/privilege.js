@@ -204,6 +204,17 @@ export async function resolveDropUser(user, { exec = execFileAsync, getentExecut
 const SUDO_CANDIDATES = Object.freeze(['/usr/bin/sudo', '/bin/sudo']);
 
 /**
+ * How often a live launch's descendant tree is re-enumerated.
+ *
+ * Cheap relative to what it buys: a `/proc` scan is not free, but a launch normally runs for many
+ * multiples of this interval, so there are many chances to see a descendant before it could ever be
+ * orphaned by a kill this module did not send itself. Short enough that a process a check backgrounds
+ * and that lives for even a second is seen well before `execFile`'s own `timeout`/`signal` handling
+ * could kill the direct child out from under it.
+ */
+const DESCENDANT_POLL_MS = 200;
+
+/**
  * A plain environment name.
  *
  * Used to keep the composed environment expressible: a name containing `=` or beginning with `-`
@@ -472,21 +483,85 @@ export class PrivilegeDropper {
   /**
    * Wrap an exec-shaped function for system utilities (git, gh, check commands).
    *
-   * Like `wrap` but without the absolute-path enforcement or termination tracking. System utilities
-   * do not need fingerprinting and their launches are short-lived, so the simpler wrapper suffices.
+   * Like `wrap` but without the absolute-path enforcement — system utilities are not fingerprinted,
+   * so PATH/`secure_path` choosing the program is not the same hazard it is for the CLI. Termination
+   * tracking is NOT simpler here: a check command is exactly as capable of backgrounding or
+   * `setsid`-ing something of its own as the coding CLI is of starting a tool subprocess, and a
+   * timeout or an abort must confirm that whole tree is gone before telling the caller the command
+   * stopped. Shares `_execTracked` with `wrap` for exactly that reason.
    */
   wrapCommand(exec) {
     return async (file, argv, options = {}) => {
       const plan = await this.plan();
       const invocation = await this.commandInvocation(file, argv, options, plan);
-      try {
-        return await exec(invocation.file, invocation.argv, invocation.options);
-      } catch (err) {
-        const refusal = this.helperFailure(err, plan);
-        if (refusal) throw refusal;
-        throw err;
-      }
+      return this._execTracked(exec, invocation, plan, options);
     };
+  }
+
+  /**
+   * Run one invocation, confirming the whole descendant tree is gone before a timeout or an abort
+   * reaches the caller. Shared by `wrap` and `wrapCommand`, which differ only in how the invocation
+   * itself was built.
+   */
+  async _execTracked(exec, invocation, plan, options) {
+    const running = exec(invocation.file, invocation.argv, invocation.options);
+    // `promisify(execFile)` exposes the child on the promise. Absent — an injected runner in a
+    // test, say — there is nothing to reap and nothing to wait for.
+    const child = running?.child ?? null;
+
+    // Enumerated continuously from the moment the child exists, not only once the launch has
+    // already failed. `execFile`'s own `timeout`/`signal` handling kills the direct child through a
+    // path this module cannot see and does not control; once that kill lands, the kernel reparents
+    // whatever the child had started to init, and nothing left in `/proc` connects it to the pid
+    // that just died. `ensureTerminated`'s own re-scan loop cannot discover a descendant that has
+    // already been orphaned before it is ever entered — reproduced with a `setsid`-detached,
+    // SIGTERM-ignoring descendant surviving a plain timeout. Polling while the launch is still alive
+    // keeps that window from being a blind spot: whatever this last saw is handed to
+    // `ensureTerminated` as a starting point, not rediscovered from a pid that may already be gone.
+    const tracked = child ? new Set([child.pid]) : null;
+    const poller = tracked ? setInterval(() => {
+      (async () => {
+        for (const known of [...tracked]) {
+          // eslint-disable-next-line no-await-in-loop
+          for (const descendant of await descendantsOf(known)) tracked.add(descendant);
+        }
+        // Pruned, not merely accumulated: a long-running launch could otherwise carry a pid for its
+        // whole life after whatever it named has already exited, and a kernel that has since reused
+        // that number for something else entirely would be signalled by the eventual SIGKILL sweep.
+        // Removing an entry the moment it is confirmed gone bounds that reuse window to about one
+        // poll interval instead of the length of the launch — nothing tracked here is ever the
+        // caller's only record of it, so losing a pid that is genuinely dead loses nothing.
+        for (const known of [...tracked]) {
+          if (!stillRunning(known)) tracked.delete(known);
+        }
+      })().catch(() => {});
+    }, DESCENDANT_POLL_MS) : null;
+    if (typeof poller?.unref === 'function') poller.unref();
+
+    try {
+      return await running;
+    } catch (err) {
+      if (poller) clearInterval(poller);
+      // Await the death of what was launched before telling the caller it stopped. The verdict is
+      // carried on the error rather than dropped: a cancellation that could not be carried out must
+      // not be indistinguishable from one that was.
+      if (child) err.terminationConfirmed = await this.ensureTerminated(child, { tracked });
+
+      const refusal = this.helperFailure(err, plan);
+      if (refusal) throw refusal;
+
+      // A kill that raced the launch can surface as EPERM or ESRCH rather than as an abort, and a
+      // cancellation reported as a process failure blocks work that was deliberately stopped. If the
+      // caller cancelled, the cancellation is what happened.
+      if (options.signal?.aborted && err?.name !== 'AbortError') {
+        throw Object.assign(new Error('the launch was cancelled'), {
+          name: 'AbortError', kind: 'cancelled', terminationConfirmed: err?.terminationConfirmed,
+        });
+      }
+      throw err;
+    } finally {
+      if (poller) clearInterval(poller);
+    }
   }
 
   /**
@@ -560,10 +635,24 @@ export class PrivilegeDropper {
    *
    * SIGTERM first, because sudo relays it to the command and the CLI can exit cleanly; SIGKILL only
    * once the grace has elapsed, since killing the helper outright would orphan what it launched.
+   *
+   * `tracked` seeds the accumulator from a set `_execTracked` has already been building *while the
+   * launch was still alive* (see there for why: by the time this function is entered, a descendant
+   * that `execFile`'s own `timeout`/`signal` handling has already reparented to init is no longer
+   * reachable from `pid` at all, seeded or not — the seed is what still remembers it).
    */
-  async ensureTerminated(child, { graceMs = this.terminationGraceMs, poll = 50 } = {}) {
-    if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return true;
-    const { pid } = child;
+  async ensureTerminated(child, { graceMs = this.terminationGraceMs, poll = 50, tracked: seed = null } = {}) {
+    const pid = child?.pid ?? null;
+    // True in the ordinary case, not the exceptional one: this normally runs only after the launch
+    // has already failed, by which point Node has already recorded the direct child's exit. That
+    // used to be this function's cue to return `true` without looking any further — correct when
+    // there is nothing else to check, wrong the moment there is a seed. A descendant `_execTracked`
+    // saw while the launch was still alive can outlive the pid that died reporting it: reparented,
+    // it is no longer reachable through `pid` at all, seed or not, so bailing out on the pid alone
+    // would stop looking for it right when it matters most.
+    const pidAlreadyGone = !pid || child.exitCode !== null || child.signalCode !== null;
+    if (pidAlreadyGone && (!seed || seed.size === 0)) return true;
+
     const deadline = Date.now() + graceMs;
 
     // What has to be confirmed dead is what was *launched*, not the helper — killing the helper
@@ -574,9 +663,10 @@ export class PrivilegeDropper {
     // /proc scan finishes the direct child can already be gone and its own children reparented to
     // init — enumerated once, the tree came back as just the helper and a live grandchild was
     // reported dead. Re-reading also catches anything spawned during the grace.
-    const tracked = new Set([pid]);
+    const tracked = seed ?? new Set();
+    if (pid) tracked.add(pid);
     const rescan = async () => {
-      for (const descendant of await descendantsOf(pid)) tracked.add(descendant);
+      if (pid) for (const descendant of await descendantsOf(pid)) tracked.add(descendant);
       // Reparented children are no longer reachable from `pid`, so anything already known is
       // followed on its own account.
       for (const known of [...tracked]) {
@@ -591,7 +681,7 @@ export class PrivilegeDropper {
     const survivors = () => [...tracked]
       // Once Node has reaped the child, its pid means nothing and signalling it would reach
       // whatever the kernel hands that number to next.
-      .filter((candidate) => candidate !== pid || (child.exitCode === null && child.signalCode === null))
+      .filter((candidate) => candidate !== pid || !pidAlreadyGone)
       .filter((candidate) => stillRunning(candidate));
 
     const send = (signal, pids) => {
@@ -602,8 +692,11 @@ export class PrivilegeDropper {
       }
     };
 
-    // SIGTERM to the helper only: sudo relays it, and the CLI gets to exit cleanly.
-    send('SIGTERM', [pid]);
+    // SIGTERM to the helper only, and only if it is not already gone: sudo relays it, and the CLI
+    // gets to exit cleanly. A seeded descendant gets no separate SIGTERM of its own here — it was
+    // never the thing this module signals directly on the first pass, matching the launch that had
+    // no seed at all — and is instead reached once the grace elapses, exactly as it always was.
+    if (pid && !pidAlreadyGone) send('SIGTERM', [pid]);
     while (Date.now() < deadline) {
       await rescan();
       if (survivors().length === 0) return true;
@@ -674,33 +767,7 @@ export class PrivilegeDropper {
       // failure is interpreted against.
       const plan = await this.plan();
       const invocation = await this.invocation(file, argv, options, plan);
-      const running = exec(invocation.file, invocation.argv, invocation.options);
-      // `promisify(execFile)` exposes the child on the promise. Absent — an injected runner in a
-      // test, say — there is nothing to reap and nothing to wait for.
-      const child = running?.child ?? null;
-
-      try {
-        return await running;
-      } catch (err) {
-        // Await the death of what was launched before telling the caller it stopped. Nothing else
-        // in the system can do this: by the time the error reaches the engine, the handle is gone.
-        // The verdict is carried on the error rather than dropped: a cancellation that could not
-        // be carried out must not be indistinguishable from one that was.
-        if (child) err.terminationConfirmed = await this.ensureTerminated(child);
-
-        const refusal = this.helperFailure(err, plan);
-        if (refusal) throw refusal;
-
-        // A kill that raced the launch can surface as EPERM or ESRCH rather than as an abort, and
-        // a cancellation reported as a process failure blocks a job that was deliberately stopped.
-        // If the caller cancelled, the cancellation is what happened.
-        if (options.signal?.aborted && err?.name !== 'AbortError') {
-          throw Object.assign(new Error('the launch was cancelled'), {
-            name: 'AbortError', kind: 'cancelled', terminationConfirmed: err?.terminationConfirmed,
-          });
-        }
-        throw err;
-      }
+      return this._execTracked(exec, invocation, plan, options);
     };
   }
 }

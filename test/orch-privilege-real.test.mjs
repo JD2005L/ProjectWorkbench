@@ -43,6 +43,8 @@ const TOOLS = Object.freeze({
   touch: '/usr/bin/touch',
   sleep: '/usr/bin/sleep',
   pgrep: '/usr/bin/pgrep',
+  setsid: '/usr/bin/setsid',
+  sh: '/bin/sh',
 });
 
 /** Whether this host can actually be asked, resolved once for the whole file. */
@@ -75,12 +77,13 @@ const capability = await (async () => {
  * the target account. Without it a developer box would quietly test the direct path and report a
  * pass for something it never ran.
  */
-function realDropper() {
+function realDropper({ terminationGraceMs } = {}) {
   return new PrivilegeDropper({
     deployMode: 'host',
     user: capability.target.name,
     forbiddenEnv: FORBIDDEN_ENV,
     currentUid: () => 0,
+    ...(terminationGraceMs !== undefined ? { terminationGraceMs } : {}),
   });
 }
 
@@ -286,6 +289,59 @@ test('a tool subprocess that outlives the CLI is killed too, not left writing to
 
   assert.equal(await pgrepCount(marker), 0, 'a tool subprocess was orphaned and left running');
   assert.equal(confirmed, true);
+});
+
+test('wrapCommand kills a setsid-detached, SIGTERM-ignoring descendant a repository check left behind', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // The shape a repository check can leave behind, distinct from the coding CLI's own tool
+  // subprocess: the check command itself hangs and is SIGTERM'd on timeout, but something it
+  // started with `setsid` has moved to its own session entirely and ignores the signal outright.
+  // git.js and checks.js run through wrapCommand, not wrap — before this fix, only wrap confirmed
+  // the descendant tree was actually dead.
+  const marker = `937.${process.pid % 100000}`;
+  const dropper = realDropper({ terminationGraceMs: 1_500 });
+  const wrapped = dropper.wrapCommand(execFileAsync);
+
+  const running = wrapped(
+    TOOLS.sh,
+    ['-c', `${TOOLS.setsid} ${TOOLS.sh} -c 'trap "" TERM; exec ${TOOLS.sleep} ${marker}' </dev/null >/dev/null 2>&1 & exec ${TOOLS.sleep} 60`],
+    { timeout: 1_000 },
+  );
+  running.catch(() => {});
+
+  await waitFor(async () => await pgrepCount(marker) > 0, 10_000, 'the setsid-detached descendant never started');
+
+  const err = await running.then(() => null, (e) => e);
+  assert.ok(err, 'the repository-check-shaped command must have timed out');
+  assert.equal(err.terminationConfirmed, true, 'termination must be confirmed, not merely reported');
+  assert.equal(await pgrepCount(marker), 0, 'a setsid-detached descendant survived wrapCommand\'s timeout');
+});
+
+test('wrap kills a setsid-detached, SIGTERM-ignoring descendant when the launch is aborted, not just on timeout', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  // The same blind spot, reached from the other trigger `execFile` can kill a direct child through
+  // without this module ever seeing it: an AbortSignal, not a timeout. The coding CLI's own phase
+  // deadline and cancellation both go through `signal`, not `timeout` — this is the path a real
+  // cancellation of a running phase actually takes.
+  const marker = `938.${process.pid % 100000}`;
+  const dropper = realDropper({ terminationGraceMs: 1_500 });
+  const wrapped = dropper.wrap(execFileAsync);
+  const controller = new AbortController();
+
+  const running = wrapped(
+    TOOLS.sh,
+    ['-c', `${TOOLS.setsid} ${TOOLS.sh} -c 'trap "" TERM; exec ${TOOLS.sleep} ${marker}' </dev/null >/dev/null 2>&1 & exec ${TOOLS.sleep} 60`],
+    { signal: controller.signal, timeout: 60_000 },
+  );
+  running.catch(() => {});
+
+  await waitFor(async () => await pgrepCount(marker) > 0, 10_000, 'the setsid-detached descendant never started');
+  controller.abort();
+
+  const err = await running.then(() => null, (e) => e);
+  assert.ok(err, 'the aborted launch must reject');
+  assert.equal(err.terminationConfirmed, true, 'termination must be confirmed, not merely reported');
+  assert.equal(await pgrepCount(marker), 0, 'a setsid-detached descendant survived the abort');
 });
 
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {

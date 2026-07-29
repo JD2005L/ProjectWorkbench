@@ -775,13 +775,124 @@ gitTest('cancel: does not hold the caller open for the whole phase budget', asyn
     }
 
     const started = Date.now();
-    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+    const state = await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
     const elapsed = Date.now() - started;
 
     // Grace is 1s; the phase takes 4s. Returning in well under 4s is the whole assertion.
     assert.ok(elapsed < 3_000, `cancel must be bounded by the grace period, took ${elapsed} ms`);
-    assert.equal(repo.getJob(jobId).status, JobStatus.CANCELLED);
+    // The worker had not yet told us anything when the grace elapsed — not "cancelled", which would
+    // be rounding an unknown up to a known-good answer. See the dedicated race tests below for the
+    // full contract this reflects.
+    assert.notEqual(state.status, JobStatus.CANCELLED);
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(repo.getJob(jobId).termination_confirmed, false);
   }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '1000' } });
+});
+
+// ---------------------------------------------------------------------------
+// cancellation: the cancelGraceMs race must never default to confirmed (round 2, criteria 3-5)
+// ---------------------------------------------------------------------------
+
+gitTest('cancel: a worker still unresolved when cancelGraceMs elapses is unconfirmed, never rounded up to cancelled', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    // The phase takes far longer to settle than the cancel grace — and, crucially, it WOULD report
+    // termination confirmed had the caller waited for it. The point under test is that the caller
+    // must not wait: a deadline that elapses before any answer has arrived has to read as "unknown",
+    // never as "it turned out fine".
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Object.assign(new Error('aborted'), {
+        name: 'AbortError', kind: 'cancelled', terminationConfirmed: true,
+      })), 3_000);
+      request.signal?.addEventListener('abort', () => {}); // acknowledged, genuinely slow to confirm
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const state = await engine.cancelJob({
+      token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' },
+    });
+
+    assert.notEqual(state.status, JobStatus.CANCELLED,
+      'a deadline that elapsed before confirmation arrived must never default to cancelled');
+    assert.equal(state.status, JobStatus.BLOCKED_PROJECT_STATE);
+    const job = repo.getJob(jobId);
+    assert.equal(job.termination_confirmed, false,
+      'termination_confirmed:false must be persisted when the deadline won the race');
+    assert.equal(job.working_tree_preserved, false);
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
+});
+
+gitTest('cancel: an unconfirmed termination fences the project lease — a later job cannot acquire it', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Object.assign(new Error('aborted'), {
+        name: 'AbortError', kind: 'cancelled', terminationConfirmed: false,
+      })), 3_000);
+      request.signal?.addEventListener('abort', () => {});
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'the project resource must be fenced, not merely un-renewed');
+
+    // A second, independent job for the SAME project must not be able to acquire the workspace lease
+    // while the fence is up.
+    const second = await submit(engine, {}, 'req-2');
+    await engine.drain();
+    const secondJob = repo.getJob(second.workbench_job_id);
+    assert.equal(secondJob.status, JobStatus.BLOCKED_PROJECT_STATE,
+      'a later job must not acquire the fenced project lease');
+    assert.notEqual(secondJob.workbench_job_id, jobId);
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
+});
+
+gitTest('cancel: clearing the fence lets a later job acquire the project again', async () => {
+  await withEngine(async ({ engine, repo, backend, config }) => {
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Object.assign(new Error('aborted'), {
+        name: 'AbortError', kind: 'cancelled', terminationConfirmed: false,
+      })), 3_000);
+      request.signal?.addEventListener('abort', () => {});
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+
+    const resource = `project-write:${config.instanceId}:Demo`;
+    await engine.store.transact((tx, state) => {
+      engine.repo.clearFence(tx, state, {
+        resource, clearedBy: 'operator:test', reason: 'manually verified no surviving process',
+      });
+    });
+    assert.equal(repo.getLease(resource)?.fenced, false);
+
+    delete backend.runPhase;
+    const second = await submit(engine, {}, 'req-2');
+    await engine.drain();
+    assert.notEqual(repo.getJob(second.workbench_job_id).status, JobStatus.BLOCKED_PROJECT_STATE,
+      'once cleared, a later job must be able to acquire the project again');
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
 });
 
 gitTest('publish: a commit message beginning with a dash publishes, and never strands the job', async () => {

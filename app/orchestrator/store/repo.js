@@ -199,6 +199,20 @@ export class OrchestratorRepository {
     const now = this.clock();
     const existing = state.get(KIND.LEASES, resource);
 
+    // Checked before expiry, and before ownership: a fence is not a lease with a very long TTL, it is
+    // a separate hold that a timer cannot end. Expiry exists so a crashed worker's project can be
+    // picked up again without an operator — exactly the behaviour that must NOT apply the one time a
+    // cancellation could not confirm a descendant was actually dead. Refused even for the job that
+    // set the fence: a quiet re-acquire past one's own fence is the auto-clear-without-evidence this
+    // mechanism exists to prevent.
+    if (existing?.fenced) {
+      throw new ApiError(
+        ErrorCode.LEASE_LOST,
+        `the write lease for this project is fenced (${existing.fenced_reason ?? 'a cancellation could not confirm termination'}) `
+        + 'and requires an operator to clear it before any job may write here again',
+      );
+    }
+
     if (existing && existing.owner !== owner && new Date(existing.expires_at) > now) {
       throw new ApiError(
         ErrorCode.CONFLICT,
@@ -243,12 +257,78 @@ export class OrchestratorRepository {
   releaseLease(tx, state, { resource, owner, fencingToken }) {
     const existing = state.get(KIND.LEASES, resource);
     if (!existing) return;
+    // A fenced lease is released only by an explicit, evidenced `clearFence` call — never by the
+    // ordinary job lifecycle. Without this, a worker whose promise was still in flight when its own
+    // cancellation was recorded as unconfirmed — and therefore fenced — would settle moments later
+    // and release the very fence that decision just put up.
+    if (existing.fenced) {
+      throw new ApiError(
+        ErrorCode.LEASE_LOST,
+        'the write lease for this project is fenced pending operator review and cannot be released',
+      );
+    }
     if (existing.owner !== owner || existing.fencing_token !== fencingToken) {
       throw new ApiError(ErrorCode.LEASE_LOST, 'the releasing worker is not the lease holder');
     }
     // The record stays, marked released, so the *counter* keeps rising and a released token can
     // never be reissued to a later holder.
     tx.put(KIND.LEASES, resource, { ...existing, released_at: this.clock().toISOString(), expires_at: existing.acquired_at });
+  }
+
+  /**
+   * Durably fence a resource: no later acquisition may succeed, whatever its TTL, until an operator
+   * clears it with evidence.
+   *
+   * A no-op when the caller is not the lease's current owner — most likely because it had already
+   * lapsed and been legitimately taken over by somebody else. Fencing in that case would block a
+   * holder this job has no standing to interrupt, over nothing it can still vouch for.
+   */
+  fenceLease(tx, state, { resource, owner, fencingToken, reason = null }) {
+    const existing = state.get(KIND.LEASES, resource);
+    if (!existing || existing.owner !== owner || existing.fencing_token !== fencingToken) return null;
+    const fenced = {
+      ...existing,
+      fenced: true,
+      fenced_at: this.clock().toISOString(),
+      // This module's own account of the failure (a fixed string built from the job id and reason),
+      // never a subprocess's raw stderr — but redacted anyway, on the same principle as every other
+      // free-text field this repository stores: it is cheap here and someone downstream may not
+      // re-check it before it is displayed.
+      fenced_reason: reason ? redactText(String(reason), { maxLength: 2_000 }) : null,
+      fenced_by: owner,
+    };
+    tx.put(KIND.LEASES, resource, fenced);
+    return fenced;
+  }
+
+  /**
+   * The only way a fence comes down: an explicit call naming who cleared it and why.
+   *
+   * Refuses when the resource is not currently fenced, rather than quietly succeeding — a caller
+   * that thinks it is clearing a fence that is not there has a wrong model of the world, and telling
+   * it so is safer than pretending the call did something.
+   */
+  clearFence(tx, state, { resource, clearedBy, reason }) {
+    const existing = state.get(KIND.LEASES, resource);
+    if (!existing?.fenced) {
+      throw new ApiError(ErrorCode.VALIDATION_FAILED, 'this resource is not currently fenced');
+    }
+    const now = this.clock().toISOString();
+    const cleared = {
+      ...existing,
+      fenced: false,
+      cleared_at: now,
+      // Operator-supplied, so redacted like anything else this repository stores as free text — a
+      // reason typed in haste is exactly where a credential could get pasted by mistake.
+      cleared_by: redactText(String(clearedBy ?? ''), { maxLength: 200 }),
+      clear_reason: redactText(String(reason ?? ''), { maxLength: 2_000 }),
+      // The lease is released outright, not merely unfenced: a fresh acquisition should start from a
+      // clean slate rather than inherit whatever ownership or expiry the fenced record last held.
+      released_at: now,
+      expires_at: existing.acquired_at,
+    };
+    tx.put(KIND.LEASES, resource, cleared);
+    return cleared;
   }
 
   /** Reject any operation carrying a token lower than the one currently accepted. */
