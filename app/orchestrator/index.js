@@ -14,6 +14,7 @@ import { OrchestrationEngine } from './engine.js';
 import { OrchestratorSessionManager, TmuxAdapter } from './session.js';
 import { ClaudeCodeBackend } from './runner/claude.js';
 import { createOrchestratorRouter } from './api.js';
+import { privilegeDropperFor } from './runner/privilege.js';
 
 /** Schema migrations for the durable store. Append-only: never edit a released migration. */
 export const MIGRATIONS = Object.freeze([
@@ -62,7 +63,24 @@ async function buildSubsystem({ config, store, workbenchVersion, audit }) {
   const repo = new OrchestratorRepository(store);
   const projectStore = new ProjectConfigStore(config.projectsPath);
   const artifacts = new ArtifactStore({ config, repo, store });
-  const checkRunner = new CheckRunner({ config, repo, store, artifacts });
+  // System-command privilege dropper: drops to the unprivileged account for git, gh, and check
+  // commands so they never create root-owned artifacts in an admin-owned workspace.
+  const commandDropper = privilegeDropperFor(config);
+  const { execFile } = await import('child_process');
+  const { promisify } = await import('util');
+  const execFileAsync = promisify(execFile);
+
+  // Eager validation: resolve the privilege-drop plan at boot. If the configured account cannot be
+  // resolved through NSS or sudo is unusable, fail NOW rather than on the first job — hours later.
+  // This is the "fail closed at boot" gate: the orchestrator refuses to start when a drop is
+  // required but cannot be made. Without this, the failure was lazy and the wording overstated
+  // what was actually enforced.
+  if (config.deployMode === 'host' && process.getuid?.() === 0) {
+    await commandDropper.plan();
+  }
+
+  const droppedExec = commandDropper.wrapCommand(execFileAsync);
+  const checkRunner = new CheckRunner({ config, repo, store, artifacts, exec: droppedExec });
   const backend = new ClaudeCodeBackend({ config });
   const tmux = new TmuxAdapter({
     socket: config.tmuxSocket, deployMode: config.deployMode, user: config.tmuxUser,
@@ -70,6 +88,7 @@ async function buildSubsystem({ config, store, workbenchVersion, audit }) {
   const sessionManager = new OrchestratorSessionManager({ config, store, repo, tmux, backend });
   const engine = new OrchestrationEngine({
     config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, audit,
+    exec: droppedExec,
   });
 
   // A job recorded as workspace-active when the process died is in an unknown state. Reconciling

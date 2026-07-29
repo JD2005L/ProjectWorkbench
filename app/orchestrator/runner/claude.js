@@ -479,7 +479,11 @@ export class ClaudeCodeBackend {
       const kind = classifyBackendFailure(err);
       if (kind === 'cancelled') {
         // Let the caller record the cancellation; this is not a backend failure to be blocked on.
-        throw Object.assign(new Error('the phase was cancelled'), { kind: 'cancelled' });
+        // Preserve terminationConfirmed so the engine knows whether descendants are confirmed dead.
+        throw Object.assign(new Error('the phase was cancelled'), {
+          kind: 'cancelled',
+          terminationConfirmed: err?.terminationConfirmed ?? undefined,
+        });
       }
       return {
         ok: false,

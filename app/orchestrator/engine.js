@@ -70,6 +70,8 @@ export class OrchestrationEngine {
     this._cancelRequested = new Set();
     /** One abort controller per running job, so a cancel reaches the child process. */
     this._aborts = new Map();
+    /** Jobs whose cancellation could not confirm all descendants are dead. */
+    this._terminationUnconfirmed = new Set();
   }
 
   now() { return this.clock().toISOString(); }
@@ -830,6 +832,10 @@ export class OrchestrationEngine {
     } catch (err) {
       if (err?.kind === 'cancelled' || err?.name === 'AbortError' || this._cancelled(jobId)) {
         // The phase was stopped on purpose. Cancellation records the terminal state itself.
+        // Surface terminationConfirmed so cancelJob knows whether descendants are dead.
+        if (err?.terminationConfirmed === false) {
+          this._terminationUnconfirmed.add(jobId);
+        }
         return null;
       }
       await this._blockWith(jobId, JobStatus.BLOCKED_CONNECTIVITY, `the coding backend failed: ${err.message}`);
@@ -1484,19 +1490,35 @@ export class OrchestrationEngine {
 
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
     const preserved = workingTreePreserved(before, after);
+    const terminationConfirmed = !this._terminationUnconfirmed.has(jobId);
 
     await this._releaseLease(jobId);
     const current = this.repo.getJob(jobId);
     if (!TERMINAL_STATES.has(current.status)) {
-      await this._transition(jobId, JobStatus.CANCELLED, {
-        message: `cancelled: ${request.reason}`,
-        detail: `cancelled: ${request.reason}`,
-        eventType: EventType.CANCELLED,
-        patch: { working_tree_preserved: preserved },
-      });
+      if (!terminationConfirmed) {
+        // Descendants may still be alive. Do NOT record as cancelled — block instead so the
+        // operator is alerted and can investigate. Recording cancelled while processes survive
+        // would let the engine take a working-tree snapshot around a live writer.
+        await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
+          message: `cancellation could not confirm all descendant processes are dead`,
+          detail: `cancelled: ${request.reason} (termination unconfirmed — descendants may still be running)`,
+          eventType: EventType.BLOCKED,
+          patch: { working_tree_preserved: false },
+        });
+      } else {
+        await this._transition(jobId, JobStatus.CANCELLED, {
+          message: `cancelled: ${request.reason}`,
+          detail: `cancelled: ${request.reason}`,
+          eventType: EventType.CANCELLED,
+          patch: { working_tree_preserved: preserved, termination_confirmed: true },
+        });
+      }
     }
     this._cancelRequested.delete(jobId);
-    this._auditEvent('orchestrator.job.cancelled', { workbench_job_id: jobId, working_tree_preserved: preserved });
+    this._terminationUnconfirmed.delete(jobId);
+    this._auditEvent('orchestrator.job.cancelled', {
+      workbench_job_id: jobId, working_tree_preserved: preserved, termination_confirmed: terminationConfirmed,
+    });
     return this._jobState(this.repo.getJob(jobId));
   }
 

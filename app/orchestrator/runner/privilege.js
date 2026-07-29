@@ -442,6 +442,54 @@ export class PrivilegeDropper {
   }
 
   /**
+   * Translate a system-utility launch into the argv actually executed.
+   *
+   * Unlike `invocation`, this does NOT require an absolute path. System utilities (git, gh) are
+   * resolved through sudo's vetted `secure_path`, which is acceptable because they are not
+   * fingerprinted — their identity is not part of an attestation claim. The only requirement is
+   * that they run as the unprivileged account so they cannot create root-owned artifacts.
+   */
+  async commandInvocation(file, argv, options = {}, resolved = null) {
+    const plan = resolved ?? await this.plan();
+    if (plan.mode === 'passthrough') return { file, argv: [...argv], options: { ...options } };
+
+    const childEnv = this.dropEnv(options.env, plan.target);
+    if (plan.mode === 'no_drop') {
+      return { file: String(file), argv: [...argv], options: { ...options, env: childEnv } };
+    }
+
+    return {
+      file: plan.sudo,
+      argv: [
+        '-n', '-H', '-u', `#${plan.target.uid}`,
+        `--preserve-env=${PRESERVED_ENV.join(',')}`,
+        '--', String(file), ...argv,
+      ],
+      options: { ...options, env: childEnv },
+    };
+  }
+
+  /**
+   * Wrap an exec-shaped function for system utilities (git, gh, check commands).
+   *
+   * Like `wrap` but without the absolute-path enforcement or termination tracking. System utilities
+   * do not need fingerprinting and their launches are short-lived, so the simpler wrapper suffices.
+   */
+  wrapCommand(exec) {
+    return async (file, argv, options = {}) => {
+      const plan = await this.plan();
+      const invocation = await this.commandInvocation(file, argv, options, plan);
+      try {
+        return await exec(invocation.file, invocation.argv, invocation.options);
+      } catch (err) {
+        const refusal = this.helperFailure(err, plan);
+        if (refusal) throw refusal;
+        throw err;
+      }
+    };
+  }
+
+  /**
    * Translate one launch into the argv actually executed.
    *
    * Exposed separately from `wrap` so a test can assert the exact argv and environment without

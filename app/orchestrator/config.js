@@ -184,7 +184,7 @@ export function loadOrchestratorConfig(env = process.env) {
     sudoExecutable,
 
     // ---- coding backend ----
-    backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, 'claude'),
+    backendExecutable: str(env.PW_ORCHESTRATOR_CLAUDE_BIN, '/usr/local/bin/claude'),
     // Pin the CLI's content hash. When set, a binary whose SHA-256 differs is refused outright
     // rather than merely re-fingerprinted — an upgrade becomes a deliberate configuration change.
     backendFingerprintSha256: str(env.PW_ORCHESTRATOR_CLI_SHA256, ''),

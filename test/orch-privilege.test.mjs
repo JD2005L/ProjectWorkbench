@@ -422,7 +422,8 @@ test('host mode refuses to launch a CLI that is not an absolute path', async () 
     PW_ORCHESTRATOR_ENABLED: 'true',
     PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
     PW_DEPLOY_MODE: 'host',
-    // The default: a bare name, which sudo would resolve through its own secure_path.
+    PW_ORCHESTRATOR_CLAUDE_BIN: 'claude',
+    // An explicitly bare name, which sudo would resolve through its own secure_path.
   });
   const { backend, calls } = backendWith({ config: relativeConfig });
 
