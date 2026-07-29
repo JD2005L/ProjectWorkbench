@@ -23,6 +23,7 @@ import { ClaudeCodeBackend, classifyBackendFailure } from '../app/orchestrator/r
 import {
   PrivilegeDropper, PrivilegeDropError, PrivilegeFailure,
   validateDropUser, resolveDropUser, resolveSudo, privilegeDropperFor,
+  descendantsIn, rescanTracked,
 } from '../app/orchestrator/runner/privilege.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { probeBinaryFingerprint, FingerprintCache, FingerprintFailure } from '../app/orchestrator/runner/fingerprint.js';
@@ -980,4 +981,90 @@ test('the dropper is built from the deployment configuration it is given', () =>
 test('the real sudo on this host, when present, satisfies the helper checks', async (t) => {
   if (!fs.existsSync('/usr/bin/sudo')) return t.skip('no sudo on this host');
   assert.equal(await resolveSudo(''), '/usr/bin/sudo');
+});
+
+// ---------------------------------------------------------------------------
+// PID safety: identity (pid + /proc start-time), not a bare number
+// ---------------------------------------------------------------------------
+//
+// A bare pid is not an identity — the kernel is free to reuse it the instant its holder is reaped.
+// These are hermetic: the `/proc` read `rescanTracked` normally performs is injected as a scripted
+// sequence of snapshots, so the identity-mismatch case (pid reused with a different start-time) is
+// deterministic rather than dependent on the kernel actually reusing a pid during the test run.
+
+test('descendantsIn: finds every transitive descendant, not just direct children', () => {
+  // 100 -> 200 -> 300, and a sibling 400 also under 100 with its own child 500.
+  const snapshot = new Map([
+    [100, { ppid: 1, startTime: 'a' }],
+    [200, { ppid: 100, startTime: 'b' }],
+    [300, { ppid: 200, startTime: 'c' }],
+    [400, { ppid: 100, startTime: 'd' }],
+    [500, { ppid: 400, startTime: 'e' }],
+    [999, { ppid: 1, startTime: 'unrelated' }],
+  ]);
+  const found = descendantsIn(snapshot, 100);
+  assert.deepEqual([...found].sort((a, b) => a - b), [200, 300, 400, 500]);
+});
+
+test('descendantsIn: a pid with no descendants finds nothing, not itself', () => {
+  const snapshot = new Map([[100, { ppid: 1, startTime: 'a' }]]);
+  assert.deepEqual(descendantsIn(snapshot, 100), []);
+});
+
+test('rescanTracked: accumulates a new descendant with the start-time recorded at first sight', async () => {
+  const tracked = new Map();
+  const snapshot = new Map([
+    [100, { ppid: 1, startTime: 'root-start' }],
+    [200, { ppid: 100, startTime: 'child-start' }],
+  ]);
+  await rescanTracked(tracked, [100], { snapshot: async () => snapshot });
+  assert.deepEqual([...tracked], [[200, 'child-start']]);
+});
+
+test('rescanTracked: a pid whose /proc start-time changed is pruned — a reused pid is never signalled', async () => {
+  const tracked = new Map([[200, 'original-start']]);
+  // The pid this module tracked as 200 is gone; the kernel has handed the number to something else,
+  // now reporting a different start-time under the same parent.
+  const reused = new Map([
+    [100, { ppid: 1, startTime: 'root-start' }],
+    [200, { ppid: 100, startTime: 'a-different-process-entirely' }],
+  ]);
+  await rescanTracked(tracked, [100, 200], { snapshot: async () => reused });
+  assert.equal(tracked.has(200), false,
+    'a pid whose recorded identity no longer matches must be pruned, not re-adopted under its new identity');
+});
+
+test('rescanTracked: a pid that vanished outright (no longer in the snapshot at all) is pruned', async () => {
+  const tracked = new Map([[200, 'original-start']]);
+  const gone = new Map([[100, { ppid: 1, startTime: 'root-start' }]]); // 200 no longer exists
+  await rescanTracked(tracked, [100, 200], { snapshot: async () => gone });
+  assert.equal(tracked.has(200), false);
+});
+
+test('rescanTracked: a pid whose start-time is unchanged survives — it is still the same process', async () => {
+  const tracked = new Map([[200, 'still-the-same-start-time']]);
+  const stillAlive = new Map([
+    [100, { ppid: 1, startTime: 'root-start' }],
+    [200, { ppid: 100, startTime: 'still-the-same-start-time' }],
+  ]);
+  await rescanTracked(tracked, [100, 200], { snapshot: async () => stillAlive });
+  assert.equal(tracked.get(200), 'still-the-same-start-time');
+});
+
+test('rescanTracked: one snapshot is shared across the whole accumulate-then-prune pass', async () => {
+  // If accumulation and pruning read two different snapshots, a pid that was legitimately alive at
+  // the moment it was discovered could be judged against a LATER snapshot instead of the one that
+  // named it — the exact class of bug identity-checking exists to prevent, just moved one step
+  // earlier. Asserted by counting snapshot calls: exactly one per `rescanTracked` invocation.
+  let calls = 0;
+  const snapshot = new Map([
+    [100, { ppid: 1, startTime: 'root-start' }],
+    [200, { ppid: 100, startTime: 'child-start' }],
+  ]);
+  const tracked = new Map();
+  await rescanTracked(tracked, [100], {
+    snapshot: async () => { calls += 1; return snapshot; },
+  });
+  assert.equal(calls, 1);
+  assert.equal(tracked.get(200), 'child-start');
 });

@@ -237,7 +237,7 @@ export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120
     const { stdout, stderr } = await exec(gitExecutable, argv, {
       cwd, timeout: timeoutMs, env, maxBuffer: 32 * 1024 * 1024,
     });
-    return { ok: true, exitCode: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? '') };
+    return { ok: true, exitCode: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), terminationConfirmed: null };
   } catch (err) {
     return {
       ok: false,
@@ -245,8 +245,24 @@ export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120
       stdout: String(err?.stdout ?? ''),
       stderr: String(err?.stderr ?? err?.message ?? ''),
       killed: Boolean(err?.killed),
+      // `null` when this failure was never a kill at all (an ordinary non-zero exit — a merge
+      // conflict, a missing ref) — there is no termination verdict to have an opinion about. `false`
+      // or `true` only when `err` actually carries one, which `PrivilegeDropper._execTracked` sets
+      // solely for a launch a signal actually ended. The caller (engine.js) must fence rather than
+      // merely record a failure when this is `false` — a `git` invocation is as capable of
+      // backgrounding something of its own as any other command this subsystem runs.
+      terminationConfirmed: err?.terminationConfirmed ?? null,
     };
   }
+}
+
+/**
+ * Whether any git invocation in a batch was actually killed without confirmation — the signal an
+ * engine caller must fence on, distinct from an ordinary git failure (a missing ref, a non-repo
+ * directory), which needs no termination verdict at all.
+ */
+function anyUnconfirmed(results) {
+  return results.some((result) => result.terminationConfirmed === false);
 }
 
 /**
@@ -254,6 +270,10 @@ export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120
  *
  * Deliberately all read-only: establishing a baseline must never be able to change the thing it is
  * measuring, and a dirty tree is a fact to be recorded, not a problem to be tidied away.
+ *
+ * `terminationConfirmed` rides alongside the durable facts rather than inside them — it is the
+ * caller's job to act on it and then keep only the facts, never to persist it as though it were a
+ * property of the repository.
  */
 export async function repositoryBaseline({ cwd, gitExecutable = 'git', exec }) {
   const opts = { cwd, gitExecutable, exec };
@@ -273,6 +293,7 @@ export async function repositoryBaseline({ cwd, gitExecutable = 'git', exec }) {
     dirty: dirtyFiles.length > 0,
     dirty_file_count: dirtyFiles.length,
     has_remote: remote.ok,
+    terminationConfirmed: anyUnconfirmed([head, branch, statusOut, remote]) ? false : null,
   };
 }
 
@@ -290,13 +311,14 @@ export async function workingTreeFingerprint({ cwd, gitExecutable = 'git', exec 
     runGit(['status', '--porcelain=v1', '--untracked-files=all', '-z'], opts),
     runGit(['rev-parse', 'HEAD'], opts),
   ]);
+  const terminationConfirmed = anyUnconfirmed([status, head]) ? false : null;
   // `-z` for the same reason publication uses it: git quotes non-ASCII paths otherwise.
   const dirty = new Set();
   for (const entry of status.stdout.split('\0').filter(Boolean)) {
     const file = entry.slice(3);
     if (file) dirty.add(file);
   }
-  return { head: head.stdout.trim(), dirty };
+  return { head: head.stdout.trim(), dirty, terminationConfirmed };
 }
 
 /**

@@ -537,6 +537,10 @@ export class OrchestrationEngine {
           correlationId: job.correlation_id,
         });
       } catch (err) {
+        // `TmuxAdapter.hasSession`/`listWindows` re-throw rather than swallow when tmux itself was
+        // killed without confirmation (as opposed to its ordinary "no such session" exit) — `_blockWith`
+        // below releases the lease unconditionally, which is exactly wrong here.
+        if (await this._guardTermination(jobId, err?.terminationConfirmed, `preparing the orchestrator lane could not confirm tmux was actually killed after it timed out: ${err.message}`)) return;
         await this._blockWith(jobId, JobStatus.BLOCKED_PROJECT_STATE, `the orchestrator lane could not be prepared: ${err.message}`);
         return;
       }
@@ -615,7 +619,10 @@ export class OrchestrationEngine {
       });
 
       // ---- baseline ----
-      const baseline = await repositoryBaseline({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
+      const { terminationConfirmed: baselineVerdict, ...baseline } = await repositoryBaseline({
+        cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec,
+      });
+      if (await this._guardTermination(jobId, baselineVerdict, 'capturing the repository baseline could not confirm a git command was actually killed after it timed out')) return;
       await this.store.transact((tx, state) => {
         const current = state.get(KIND.JOBS, jobId);
         this.repo.putJob(tx, { ...current, baseline, updated_at: this.now() });
@@ -643,6 +650,7 @@ export class OrchestrationEngine {
 
       // What actually changed, according to git rather than the model.
       const observed = await diffStat({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
+      if (await this._guardTermination(jobId, observed.terminationConfirmed, 'observing the diff could not confirm a git command was actually killed after it timed out')) return;
       const diffArtifact = await this.artifacts.write({
         jobId, kind: ArtifactKind.DIFF, name: 'implementation.diff',
         content: observed.changed_files.join('\n'),
@@ -659,6 +667,7 @@ export class OrchestrationEngine {
       await this._transition(jobId, JobStatus.VERIFYING_TARGETED, { message: 'running targeted verification', phase: 'verification' });
       if (await this._stopIfCancelled(jobId, workspacePath)) return;
       const targeted = await this._runChecks(jobId, project, workspacePath, this._targetedChecks(job));
+      if (await this._guardTermination(jobId, targeted.terminationConfirmed, 'targeted verification could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (targeted.failed) {
         await this._transition(jobId, JobStatus.BLOCKED_VERIFICATION, {
           message: 'targeted verification failed', detail: 'targeted verification failed', eventType: EventType.BLOCKED,
@@ -670,6 +679,7 @@ export class OrchestrationEngine {
       await this._transition(jobId, JobStatus.VERIFYING_FULL, { message: 'running full verification', phase: 'verification' });
       if (await this._stopIfCancelled(jobId, workspacePath)) return;
       const full = await this._runChecks(jobId, project, workspacePath, this._fullChecks(job));
+      if (await this._guardTermination(jobId, full.terminationConfirmed, 'full verification could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (full.failed) {
         await this._transition(jobId, JobStatus.BLOCKED_VERIFICATION, {
           message: 'full verification failed', detail: 'full verification failed', eventType: EventType.BLOCKED,
@@ -752,12 +762,14 @@ export class OrchestrationEngine {
 
       await this._transition(jobId, JobStatus.VERIFYING_TARGETED, { message: 'verifying the revision', phase: 'verification' });
       const targeted = await this._runChecks(jobId, project, workspacePath, this._targetedChecks(job));
+      if (await this._guardTermination(jobId, targeted.terminationConfirmed, 'verification after the revision could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (targeted.failed) {
         await this._blockWith(jobId, JobStatus.BLOCKED_VERIFICATION, 'verification failed after the revision');
         return;
       }
       await this._transition(jobId, JobStatus.VERIFYING_FULL, { message: 'running full verification', phase: 'verification' });
       const full = await this._runChecks(jobId, project, workspacePath, this._fullChecks(job));
+      if (await this._guardTermination(jobId, full.terminationConfirmed, 'full verification after the revision could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (full.failed) {
         await this._blockWith(jobId, JobStatus.BLOCKED_VERIFICATION, 'full verification failed after the revision');
         return;
@@ -923,9 +935,14 @@ export class OrchestrationEngine {
   async _runChecks(jobId, project, workspacePath, checkNames) {
     const records = [];
     let failed = false;
+    // `null` unless some check in this batch reports an unconfirmed kill — the caller must fence and
+    // stop rather than treat it as an ordinary check failure the moment this is `false`.
+    let terminationConfirmed = null;
     for (const checkName of checkNames) {
       // eslint-disable-next-line no-await-in-loop
-      const { check, artifact } = await this.checkRunner.run({ jobId, checkName, project, cwd: workspacePath });
+      const outcome = await this.checkRunner.run({ jobId, checkName, project, cwd: workspacePath });
+      const { check, artifact } = outcome;
+      if (outcome.terminationConfirmed === false) terminationConfirmed = false;
       // eslint-disable-next-line no-await-in-loop
       await this.store.transact((tx) => { tx.put(KIND.CHECKS, check.check_id, check); });
       // eslint-disable-next-line no-await-in-loop
@@ -941,8 +958,11 @@ export class OrchestrationEngine {
       });
       records.push(check);
       if (check.outcome === CheckOutcome.FAILED || check.outcome === CheckOutcome.ERRORED) failed = true;
+      // An unconfirmed kill takes priority over continuing the batch: whatever it left behind in the
+      // workspace matters more than whichever check was scheduled to run next.
+      if (terminationConfirmed === false) break;
     }
-    return { records, failed };
+    return { records, failed, terminationConfirmed };
   }
 
   // -- review ----------------------------------------------------------------
@@ -1482,10 +1502,14 @@ export class OrchestrationEngine {
 
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
     const preserved = workingTreePreserved(before, after);
-    // Confirmed only when the worker's own promise actually settled inside the grace window AND it
-    // did not itself report an unconfirmed kill. Anything else — including "the deadline won the
-    // race and we simply do not know yet" — is unconfirmed, never rounded up to cancelled.
-    const terminationConfirmed = settledInTime && !this._terminationUnconfirmed.has(jobId);
+    // Confirmed only when the worker's own promise actually settled inside the grace window, it did
+    // not itself report an unconfirmed kill, AND the git commands used to take the fingerprint
+    // either side of the abort were not themselves killed without confirmation — a fingerprinting
+    // command is exactly as capable of backgrounding something of its own as any other. Anything
+    // else — including "the deadline won the race and we simply do not know yet" — is unconfirmed,
+    // never rounded up to cancelled.
+    const terminationConfirmed = settledInTime && !this._terminationUnconfirmed.has(jobId)
+      && before.terminationConfirmed !== false && after.terminationConfirmed !== false;
 
     const current = this.repo.getJob(jobId);
     if (!TERMINAL_STATES.has(current.status)) {
@@ -1613,6 +1637,32 @@ export class OrchestrationEngine {
       : 'another job holds the write lease for this project';
     await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, { message, detail: message, eventType: EventType.BLOCKED });
     return null;
+  }
+
+  /**
+   * Fence and quarantine a job whenever a git or check operation reports a kill that could not be
+   * confirmed dead — the same treatment an unconfirmed cancellation gets, because a `git` invocation
+   * or a project's own verification command is exactly as capable of backgrounding something of its
+   * own as the coding CLI is. `terminationConfirmed` is `null` for the overwhelming majority of
+   * calls (nothing was ever killed — most git commands succeed, and most checks are simply allowed
+   * to fail), so this is a no-op unless it is specifically `false`.
+   *
+   * Returns `true` when this handled the situation — the caller must stop immediately, exactly like
+   * `_stopIfCancelled` — and `false` when there is nothing to act on.
+   */
+  async _guardTermination(jobId, terminationConfirmed, contextMessage) {
+    if (terminationConfirmed !== false) return false;
+    await this._fenceLease(jobId, contextMessage);
+    const current = this.repo.getJob(jobId);
+    if (!TERMINAL_STATES.has(current.status)) {
+      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
+        message: 'a git or verification command could not be confirmed dead after a timeout or abort',
+        detail: contextMessage,
+        eventType: EventType.BLOCKED,
+        patch: { termination_confirmed: false },
+      });
+    }
+    return true;
   }
 
   /**

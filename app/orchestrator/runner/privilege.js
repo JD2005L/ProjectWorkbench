@@ -499,9 +499,9 @@ export class PrivilegeDropper {
   }
 
   /**
-   * Run one invocation, confirming the whole descendant tree is gone before a timeout or an abort
-   * reaches the caller. Shared by `wrap` and `wrapCommand`, which differ only in how the invocation
-   * itself was built.
+   * Run one invocation, making a best-effort attempt to kill the whole descendant tree before a
+   * timeout or an abort reaches the caller. Shared by `wrap` and `wrapCommand`, which differ only in
+   * how the invocation itself was built.
    */
   async _execTracked(exec, invocation, plan, options) {
     const running = exec(invocation.file, invocation.argv, invocation.options);
@@ -510,42 +510,20 @@ export class PrivilegeDropper {
     const child = running?.child ?? null;
 
     // Enumerated continuously from the moment the child exists, not only once the launch has
-    // already failed. `execFile`'s own `timeout`/`signal` handling kills the direct child through a
-    // path this module cannot see and does not control; once that kill lands, the kernel reparents
-    // whatever the child had started to init, and nothing left in `/proc` connects it to the pid
-    // that just died. `ensureTerminated`'s own re-scan loop cannot discover a descendant that has
-    // already been orphaned before it is ever entered — reproduced with a `setsid`-detached,
-    // SIGTERM-ignoring descendant surviving a plain timeout. Polling while the launch is still alive
-    // keeps that window from being a blind spot: whatever this last saw is handed to
-    // `ensureTerminated` as a starting point, not rediscovered from a pid that may already be gone.
-    const tracked = child ? new Set([child.pid]) : null;
-    // Counts *completed* observations of the live tree, not timer firings — incremented as the last
-    // step of a tick, after that tick's accumulate-and-prune has actually finished. This is the
-    // evidence `ensureTerminated` is told about below: whether the tree was ever looked at, even
-    // once, while the launch was still alive. Polling itself is a sampling process and cannot prove a
-    // negative — an adversary need only fork and detach faster than whatever interval is chosen, and
-    // `DESCENDANT_POLL_MS` is exactly such an interval. What it CAN prove is the specific, narrower
-    // claim this counter exists for: "the launch failed before a single look ever happened", which is
-    // a fact about elapsed wall-clock time, not a guess. See `ensureTerminated` for how that claim is
-    // used, and the module doc for why a shorter interval would not be a fix.
-    let liveTicks = 0;
+    // already failed — `execFile`'s own `timeout`/`signal` handling kills the direct child through a
+    // path this module cannot see and does not control, and once that kill lands the kernel
+    // reparents whatever the child had started to init, unreachable from `pid` at all. Polling while
+    // the launch is still alive is what lets `ensureTerminated`'s best-effort kill reach as much of
+    // the tree as possible — but it does NOT make "confirmed" a provable claim; see there for why.
+    const tracked = child ? new Map() : null; // pid -> /proc start-time, for identity before signalling
+    // Tracks the currently-running tick's promise, if any, so a caller entering the catch block can
+    // await it rather than starting `ensureTerminated`'s own mutation of `tracked` while a tick is
+    // still in the middle of reading `/proc` and writing to the very same map.
+    let pollInFlight = null;
     const poller = tracked ? setInterval(() => {
-      (async () => {
-        for (const known of [...tracked]) {
-          // eslint-disable-next-line no-await-in-loop
-          for (const descendant of await descendantsOf(known)) tracked.add(descendant);
-        }
-        // Pruned, not merely accumulated: a long-running launch could otherwise carry a pid for its
-        // whole life after whatever it named has already exited, and a kernel that has since reused
-        // that number for something else entirely would be signalled by the eventual SIGKILL sweep.
-        // Removing an entry the moment it is confirmed gone bounds that reuse window to about one
-        // poll interval instead of the length of the launch — nothing tracked here is ever the
-        // caller's only record of it, so losing a pid that is genuinely dead loses nothing.
-        for (const known of [...tracked]) {
-          if (!stillRunning(known)) tracked.delete(known);
-        }
-        liveTicks += 1;
-      })().catch(() => {});
+      pollInFlight = rescanTracked(tracked, [child.pid, ...tracked.keys()])
+        .catch(() => {})
+        .finally(() => { pollInFlight = null; });
     }, DESCENDANT_POLL_MS) : null;
     if (typeof poller?.unref === 'function') poller.unref();
 
@@ -553,10 +531,25 @@ export class PrivilegeDropper {
       return await running;
     } catch (err) {
       if (poller) clearInterval(poller);
+      // Never let `ensureTerminated` start reading and mutating `tracked` while a poll tick already
+      // in flight is doing the same thing — the interval is stopped above, but a tick that started
+      // just before is still awaiting its own `/proc` reads and would otherwise race the rescan
+      // `ensureTerminated` is about to perform on the identical map.
+      if (pollInFlight) await pollInFlight;
+      // Only a launch that was actually KILLED — by this module's own timeout/abort, or by anything
+      // else that reaches the child as a signal — needs a termination verdict at all. A command that
+      // simply ran to completion and exited non-zero (a failing check, `git rev-parse` outside a
+      // repository) rejects through this exact same catch, and must not be confused with one: every
+      // check a caller runs is *expected* to fail sometimes, and treating an ordinary failing exit
+      // code as "termination unconfirmed" would fence a project on a red test rather than on anything
+      // resembling a live, unaccounted-for process. `err.signal`/`err.killed` are null for a normal
+      // exit and set only when a signal ended the process — the same discriminator
+      // `classifyBackendFailure` already uses to tell a timeout or a crash from a plain failure.
+      const wasKilled = Boolean(err?.signal) || Boolean(err?.killed) || Boolean(options.signal?.aborted);
       // Await the death of what was launched before telling the caller it stopped. The verdict is
       // carried on the error rather than dropped: a cancellation that could not be carried out must
       // not be indistinguishable from one that was.
-      if (child) err.terminationConfirmed = await this.ensureTerminated(child, { tracked, liveTicks });
+      if (child && wasKilled) err.terminationConfirmed = await this.ensureTerminated(child, { tracked });
 
       const refusal = this.helperFailure(err, plan);
       if (refusal) throw refusal;
@@ -652,68 +645,40 @@ export class PrivilegeDropper {
    * that `execFile`'s own `timeout`/`signal` handling has already reparented to init is no longer
    * reachable from `pid` at all, seeded or not — the seed is what still remembers it).
    */
-  async ensureTerminated(child, { graceMs = this.terminationGraceMs, poll = 50, tracked: seed = null, liveTicks = 0 } = {}) {
+  async ensureTerminated(child, { graceMs = this.terminationGraceMs, poll = 50, tracked: seed = null } = {}) {
     const pid = child?.pid ?? null;
-    // True in the ordinary case, not the exceptional one: this normally runs only after the launch
-    // has already failed, by which point Node has already recorded the direct child's exit. That
-    // used to be this function's cue to return `true` without looking any further — correct when
-    // there is nothing else to check, wrong the moment there is a seed. A descendant `_execTracked`
-    // saw while the launch was still alive can outlive the pid that died reporting it: reparented,
-    // it is no longer reachable through `pid` at all, seed or not, so bailing out on the pid alone
-    // would stop looking for it right when it matters most.
-    const pidAlreadyGone = !pid || child.exitCode !== null || child.signalCode !== null;
-    if (pidAlreadyGone && (!seed || seed.size === 0)) return true;
-
-    // Sampling cannot prove a negative, and pretending otherwise is exactly the gap an independent
-    // review found: `execFile`'s own `timeout`/`signal` handling can kill the direct child before
-    // `_execTracked`'s poller has ever completed a single tick — a launch shorter than
-    // `DESCENDANT_POLL_MS` guarantees this, and it is not the only way to reach it. When that
-    // happens, the ONLY thing tracked here is the trivial seed of the top pid itself; there is
-    // nothing to distinguish "genuinely no descendants" from "a descendant this module never had a
-    // chance to see". Reported as unconfirmed regardless of what the tree looks like by the time
-    // anyone gets to look, because "by the time anyone gets to look" is exactly the window a
-    // fast-forking, self-detaching descendant has already escaped through. This is a documented
-    // limitation of a purely time-sampled tree, not a bug a shorter interval would fix — an adversary
-    // need only fork and detach faster than whatever interval is chosen. Closing it for good would
-    // need a kernel-level containment primitive (a dedicated PID namespace so the kernel itself kills
-    // every process in it when the namespace's own init dies, or a cgroup with `cgroup.kill`/
-    // `cgroup.procs`, which — unlike `/proc` ppid-chasing — tracks membership independently of
-    // reparenting) rather than anything this module can observe from outside. That is a materially
-    // larger, more platform-specific change than this fix, and is left as a known follow-up; being
-    // honest about the limit here is what lets the durable fence (`OrchestrationEngine._fenceLease`)
-    // stand in for it safely in the meantime.
-    const unproven = pidAlreadyGone && liveTicks === 0;
+    // Nothing was ever launched — an injected runner with no real child, say. Vacuously nothing to
+    // confirm, and nothing this function's own limitation below applies to.
+    if (!pid) return true;
 
     const deadline = Date.now() + graceMs;
+    const tracked = seed ?? new Map(); // descendant pid -> /proc start-time, recorded at first sight
 
-    // What has to be confirmed dead is what was *launched*, not the helper — killing the helper
-    // alone is what reparents a CLI that ignores SIGTERM to init and then calls it terminated.
-    //
-    // Accumulated rather than snapshotted, and re-read on every round. This function is first
-    // entered after `execFile` has already delivered its own SIGTERM, so by the time a single
-    // /proc scan finishes the direct child can already be gone and its own children reparented to
-    // init — enumerated once, the tree came back as just the helper and a live grandchild was
-    // reported dead. Re-reading also catches anything spawned during the grace.
-    const tracked = seed ?? new Set();
-    if (pid) tracked.add(pid);
-    const rescan = async () => {
-      if (pid) for (const descendant of await descendantsOf(pid)) tracked.add(descendant);
-      // Reparented children are no longer reachable from `pid`, so anything already known is
-      // followed on its own account.
-      for (const known of [...tracked]) {
-        if (known === pid) continue;
-        for (const descendant of await descendantsOf(known)) tracked.add(descendant);
-      }
-    };
+    // Re-evaluated on every round via Node's own bookkeeping, never snapshotted once at entry: a
+    // verdict computed before this function was even called (as an earlier version did) could
+    // already be stale by the time it is used to decide whether to signal `pid` at all.
+    const directChildGone = () => child.exitCode !== null || child.signalCode !== null;
+
+    // What has to be reached is what was *launched*, not the helper — killing the helper alone is
+    // what reparents a CLI that ignores SIGTERM to init and then calls it terminated. Accumulated
+    // rather than snapshotted, and re-read on every round: this function is first entered after
+    // `execFile` has already delivered its own SIGTERM, so by the time a single `/proc` scan
+    // finishes the direct child can already be gone and its own children reparented to init.
+    const rescan = () => rescanTracked(tracked, [pid, ...tracked.keys()]);
     await rescan();
 
-    // `child.exitCode` is re-checked each round, not only on entry: once Node has reaped the child
-    // the pid means nothing, and signalling it would reach whatever the kernel handed it to next.
-    const survivors = () => [...tracked]
-      // Once Node has reaped the child, its pid means nothing and signalling it would reach
-      // whatever the kernel hands that number to next.
-      .filter((candidate) => candidate !== pid || !pidAlreadyGone)
-      .filter((candidate) => stillRunning(candidate));
+    // A tracked descendant only counts as a survivor if its CURRENT `/proc` start-time still matches
+    // the one recorded when this module first saw it. A bare pid number is not an identity — the
+    // kernel is free to reuse it the instant its holder is reaped, and signalling a reused pid
+    // signals a process this module has never heard of and has no business touching. `rescanTracked`
+    // already prunes anything whose start-time no longer matches, so survival here just means
+    // "still present in `tracked`, and actually alive right now".
+    const survivors = () => {
+      const found = [];
+      if (!directChildGone() && stillRunning(pid)) found.push(pid);
+      for (const descendant of tracked.keys()) found.push(descendant);
+      return found;
+    };
 
     const send = (signal, pids) => {
       for (const target of pids) {
@@ -723,16 +688,13 @@ export class PrivilegeDropper {
       }
     };
 
-    // SIGTERM to the helper only, and only if it is not already gone: sudo relays it, and the CLI
-    // gets to exit cleanly. A seeded descendant gets no separate SIGTERM of its own here — it was
-    // never the thing this module signals directly on the first pass, matching the launch that had
-    // no seed at all — and is instead reached once the grace elapses, exactly as it always was.
-    if (pid && !pidAlreadyGone) send('SIGTERM', [pid]);
+    // SIGTERM to the direct child only, and only if it is not already gone: sudo relays it, and the
+    // CLI gets to exit cleanly. A tracked descendant gets no separate SIGTERM of its own here — it
+    // is reached once the grace elapses, exactly as it always was.
+    if (!directChildGone()) send('SIGTERM', [pid]);
     while (Date.now() < deadline) {
       await rescan();
-      // Never `return true` outright: an empty survivor list proves nothing when `unproven`, since
-      // survivors were only ever going to be found among pids this module actually knew to look for.
-      if (survivors().length === 0) return !unproven;
+      if (survivors().length === 0) break;
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
 
@@ -743,12 +705,30 @@ export class PrivilegeDropper {
     for (let i = 0; i < 20; i++) {
       await rescan();
       const left = survivors();
-      if (left.length === 0) return !unproven;
+      if (left.length === 0) break;
       send('SIGKILL', left);
       await new Promise((resolve) => setTimeout(resolve, poll));
     }
-    // Said plainly rather than assumed. Something is still running, and the caller is entitled to
-    // know that its cancellation was not carried out.
+
+    // Whatever this search found is now (best-effort) dead — but temporal `/proc`-ancestry sampling
+    // can never prove that is the WHOLE tree, and an independent review reproduced exactly why: a
+    // descendant that forked and `setsid`-detached in a gap this scan never covered — before the
+    // first poll tick, between two ticks, or between the last tick and the direct child's own death
+    // — is structurally indistinguishable from one that never existed. One or more samples having
+    // run, or every tracked pid having disappeared, proves only that nothing THIS SEARCH HAPPENED TO
+    // SEE survived; it is not a claim about anything else. So this reports unconfirmed
+    // UNCONDITIONALLY for every timeout or abort once a real child was launched — never `true` from
+    // this point on — so the durable fence (`OrchestrationEngine._fenceLease`) always engages rather
+    // than sometimes rounding an unproven search up to a false "confirmed". A normal, successful
+    // completion never reaches this function at all: only a timeout or an abort does.
+    //
+    // Closing this for good, rather than living with it as a documented trade-off, needs a
+    // kernel-backed per-invocation containment primitive whose membership is provably empty — a
+    // dedicated PID namespace, where the kernel itself kills every process in it the moment the
+    // namespace's own init exits, or a cgroup with `cgroup.kill`/`cgroup.procs`, which (unlike
+    // `/proc` ppid-chasing) tracks membership independently of reparenting. That is a materially
+    // larger, more platform-specific undertaking than this fix and is tracked as a follow-up rather
+    // than attempted here; see the module doc for the full trade-off.
     return false;
   }
 
@@ -816,47 +796,85 @@ function stillRunning(pid) {
 }
 
 /**
- * Every process descended from `pid`, read from /proc.
+ * Every currently-live pid's parent and `/proc` start-time, in one pass.
  *
- * Used to know what a cancellation actually has to kill. A tool the agent started — a build, a test
- * run, a `git` — is a grandchild, survives a SIGTERM aimed at its parent, and goes on writing to the
- * workspace while the engine samples it to decide whether the working tree was preserved.
+ * Start-time (field 22 of `/proc/<pid>/stat`, a raw kernel clock-tick count that is unique for the
+ * lifetime of a pid slot) is what turns a bare pid number into an actual identity check: the kernel
+ * is free to reuse a pid the instant its previous holder is reaped, and a bare `process.kill(pid,
+ * sig)` cannot tell "the process this module has been tracking" from "whatever unrelated process the
+ * kernel handed that number to next". Comparing start-times closes that gap — recorded once, at
+ * first sight, and checked again immediately before every signal.
  *
- * Returns `[]` on a system without /proc rather than throwing: the caller then does what it did
- * before, which is signal the helper and confirm what it can.
+ * Returns an empty map on a system without `/proc` rather than throwing: the caller then does what
+ * it did before, which is signal the direct child and confirm what it can.
  */
-async function descendantsOf(pid) {
+async function procSnapshot() {
   let entries;
   try {
     entries = await fsp.readdir('/proc');
   } catch {
-    return [];
+    return new Map();
   }
-
-  const children = new Map();
+  const snapshot = new Map();
   await Promise.all(entries.filter((entry) => /^\d+$/.test(entry)).map(async (entry) => {
     try {
       const stat = await fsp.readFile(`/proc/${entry}/stat`, 'utf8');
       // The comm field is parenthesised and may contain spaces and parentheses of its own, so the
-      // fields are read from after the LAST ')': state, then ppid.
+      // fields are read from after the LAST ')': state, ppid, …, start-time (field 22 overall, index
+      // 19 of this array once the first two — pid and comm — are accounted for by the split point).
       const after = stat.slice(stat.lastIndexOf(')') + 2).split(' ');
       const ppid = Number(after[1]);
-      if (!Number.isInteger(ppid)) return;
-      if (!children.has(ppid)) children.set(ppid, []);
-      children.get(ppid).push(Number(entry));
+      const startTime = after[19];
+      if (!Number.isInteger(ppid) || startTime === undefined) return;
+      snapshot.set(Number(entry), { ppid, startTime });
     } catch { /* the process ended while we were reading it */ }
   }));
+  return snapshot;
+}
 
+/** Every pid whose recorded parent, within one already-taken snapshot, traces back to `pid`. */
+export function descendantsIn(snapshot, pid) {
   const found = [];
   const queue = [pid];
   while (queue.length) {
-    for (const child of children.get(queue.shift()) ?? []) {
-      if (found.includes(child)) continue;
-      found.push(child);
-      queue.push(child);
+    const current = queue.shift();
+    for (const [candidate, info] of snapshot) {
+      if (info.ppid === current && candidate !== pid && !found.includes(candidate)) {
+        found.push(candidate);
+        queue.push(candidate);
+      }
     }
   }
   return found;
+}
+
+/**
+ * Grow `tracked` (a `Map<pid, startTime>`) with every live descendant of `roots`, then prune any
+ * entry whose current `/proc` start-time no longer matches what was recorded when it was first
+ * seen — because that pid is either gone outright, or has been handed by the kernel to a process
+ * this module never launched and has no business tracking, let alone signalling.
+ *
+ * One `/proc` snapshot per call, shared across the whole accumulate-then-prune pass, so an entry is
+ * never accumulated from one instant and pruned against a different, later one. `snapshot` is
+ * injectable — defaulting to a real `/proc` read — so a test can drive the identity-check logic
+ * deterministically with a scripted sequence of snapshots, including a pid reused with a different
+ * start-time, without needing the kernel to actually reuse one on cue.
+ */
+export async function rescanTracked(tracked, roots, { snapshot: takeSnapshot = procSnapshot } = {}) {
+  const snapshot = await takeSnapshot();
+  for (const root of roots) {
+    for (const descendant of descendantsIn(snapshot, root)) {
+      if (!tracked.has(descendant)) {
+        const info = snapshot.get(descendant);
+        if (info) tracked.set(descendant, info.startTime);
+      }
+    }
+  }
+  for (const [pid, startTime] of [...tracked]) {
+    const info = snapshot.get(pid);
+    if (!info || info.startTime !== startTime) tracked.delete(pid);
+  }
+  return snapshot;
 }
 
 /** Build the dropper this deployment's configuration calls for. */

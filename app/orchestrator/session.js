@@ -83,7 +83,13 @@ export class TmuxAdapter {
     try {
       await this.raw(['has-session', '-t', `=${session}`]);
       return true;
-    } catch {
+    } catch (err) {
+      // tmux exiting non-zero because the session genuinely does not exist yet is the ordinary,
+      // expected case here — swallowed into `false` as always. But a `false` this module cannot
+      // vouch for — tmux itself killed without confirming its own descendant tree died — must not
+      // be indistinguishable from "no such session": the caller needs to fence, not proceed as
+      // though nothing happened.
+      if (err?.terminationConfirmed === false) throw err;
       return false;
     }
   }
@@ -104,7 +110,11 @@ export class TmuxAdapter {
     let stdout;
     try {
       ({ stdout } = await this.raw(['list-windows', '-t', `=${session}`, '-F', format]));
-    } catch {
+    } catch (err) {
+      // Same distinction as `hasSession`: an ordinary tmux failure reads as "no windows", but a
+      // kill this module cannot confirm was actually carried out must reach the caller, not be
+      // rounded down to an empty, unremarkable list.
+      if (err?.terminationConfirmed === false) throw err;
       return [];
     }
     return stdout.split('\n').filter(Boolean).map((line) => {

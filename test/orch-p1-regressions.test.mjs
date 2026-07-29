@@ -895,6 +895,60 @@ gitTest('cancel: clearing the fence lets a later job acquire the project again',
   }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
 });
 
+// ---------------------------------------------------------------------------
+// checks.js / git.js unconfirmed kills must fence, not merely record a failure
+// ---------------------------------------------------------------------------
+
+gitTest('verification: a check killed without confirmation fences the project rather than merely failing it', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    // A real, non-zero-exit check failure must NOT reach this — only an actual unconfirmed kill,
+    // which `PrivilegeDropper._execTracked` marks with `terminationConfirmed: false` on the error it
+    // hands back. Injected directly onto the CheckRunner this engine already built, standing in for
+    // a verification command that timed out and could not confirm its own descendant tree was dead.
+    engine.checkRunner.exec = async () => {
+      const err = new Error('Command failed');
+      err.code = null;
+      err.killed = true;
+      err.signal = 'SIGTERM';
+      err.terminationConfirmed = false;
+      throw err;
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE,
+      'an unconfirmed kill must fence and quarantine, not merely record blocked_verification');
+    assert.equal(job.termination_confirmed, false);
+
+    const resource = `project-write:${engine.config.instanceId}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'the project must be durably fenced, exactly like an unconfirmed cancellation');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('verification: an ordinary failing check still just fails — no fence over a red test', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    engine.checkRunner.exec = async () => {
+      const err = new Error('Command failed');
+      err.code = 1; // a plain non-signal exit — the shape a red test actually has
+      throw err;
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_VERIFICATION,
+      'a red test is an ordinary, recoverable outcome and must not fence the project');
+    const resource = `project-write:${engine.config.instanceId}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced ?? false, false);
+  }, { backendOptions: ATTESTING });
+});
+
 gitTest('publish: a commit message beginning with a dash publishes, and never strands the job', async () => {
   await withEngine(async ({ engine, repo, repoDir }) => {
     const { jobId, approval } = await driveToGate(engine);

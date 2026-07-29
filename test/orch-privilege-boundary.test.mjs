@@ -242,8 +242,15 @@ test('wrapCommand confirms termination of the tracked child on failure, exactly 
     return true;
   };
   const fakeExec = (file, argv, options) => {
+    // A genuinely killed launch, not merely a non-zero exit: `killed`/`signal` are what Node itself
+    // sets when a signal ended the process, and are exactly the discriminator `_execTracked` uses to
+    // decide whether a termination verdict applies at all — a check that simply exits non-zero (a
+    // failing test, `git rev-parse` outside a repository) must not reach `ensureTerminated`, or every
+    // ordinary failure would fence a project on nothing resembling a live, unaccounted-for process.
     const err = new Error('Command failed');
-    err.code = 124;
+    err.code = null;
+    err.killed = true;
+    err.signal = 'SIGTERM';
     const promise = Promise.reject(err);
     promise.child = fakeChild;
     return promise;
@@ -264,7 +271,9 @@ test('wrapCommand reports an unconfirmed kill rather than hiding it, exactly lik
   dp.ensureTerminated = async () => false;
   const fakeExec = (file, argv, options) => {
     const err = new Error('Command failed');
-    err.code = 124;
+    err.code = null;
+    err.killed = true;
+    err.signal = 'SIGTERM';
     const promise = Promise.reject(err);
     promise.child = fakeChild;
     return promise;
@@ -275,6 +284,33 @@ test('wrapCommand reports an unconfirmed kill rather than hiding it, exactly lik
 
   assert.ok(err);
   assert.equal(err.terminationConfirmed, false);
+});
+
+test('wrapCommand does not invoke ensureTerminated for an ordinary non-zero exit — a failing check is not a kill', async () => {
+  // execFile rejects on ANY non-zero exit, not only a signal-killed one — and a check failing (a red
+  // test, `git diff --check` finding a whitespace error) is exactly that: a normal, expected,
+  // non-zero exit with no signal at all. If this reached `ensureTerminated` the way a real kill does,
+  // every ordinary check failure would report an (unconditionally false, per this module's own
+  // design) termination verdict, and an engine that fences on that verdict would fence the project on
+  // a red test rather than on anything resembling a live, unaccounted-for process.
+  const dp = makeDropper({ deployMode: 'container' });
+  let ensureTerminatedCalled = false;
+  dp.ensureTerminated = async () => { ensureTerminatedCalled = true; return false; };
+  const fakeExec = (file, argv, options) => {
+    const err = new Error('Command failed');
+    err.code = 1; // a plain, non-signal exit code — the shape a failing check actually has
+    const promise = Promise.reject(err);
+    promise.child = { pid: 999998, exitCode: 1, signalCode: null };
+    return promise;
+  };
+  const wrapped = dp.wrapCommand(fakeExec);
+
+  const err = await wrapped('some-check', [], {}).then(() => null, (e) => e);
+
+  assert.ok(err, 'a non-zero exit must still reject');
+  assert.equal(ensureTerminatedCalled, false, 'an ordinary non-zero exit must never reach ensureTerminated');
+  assert.equal(err.terminationConfirmed, undefined,
+    'no termination verdict applies at all to an exit that was never a kill');
 });
 
 test('production wiring: index.js constructs the tmux lane with the same droppedExec as checks/git, never its own dropper', () => {

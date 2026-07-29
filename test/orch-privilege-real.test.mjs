@@ -87,6 +87,27 @@ function realDropper({ terminationGraceMs } = {}) {
   });
 }
 
+/** Container mode: no drop at all, the launch runs exactly as this process does. */
+function containerDropper({ terminationGraceMs } = {}) {
+  return new PrivilegeDropper({
+    deployMode: 'container',
+    forbiddenEnv: FORBIDDEN_ENV,
+    ...(terminationGraceMs !== undefined ? { terminationGraceMs } : {}),
+  });
+}
+
+/** Host mode, but already running as the configured account: the `no_drop` plan, no helper at all. */
+function alreadyTargetDropper({ terminationGraceMs } = {}) {
+  return new PrivilegeDropper({
+    deployMode: 'host',
+    user: capability.target.name,
+    forbiddenEnv: FORBIDDEN_ENV,
+    currentUid: () => capability.target.uid,
+    currentGid: () => capability.target.gid,
+    ...(terminationGraceMs !== undefined ? { terminationGraceMs } : {}),
+  });
+}
+
 function skipUnlessCapable(t) {
   if (!capability.ok) {
     t.skip(`real-process privilege drop not exercisable here: ${capability.why}`);
@@ -263,7 +284,11 @@ test('a command that ignores SIGTERM is killed, not orphaned and called dead', a
   const confirmed = await dropper.ensureTerminated(running.child, { graceMs: 1_500 });
 
   assert.equal(await pgrepCount(marker), 0, 'the command that ignored SIGTERM was left running');
-  assert.equal(confirmed, true, 'and termination was reported as confirmed only because it was');
+  // The kill is real — the process is actually gone, verified above — but the VERDICT is
+  // unconditionally false for any real launch that reached this function at all: temporal
+  // `/proc`-ancestry sampling cannot prove that was everything, only that this search found nothing
+  // left. See `ensureTerminated`'s own doc for why "it happened to come back clean" is not proof.
+  assert.equal(confirmed, false, 'a real launch reaching ensureTerminated must never report confirmed');
 });
 
 test('a tool subprocess that outlives the CLI is killed too, not left writing to the workspace', async (t) => {
@@ -288,7 +313,8 @@ test('a tool subprocess that outlives the CLI is killed too, not left writing to
   const confirmed = await dropper.ensureTerminated(running.child, { graceMs: 1_500 });
 
   assert.equal(await pgrepCount(marker), 0, 'a tool subprocess was orphaned and left running');
-  assert.equal(confirmed, true);
+  // Killed for real, but never reported confirmed: see the sibling SIGTERM-ignoring test above.
+  assert.equal(confirmed, false);
 });
 
 test('wrapCommand kills a setsid-detached, SIGTERM-ignoring descendant a repository check left behind', async (t) => {
@@ -313,7 +339,9 @@ test('wrapCommand kills a setsid-detached, SIGTERM-ignoring descendant a reposit
 
   const err = await running.then(() => null, (e) => e);
   assert.ok(err, 'the repository-check-shaped command must have timed out');
-  assert.equal(err.terminationConfirmed, true, 'termination must be confirmed, not merely reported');
+  // The tree is genuinely killed (verified below), but unconditionally reported unconfirmed: see
+  // `ensureTerminated`'s own doc — a clean-looking search is not proof nothing else was ever alive.
+  assert.equal(err.terminationConfirmed, false, 'a real timeout must never report confirmed');
   assert.equal(await pgrepCount(marker), 0, 'a setsid-detached descendant survived wrapCommand\'s timeout');
 });
 
@@ -340,7 +368,7 @@ test('wrap kills a setsid-detached, SIGTERM-ignoring descendant when the launch 
 
   const err = await running.then(() => null, (e) => e);
   assert.ok(err, 'the aborted launch must reject');
-  assert.equal(err.terminationConfirmed, true, 'termination must be confirmed, not merely reported');
+  assert.equal(err.terminationConfirmed, false, 'a real abort must never report confirmed either');
   assert.equal(await pgrepCount(marker), 0, 'a setsid-detached descendant survived the abort');
 });
 
@@ -375,6 +403,85 @@ test('a timeout shorter than one poll interval cannot prove a fast descendant is
   assert.equal(err.terminationConfirmed, false,
     'zero live polls of the tree occurred before the direct child died — this must read as unconfirmed, '
     + 'never as confirmed, however the (necessarily incomplete) survivor search came out');
+});
+
+// ---------------------------------------------------------------------------
+// the between-polls regression: liveTicks > 0 is not proof either
+// ---------------------------------------------------------------------------
+//
+// An independent review reproduced a case the zero-tick fix above did not cover: a descendant forked
+// AFTER a poll tick had already completed, and died with the direct child BEFORE the next tick. One
+// or more samples having run — and every tracked pid having disappeared — is not proof that nothing
+// else was ever alive: it proves only that nothing THIS MODULE HAPPENED TO SEE survived. So the fix
+// is not "count the ticks and trust a nonzero count" (that heuristic is exactly what this reproduces
+// as false); it is "never claim confirmation from a sampled search at all, once a real subprocess was
+// launched and the launch failed by timeout or abort". `ensureTerminated` still makes a best-effort
+// kill of everything it can find — the assertions below require that cleanup, not merely the correct
+// flag — but the returned verdict must be unconfirmed regardless of how clean that search comes back.
+
+/**
+ * Reproduces the review's exact timing: a poll at 200ms sees nothing, a setsid/SIGTERM-ignoring
+ * descendant is forked at 270ms — after that tick, before the next one at 400ms — and the direct
+ * child is killed by a 340ms timeout. Run against whichever dropper/method the caller supplies, so
+ * the same regression is exercised across every deploy mode and both wrapped entry points.
+ */
+async function assertBetweenPollsUnconfirmed(t, { dropper, method, label }) {
+  const marker = `950.${process.pid % 100000}.${Math.floor(Math.random() * 1e6)}`;
+  const wrapped = dropper[method](execFileAsync);
+
+  // Mandatory survivor cleanup, on every exit from this test — the point of the regression is that a
+  // real process is left running, and the suite must not leak it regardless of pass or fail.
+  t.after(async () => {
+    const survivor = (await execFileAsync(TOOLS.pgrep, ['-x', '-f', `${TOOLS.sleep} ${marker}`]).catch(() => ({ stdout: '' }))).stdout.trim();
+    if (survivor) { try { process.kill(Number(survivor), 'SIGKILL'); } catch { /* already gone */ } }
+  });
+
+  const running = wrapped(
+    TOOLS.sh,
+    [
+      '-c',
+      `(${TOOLS.sleep} 0.27; ${TOOLS.setsid} ${TOOLS.sh} -c 'trap "" TERM; exec ${TOOLS.sleep} ${marker}' `
+      + `</dev/null >/dev/null 2>&1) & exec ${TOOLS.sleep} 60`,
+    ],
+    { timeout: 340 },
+  );
+  running.catch(() => {});
+
+  const err = await running.then(() => null, (e) => e);
+  assert.ok(err, `[${label}] the 340ms timeout must fail the launch`);
+  assert.equal(err.terminationConfirmed, false,
+    `[${label}] a descendant forked between poll ticks must never be reported as confirmed dead, `
+    + 'whatever the survivor search happened to find');
+}
+
+test('between-polls regression: wrap, container passthrough', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertBetweenPollsUnconfirmed(t, { dropper: containerDropper({ terminationGraceMs: 1_500 }), method: 'wrap', label: 'wrap/container' });
+});
+
+test('between-polls regression: wrapCommand, container passthrough', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertBetweenPollsUnconfirmed(t, { dropper: containerDropper({ terminationGraceMs: 1_500 }), method: 'wrapCommand', label: 'wrapCommand/container' });
+});
+
+test('between-polls regression: wrap, root -> admin drop', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertBetweenPollsUnconfirmed(t, { dropper: realDropper({ terminationGraceMs: 1_500 }), method: 'wrap', label: 'wrap/root-admin' });
+});
+
+test('between-polls regression: wrapCommand, root -> admin drop', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertBetweenPollsUnconfirmed(t, { dropper: realDropper({ terminationGraceMs: 1_500 }), method: 'wrapCommand', label: 'wrapCommand/root-admin' });
+});
+
+test('between-polls regression: wrap, already the target account (no_drop)', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertBetweenPollsUnconfirmed(t, { dropper: alreadyTargetDropper({ terminationGraceMs: 1_500 }), method: 'wrap', label: 'wrap/already-admin' });
+});
+
+test('between-polls regression: wrapCommand, already the target account (no_drop)', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertBetweenPollsUnconfirmed(t, { dropper: alreadyTargetDropper({ terminationGraceMs: 1_500 }), method: 'wrapCommand', label: 'wrapCommand/already-admin' });
 });
 
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
