@@ -168,6 +168,76 @@ test('CheckRunner.run: the secret-scan check propagates a kill from its underlyi
 });
 
 // ---------------------------------------------------------------------------
+// CheckRunner: an unconfirmed kill must never reach the fallible artifact write — a disk error there
+// (ENOSPC, say) would otherwise escape as an ordinary exception with no verdict attached at all,
+// while the check that actually observed the kill is never heard from again.
+// ---------------------------------------------------------------------------
+
+/** A `runner.artifacts.write` that proves whether it was ever invoked, and would poison the verdict
+ *  if it were: it always fails with an ordinary disk error carrying no termination information. */
+function poisonedArtifacts() {
+  const state = { called: false };
+  return { state, write: async () => { state.called = true; throw new Error('ENOSPC: no space left on device'); } };
+}
+
+test('CheckRunner.run: a killed configured command never reaches the artifact write', async () => {
+  const artifacts = poisonedArtifacts();
+  const runner = new CheckRunner({
+    config: { gitExecutable: 'git' }, repo: null, store: null, artifacts,
+    exec: killedExec({ terminationConfirmed: false }),
+  });
+  const { terminationConfirmed, check } = await runner.run({ jobId: 'j1', checkName: 'targeted_test', project: PROJECT, cwd: '/tmp' });
+  assert.equal(terminationConfirmed, false);
+  assert.equal(check.outcome, 'failed');
+  assert.equal(artifacts.state.called, false,
+    'a kill that could not be confirmed dead must never reach the fallible artifact write');
+});
+
+test('CheckRunner.run: a killed git-shaped check (diff_check) never reaches the artifact write', async () => {
+  const artifacts = poisonedArtifacts();
+  const runner = new CheckRunner({
+    config: { gitExecutable: 'git' }, repo: null, store: null, artifacts,
+    exec: killedExec({ terminationConfirmed: false }),
+  });
+  const { terminationConfirmed } = await runner.run({ jobId: 'j1', checkName: 'diff_check', project: PROJECT, cwd: '/tmp' });
+  assert.equal(terminationConfirmed, false);
+  assert.equal(artifacts.state.called, false,
+    'a kill that could not be confirmed dead must never reach the fallible artifact write');
+});
+
+test('CheckRunner.run: a killed secret-scan check never reaches the artifact write', async () => {
+  const artifacts = poisonedArtifacts();
+  const runner = new CheckRunner({
+    config: { gitExecutable: 'git' }, repo: null, store: null, artifacts,
+    exec: killedExec({ terminationConfirmed: false }),
+  });
+  const { terminationConfirmed } = await runner.run({ jobId: 'j1', checkName: 'secret_scan', project: PROJECT, cwd: '/tmp' });
+  assert.equal(terminationConfirmed, false);
+  assert.equal(artifacts.state.called, false,
+    'a kill that could not be confirmed dead must never reach the fallible artifact write');
+});
+
+test('CheckRunner.run: canonical_verification stops the command chain the instant one command is killed unconfirmed', async () => {
+  // `canonical_verification` is the one catalogue entry that can run more than one configured
+  // command in a single `run()` call (`allCommands: true`). The second command here would succeed if
+  // it ever ran — proving the loop really does stop, not merely that the final verdict comes out false.
+  let execCalls = 0;
+  const exec = async (...args) => {
+    execCalls += 1;
+    if (execCalls === 1) return killedExec({ terminationConfirmed: false })(...args);
+    return okExec('')(...args);
+  };
+  const artifacts = poisonedArtifacts();
+  const runner = new CheckRunner({ config: { gitExecutable: 'git' }, repo: null, store: null, artifacts, exec });
+  const project = { verification_commands: ['true', 'true'] };
+  const { terminationConfirmed } = await runner.run({ jobId: 'j1', checkName: 'canonical_verification', project, cwd: '/tmp' });
+  assert.equal(terminationConfirmed, false);
+  assert.equal(execCalls, 1, 'the second configured command must never run once the first could not be confirmed dead');
+  assert.equal(artifacts.state.called, false,
+    'a kill that could not be confirmed dead must never reach the fallible artifact write');
+});
+
+// ---------------------------------------------------------------------------
 // TmuxAdapter.hasSession / listWindows
 // ---------------------------------------------------------------------------
 

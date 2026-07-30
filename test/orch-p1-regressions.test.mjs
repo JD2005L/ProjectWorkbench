@@ -20,7 +20,7 @@ import { FakeCodingBackend } from '../app/orchestrator/runner/fake.js';
 import { TmuxAdapter, OrchestratorSessionManager } from '../app/orchestrator/session.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { ApiError } from '../app/orchestrator/errors.js';
-import { JobStatus, ApprovalStatus, PhaseClass } from '../app/orchestrator/contract.js';
+import { JobStatus, ApprovalStatus, PhaseClass, ArtifactKind } from '../app/orchestrator/contract.js';
 import { SCOPES } from '../app/orchestrator/auth.js';
 
 const execFileAsync = promisify(execFile);
@@ -1317,6 +1317,58 @@ gitTest('verification: an ordinary failing check still just fails — no fence o
       'a red test is an ordinary, recoverable outcome and must not fence the project');
     const resource = `project-write:${engine.config.instanceId}:Demo`;
     assert.equal(repo.getLease(resource)?.fenced ?? false, false);
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('verification: a check killed without confirmation is fenced BEFORE any artifact write — a secondary disk error changes nothing', async () => {
+  // `checkRunner.run` observed the kill internally, but used to keep going anyway: parse the output,
+  // then call `this.artifacts.write` — real disk I/O plus a store transaction, both fallible for
+  // reasons that have nothing to do with the kill. If that write threw an ordinary ENOSPC, the
+  // exception escaped `_runChecks` (which has no try/catch of its own) carrying no verdict of its
+  // own, and `_run`'s outer catch — seeing nothing — released the lease instead of fencing it.
+  await withEngine(async ({ engine, repo }) => {
+    let execCalls = 0;
+    engine.checkRunner.exec = async () => {
+      execCalls += 1;
+      const err = new Error('Command failed');
+      err.code = null;
+      err.killed = true;
+      err.signal = 'SIGTERM';
+      err.terminationConfirmed = false;
+      throw err;
+    };
+    // `_run` writes its own `implementation.diff` artifact before verification ever starts — real,
+    // unrelated work that must keep succeeding. Only a check's *own* artifact write (never reached
+    // once a check reports an unconfirmed kill) is poisoned here.
+    let artifactWriteCalled = false;
+    const realWrite = engine.artifacts.write.bind(engine.artifacts);
+    engine.artifacts.write = async (opts) => {
+      if (opts.kind !== ArtifactKind.DIFF) {
+        artifactWriteCalled = true;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      return realWrite(opts);
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(artifactWriteCalled, false,
+      'fencing must happen before any artifact write is even attempted, not merely before it fails');
+    assert.equal(execCalls, 1,
+      'no later check may run in the same batch once one has already been killed unconfirmed');
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false, 'the durable job record must show false');
+
+    const resource = `project-write:${engine.config.instanceId}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'fenced=1');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'released=0: the resource must not be reusable by a later job',
+    );
   }, { backendOptions: ATTESTING });
 });
 

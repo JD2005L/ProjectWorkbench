@@ -1012,8 +1012,17 @@ export class OrchestrationEngine {
     for (const checkName of checkNames) {
       // eslint-disable-next-line no-await-in-loop
       const outcome = await this.checkRunner.run({ jobId, checkName, project, cwd: workspacePath });
+      if (outcome.terminationConfirmed === false) {
+        terminationConfirmed = false;
+        // Tracked before anything else below runs — the persistence transaction and the event emit
+        // are both fallible I/O of their own, and an unrelated secondary failure there must not be
+        // able to lose a verdict already observed. Nothing after this point is safe to do with a
+        // check we cannot confirm actually finished: no persistence, no event, no later check in
+        // this batch.
+        this._terminationUnconfirmed.add(jobId);
+        break;
+      }
       const { check, artifact } = outcome;
-      if (outcome.terminationConfirmed === false) terminationConfirmed = false;
       // eslint-disable-next-line no-await-in-loop
       await this.store.transact((tx) => { tx.put(KIND.CHECKS, check.check_id, check); });
       // eslint-disable-next-line no-await-in-loop
@@ -1029,9 +1038,6 @@ export class OrchestrationEngine {
       });
       records.push(check);
       if (check.outcome === CheckOutcome.FAILED || check.outcome === CheckOutcome.ERRORED) failed = true;
-      // An unconfirmed kill takes priority over continuing the batch: whatever it left behind in the
-      // workspace matters more than whichever check was scheduled to run next.
-      if (terminationConfirmed === false) break;
     }
     return { records, failed, terminationConfirmed };
   }

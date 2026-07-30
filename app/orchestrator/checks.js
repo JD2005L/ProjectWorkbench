@@ -256,8 +256,29 @@ export class CheckRunner {
       const outcome = await this._exec(file, args, cwd);
       combined += `$ ${command}\n${outcome.stdout}${outcome.stderr}\n`;
       lastExit = outcome.exitCode;
-      if (outcome.terminationConfirmed === false) terminationConfirmed = false;
+      if (outcome.terminationConfirmed === false) {
+        terminationConfirmed = false;
+        // Stop the chain immediately: whichever command was scheduled next never gets to run once
+        // one already could not be confirmed dead.
+        break;
+      }
       if (lastExit !== 0) break;
+    }
+
+    if (terminationConfirmed === false) {
+      // The artifact write below is real disk I/O plus a store transaction, and can throw for
+      // reasons that have nothing to do with the kill (ENOSPC, a store contention error). An
+      // unconfirmed kill must be reported before that fallible work ever runs, so an unrelated
+      // secondary failure there can never be the thing that erases this verdict on its way out.
+      return {
+        check: buildCheck({
+          jobId, kind: spec.kind, name: spec.name, outcome: CheckOutcome.FAILED,
+          command: commands.join(' && '), exitCode: lastExit,
+          durationSeconds: (Date.now() - startedAt) / 1_000, recordedAt,
+        }),
+        artifact: null,
+        terminationConfirmed,
+      };
     }
 
     const counts = parseTestCounts(combined);
@@ -316,6 +337,19 @@ export class CheckRunner {
 
   async _gitCheck({ jobId, cwd, spec, recordedAt, startedAt }) {
     const result = await runGit(spec.git, { cwd, gitExecutable: this.config.gitExecutable, exec: this.exec });
+    if (result.terminationConfirmed === false) {
+      // Same rule as the configured-command path above: stop before the fallible artifact write,
+      // not after it.
+      return {
+        check: buildCheck({
+          jobId, kind: spec.kind, name: spec.name, outcome: CheckOutcome.FAILED,
+          command: `git ${spec.git.join(' ')}`, exitCode: result.exitCode,
+          durationSeconds: (Date.now() - startedAt) / 1_000, recordedAt,
+        }),
+        artifact: null,
+        terminationConfirmed: false,
+      };
+    }
     const artifact = await this.artifacts.write({
       jobId, kind: ArtifactKind.LOG, name: `${spec.kind}.log`,
       content: `$ git ${spec.git.join(' ')}\n${result.stdout}${result.stderr}`,
@@ -343,6 +377,19 @@ export class CheckRunner {
    */
   async _secretScan({ jobId, cwd, spec, recordedAt, startedAt }) {
     const diff = await runGit(['diff', 'HEAD', '--unified=0'], { cwd, gitExecutable: this.config.gitExecutable, exec: this.exec });
+    if (diff.terminationConfirmed === false) {
+      // Same rule again: an unconfirmed kill on the diff this scan depends on stops here, before the
+      // added-line parsing, the scan, and the fallible artifact write that follow.
+      return {
+        check: buildCheck({
+          jobId, kind: spec.kind, name: spec.name, outcome: CheckOutcome.FAILED,
+          command: 'git diff HEAD --unified=0 | added-line credential scan', exitCode: diff.exitCode,
+          durationSeconds: (Date.now() - startedAt) / 1_000, recordedAt,
+        }),
+        artifact: null,
+        terminationConfirmed: false,
+      };
+    }
     const addedLines = [];
     let currentFile = null;
     let lineNumber = 0;

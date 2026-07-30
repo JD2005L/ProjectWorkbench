@@ -715,6 +715,87 @@ in this round). `test/release-version.test.mjs` 4/4.
 * **`git diff --check`** against the merge-base with `origin/main`: clean.
 * **Syntax.** `node --check` on `publish.js`, `engine.js`, and both changed test files: clean.
 
+## Round 7 — `CheckRunner` observed a kill internally but still did fallible artifact I/O before returning it
+
+A final review found the exact same "false → fallible work → lost verdict" pattern round 6 closed in
+`Publisher`/`_runPublication` was still open one layer down, in `checks.js`'s own `CheckRunner`. All
+three of its subprocess-shaped paths — the configured-command loop (`run`), the git-shaped check
+(`_gitCheck`, e.g. `diff_check`), and the secret scan (`_secretScan`, which depends on its own
+`git diff`) — observed `terminationConfirmed === false` from the underlying `_exec`/`runGit` call, but
+then still parsed output and called `this.artifacts.write(...)` — real disk I/O plus a store
+transaction — before ever returning. An ENOSPC (or any other ordinary secondary error) there escaped
+`checkRunner.run()` as a plain exception carrying no verdict of its own, past `_runChecks` (which has no
+try/catch of its own around this call), and into `_run`'s/`_runRevision`'s outer catch, which saw
+nothing and released the lease instead of fencing it — reproduced exactly as the review described:
+`artifactWriteCalled:true`, `escapingTerminationConfirmed:null`.
+
+A second, narrower instance of the same pattern was also present one level up: `_runChecks` itself
+recorded `terminationConfirmed = false` locally but still ran a `store.transact` (persist the check) and
+`_emit` (persist the event) for the very check that had just been killed, before checking the flag and
+breaking — the identical ordering bug, just with the engine's own persistence as the fallible secondary
+work instead of the check runner's artifact write.
+
+### Fix — stop before the write, not after it; track before persistence
+
+* **`checks.js` — `run()` (configured-command path).** The loop now breaks the instant any command
+  reports `terminationConfirmed === false` (previously it only fell through incidentally via the
+  non-zero-exit check). Once that flag is set, the function returns immediately with a `FAILED` check
+  built from the command/exit-code alone — `parseTestCounts` and `this.artifacts.write` are never
+  reached.
+* **`checks.js` — `_gitCheck()`.** Checks `result.terminationConfirmed === false` immediately after the
+  single `runGit` call and returns before the artifact write if so; otherwise unchanged (including that
+  a *confirmed* kill, `true`, still flows through to the write exactly as before — only `false` skips
+  it).
+* **`checks.js` — `_secretScan()`.** Same check on the `git diff` call the scan depends on, before the
+  added-line parsing, `scanForSecrets`, or the artifact write.
+* **`engine.js` — `_runChecks()`.** The instant `outcome.terminationConfirmed === false` is observed,
+  the engine now adds the job to `_terminationUnconfirmed` *before* touching `store.transact`/`_emit`
+  for that check, and breaks immediately — no persistence, no event, and (critically) no later check
+  name in the batch is even started. The Set-add is a second, independent backstop of the same shape as
+  round 6's `_terminationIsUnconfirmed`: even if something between this point and the caller's own
+  `_guardTermination` call were to throw an ordinary secondary error, the tracked verdict already
+  survives it.
+
+### RED → GREEN evidence
+
+* **Unit-level (`orch-termination-verdict.test.mjs`, checks.js section), 4 new tests** — each wires a
+  `write` that flips a flag then throws `ENOSPC`, proving it is never called once a kill is observed:
+  - configured command (`targeted_test`) killed → artifact write never reached.
+  - git-shaped check (`diff_check`) killed → same.
+  - secret-scan check killed (via its underlying `git diff`) → same.
+  - `canonical_verification` (the one catalogue entry that can run more than one configured command in
+    a single call) killed on its first command → the second command, wired to succeed if it ever ran,
+    is proven to never run (`execCalls === 1`), on top of the same artifact-write assertion.
+  All four failed against the pre-fix code (`artifacts.state.called === true`, or the call rejected
+  outright with the injected `ENOSPC`); all four pass against the fix.
+* **Engine-level (`orch-p1-regressions.test.mjs`), 1 new test** — `checkRunner.exec` wired to kill
+  unconditionally, `engine.artifacts.write` wired to throw `ENOSPC` for any non-diff artifact (the
+  pre-verification `implementation.diff` write is real and must keep succeeding — only a check's *own*
+  write is poisoned). Asserts: the poisoned write is never called, only one `exec` call happens across
+  the whole run (no later check in the batch), `job.status === BLOCKED_PROJECT_STATE`,
+  `job.termination_confirmed === false` durably, the project lease is `fenced: true` (fence=1), and a
+  later job's lease-acquire attempt against the same resource still rejects with `/fenced/` (released=0).
+  Failed against the pre-fix code exactly as the review predicted
+  (`artifactWriteCalled: true !== false`); passes against the fix.
+* Confirmed via `git stash push -- app/orchestrator/checks.js app/orchestrator/engine.js` / `pop` that
+  all 5 new tests are genuinely RED against the pre-fix code before the corresponding fix, and GREEN
+  after.
+* Public wire stripping (`_publicPublicationRecord`) was not touched this round — this gap was entirely
+  upstream of it, in `CheckRunner`/`_runChecks`, neither of which returns anything on the public
+  MCP/REST surface; the existing strip points from round 5 remain the only ones needed.
+
+## Final verification, round 7
+
+App VERSION bumped `1.26.0730.0341` → `1.26.0730.0526` (forward; `checks.js`/`engine.js` changed again
+in this round). `test/release-version.test.mjs` 4/4.
+
+* **Full suite, as admin:** run twice, both clean — 526 pass, 3 skipped (identity-required), 0 fail.
+* **Full suite, as real root, `PW_TEST_DROP_USER=admin`:** **526 pass, 0 skipped, 0 fail.**
+* **Focused/adversarial:** `orch-termination-verdict.test.mjs` + `orch-p1-regressions.test.mjs` together,
+  68/68 pass.
+* **`git diff --check`** against the merge-base with `origin/main`: clean.
+* **Syntax.** `node --check` on `checks.js`, `engine.js`, and both changed test files: clean.
+
 ## Remaining limitations (stated, not fixed)
 
 1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no
