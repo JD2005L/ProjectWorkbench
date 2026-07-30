@@ -200,7 +200,10 @@ export function assertGitArgvAllowed(argv) {
  * `-c` and every other configuration-injection option is refused above, and the environment is
  * pruned of the variables that would let git write somewhere else or prompt for credentials.
  */
-export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120_000, exec = execFileAsync, indexFile = null, envExtra = null } = {}) {
+export async function runGit(argv, {
+  cwd, gitExecutable = 'git', timeoutMs = 120_000, exec = execFileAsync, indexFile = null,
+  envExtra = null, signal = undefined,
+} = {}) {
   assertGitArgvAllowed(argv);
   const env = { ...process.env };
   for (const key of ['GIT_DIR', 'GIT_WORK_TREE', 'GIT_INDEX_FILE', 'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES']) {
@@ -235,7 +238,7 @@ export async function runGit(argv, { cwd, gitExecutable = 'git', timeoutMs = 120
 
   try {
     const { stdout, stderr } = await exec(gitExecutable, argv, {
-      cwd, timeout: timeoutMs, env, maxBuffer: 32 * 1024 * 1024,
+      cwd, timeout: timeoutMs, env, maxBuffer: 32 * 1024 * 1024, signal,
     });
     return { ok: true, exitCode: 0, stdout: String(stdout ?? ''), stderr: String(stderr ?? ''), terminationConfirmed: null };
   } catch (err) {

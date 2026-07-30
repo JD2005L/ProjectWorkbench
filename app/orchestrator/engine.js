@@ -1398,14 +1398,73 @@ export class OrchestrationEngine {
 
     const workspacePath = resolveWorkspacePath(this.config, project);
 
+    // One writer per project — exactly the same rule the coding phases obey, and for the same
+    // reason: `git add`/`commit`/`push` run directly against the shared checkout. Acquired only now
+    // that the claim transaction has durably moved the job to `publishing`, so a denial here is
+    // reported as *this* job being blocked (a legal edge from `publishing`) rather than stranding it
+    // mid-transition. `_acquireLeaseOrBlock` already tells a competing holder from a durable fence
+    // apart and blocks the job itself; there is nothing left for `publish` to decide on denial.
+    const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
+    if (!lease) {
+      const blocked = this.repo.getJob(jobId);
+      return this.publisher.refusedRecord(blocked, blocked.detail ?? 'the project write lease could not be acquired');
+    }
+
+    // Registered exactly like a coding-phase worker: `cancelJob` finds this job in `_running` and
+    // `_aborts`, aborts the signal threaded into every publisher/git command below, and races this
+    // same promise against its grace window — without this, cancelling a job that is publishing was
+    // a pure no-op, and `cancelJob` recorded `cancelled` while `git push` kept running unattended.
+    this._aborts.set(jobId, new AbortController());
+    const entry = {};
+    entry.promise = this._runPublication(jobId, project, workspacePath, request, {
+      scope, idempotencyKey, contentHash,
+    }).finally(() => {
+      if (this._running.get(jobId) === entry) {
+        this._running.delete(jobId);
+        this._aborts.delete(jobId);
+      }
+    });
+    this._running.set(jobId, entry);
+    return entry.promise;
+  }
+
+  /**
+   * Run the publication itself: the actual git work, its evidence, and the terminal transition.
+   *
+   * Split out of `publish` so the whole thing — not just the git calls — is the promise `cancelJob`
+   * races and `drain()` waits for, matching `_startWorker`/`_run`.
+   */
+  async _runPublication(jobId, project, workspacePath, request, { scope, idempotencyKey, contentHash }) {
+    // The lease TTL is far shorter than a publication can legitimately take (a slow push, a large
+    // diff), so without renewal it lapsed mid-push and a second job walked into the same checkout.
+    const renewal = setInterval(() => {
+      this._renewLease(jobId, project.project_id).catch(() => {});
+    }, Math.max(1_000, Math.floor(this.config.leaseTtlMs / 3)));
+    if (typeof renewal.unref === 'function') renewal.unref();
+
+    const job = this.repo.getJob(jobId);
     let record;
     try {
-      record = await this.publisher.publish({ job, project, workspacePath, request });
+      record = await this.publisher.publish({
+        job, project, workspacePath, request, signal: this._aborts.get(jobId)?.signal,
+      });
     } catch (err) {
-      // The job has already been moved to `publishing`, so an exception escaping here would strand
-      // it there with no legal way back. Any refusal becomes a recorded failed publication instead.
+      // The job is already `publishing`, so an exception escaping here would strand it there with
+      // no legal way back. Any refusal becomes a recorded failed publication instead.
       record = this.publisher.refusedRecord(job, err instanceof ApiError ? err.message : 'the publication was refused');
+    } finally {
+      clearInterval(renewal);
     }
+
+    // Surface terminationConfirmed so cancelJob knows whether a descendant of some git invocation is
+    // still unaccounted for, exactly as `_runPhase` does for the coding backend.
+    if (record.terminationConfirmed === false) this._terminationUnconfirmed.add(jobId);
+
+    // Cancellation records its own terminal state, from its own fingerprint comparison — a worker
+    // that raced ahead and recorded `completed`/`blocked_project_state` here too would either
+    // overwrite that verdict or claim a publication `cancelJob` never confirmed was safe to stop,
+    // whichever transition happened to land last.
+    if (this._cancelled(jobId)) return record;
 
     const artifact = await this.artifacts.write({
       jobId, kind: ArtifactKind.LOG, name: 'publication.log',
@@ -1413,7 +1472,7 @@ export class OrchestrationEngine {
       summary: record.remote_sha_verified ? 'published and verified' : (record.failure_reason ?? 'publication incomplete'),
     });
 
-    const { steps: _steps, failure_reason: failureReason, ...publicRecord } = record;
+    const { steps: _steps, failure_reason: failureReason, terminationConfirmed, ...publicRecord } = record;
 
     await this.store.transact((tx, state) => {
       tx.put(KIND.PUBLICATIONS, publicRecord.publication_id, publicRecord);
@@ -1437,18 +1496,28 @@ export class OrchestrationEngine {
       this.repo.recordIdempotency(tx, scope, idempotencyKey, contentHash, publicRecord);
     });
 
+    // A commit/push/verification that could not be confirmed dead is fenced and quarantined, never
+    // just recorded as a failure — the same treatment every other integration point in this engine
+    // gives an unconfirmed kill.
+    if (await this._guardTermination(
+      jobId, terminationConfirmed,
+      'publication could not confirm a git command was actually killed after a timeout or abort',
+    )) {
+      return publicRecord;
+    }
+
     if (publicRecord.remote_sha_verified) {
+      await this._releaseLease(jobId);
       await this._transition(jobId, JobStatus.COMPLETED, {
         message: 'the change is published and the remote SHA was verified',
         detail: 'published', eventType: EventType.COMPLETED,
       });
     } else {
       // Never claim publication from local output alone.
-      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-        message: `publication did not complete: ${failureReason ?? 'the remote SHA was not verified'}`,
-        detail: failureReason ?? 'the remote SHA was not verified',
-        eventType: EventType.BLOCKED,
-      });
+      await this._blockWith(
+        jobId, JobStatus.BLOCKED_PROJECT_STATE,
+        `publication did not complete: ${failureReason ?? 'the remote SHA was not verified'}`,
+      );
     }
     return publicRecord;
   }

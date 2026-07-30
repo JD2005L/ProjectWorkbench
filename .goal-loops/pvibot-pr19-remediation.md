@@ -340,17 +340,126 @@ format and ordering checks, both passing).
   rather than killed, consistent with not taking destructive action on processes this session cannot
   attribute to itself on a shared host.
 
+## Round 4 — an independent final review found a false confirmation and an unguarded publish path
+
+### Part A — `ensureTerminated` could report `terminationConfirmed: true` with a live survivor
+
+Round 3's fix (Gap B above) closed the *zero-poll-tick* case but was not the general fix it needed to
+be: the reviewer reproduced a detached, SIGTERM-ignoring `setsid` child forked at 270ms, between two
+200ms poll ticks, with the launch timing out at 340ms. One or more polls *had* run, and the tracked pid
+set was empty at the end (nothing survived under a pid this module was still watching) — so the old
+`liveTicks > 0` logic reported `terminationConfirmed: true`. The child was real and alive; the verdict
+was wrong. Temporal `/proc` sampling cannot prove a negative in general — only the narrower fact that
+*nothing currently tracked* survived, which is not the same claim.
+
+* **RED.** Added `assertBetweenPollsUnconfirmed` to `orch-privilege-real.test.mjs`, reproducing the
+  exact scenario (`(sleep 0.27; setsid sh -c 'trap "" TERM; exec sleep …') & exec sleep 60`, poll
+  200ms, timeout 340ms) across all three privilege modes (container passthrough, root → admin,
+  already-the-target-account) and both call shapes (`wrap`, `wrapCommand`) — 6 tests. Confirmed a live
+  survivor via `pgrep` before mandatory cleanup in every case; 2 of 6 failed against round-3 code with
+  `terminationConfirmed: true` and a genuinely surviving process.
+* **Fix — stop trying to prove sampling can prove a negative.** `ensureTerminated` no longer counts
+  ticks at all: for any launch that actually reaches this method (a real kill, past the `wasKilled`
+  gate below), it now unconditionally returns `false`. A durable fence/manual clear on any timeout or
+  abort after the child started is the intended, conservative behaviour from here on; normal
+  successful completion is entirely unaffected, since `ensureTerminated` is never called for it.
+* **PID-reuse safety.** Replaced the old `descendantsOf(pid)` ppid-walk with `procSnapshot()` (reads
+  every `/proc/<pid>/stat`, capturing pid *and* kernel start-time) and `rescanTracked(tracked, roots)`
+  (grows the tracked set, records each pid's start-time at first sight, then prunes any entry whose
+  *current* start-time no longer matches — pid reused or gone). Signalling now always re-checks
+  identity via start-time immediately before sending, never off a stale snapshot. The direct child's
+  own liveness (`child.exitCode`/`child.signalCode`) is re-evaluated live each round rather than
+  snapshotted once. A `pollInFlight` handle is awaited before `ensureTerminated` mutates the tracked
+  map, so a tick reading `/proc` never races the very mutation the catch handler is about to perform.
+* **The regression this redesign could have caused, caught before it shipped:** making
+  `ensureTerminated` unconditionally `false` meant `_execTracked`'s catch handler would fence a project
+  on *any* rejection — including an ordinary failing check or a `git rev-parse` outside a repository,
+  neither of which is a kill. Added a `wasKilled` gate (`err.signal || err.killed ||
+  options.signal?.aborted`, the same discriminator `classifyBackendFailure` already uses) so
+  `ensureTerminated` only runs for launches a signal actually ended. New regression test: an ordinary
+  non-zero exit does not invoke `ensureTerminated` at all, and carries no termination verdict.
+* **Propagation.** `git.js` (`runGit`, `repositoryBaseline`, `workingTreeFingerprint`) and `checks.js`
+  (`CheckRunner._exec`/`run`, `diffStat`) previously discarded whatever the exec layer attached,
+  rebuilding a plain result object. Both now carry `terminationConfirmed` through unchanged (`false`
+  only for an unconfirmed kill, `null` otherwise — never averaged or dropped when several parallel
+  calls disagree). `TmuxAdapter.hasSession`/`listWindows` re-throw rather than round an unconfirmed
+  kill down to their ordinary "false"/"[]" failure case. `engine.js` gained one reusable guard,
+  `_guardTermination(jobId, terminationConfirmed, contextMessage)` — fences the lease and moves the
+  job to `blocked_project_state` only when the verdict is exactly `false` — wired into every check run
+  (targeted, full, and both revision variants), the repository baseline capture, the diff-stat capture,
+  and `sessionManager.ensureSession`'s failure path (previously an unconditional `_blockWith`, which
+  releases). `cancelJob`'s own `terminationConfirmed` computation now also factors in the fingerprint
+  calls' own verdict, not just the worker's.
+* **GREEN.** New dedicated `test/orch-termination-verdict.test.mjs` (18 tests, RED-verified by
+  stashing the git.js/checks.js changes) plus 2 new engine-integration tests in
+  `orch-p1-regressions.test.mjs`. Full suite 491 pass/3 skip/0 fail as admin; 494 pass/0 skip/0 fail as
+  real root.
+
+### Part B — `publish` never held a lease, never registered for cancellation, never fenced
+
+Confirmed by direct inspection: `publish()` moved a job to `publishing` and called
+`this.publisher.publish(...)` without ever calling `_acquireLease`/`_acquireLeaseOrBlock`, without a
+renewal interval, without registering in `_running`/`_aborts`, and without threading any signal into a
+single git or `gh` command it ran. Concretely, this meant: two jobs for the same project could both be
+mid-write at once (one coding, one publishing, or two publishing); `cancelJob` on a publishing job was a
+pure no-op (`_aborts.get(jobId)` was never set, `_running.get(jobId)` was never set, so its race-wait
+step did nothing and it proceeded straight to recording `cancelled` while `git commit`/`push` kept
+running, unobserved); and the existing "competing lease" test was vacuous — it held no dirty file, so
+`publish` reported `pushed: false` for the unrelated reason "there is nothing to publish" whether or
+not the lease check ever ran.
+
+* **Fix.** `publish()` now acquires the project write lease via the same `_acquireLeaseOrBlock` used by
+  `_run`/`_runRevision` — after the atomic claim transaction has already moved the job to `publishing`
+  (the only edge the state machine allows into `blocked_project_state` from there), so a denial is
+  reported as this job being blocked, never a stranding. On denial, `publish` returns a
+  `refusedRecord`-shaped result without touching the idempotency store, so a genuine retry (new
+  attempt, same key) is not permanently poisoned by a transient conflict — unlike a deterministic
+  refusal (bad pathspec, empty commit), which correctly *is* cached under the key. On success, the
+  work is split into `_runPublication`, registered in `_running`/`_aborts` exactly like a coding-phase
+  worker (so `cancelJob` finds it, aborts it, and races its completion the same way), with its own
+  lease-renewal interval. An `AbortSignal` now threads from the engine through `Publisher.publish` →
+  every `_git` call → `runGit` → the underlying `exec`'s `signal` option, and into the `gh` calls inside
+  `_pullRequest`. `Publisher` accumulates `terminationConfirmed` across every git call in a publication
+  attempt (not just the three already wrapped in `steps`) and carries it on both the success and
+  `_failed()`/`refusedRecord()` shapes. `_runPublication` surfaces an unconfirmed kill to
+  `_terminationUnconfirmed` (so a racing `cancelJob` sees it), defers entirely to `cancelJob`'s own
+  verdict when cancellation was requested (mirroring `_runPhase`, never both the worker and `cancelJob`
+  transitioning the same job), and otherwise calls the same `_guardTermination` to fence rather than
+  release on an unconfirmed kill.
+* **Tests — real dirty files, not vacuous ones.** Rewrote the competing-lease test to actually dirty
+  `src.js` first, and added: nothing is committed while blocked, the job lands in
+  `blocked_project_state` (not stranded in `publishing`), and the *other* job's lease is untouched. New
+  tests: a pre-existing fence blocks publication the same way (and the fence survives the refusal
+  unchanged); cancelling mid-`push` (a fake `exec` that runs every other git subcommand for real and
+  only blocks on `push` until the threaded `AbortSignal` fires, rejecting with
+  `terminationConfirmed: false` the way a real kill nobody could confirm would) never reports
+  `cancelled`, fences the lease, and leaves nothing on the remote; a job left `publishing` with a real
+  lease held (simulating a crash) is reconciled by the existing `reconcileOnStart` exactly like any
+  other stranded workspace-active job, now that `publish` actually leaves a lease for it to find.
+* **A test-authoring bug caught along the way, not a product bug:** the mid-push cancellation test
+  originally hung every run — traced to `store.transact()` being asynchronous (queued and serialised,
+  never throwing synchronously) while the test asserted on it with `assert.throws` instead of
+  `assert.rejects`, leaving the rejected promise unhandled. Separately, the same test's
+  `withEngine` helper did not expose `checkRunner`/`sessionManager`/`artifacts`/`projectStore` to the
+  test body at all, so a second `OrchestrationEngine` instance built to inject a custom `exec` silently
+  received `undefined` for all four — `withEngine` now passes them through, which several tests can now
+  make use of.
+* **GREEN.** All rewritten/new tests pass; full suite 494 pass/0 skip/0 fail (this file's tests do not
+  require real-root privilege dropping, so no separate root run was needed for this part specifically —
+  covered by the same full-suite root run recorded below).
+
 ## Remaining limitations (stated, not fixed)
 
 1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no
    persisted per-launch pid, survives a restart to check against. Durable pid tracking across
-   restarts would close this; out of scope here.
-2. **Polling-based descendant tracking cannot prove a negative in general** — only the specific,
-   provable case of "zero live observations ever happened" is caught. A descendant that forks in the
-   gap between the *last* poll tick and the direct child's death (as opposed to *before the first*
-   tick) remains a theoretical, unclosed gap; closing it needs kernel-level containment (PID
-   namespace or cgroup), not a polling adjustment.
-3. **`HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS`** remain preserved across the privilege drop, a stated
+   restarts would close this; out of scope here. (Unchanged by round 4 — round 4 made `publish` itself
+   leave a lease for this to find, but did not change what reconciliation can prove.)
+2. **`HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS`** remain preserved across the privilege drop, a stated
    interception-risk-for-compatibility trade-off from the original PR #19 work, unchanged here.
-4. Two unrelated, unattributed processes observed on the shared container at verification time (see
+3. Two unrelated, unattributed processes observed on the shared container at verification time (see
    above) — not from this codebase, left untouched, and not this session's to clean up.
+4. **Kernel-level containment (PID namespace or cgroup) remains the only structural fix** for temporal
+   sampling's fundamental limit — round 4 made the reporting *conservative* (unconditionally `false` on
+   any real kill after the child started) rather than closing the underlying gap, which is a
+   containment primitive with provably-empty membership. Explicitly out of scope, per the reviewer's
+   own framing of the trade-off as intentional.

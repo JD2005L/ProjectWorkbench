@@ -39,9 +39,9 @@ export class Publisher {
     this.clock = clock;
   }
 
-  _git(argv, cwd, indexFile = null) {
+  _git(argv, cwd, indexFile = null, signal = undefined) {
     return runGit(argv, {
-      cwd, gitExecutable: this.config.gitExecutable, exec: this.exec, indexFile,
+      cwd, gitExecutable: this.config.gitExecutable, exec: this.exec, indexFile, signal,
       // Supplied on every call so a commit never depends on the ambient identity of whatever user
       // the dashboard runs as. A service account with no global git config is the normal case, and
       // without this `git commit` fails with "Please tell me who you are".
@@ -68,11 +68,11 @@ export class Publisher {
    * `read-tree HEAD` produces an index with no stat data at all, so git has to hash the file to
    * decide — which is the only way to be right about it.
    */
-  async _privateIndex(workspacePath) {
+  async _privateIndex(workspacePath, signal = undefined) {
     const scratch = path.join(
       os.tmpdir(), `pw-orch-index-${crypto.randomBytes(8).toString('hex')}`,
     );
-    const seeded = await this._git(['read-tree', 'HEAD'], workspacePath, scratch);
+    const seeded = await this._git(['read-tree', 'HEAD'], workspacePath, scratch, signal);
     if (!seeded.ok) {
       // An unborn HEAD (a repository with no commits) leaves an empty index, which is correct.
       try { fs.rmSync(scratch, { force: true }); } catch { /* nothing to remove */ }
@@ -106,7 +106,7 @@ export class Publisher {
     }
   }
 
-  async publish({ job, project, workspacePath, request }) {
+  async publish({ job, project, workspacePath, request, signal = undefined }) {
     this.assertIntendedFilesSafe(request.intended_files, workspacePath);
     const steps = [];
     const record = (step, result) => {
@@ -114,26 +114,40 @@ export class Publisher {
       return result;
     };
 
-    const index = await this._privateIndex(workspacePath);
+    const index = await this._privateIndex(workspacePath, signal);
     try {
-      return await this._publishWithIndex({ job, project, workspacePath, request, steps, record, index });
+      return await this._publishWithIndex({
+        job, project, workspacePath, request, steps, record, index, signal,
+      });
     } finally {
       // Whatever happened, the scratch index goes away and the operator's index is as they left it.
       try { fs.rmSync(index, { force: true }); } catch { /* already gone */ }
     }
   }
 
-  async _publishWithIndex({ job, project, workspacePath, request, steps, record, index }) {
+  async _publishWithIndex({ job, project, workspacePath, request, steps, record, index, signal }) {
+    // Every git call this method makes is folded through here, so a single unconfirmed kill
+    // anywhere in the sequence — commit, push, the post-push verification, any of it — marks the
+    // whole publication attempt unconfirmed. The engine fences rather than releases on `false`; a
+    // `git push` is exactly as capable of backgrounding something of its own as any other command
+    // this subsystem runs, and a command aborted mid-push is the load-bearing case here.
+    let terminationConfirmed = null;
+    const note = (result) => {
+      if (result.terminationConfirmed === false) terminationConfirmed = false;
+      return result;
+    };
+    const failed = (reason) => this._failed(job, reason, steps, terminationConfirmed);
+
     // -- stage only the intended files ------------------------------------
     // `--` separates paths from revisions, so a filename can never be read as a ref or an option.
-    const add = record('add', await this._git(['add', '--', ...request.intended_files], workspacePath, index));
-    if (!add.ok) return this._failed(job, 'the intended files could not be staged', steps);
+    const add = note(record('add', await this._git(['add', '--', ...request.intended_files], workspacePath, index, signal)));
+    if (!add.ok) return failed('the intended files could not be staged');
 
     // -- verify what is actually staged -----------------------------------
     // `-z` because git quotes non-ASCII paths in its default output ("caf\303\251.txt"), and
     // `--no-renames` because a rename otherwise reports only the destination — both made the
     // comparison fail for changes that were entirely legitimate.
-    const staged = await this._git(['diff', '--cached', '--name-only', '-z', '--no-renames'], workspacePath, index);
+    const staged = note(await this._git(['diff', '--cached', '--name-only', '-z', '--no-renames'], workspacePath, index, signal));
     const stagedFiles = staged.stdout.split('\0').filter(Boolean).sort();
     const intended = [...new Set(request.intended_files)].sort();
 
@@ -141,30 +155,26 @@ export class Publisher {
     // sides of a rename is correct even though only one side may show as changed.
     const unintended = stagedFiles.filter((f) => !intended.includes(f));
     if (unintended.length) {
-      return this._failed(
-        job,
-        `${unintended.length} file(s) were staged that were not intended`,
-        steps,
-      );
+      return failed(`${unintended.length} file(s) were staged that were not intended`);
     }
     if (!stagedFiles.length) {
-      return this._failed(job, 'there is nothing to publish', steps);
+      return failed('there is nothing to publish');
     }
 
     // -- commit -----------------------------------------------------------
     // No -a: only the explicitly staged set is committed. An `-a` here would sweep up every other
     // dirty file in the operator's checkout.
-    const commit = record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath, index));
+    const commit = note(record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath, index, signal)));
     if (!commit.ok) {
       // Name the cause. "the commit failed" sent an operator hunting through artifacts for what was
       // often a one-line git message.
       const why = redactText(String(commit.stderr || commit.stdout || ''), { maxLength: 160 }).trim();
-      return this._failed(job, why ? `the commit failed: ${why}` : 'the commit failed', steps);
+      return failed(why ? `the commit failed: ${why}` : 'the commit failed');
     }
 
-    const localHead = await this._git(['rev-parse', 'HEAD'], workspacePath);
+    const localHead = note(await this._git(['rev-parse', 'HEAD'], workspacePath, null, signal));
     const localCommit = localHead.stdout.trim();
-    if (!FULL_SHA.test(localCommit)) return this._failed(job, 'the local commit could not be determined', steps);
+    if (!FULL_SHA.test(localCommit)) return failed('the local commit could not be determined');
 
     // The commit was made from a private index, so the repository's own index still holds the
     // pre-publication version of the published files. Relative to the NEW HEAD that reads as a
@@ -173,18 +183,18 @@ export class Publisher {
     // agreement with HEAD, and touches nothing else the operator had staged.
     //
     // Only on success. A failed publication still never touches the real index at all.
-    await this._git(['add', '--', ...request.intended_files], workspacePath);
+    await this._git(['add', '--', ...request.intended_files], workspacePath, null, signal);
 
     // -- push -------------------------------------------------------------
     // An explicit refspec, never a bare `git push`: what gets pushed must not depend on the
     // repository's push configuration.
-    const push = record('push', await this._git(['push', 'origin', `HEAD:refs/heads/${request.branch}`], workspacePath));
+    const push = note(record('push', await this._git(['push', 'origin', `HEAD:refs/heads/${request.branch}`], workspacePath, null, signal)));
     const pushed = push.ok;
 
     // -- verify the remote actually has it --------------------------------
     let remoteCommit = null;
     if (pushed) {
-      const lsRemote = await this._git(['ls-remote', 'origin', `refs/heads/${request.branch}`], workspacePath);
+      const lsRemote = note(await this._git(['ls-remote', 'origin', `refs/heads/${request.branch}`], workspacePath, null, signal));
       const candidate = lsRemote.stdout.split(/\s+/)[0]?.trim() ?? '';
       if (FULL_SHA.test(candidate)) remoteCommit = candidate;
     }
@@ -195,16 +205,16 @@ export class Publisher {
     // -- the live pull request --------------------------------------------
     let pullRequest = { url: null, state: null, headSha: null, mergeable: null, ciState: CiState.NOT_STARTED };
     if (remoteShaVerified && request.open_pull_request) {
-      pullRequest = await this._pullRequest(workspacePath, request.branch, project);
+      pullRequest = await this._pullRequest(workspacePath, request.branch, project, signal);
     } else if (!project.has_ci) {
       pullRequest.ciState = CiState.NOT_CONFIGURED;
     }
 
     // `-z` again: the published file list is compared against the intended one and shown to a
     // human, so it must carry real filenames rather than git's quoted escapes.
-    const changed = await this._git(
-      ['show', '--numstat', '-z', '--no-renames', '--format=', localCommit], workspacePath,
-    );
+    const changed = note(await this._git(
+      ['show', '--numstat', '-z', '--no-renames', '--format=', localCommit], workspacePath, null, signal,
+    ));
     const { files, insertions, deletions, changedFiles } = parseNumstatZ(changed.stdout);
 
     return {
@@ -224,6 +234,7 @@ export class Publisher {
       diff_stat: { schema_version: SCHEMA_VERSION, files, insertions, deletions },
       changed_files: changedFiles.slice(0, 200),
       recorded_at: this.clock().toISOString(),
+      terminationConfirmed,
       steps,
     };
   }
@@ -236,12 +247,12 @@ export class Publisher {
    * `gh` is unavailable the fields stay null and CI is reported as `not_configured` — explicitly
    * unknown rather than quietly optimistic.
    */
-  async _pullRequest(workspacePath, branch, project) {
+  async _pullRequest(workspacePath, branch, project, signal = undefined) {
     const base = project.default_branch ?? 'main';
     const gh = async (argv) => {
       try {
         const { stdout } = await (this.exec ?? (await import('util')).promisify((await import('child_process')).execFile))(
-          this.config.ghExecutable, argv, { cwd: workspacePath, timeout: 60_000, maxBuffer: 8 * 1024 * 1024 },
+          this.config.ghExecutable, argv, { cwd: workspacePath, timeout: 60_000, maxBuffer: 8 * 1024 * 1024, signal },
         );
         return { ok: true, stdout: String(stdout ?? '') };
       } catch (err) {
@@ -288,12 +299,12 @@ export class Publisher {
   }
 
   /** A refusal that happened before any git ran, shaped like any other failed publication. */
-  refusedRecord(job, reason) {
-    return this._failed(job, reason, []);
+  refusedRecord(job, reason, terminationConfirmed = null) {
+    return this._failed(job, reason, [], terminationConfirmed);
   }
 
   /** A publication that did not complete. Never partially claimed as success. */
-  _failed(job, reason, steps) {
+  _failed(job, reason, steps, terminationConfirmed = null) {
     return {
       schema_version: SCHEMA_VERSION,
       publication_id: newId('pwpub'),
@@ -312,6 +323,7 @@ export class Publisher {
       changed_files: [],
       recorded_at: this.clock().toISOString(),
       failure_reason: reason,
+      terminationConfirmed,
       steps,
     };
   }

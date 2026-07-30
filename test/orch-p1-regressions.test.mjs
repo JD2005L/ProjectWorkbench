@@ -111,13 +111,16 @@ async function withEngine(fn, { backendOptions, envOverrides } = {}) {
       })),
     }),
   };
+  const checkRunner = new CheckRunner({ config, repo, store, artifacts });
   const engine = new OrchestrationEngine({
-    config, store, repo, backend, sessionManager, artifacts, projectStore,
-    checkRunner: new CheckRunner({ config, repo, store, artifacts }),
+    config, store, repo, backend, sessionManager, artifacts, projectStore, checkRunner,
   });
 
   try {
-    await fn({ engine, store, repo, config, backend, repoDir, git, remote, dir });
+    await fn({
+      engine, store, repo, config, backend, repoDir, git, remote, dir,
+      sessionManager, artifacts, projectStore, checkRunner,
+    });
   } finally {
     await engine.drain().catch(() => {});
     await store.close();
@@ -418,9 +421,14 @@ gitTest('publish: a failed commit says why, rather than reporting a bare failure
   }, { backendOptions: ATTESTING });
 });
 
-gitTest('publish: publication holds the project write lease while it runs', async () => {
-  await withEngine(async ({ engine, store, repo, config }) => {
+gitTest('publish: a competing lease blocks publication before any git runs — not just a no-op diff', async () => {
+  // Previously this test held no dirty file at all, so `publish` reported `pushed: false` for the
+  // *same* reason it always would have — "there is nothing to publish" — whether or not the lease
+  // check ran. It proved nothing about the lease. A real dirty, intended file is what makes "was
+  // this actually blocked by the competing lease" a question the test can answer.
+  await withEngine(async ({ engine, store, repo, config, repoDir, remote }) => {
     const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
     await engine.approveStage({
       token: APPROVER, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
@@ -431,6 +439,8 @@ gitTest('publish: publication holds the project write lease while it runs', asyn
     // actively editing.
     const resource = `project-write:${INSTANCE}:Demo`;
     await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'other-job', ttlMs: 600_000 }));
+
+    const before = (await execFileAsync('git', ['rev-list', '--count', 'HEAD'], { cwd: repoDir })).stdout.trim();
 
     const record = await engine.publish({
       token: SUBMITTER, jobId,
@@ -443,6 +453,165 @@ gitTest('publish: publication holds the project write lease while it runs', asyn
 
     const blocked = record instanceof ApiError || record.pushed === false;
     assert.ok(blocked, 'publication must not proceed while another job holds the write lease');
+
+    // Nothing was staged or committed — the block happened before any git ran, not after a commit
+    // that then failed to push.
+    const after = (await execFileAsync('git', ['rev-list', '--count', 'HEAD'], { cwd: repoDir })).stdout.trim();
+    assert.equal(after, before, 'no commit may have been made while another job holds the lease');
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
+
+    // The job itself must not be stranded in `publishing` — it is blocked, on a legal edge, and the
+    // OTHER job's lease is still exactly what it was (still held, still unfenced by this refusal).
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    const lease = repo.getLease(resource);
+    assert.equal(lease.owner, 'other-job');
+    assert.notEqual(lease.fenced, true, 'a routine competing lease is contention, not a fence');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: a pre-existing fence blocks publication just like a competing lease', async () => {
+  await withEngine(async ({ engine, store, repo, repoDir, remote }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // A prior, unrelated cancellation left this project's workspace fenced pending operator review.
+    const resource = `project-write:${INSTANCE}:Demo`;
+    const fenceOwner = await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'earlier-job', ttlMs: 600_000 }));
+    await store.transact((tx, s) => repo.fenceLease(tx, s, {
+      resource, owner: 'earlier-job', fencingToken: fenceOwner.fencing_token, reason: 'an earlier cancellation could not confirm termination',
+    }));
+
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    }).catch((err) => err);
+
+    const blocked = record instanceof ApiError || record.pushed === false;
+    assert.ok(blocked, 'publication must not proceed against a fenced project');
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
+    assert.equal(repo.getLease(resource).fenced, true, 'the pre-existing fence must remain in place, not be cleared as a side effect');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: cancelling mid-push fences the project rather than confirming cancellation', async () => {
+  await withEngine(async ({
+    engine, repo, repoDir, remote, config, store, backend, sessionManager, artifacts, checkRunner, projectStore,
+  }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // A fake exec that runs every git subcommand for real EXCEPT `push`, which hangs until the
+    // AbortSignal `runGit` now threads through actually fires — standing in for a `git push` that
+    // is genuinely in flight (blocked on the network, or backgrounded) at the moment of cancellation.
+    // On abort it rejects the way `PrivilegeDropper._execTracked` would for a kill nobody could
+    // confirm: `terminationConfirmed: false`, never assumed true just because the signal fired.
+    let pushStarted;
+    const pushStartedPromise = new Promise((resolve) => { pushStarted = resolve; });
+    const exec = async (file, argv, options) => {
+      if (argv[0] === 'push') {
+        pushStarted();
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            const err = new Error('the push was aborted');
+            err.name = 'AbortError';
+            err.killed = true;
+            err.signal = 'SIGTERM';
+            err.terminationConfirmed = false;
+            reject(err);
+          };
+          if (options.signal?.aborted) return onAbort();
+          options.signal?.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+      return execFileAsync(file, argv, options);
+    };
+
+    const engineWithExec = new OrchestrationEngine({
+      config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, exec,
+    });
+
+    const publishPromise = engineWithExec.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    }).catch((err) => err);
+
+    await pushStartedPromise;
+    const cancelled = await engineWithExec.cancelJob({
+      token: SUBMITTER, jobId,
+      body: { workbench_job_id: jobId, reason: 'operator changed their mind mid-push' },
+    });
+    await publishPromise;
+
+    // Never a false "cancelled" while the push could not be confirmed dead.
+    assert.notEqual(cancelled.status, JobStatus.CANCELLED,
+      'cancellation must not be confirmed while an in-flight push could not be confirmed killed');
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(repo.getJob(jobId).termination_confirmed, false);
+
+    // The project is fenced, not merely released — a later job must not be able to walk into the
+    // same checkout while the aborted push is unaccounted for.
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource).fenced, true, 'an unconfirmed mid-push cancellation must fence the project');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'the workspace must not be reusable until an operator clears the fence with evidence',
+    );
+
+    // Nothing reached the remote — the push never actually completed.
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'an aborted push must not have landed on the remote');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: a restart while publishing is reconciled the same as any other mid-flight job', async () => {
+  // Simulates the moment right after a crash: the job record was durably left in `publishing`
+  // holding a real lease (this is exactly the gap Part B closes — before it, `publish` never
+  // acquired a lease at all, so a stranded `publishing` job held nothing for a restart to find).
+  await withEngine(async ({ engine, store, repo, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    const lease = await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: jobId, ttlMs: 600_000 }));
+    await store.transact((tx, s) => {
+      const job = s.get('jobs', jobId);
+      repo.putJob(tx, { ...job, status: JobStatus.PUBLISHING, phase: 'publication', lease_fencing_token: lease.fencing_token });
+    });
+
+    const reconciled = await engine.reconcileOnStart();
+    assert.equal(reconciled, 1);
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(repo.getJob(jobId).termination_confirmed, false);
+    assert.equal(repo.getLease(resource).fenced, true,
+      'a job left publishing across a restart must fence the lease it held, not release it');
   }, { backendOptions: ATTESTING });
 });
 
