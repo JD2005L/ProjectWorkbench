@@ -11,6 +11,21 @@
 # Idempotent: sessions that already exist are left untouched, and a Claude
 # session that is already running is never launched a second time. Always exits
 # 0 so it can never block terminal startup.
+#
+# Round 6 REGRESSION: this script used to recreate every session/window with a
+# single fixed shared ENVBASH, with no owner resolution and no fingerprint at
+# all — completely bypassing the per-user credential feature regardless of
+# PW_PER_USER_CLAUDE or a project's primaryUser. A reboot silently downgraded
+# every restored project back to the shared login (and then resumed Claude
+# under it), the exact silent identity swap the whole feature exists to
+# prevent. Every NEWLY created session (and every new window added to one this
+# run) now resolves its project's CURRENT credential context via
+# app/project-terminal-credentials.mjs (the SAME fail-closed helper
+# project-terminal-start uses) and stamps + reads back @pw_cred_key, exactly
+# like that script. A session whose owner/credential/helper resolution fails,
+# or whose stamp cannot be verified, is not created at all — never silently
+# shared. Sessions this run does NOT create (already existed at boot) are left
+# entirely alone, same as before: this run does not touch their attribution.
 set -uo pipefail
 
 # Pin locale (systemd gives us a minimal env); keeps tmux/format handling and
@@ -27,11 +42,29 @@ MAX_CLAUDE="${PW_TMUX_MAX_CLAUDE:-30}"          # safety cap on auto-launched se
 LOG="${PW_TMUX_LOG:-$STATE_DIR/persist.log}"
 SEP=$'\x1f'                                      # manifest field separator (matches pw-tmux-save)
 
-# Match how project-terminal-start launches its shells, so restored panes behave
-# identically to freshly created ones.
+# Same registry/app-dir conventions as scripts/project-terminal-start, so both
+# scripts can never disagree about which project a session belongs to.
+REGISTRY_JSON="${PW_REGISTRY_PATH:-/opt/project-workbench/projects.json}"
+APP_DIR="${PW_APP_DIR:-/opt/project-workbench/app}"
+NODE_BIN=$(command -v node || echo /usr/bin/node)
+
+# Shared-login shell, used ONLY for the legitimate off/no-owner case (a
+# resolved cred_env_prefix of exactly this) — never as a fallback for a
+# resolution failure.
 ENVBASH='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
 
 log() { printf '%s restore: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null || true; }
+
+# Isolates every tmux call onto a private socket for tests (see
+# test/pw-tmux-restore.test.mjs); unset (the default, always true in
+# production) means the normal per-user default socket, byte-identical to
+# before this variable existed. Mirrors app/server.js's own PW_TMUX_SOCKET and
+# scripts/project-terminal-start's tmux_sock_args exactly — this script must
+# never issue a BARE tmux command that could resolve against an ambient
+# $TMUX/default socket instead of the one it was explicitly told to use.
+tmux_sock_args=()
+[[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
+tmux() { command tmux "${tmux_sock_args[@]}" "$@"; }
 
 [[ -f "$MANIFEST" ]] || { log "no manifest; nothing to restore"; exit 0; }
 tmux start-server 2>/dev/null || true
@@ -47,8 +80,171 @@ if [[ -d "$SESS_REG" ]]; then
 	done
 fi
 
-# ---- Pass 1: recreate sessions/windows as plain shells; record created index.
-declare -A CREATED IDX
+# Reads the session's stamped credential fingerprint, distinguishing a
+# genuinely-unset option (tmux's own "invalid option" error, surfaced by NOT
+# passing -q) from any other tmux failure — mirrors
+# scripts/project-terminal-start's read_cred_key exactly.
+read_cred_key() {
+	local sess="$1" errfile rc
+	errfile=$(mktemp)
+	cred_key_read=$(tmux show-options -t "$sess" -v @pw_cred_key 2>"$errfile")
+	rc=$?
+	cred_key_read_err=$(cat "$errfile")
+	rm -f "$errfile"
+	if [[ $rc -eq 0 ]]; then
+		cred_key_read_ok=1
+		return 0
+	fi
+	if [[ "$cred_key_read_err" == *"invalid option"* ]]; then
+		cred_key_read_ok=1
+		cred_key_read=""
+		return 0
+	fi
+	cred_key_read_ok=0
+	cred_key_read=""
+	return 1
+}
+# Stamps the fingerprint AND reads it back to confirm the write actually
+# landed — mirrors scripts/project-terminal-start's stamp_cred_key exactly.
+stamp_cred_key() {
+	local sess="$1" key="$2" errfile rc seterr
+	errfile=$(mktemp)
+	tmux set-option -t "$sess" @pw_cred_key "$key" 2>"$errfile"
+	rc=$?
+	seterr=$(cat "$errfile"); rm -f "$errfile"
+	if [[ $rc -ne 0 ]]; then
+		log "failed to stamp credential fingerprint on session '$sess': $seterr"
+		return 1
+	fi
+	if ! read_cred_key "$sess" || [[ "$cred_key_read" != "$key" ]]; then
+		log "could not verify credential fingerprint stamp on session '$sess' (wrote '$key', read back '${cred_key_read}', ok=${cred_key_read_ok:-0})"
+		return 1
+	fi
+	return 0
+}
+
+# Resolves the CURRENT credential context for the project that tmux session
+# name `$1` belongs to, via the SAME fail-closed helper
+# scripts/project-terminal-start uses. Sets cred_ok (0/1), cred_env_prefix
+# (the "env KEY=VAL... bash ..." string to launch panes with), and cred_key
+# (the fingerprint, or "off"). Never falls back to the shared ENVBASH on a
+# resolution failure — that IS the bug this round closes.
+#
+# Stricter than scripts/project-terminal-start (and the underlying
+# app/project-owner.js contract it relies on) on ONE point: those treat "the
+# feature is on, but this project intentionally has no primaryUser" as a
+# second legitimate shared/off case, alongside the feature being off outright
+# — an interactive human path where somebody would notice a wrong identity.
+# A reboot restore has no human present to notice anything, so here "off" is
+# legitimate ONLY when PW_PER_USER_CLAUDE is disabled outright; a project
+# enabled for per-user credentials but missing a primaryUser assignment is an
+# incomplete configuration, not an intentional choice, and refuses rather
+# than silently restoring under the shared login.
+resolve_session_credentials() {
+	local sess="$1" name primary_user cred_json cred_err
+	cred_ok=0; cred_env_prefix=""; cred_key=""
+	if [[ ! -f "$REGISTRY_JSON" ]]; then
+		log "no registry at $REGISTRY_JSON; refusing to restore $sess under shared credentials"
+		return 1
+	fi
+	name=$(jq -r --arg s "$sess" '.[] | select(("pw_" + (.name | gsub("[^A-Za-z0-9_]"; "_"))) == $s) | .name' "$REGISTRY_JSON" 2>/dev/null | head -1)
+	if [[ -z "$name" ]]; then
+		log "no current project maps to session $sess; refusing to restore under shared credentials"
+		return 1
+	fi
+	primary_user=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .primaryUser // empty' "$REGISTRY_JSON" 2>/dev/null)
+	if [[ -z "$primary_user" ]]; then
+		local per_user_enabled
+		per_user_enabled=$(printf '%s' "${PW_PER_USER_CLAUDE:-}" | tr '[:upper:]' '[:lower:]')
+		if [[ "$per_user_enabled" == "true" ]]; then
+			log "project '$name' (session $sess) has per-user credentials enabled but no primaryUser configured; refusing to restore under the shared login"
+			return 1
+		fi
+	fi
+	if ! cred_json=$("$NODE_BIN" "$APP_DIR/project-terminal-credentials.mjs" "$name" "$primary_user" 2>>"$LOG"); then
+		cred_err=$(printf '%s' "$cred_json" | jq -r '.error // empty' 2>/dev/null || true)
+		log "credential resolution failed for project '$name' (session $sess): ${cred_err:-$cred_json}"
+		return 1
+	fi
+	# A zero exit only means the helper's own PROCESS succeeded — its response is still untrusted
+	# data until its shape is validated against app/project-terminal-credentials.mjs's own success
+	# contract: exactly {ok:true, shared:true}, or {ok:true, shared:false, configDir, envFile,
+	# fingerprint}. A jq `// empty` filter never fails on a response missing those fields, so without
+	# this a malformed, truncated, or schema-drifted (but still valid JSON, still exit 0) response
+	# was silently treated as the legitimate shared/off case — mirrors scripts/project-terminal-
+	# start's identical validation. Refuse before this session's window loop ever runs.
+	local cred_response_ok cred_shape
+	cred_response_ok=$(printf '%s' "$cred_json" | jq -r 'if (type == "object") and (.ok == true) then "true" else "false" end' 2>/dev/null || echo false)
+	if [[ "$cred_response_ok" != "true" ]]; then
+		log "credential helper returned an unexpected response for project '$name' (session $sess): $cred_json"
+		return 1
+	fi
+	cred_shape=$(printf '%s' "$cred_json" | jq -r 'if .shared == true then "shared" elif .shared == false then "owned" else "invalid" end' 2>/dev/null || echo invalid)
+	if [[ "$cred_shape" == "invalid" ]]; then
+		log "credential helper response for project '$name' (session $sess) is missing a valid 'shared' field: $cred_json"
+		return 1
+	fi
+	local cred_config_dir cred_env_file
+	if [[ "$cred_shape" == "shared" ]]; then
+		cred_config_dir=""
+		cred_env_file=""
+		cred_key="off"
+	else
+		# `jq -r '.field // empty'` silently STRINGIFIES any JSON scalar (a boolean becomes "true"/
+		# "false", a number becomes its decimal digits) — a bare non-empty-string check on the RESULT
+		# cannot tell a hijacked boolean/number apart from a real path or fingerprint. Check the actual
+		# JSON types first: app/project-terminal-credentials.mjs's own contract for shared:false is
+		# exactly configDir (string) and fingerprint (string), plus envFile — ALWAYS a string too
+		# (possibly empty, when the owner has no GitHub token; never absent, never any other type —
+		# see app/user-credentials.js's ensureUserCredentials()). Mirrors scripts/project-terminal-
+		# start's identical validation.
+		local cred_types_ok
+		cred_types_ok=$(printf '%s' "$cred_json" | jq -r '
+			((.configDir | type) == "string")
+			and ((.fingerprint | type) == "string")
+			and ((.envFile | type) == "string")
+		' 2>/dev/null || echo false)
+		if [[ "$cred_types_ok" != "true" ]]; then
+			log "credential helper reported a per-user owner for project '$name' (session $sess) but configDir/fingerprint/envFile are not the expected types: $cred_json"
+			return 1
+		fi
+		cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir')
+		cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile')
+		cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint')
+		if [[ -z "$cred_config_dir" ]]; then
+			log "credential helper reported a per-user owner for project '$name' (session $sess) but configDir is empty: $cred_json"
+			return 1
+		fi
+		# A real fingerprint is exactly the 16-character lowercase hex digest
+		# app/user-credentials.js's credentialFingerprint() produces, and can never legitimately equal
+		# "off" (CREDENTIALS_OFF) here: shared:false already asserts a real per-user owner, and
+		# letting "off" through would make every LATER fingerprint comparison treat this owned session
+		# as though it were the shared/disabled case.
+		if [[ ! "$cred_key" =~ ^[0-9a-f]{16}$ ]] || [[ "$cred_key" == "off" ]]; then
+			log "credential helper reported a per-user owner for project '$name' (session $sess) but its fingerprint is not a valid credential fingerprint: $cred_json"
+			return 1
+		fi
+	fi
+	if [[ -n "$cred_config_dir" ]]; then
+		local quoted_cfg quoted_rcfile
+		printf -v quoted_cfg '%q' "CLAUDE_CONFIG_DIR=$cred_config_dir"
+		if [[ -n "$cred_env_file" ]]; then
+			printf -v quoted_rcfile '%q' "$cred_env_file"
+			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --rcfile $quoted_rcfile"
+		else
+			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --norc"
+		fi
+	else
+		cred_env_prefix="$ENVBASH"
+	fi
+	cred_ok=1
+	return 0
+}
+
+# ---- Pass 1: recreate sessions/windows; record created index + per-session
+# resolved credential env (computed ONCE per session, reused for every window
+# added to it in this same run — they are all the same project).
+declare -A CREATED IDX SESSENV
 while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
 	[[ -n "$s" ]] || continue
 	if [[ ! -d "$cwd" ]]; then
@@ -60,14 +256,23 @@ while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
 			CREATED[$s]="skip"; log "session $s already exists; skipping"
 			continue
 		fi
-		idx=$(tmux new-session -d -P -F '#{window_index}' -s "$s" -c "$cwd" "$ENVBASH" 2>>"$LOG") \
+		if ! resolve_session_credentials "$s"; then
+			CREATED[$s]="skip"; log "refusing to create session $s under shared credentials (owner/credential resolution failed)"
+			continue
+		fi
+		idx=$(tmux new-session -d -P -F '#{window_index}' -s "$s" -c "$cwd" "$cred_env_prefix" 2>>"$LOG") \
 			&& CREATED[$s]="own" || { CREATED[$s]="skip"; log "failed to create session $s"; continue; }
+		if ! stamp_cred_key "$s" "$cred_key"; then
+			log "session $s: could not verify credential fingerprint stamp — leaving it running but adding no more windows/resume this run"
+			CREATED[$s]="skip"; continue
+		fi
+		SESSENV[$s]="$cred_env_prefix"
 		IDX["$s"$'\t'"$w"]="$idx"
 		tmux rename-window -t "$s:$idx" "$wn" 2>/dev/null || true
 		continue
 	fi
 	[[ "${CREATED[$s]}" == "skip" ]] && continue
-	idx=$(tmux new-window -d -P -F '#{window_index}' -t "$s:" -c "$cwd" "$ENVBASH" 2>>"$LOG") || continue
+	idx=$(tmux new-window -d -P -F '#{window_index}' -t "$s:" -c "$cwd" "${SESSENV[$s]}" 2>>"$LOG") || continue
 	IDX["$s"$'\t'"$w"]="$idx"
 	tmux rename-window -t "$s:$idx" "$wn" 2>/dev/null || true
 done <"$MANIFEST"
@@ -76,6 +281,9 @@ done <"$MANIFEST"
 sleep 1
 
 # ---- Pass 2: replay scrollback / re-launch Claude in each restored window.
+# The pane's environment (CLAUDE_CONFIG_DIR, if any) was already set at
+# creation time above; `claude --resume` inherits it from the shell it runs
+# in, so nothing further is needed here for attribution.
 claude_count=0
 while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
 	[[ -n "$s" ]] || continue

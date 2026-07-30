@@ -92,6 +92,25 @@ const FORBIDDEN_ENV = [
 ];
 
 /**
+ * The ONLY environment key a resolved credential token is permitted to set — see phaseEnv().
+ * app/orchestrator/lane-credentials.js's resolveLaneCredentials() never produces anything else
+ * (`tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir]`, always exactly this one key when non-empty).
+ * `credentialTokens` is caller-supplied data threaded through several layers (engine.js, session.js)
+ * before it reaches here; trusting an arbitrary key from it — rather than checking it against what
+ * the resolver actually owns — is how a bug (or a malicious project registry entry) upstream could
+ * reintroduce a forbidden API-billing key or override an unrelated variable like PATH. Keep this in
+ * lockstep with resolveLaneCredentials() if it is ever extended to produce another key.
+ *
+ * `CLAUDE_CONFIG_DIR` is ALSO in FORBIDDEN_ENV above, deliberately: for every launch that does not
+ * go through this narrow, vetted mechanism, it is exactly the escape hatch that list exists to
+ * remove — a settings.json anywhere else the CLI would look carries its own `env` block and
+ * `apiKeyHelper`. `phaseEnv()` and `PRIVILEGE_DROP_FORBIDDEN_ENV` below both carve out an exception
+ * for it ONLY after routing it through this allowlist — never a blanket removal from FORBIDDEN_ENV
+ * itself, so every other reader of that constant keeps treating the key as forbidden.
+ */
+const ALLOWED_CREDENTIAL_TOKEN_KEYS = new Set(['CLAUDE_CONFIG_DIR']);
+
+/**
  * Whole families the CLI reads, removed by prefix.
  *
  * Enumerating `ANTHROPIC_*` names is a race this side cannot win — `ANTHROPIC_DEFAULT_OPUS_MODEL`
@@ -109,6 +128,17 @@ const FORBIDDEN_ENV = [
  * does not need them should not set them on the service.
  */
 const FORBIDDEN_ENV_PREFIXES = ['ANTHROPIC_', 'LD_', 'DYLD_'];
+
+/**
+ * The forbidden-env list handed to the privilege dropper (see the constructor) — FORBIDDEN_ENV minus
+ * the keys `phaseEnv()` is narrowly, explicitly permitted to set via ALLOWED_CREDENTIAL_TOKEN_KEYS.
+ * `PrivilegeDropper.dropEnv()` (privilege.js) strips its OWN copy of `forbiddenEnv` independently, a
+ * second time, on the environment `phaseEnv()` already produced and handed to `this.exec` — without
+ * this exclusion, that second, unrelated strip would silently undo the one thing the credential-
+ * token mechanism exists to do, on every host-mode launch, with no error and no test able to catch
+ * it short of asserting on the real child's environment (which the regression tests below do).
+ */
+const PRIVILEGE_DROP_FORBIDDEN_ENV = FORBIDDEN_ENV.filter((key) => !ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key));
 
 /**
  * Classify a process failure into a distinct kind, so each can reach its own safe state.
@@ -160,7 +190,7 @@ export class ClaudeCodeBackend {
     // the fingerprint's `--version` and `--help`, verification and the phase itself by construction,
     // and a launch added later cannot forget it. Container mode wraps to a passthrough.
     this.privilege = privilege ?? privilegeDropperFor(config, {
-      forbiddenEnv: FORBIDDEN_ENV, forbiddenEnvPrefixes: FORBIDDEN_ENV_PREFIXES,
+      forbiddenEnv: PRIVILEGE_DROP_FORBIDDEN_ENV, forbiddenEnvPrefixes: FORBIDDEN_ENV_PREFIXES,
     });
     this.exec = this.privilege.wrap(exec);
     // Cached per binary identity, so the ~1s hash of a 275 MB binary happens once and any change
@@ -225,12 +255,44 @@ export class ClaudeCodeBackend {
     return argv;
   }
 
-  /** A child environment with every API-billing escape hatch removed. */
-  phaseEnv() {
+  /**
+   * A child environment with every API-billing/identity-override escape hatch removed (FORBIDDEN_ENV
+   * and FORBIDDEN_ENV_PREFIXES — see both), and the resolved per-user credential tokens applied (see
+   * app/orchestrator/lane-credentials.js / session.js's laneLaunchCommand — the SAME `KEY=VALUE`
+   * tokens applied to the lane's tmux pane, so a phase spawned directly by this backend can never run
+   * under a different identity than what the pane is attributed as). `credentialTokens` omitted or
+   * empty (disabled mode, or the legitimate no-primaryUser case) leaves the environment byte-
+   * identical to before this parameter existed.
+   *
+   * SECURITY: only ALLOWED_CREDENTIAL_TOKEN_KEYS may be set this way, and FORBIDDEN_ENV is stripped
+   * again AFTER applying tokens (not just before) — a token naming an unexpected or forbidden key is
+   * dropped outright, never trusted. Without both of these, a token like `ANTHROPIC_API_KEY=...`
+   * reaching this function (a resolver bug, or a malicious project registry entry) would silently
+   * reintroduce exactly the escape hatch this function's own contract says it removes. The final pass
+   * skips whatever ALLOWED_CREDENTIAL_TOKEN_KEYS just applied — otherwise this same "strip it all
+   * again" step would immediately erase the one thing this function exists to add.
+   */
+  phaseEnv(credentialTokens = []) {
     const env = { ...process.env };
     for (const key of FORBIDDEN_ENV) delete env[key];
     for (const key of Object.keys(env)) {
       if (FORBIDDEN_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) delete env[key];
+    }
+    for (const token of credentialTokens) {
+      const eq = token.indexOf('=');
+      if (eq === -1) continue;
+      const key = token.slice(0, eq);
+      const value = token.slice(eq + 1);
+      if (!ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key)) continue;
+      if (!value) continue;
+      env[key] = value;
+    }
+    // Defense in depth: even if ALLOWED_CREDENTIAL_TOKEN_KEYS were ever misconfigured to include a
+    // forbidden key, this function's contract must hold unconditionally — EXCEPT for the keys just
+    // applied above through that narrow allowlist.
+    for (const key of FORBIDDEN_ENV) {
+      if (ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key)) continue;
+      delete env[key];
     }
     return env;
   }
@@ -246,14 +308,14 @@ export class ClaudeCodeBackend {
    * and also an email and an org id, which are deliberately *not* propagated: the contract's
    * `account_label` is a label, never an address.
    */
-  async probeAuth() {
+  async probeAuth(credentialTokens = []) {
     const checkedAt = this.clock().toISOString();
     const base = { schema_version: SCHEMA_VERSION, backend: this.name, checked_at: checkedAt };
 
     let stdout;
     try {
       ({ stdout } = await this.exec(this.config.backendExecutable, ['auth', 'status'], {
-        timeout: 15_000, env: this.phaseEnv(),
+        timeout: 15_000, env: this.phaseEnv(credentialTokens),
       }));
     } catch (err) {
       const kind = classifyBackendFailure(err);
@@ -388,6 +450,12 @@ export class ClaudeCodeBackend {
     // This build's own contract when no peer is in the picture — a direct caller is not a peer.
     // A peer's version always arrives explicitly, via session.js from the validated request.
     attestationContractVersion = ATTESTATION_CONTRACT_VERSION,
+    // The SAME resolved per-user credential tokens session.js applies to the lane's tmux pane (see
+    // app/orchestrator/lane-credentials.js) — omitted/empty means disabled mode, byte-identical to
+    // before this parameter existed. Applied to BOTH the auth probe and the verification phase
+    // itself: checking sign-in status under a DIFFERENT identity than the one that will actually run
+    // the job would make "verified" mean nothing.
+    credentialTokens = [],
   }) {
     const argv = this.buildPhaseArgv({
       prompt: 'Reply with exactly: ready',
@@ -412,14 +480,14 @@ export class ClaudeCodeBackend {
     const fingerprint = await this.fingerprint();
     this._refuseIfProbeUnconfirmed(fingerprint);
 
-    const probedAuth = await this.probeAuth().catch(() => null);
+    const probedAuth = await this.probeAuth(credentialTokens).catch(() => null);
     this._refuseIfProbeUnconfirmed(probedAuth);
 
     let stdout = '';
     let stderr = '';
     try {
       ({ stdout, stderr } = await this.exec(this.config.backendExecutable, argv, {
-        cwd, timeout: Math.min(this.config.backendTimeoutMs, 300_000), env: this.phaseEnv(),
+        cwd, timeout: Math.min(this.config.backendTimeoutMs, 300_000), env: this.phaseEnv(credentialTokens),
         maxBuffer: 8 * 1024 * 1024,
       }));
     } catch (err) {
@@ -494,7 +562,14 @@ export class ClaudeCodeBackend {
    * evidence of anything: whether the work was actually done is decided by the deterministic checks
    * and by git, never by what the model said about itself.
    */
-  async runPhase({ prompt, model, effort, maxTurns, phaseClass, cwd, resumeSessionId = null, sessionId = null, timeoutMs = null, signal = null }) {
+  async runPhase({
+    prompt, model, effort, maxTurns, phaseClass, cwd, resumeSessionId = null, sessionId = null,
+    timeoutMs = null, signal = null,
+    // The SAME resolved per-user credential tokens applied to the lane's tmux pane and to
+    // verifyConfiguration's probe — see phaseEnv()'s doc comment. Omitted/empty means disabled
+    // mode, byte-identical to before this parameter existed.
+    credentialTokens = [],
+  }) {
     const argv = this.buildPhaseArgv({ prompt, model, effort, maxTurns, phaseClass, resumeSessionId, sessionId });
     const permissionMode = PERMISSION_MODE_BY_PHASE[phaseClass];
 
@@ -504,7 +579,7 @@ export class ClaudeCodeBackend {
       ({ stdout, stderr } = await this.exec(this.config.backendExecutable, argv, {
         cwd,
         timeout: timeoutMs ?? this.config.backendTimeoutMs,
-        env: this.phaseEnv(),
+        env: this.phaseEnv(credentialTokens),
         maxBuffer: 32 * 1024 * 1024,
         // Cancellation has to reach the child process. Without this the agent kept editing while
         // the caller waited out the phase budget — up to half an hour by default.
@@ -544,6 +619,35 @@ export class ClaudeCodeBackend {
     }
 
     const { sawJson, init, result, rateLimit } = this.parseStream(stdout);
+
+    // The SAME "no API-billing escape hatch, ever" rule verifyConfiguration() enforces once per
+    // job (see app/orchestrator/attestation.js's claimsSubscription check) must hold for every REAL
+    // phase too — a one-time verification probe spends no money and does no work; a phase does
+    // both. CLAUDE_CONFIG_DIR (phaseEnv()'s one allowed credential token) points at the SAME
+    // per-user config directory verifyConfiguration() already checked, but nothing about phaseEnv()
+    // stops a settings.json placed THERE from carrying its own `env.ANTHROPIC_API_KEY` — the real
+    // CLI honors that regardless of what phaseEnv() stripped from the process environment.
+    // init.apiKeySource is the CLI's own authoritative report of what it actually authenticated
+    // with. Mirrors attestation.js's exact fail-closed treatment: a non-string/missing value is
+    // never read as "none" — absence is not consent, the same reasoning that field's own producing
+    // comment (on INIT_LINE, in the test suite) documents for why it is never omitted legitimately.
+    if (init) {
+      const apiKeySource = typeof init.apiKeySource === 'string' ? init.apiKeySource : null;
+      if (apiKeySource !== 'none') {
+        return {
+          ok: false,
+          failure_kind: 'api_billed',
+          retry_after_seconds: null,
+          session_id: init.session_id ?? null,
+          model: init.model ?? null,
+          permission_mode: init.permissionMode ?? permissionMode,
+          summary: 'the coding CLI ran under API-key billing, not the subscription — refusing to treat this as a valid phase',
+          turns_used: 0,
+          max_turns_reached: false,
+        };
+      }
+    }
+
     if (!sawJson || !result) {
       return {
         ok: false,

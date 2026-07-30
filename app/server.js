@@ -9,9 +9,17 @@ import { RELEASE_VERSION } from './version.js';
 import { resolveIsolation } from './isolation.js';
 import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
-import { normalizeUserRecord } from './users-compat.js';
 import { deployCss } from './deploy-css.js';
+import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
+import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
+import { makeSecretCrypto } from './secret-crypto.js';
+import { resolveProjectCredentialOwner } from './project-owner.js';
+import { loadUsersFile } from './users-file.js';
+import { writeFileAtomic } from './atomic-file.js';
+import { withLifecycleLock } from './lifecycle-lock.js';
+import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 
@@ -48,6 +56,14 @@ const nginxReloadCmd = process.env.PW_NGINX_RELOAD_CMD || '';
 const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
 const emptyMcpPath = '/etc/project-workbench/empty-mcp.json';
+// Per-user CLI credentials: when ON, a project's terminal runs on its assigned
+// owner's (primaryUser's) own Claude login + GitHub token instead of the shared
+// box login. Opt-in (default OFF = today's single shared login, upstream-generic).
+const PER_USER_CLAUDE = String(process.env.PW_PER_USER_CLAUDE || '').toLowerCase() === 'true';
+const USER_CRED_BASE = process.env.PW_USER_CRED_BASE || '/home/admin/pw-users';
+// The shared/default Claude config (source for seeding managed MCP servers into
+// each per-user config dir so team MCP — teamkb/pulse/skillhub — still loads).
+const sharedClaudeJson = path.join(process.env.HOME || '/home/admin', '.claude.json');
 const setupTtydPort = 7680;
 const setupTmuxSession = 'pw_setup';
 const internalHandoffToken = process.env.PW_INTERNAL_HANDOFF_TOKEN || '';
@@ -125,7 +141,7 @@ app.use((req, res, next) => {
 app.use(attachUser);
 
 async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
-async function saveProjects(projects){ await fs.writeFile(registryPath, JSON.stringify(projects, null, 2)+'\n'); }
+async function saveProjects(projects){ await writeFileAtomic(registryPath, JSON.stringify(projects, null, 2)+'\n', { mode: 0o644 }); }
 
 // Configure per-workspace git credentials based on the project's primaryUser token.
 async function syncProjectCredentials(project, users){
@@ -151,15 +167,149 @@ async function syncProjectCredentials(project, users){
  }
 }
 
-// Serialize every projects.json read-modify-write transaction. Concurrent POSTs
-// from two browser tabs would otherwise both loadProjects() against the same
-// pre-edit snapshot, mutate independently, then last-write-wins on saveProjects.
-let projectsLock = Promise.resolve();
+// ── Per-user CLI credentials (opt-in via PW_PER_USER_CLAUDE) ────────────────
+// A project is "owned" by its primaryUser. When per-user creds are enabled, the
+// project's terminal launches with CLAUDE_CONFIG_DIR pointed at that owner's
+// private config dir, so Claude runs on the owner's OWN login/seat. The first
+// `claude` run in the project triggers the owner's OAuth login into that dir;
+// it then persists. Copilot rides on the owner's GitHub token (GH_TOKEN), which
+// is delivered through a 0600 rcfile — never argv (see user-credentials.js).
+// NOTE: all sessions still run as one OS user — this gives per-user
+// accountability/seat-usage, NOT hard OS isolation between users on the box.
+function userClaudeDir(username){ return userClaudeConfigDir(USER_CRED_BASE, username); }
+// Whether this owner has completed their own Claude login (GET /api/users'
+// claudeSignedIn column). Routed through the SAME privilege-dropped helper
+// as every other read of the credential tree — never fs.stat() as this
+// (possibly root) process — because stat() follows a symlink at the final
+// component, and a pane user could plant one at
+// <base>/<victim>/claude/.credentials.json pointing anywhere readable by
+// root, turning the boolean claudeSignedIn field into a 1-bit oracle for an
+// arbitrary path's existence/size. Purely informational: any failure here
+// (helper unavailable, drop failed) degrades to "not shown as signed in"
+// rather than breaking the whole user list.
+async function userClaudeSignedIn(username){
+ try {
+  return await checkUserSignedIn({
+   fsp: fs, base: USER_CRED_BASE, username,
+   owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
+  });
+ } catch(e){
+  console.warn(`[per-user-claude] ${username}: could not determine Claude sign-in status: ${e?.message || e}`);
+  return false;
+ }
+}
+// The account agent panes run as. Resolved once and memoised — but ONLY on
+// success: a passwd lookup that merely failed (an unanswered directory query)
+// must not disable per-user credentials for the life of the process, whereas a
+// stable answer never changes underneath us.
+const passwdLookup = makePasswdLookup({ execFile: execFileAsync, readFile: fs.readFile });
+let terminalOwnerCache;
+async function terminalOwner(){
+ if(terminalOwnerCache !== undefined) return terminalOwnerCache;
+ const owner = await resolveTerminalOwner(process.env, passwdLookup);
+ terminalOwnerCache = owner;
+ return owner;
+}
+// Credential-tree work is NEVER done by this root process: the tree lives under
+// an account every terminal shares, so a root write there is a symlink attack
+// away from being a local root escalation. We drop to that account and run
+// app/credential-writer.mjs, handing it the job (token included) on stdin so it
+// never reaches a command line. See app/user-credentials.js for the full note.
+const CREDENTIAL_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), 'credential-writer.mjs');
+function runCredentialJob(job, plan){
+ const argv = credentialDropArgv({ owner: plan.owner, execPath: process.execPath, helperPath: CREDENTIAL_HELPER });
+ return spawnCredentialJob({ spawn, argv, job });
+}
+// Drop credential trees that no longer belong to a current user. Called after a
+// deletion and once at boot, so a tree orphaned while the service was down (or
+// by an out-of-band edit of users.json) does not linger with a live token in it.
+async function pruneUserCredentialTrees(users){
+ if(!PER_USER_CLAUDE) return { removed: [] };
+ const list = users || await loadUsers();
+ return pruneCredentials({
+  fsp: fs, base: USER_CRED_BASE, keep: list.map(u => u.username).filter(Boolean),
+  owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
+ });
+}
+// What a project's tmux session should be launched with. `tokens` are extra
+// non-secret `env` KEY=VALUE entries; `shellArgs` is the pane shell's argv tail;
+// `key` is the credential fingerprint stamped on the session (see CRED_KEY_OPTION).
+const DEFAULT_SHELL_ARGS = ['--noprofile','--norc'];
+// Resolve the project's credential owner, or `null` for the two cases where
+// shared credentials are the INTENDED behaviour: the feature is off, or the
+// project intentionally has no primaryUser. Every other failure — the users
+// store cannot be read, the primaryUser doesn't resolve to a record, the
+// owner's GitHub token cannot be decrypted — THROWS. It must never be
+// swallowed into a `null` here, because the only caller-visible difference
+// between "no owner" and "owner resolution failed" is whether the session
+// launches under the shared identity, and AC1 is exactly that a failure must
+// never do that silently (or warning-only).
+async function projectCredentialOwner(project){
+ if(!PER_USER_CLAUDE || !project?.primaryUser) return null;
+ const users = await loadUsers();
+ // Delegates to app/project-owner.js so this dashboard path and
+ // app/project-terminal-credentials.mjs (the host-mode systemd terminal
+ // startup path) enforce the identical fail-closed contract — one
+ // implementation, not two that could drift.
+ return resolveProjectCredentialOwner({ perUserEnabled: PER_USER_CLAUDE, project, users, decrypt });
+}
+// The fingerprint a project SHOULD be running on, computed without creating or
+// touching anything — cheap enough for the status poll. Propagates the same
+// failures as projectCredentialOwner(); callers that are read-only status
+// polls (not launches) decide separately how to surface that.
+async function desiredCredentialKey(project){
+ const owner = await projectCredentialOwner(project);
+ if(!owner) return CREDENTIALS_OFF;
+ return credentialFingerprint({ username: owner.username, configDir: userClaudeDir(owner.username), ghToken: owner.ghToken });
+}
+// What a session should launch with. THROWS — never falls back to the shared
+// login — when the feature is on, the project has a primaryUser, and that
+// owner's credentials cannot be resolved or materialized for any reason
+// (unreadable users store, undecryptable token, missing owner record, a
+// failing privilege-dropped helper). A working shared session that nobody
+// asked for is not an acceptable substitute for a broken private one: it is
+// exactly the silent identity swap this feature must not perform. Callers
+// (ensureTmuxSession / newTmuxWindow) are already wrapped by route-level
+// try/catch, so this failure reaches the operator as a real error instead of
+// vanishing into a console.warn.
+async function credentialContext(project){
+ const off = { tokens: [], shellArgs: DEFAULT_SHELL_ARGS, key: CREDENTIALS_OFF };
+ let owner;
+ try {
+  owner = await projectCredentialOwner(project);
+ } catch(e){
+  throw new Error(`[per-user-claude] project "${project?.name || '?'}" cannot resolve its credential owner (primaryUser "${project?.primaryUser || ''}"): ${e?.message || e}. Refusing to fall back to the shared Claude/GitHub login.`);
+ }
+ if(!owner) return off;
+ try {
+  const cred = await ensureUserCredentials({
+   fsp: fs, base: USER_CRED_BASE, username: owner.username,
+   ghToken: owner.ghToken, sharedClaudeJson,
+   owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
+  });
+  return {
+   tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir],
+   shellArgs: cred.envFile ? ['--noprofile','--rcfile',cred.envFile] : DEFAULT_SHELL_ARGS,
+   key: cred.fingerprint,
+  };
+ } catch(e){
+  throw new Error(`[per-user-claude] project "${project.name}" (owner "${owner.username}") credential materialization failed: ${e?.message || e}. Refusing to fall back to the shared Claude/GitHub login.`);
+ }
+}
+
+// Serialize every projects.json read-modify-write transaction, cross-process
+// (app/lifecycle-lock.js) — not just in-process. Concurrent POSTs from two
+// browser tabs against ONE dashboard process were already covered by a bare
+// in-process promise chain, but that gave no protection at all across TWO
+// real dashboard processes (a rolling restart overlap, two instances): each
+// would loadProjects() its own snapshot, mutate independently, and
+// last-write-wins on saveProjects — the exact same defect class closed for
+// users.json (round 3) and sessions.json (round 5, item 4). Every call site
+// already does its own load/mutate/save inside the callback, so only the
+// serialization mechanism changes here, not the call signature.
+const PROJECTS_LOCK_PATH = process.env.PW_PROJECTS_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-projects.lock');
 async function withProjectsLock(fn){
- const prev = projectsLock;
- let release;
- projectsLock = new Promise(r => { release = r; });
- try { await prev; return await fn(); } finally { release(); }
+ return withLifecycleLock(PROJECTS_LOCK_PATH, fn);
 }
 
 // ============================================================================
@@ -234,14 +384,36 @@ async function verifyPassword(plain, stored){
 
 // Legacy GOA `isAdmin` records are mapped to canonical role/projects/id shape
 // (and the obsolete flag dropped) by normalizeUserRecord — see app/users-compat.js.
-async function loadUsers(){
- try { const raw = await fs.readFile(usersPath,'utf8'); const data = JSON.parse(raw); return (Array.isArray(data?.users) ? data.users : []).map(normalizeUserRecord); }
- catch(e){ if(e.code === 'ENOENT') return []; throw e; }
-}
+// Shared with app/project-terminal-credentials.mjs (see app/users-file.js) so
+// both entrypoints read users.json identically.
+async function loadUsers(){ return loadUsersFile(usersPath); }
 async function saveUsers(users){
  await fs.mkdir(path.dirname(usersPath),{recursive:true});
- await fs.writeFile(usersPath, JSON.stringify({ users }, null, 2)+'\n');
- await fs.chmod(usersPath, 0o600).catch(()=>{});
+ await writeFileAtomic(usersPath, JSON.stringify({ users }, null, 2)+'\n', { mode: 0o600 });
+}
+
+// Cross-process serialization for the ENTIRE user lifecycle: every users.json
+// read-modify-write (create, rename, delete, reconcile, password change,
+// login's lastLoginAt, saving a deploy password) funnels through ONE lock, so
+// a rolling restart overlapping the old and new dashboard process, a second
+// instance, or just two requests in this SAME process can never interleave
+// two snapshot-based read-modify-write cycles against the same file — the
+// in-process-only tail chain this replaces (app/user-store.js, still used
+// and tested standalone) could not see across a process boundary at all, and
+// two DIFFERENT serialization mechanisms guarding the same file would not
+// compose (one write landing "between" the other's read and save is exactly
+// how an update gets silently lost). Rename/delete additionally hold this
+// SAME lock across their project-reference and credential-tree effects, not
+// just the users.json write — see the route handlers below.
+const LIFECYCLE_LOCK_PATH = process.env.PW_LIFECYCLE_LOCK_PATH || path.join(path.dirname(usersPath), '.pw-lifecycle.lock');
+async function withUsersLock(mutate){
+ return withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+  const users = await loadUsers();
+  const outcome = await mutate(users);
+  if(outcome === false) return { changed:false, result: outcome };
+  await saveUsers(users);
+  return { changed:true, result: outcome };
+ });
 }
 
 // ---- LDAP (ldap mode) --------------------------------------------------------
@@ -304,41 +476,47 @@ async function authenticate(rawUsername, password){
  return (await verifyPassword(password, u.passwordHash)) ? u : null;
 }
 
-let sessionsCache = null;
-let sessionsLock = Promise.resolve();
-async function withSessionsLock(fn){
- const prev = sessionsLock;
- let release;
- sessionsLock = new Promise(r => { release = r; });
- try { await prev; return await fn(); } finally { release(); }
-}
+// Cross-process serialized, exactly like users.json's withUsersLock: no
+// process-local cache (a process-local cache is precisely what made the
+// original in-process-only sessionsLock lose sessions across processes — two
+// dashboard processes each kept their OWN sessionsCache, and whichever one's
+// whole-file write landed last silently discarded every session the OTHER
+// process had created or revoked in the meantime). Every mutation reloads
+// the current on-disk sessions under the SAME cross-process lifecycle lock
+// app/lifecycle-lock.js already provides for users.json, so two real
+// processes racing create/revoke/purge can never lose or resurrect a session.
+const SESSIONS_LOCK_PATH = process.env.PW_SESSIONS_LOCK_PATH || path.join(path.dirname(sessionsPath), '.pw-sessions.lock');
 async function loadSessions(){
- if(sessionsCache) return sessionsCache;
- try { const raw = await fs.readFile(sessionsPath,'utf8'); const data = JSON.parse(raw); sessionsCache = Array.isArray(data?.sessions) ? data.sessions : []; }
- catch { sessionsCache = []; }
- return sessionsCache;
+ try { const raw = await fs.readFile(sessionsPath,'utf8'); const data = JSON.parse(raw); return Array.isArray(data?.sessions) ? data.sessions : []; }
+ catch(e){ if(e.code === 'ENOENT') return []; throw e; }
 }
-async function saveSessions(){
- if(!sessionsCache) return;
+async function saveSessions(sessions){
  await fs.mkdir(path.dirname(sessionsPath),{recursive:true});
- await fs.writeFile(sessionsPath, JSON.stringify({ sessions: sessionsCache }, null, 2)+'\n');
- await fs.chmod(sessionsPath, 0o600).catch(()=>{});
+ await writeFileAtomic(sessionsPath, JSON.stringify({ sessions }, null, 2)+'\n', { mode: 0o600 });
 }
-async function createSession(userId){
- return withSessionsLock(async () => {
+async function withSessionsLock(mutate){
+ return withLifecycleLock(SESSIONS_LOCK_PATH, async () => {
   const sessions = await loadSessions();
-  const id = crypto.randomBytes(32).toString('base64url');
-  const now = new Date();
-  sessions.push({ id, userId, createdAt: now.toISOString(), expiresAt: new Date(now.getTime()+SESSION_TTL_MS).toISOString() });
-  await saveSessions();
-  return id;
+  const outcome = await mutate(sessions);
+  if(outcome === false) return { changed:false, result: outcome };
+  await saveSessions(sessions);
+  return { changed:true, result: outcome };
  });
 }
+async function createSession(userId){
+ const { result: id } = await withSessionsLock((sessions) => {
+  const newId = crypto.randomBytes(32).toString('base64url');
+  const now = new Date();
+  sessions.push({ id: newId, userId, createdAt: now.toISOString(), expiresAt: new Date(now.getTime()+SESSION_TTL_MS).toISOString() });
+  return newId;
+ });
+ return id;
+}
 async function revokeSession(id){
- return withSessionsLock(async () => {
-  const sessions = await loadSessions();
+ await withSessionsLock((sessions) => {
   const i = sessions.findIndex(s => s.id === id);
-  if(i >= 0){ sessions.splice(i,1); await saveSessions(); }
+  if(i < 0) return false;
+  sessions.splice(i,1);
  });
 }
 async function lookupSession(id){
@@ -350,11 +528,13 @@ async function lookupSession(id){
  return s;
 }
 async function purgeExpiredSessions(){
- return withSessionsLock(async () => {
-  const sessions = await loadSessions();
+ await withSessionsLock((sessions) => {
   const now = new Date();
+  const before = sessions.length;
   const kept = sessions.filter(s => new Date(s.expiresAt) >= now);
-  if(kept.length !== sessions.length){ sessionsCache = kept; await saveSessions(); }
+  if(kept.length === before) return false;
+  sessions.length = 0;
+  sessions.push(...kept);
  });
 }
 
@@ -500,39 +680,11 @@ function slug(s){ return String(s ?? '').replace(/[^A-Za-z0-9._-]/g,'_').slice(0
 function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
 
 // ── Deploy Centre credential encryption (AES-256-GCM) ───────────────────────
-let _encKey = null;
-function getEncryptionKey() {
- if (_encKey) return _encKey;
- try {
-  const hex = fsSync.readFileSync(SECRET_KEY_PATH, 'utf8').trim();
-  _encKey = Buffer.from(hex, 'hex');
-  if (_encKey.length !== 32) throw new Error('Key must be 32 bytes');
-  return _encKey;
- } catch (e) {
-  throw new Error('Encryption key not found at ' + SECRET_KEY_PATH + ': ' + e.message);
- }
-}
-function encrypt(plaintext) {
- if (!plaintext) return '';
- const key = getEncryptionKey();
- const iv = crypto.randomBytes(12);
- const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
- const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
- const tag = cipher.getAuthTag();
- return 'enc:' + Buffer.concat([iv, tag, enc]).toString('base64');
-}
-function decrypt(ciphertext) {
- if (!ciphertext) return '';
- if (!ciphertext.startsWith('enc:')) return ciphertext;
- const key = getEncryptionKey();
- const buf = Buffer.from(ciphertext.slice(4), 'base64');
- const iv = buf.subarray(0, 12);
- const tag = buf.subarray(12, 28);
- const enc = buf.subarray(28);
- const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
- decipher.setAuthTag(tag);
- return decipher.update(enc, null, 'utf8') + decipher.final('utf8');
-}
+// Shared with app/project-terminal-credentials.mjs (see app/secret-crypto.js)
+// so the host-mode terminal-startup path decrypts a user's GitHub token with
+// the exact same implementation, not a second hand-copied one that could
+// silently drift from it.
+const { encrypt, decrypt } = makeSecretCrypto({ secretKeyPath: SECRET_KEY_PATH });
 
 // ─── Deploy Centre helpers ──────────────────────────────────────────────────
 async function loadDeployConfig(){ try { return JSON.parse(await fs.readFile(deployConfigPath,'utf8')); } catch { return {}; } }
@@ -691,7 +843,9 @@ async function stopPreviewUnit(name){
 }
 async function tmux(args,opts={}){
  if(DEPLOY_MODE === 'container') return execFileAsync('tmux',['-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
- return execFileAsync('sudo',['-u','admin','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+ // hostTerminalUser() (not a literal) so the account panes run as and the account
+ // per-user credential files are chowned to cannot drift apart — see terminal-owner.js.
+ return execFileAsync('sudo',['-u',hostTerminalUser(process.env),'tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
 }
 function parseTmuxWindows(stdout){
  return String(stdout || '').split('\n').filter(Boolean).map(line=>{
@@ -779,27 +933,165 @@ const projectTerminals = new Map();
 // Unset PW_TERMINAL_UID (or host mode) => passthrough, byte-identical upstream.
 const TERMINAL_PRIV = resolveTerminalPriv(process.env);
 function agentEnvTokens(canonicalTokens){ return wrapAgentEnv(TERMINAL_PRIV, canonicalTokens); }
-const agentLoginDropArgv = agentLoginDrop(TERMINAL_PRIV);async function ensureTmuxSession(p){
+const agentLoginDropArgv = agentLoginDrop(TERMINAL_PRIV);
+// A live session's panes keep the environment they were created with, so
+// enabling PW_PER_USER_CLAUDE or reassigning a project's primaryUser cannot
+// retroactively re-key a running session. Stamp the credential fingerprint on
+// the session at creation so that drift is DETECTABLE, and let an operator
+// reconcile it deliberately (POST /api/term/:project/recycle) rather than
+// silently killing a session that may be holding running work.
+const CRED_KEY_OPTION = '@pw_cred_key';
+// Reads the session's stamped credential fingerprint. Deliberately omits `-q`
+// (which makes tmux swallow ALL errors — a genuinely-unset option, a session
+// that no longer exists, and a control-plane hiccup all collapse to the same
+// empty-stdout/exit-0 result, indistinguishable from each other): without it,
+// a truly-unset option fails with tmux's own "invalid option" error, which is
+// the ONLY case this treats as a real, positive "nothing stamped" signal.
+// Anything else — the session vanished, a socket error, a corrupt server —
+// comes back `ok:false`, and callers must fail closed on that, never coerce
+// it into "unstamped" (that ambiguity is exactly what let a stale identity
+// through before this fix).
+async function readSessionCredKey(sess){
+ try {
+  const { stdout } = await tmux(['show-options','-t',sess,'-v',CRED_KEY_OPTION]);
+  return { ok:true, key: String(stdout || '').trim() };
+ } catch(e){
+  const stderr = String(e?.stderr || e?.message || '');
+  if(/invalid option/i.test(stderr)) return { ok:true, key:'' };
+  return { ok:false, error: stderr.trim() || String(e) };
+ }
+}
+// Stamps the fingerprint AND reads it back to confirm the write actually
+// landed — a `set-option` that exits nonzero, or one that "succeeds" but a
+// control-plane hiccup silently drops, must not be trusted without checking.
+async function stampSessionCredKey(sess,key){
+ await tmux(['set-option','-t',sess,CRED_KEY_OPTION,key]);
+ const verify = await readSessionCredKey(sess);
+ if(!verify.ok || verify.key !== key){
+  throw new Error(`could not verify the credential fingerprint stamp on session "${sess}" (wrote ${JSON.stringify(key)}, read back ${verify.ok ? JSON.stringify(verify.key) : `unreadable: ${verify.error}`})`);
+ }
+}
+// Is this project's live session running on credentials other than the ones it
+// would get today? Still checks the session's stamp even while the feature is
+// off — a real per-user fingerprint left over from when it was on is exactly
+// as stale as any other mismatch (see the round-4 fix to sessionCredentialState
+// in app/user-credentials.js) — but skips resolving a project owner (and its
+// loadUsers/decrypt cost) in that case, since the desired state is unconditionally
+// 'off' regardless of the project. This is a READ-ONLY status poll across every project, not a launch path, so a
+// broken project's credential owner (e.g. a dangling primaryUser) must not
+// throw and 500 the whole /api/projects/status response for every other
+// project too. But it must also never silently report "not stale" when it
+// cannot tell — that would just move AC1's silent-shared-fallback failure
+// mode into the status poll instead of removing it. So an unresolvable owner
+// is reported stale (visible, actionable) rather than swallowed either way.
+async function credentialsStale(p){
  const sess = tmuxSession(p.name);
- try { await tmux(['has-session','-t',sess]); return; } catch {}
+ try { await tmux(['has-session','-t',sess]); } catch { return false; }
+ const stamped = await readSessionCredKey(sess);
+ if(!stamped.ok){
+  console.warn(`[per-user-claude] ${p?.name || '?'}: cannot read the session's credential fingerprint — reporting stale: ${stamped.error}`);
+  return true;
+ }
+ if(!PER_USER_CLAUDE){
+  // Desired is unconditionally 'off' while disabled — no need to resolve a
+  // project owner (and pay loadUsers/decrypt cost) just to learn that. A
+  // real per-user fingerprint left stamped from when the feature was on is
+  // still reported stale here, via sessionCredentialState's own enforcement
+  // of "disabled always desires off" — see app/user-credentials.js.
+  return sessionCredentialState({ perUserEnabled: false, desiredKey: CREDENTIALS_OFF, stampedKey: stamped.key }).stale;
+ }
+ const desired = await desiredCredentialKey(p).then(key => ({ ok:true, key })).catch(e => ({ ok:false, e }));
+ if(!desired.ok){
+  console.warn(`[per-user-claude] ${p?.name || '?'}: cannot determine desired credential state — reporting stale: ${desired.e?.message || desired.e}`);
+  return true;
+ }
+ return sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: desired.key, stampedKey: stamped.key }).stale;
+}
+// Unified existing-session policy (both for this function and for
+// scripts/project-terminal-start, which applies the identical rule in bash):
+// the underlying tmux session may keep running either way — this function
+// never kills one — but ATTACHING to (or creating) one always resolves the
+// CURRENT owner and requires an exact fingerprint match first. A session
+// that does not exist yet is created fresh with the current owner's real
+// materialized credentials (fail-closed: never the shared login on a
+// resolution failure). A session that DOES exist is only handed off to
+// (ttyd, a new window, boot) when its stamped fingerprint matches the
+// CURRENT desired one exactly (or the "legitimately never stamped, and
+// desired is genuinely shared/off" case) — a mismatch (the owner rotated a
+// token, was renamed, or reassigned) or an unresolvable owner (dangling
+// primaryUser, corrupt token, unreadable users store) both refuse to attach
+// with an actionable recycle-required error. Continuity of an already-open
+// terminal is NOT a reason to attach under an unverified or stale identity —
+// attribution safety comes first; POST /api/term/:project/recycle is the
+// deliberate, explicit way to reconcile a stale session.
+async function ensureTmuxSession(p){
+ const sess = tmuxSession(p.name);
+ let exists = true;
+ try { await tmux(['has-session','-t',sess]); } catch { exists = false; }
+ // Resolves AND materializes the current owner's credentials unconditionally
+ // — for a fresh session this IS what a new pane needs; for an existing one
+ // it is exactly what its stamped fingerprint must match before attaching is
+ // allowed. THROWS (fail-closed) on any resolution/materialization failure,
+ // for either case — see the policy note above.
+ const cred = await credentialContext(p);
+ if(exists){
+  const stamped = await readSessionCredKey(sess);
+  if(!stamped.ok){
+   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credential fingerprint could not be verified (${stamped.error}). Refusing to attach under an unverifiable identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+  }
+  const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
+  if(state.stale){
+   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to attach a possibly-mismatched identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+  }
+  // Exact match (or nothing to be stale about): safe to attach. Adopt the
+  // stamp on a legacy-unstamped session now that we've confirmed there is
+  // nothing to be stale about (sessionCredentialState already only reports
+  // stale:false-unstamped for the legitimate off case).
+  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
+  return;
+ }
  const cwd = p.path || workspacePath(p.name);
- const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']);
+ // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
+ // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
+ // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
+ const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  const tabs = Array.isArray(p.tabs) ? p.tabs : [];
  const firstName = tabs[0]?.name || 'Base';
- await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash','--noprofile','--norc']);
+ await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash',...cred.shellArgs]);
+ await stampSessionCredKey(sess, cred.key);
  if(tabs[0]?.cmd?.trim()) await tmux(['send-keys','-t',`${sess}:${firstName}`,tabs[0].cmd.trim(),'C-m']);
  for(let i=1; i<tabs.length; i++){
   const t = tabs[i]; if(!t?.name) continue;
-  await tmux(['new-window','-t',sess,'-c',cwd,'-n',t.name,...env,'bash','--noprofile','--norc']);
+  await tmux(['new-window','-t',sess,'-c',cwd,'-n',t.name,...env,'bash',...cred.shellArgs]);
   if(t.cmd?.trim()){ await new Promise(r=>setTimeout(r,80)); await tmux(['send-keys','-t',`${sess}:${t.name}`,t.cmd.trim(),'C-m']); }
  }
  await tmux(['select-window','-t',`${sess}:0`]).catch(()=>{});
 }
 async function ensureProjectTmuxSession(p){
- try { await tmux(['has-session','-t',tmuxSession(p.name)]); return; } catch {}
- const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']).join(' ') + ' bash --noprofile --norc';
- await tmux(['new-session','-d','-s',tmuxSession(p.name),'-c',p.path,cmd]);
- await tmux(['send-keys','-t',tmuxSession(p.name),`printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' ${shellQuote(p.path)} ${shellQuote('/usr/local/bin/claude')} ${shellQuote(tmuxSession(p.name))}`,'C-m']);
+ // Same unified existing-session policy as ensureTmuxSession: resolves the
+ // current owner unconditionally and requires an exact fingerprint match
+ // before handing off to an EXISTING session; fail-closed on resolution
+ // failure or mismatch either way. See ensureTmuxSession's policy comment.
+ const sess = tmuxSession(p.name);
+ let exists = true;
+ try { await tmux(['has-session','-t',sess]); } catch { exists = false; }
+ const cred = await credentialContext(p);
+ if(exists){
+  const stamped = await readSessionCredKey(sess);
+  if(!stamped.ok){
+   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credential fingerprint could not be verified (${stamped.error}). Refusing to attach under an unverifiable identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+  }
+  const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
+  if(state.stale){
+   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to attach a possibly-mismatched identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+  }
+  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
+  return;
+ }
+ const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]).join(' ') + ' bash ' + cred.shellArgs.join(' ');
+ await tmux(['new-session','-d','-s',sess,'-c',p.path,cmd]);
+ await stampSessionCredKey(sess, cred.key);
+ await tmux(['send-keys','-t',sess,`printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' ${shellQuote(p.path)} ${shellQuote('/usr/local/bin/claude')} ${shellQuote(sess)}`,'C-m']);
 }
 async function ensurePvikpbotClaude(p){
  await ensureProjectTmuxSession(p);
@@ -865,7 +1157,26 @@ async function injectPvikpbotPrompt(p,prompt){
 }
 async function newTmuxWindow(p,name='new task',cmd=''){
  const safeName = String(name || 'new task').replace(/[\r\n\t]/g,' ').trim().slice(0,80) || 'new task';
- await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin']),'bash','--noprofile','--norc']);
+ const sess = tmuxSession(p.name);
+ // A new window gets today's credentials, which may differ from the ones the
+ // session was created with; that is why drift is reported per session and
+ // reconciled by recreating it, rather than left to accumulate silently. The
+ // LIVE session's stamped fingerprint must match exactly before adding to
+ // it — otherwise a new window lands under a different identity than the
+ // rest of the session (mixed-attribution panes), which is never allowed
+ // implicitly; POST /api/term/:project/recycle is the deliberate fix.
+ const cred = await credentialContext(p);
+ const stamped = await readSessionCredKey(sess);
+ if(!stamped.ok){
+  throw new Error(`[per-user-claude] project "${p.name}"'s existing session credential fingerprint could not be verified (${stamped.error}). Refusing to create a window under an unverifiable identity.`);
+ }
+ const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
+ if(state.stale){
+  throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to create a mixed-attribution window — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+ }
+ if(!stamped.key) await stampSessionCredKey(sess, cred.key);
+ const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
+ await tmux(['new-window','-t',sess,'-c',p.path,'-n',safeName,...winEnv,'bash',...cred.shellArgs]);
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
   await new Promise(r=>setTimeout(r,80));
@@ -1276,7 +1587,7 @@ const designTokensCss = `:root{--bg:#05080f;--bg2:#0a101d;--panel:#0c1424;--pane
 // deployCss (fully scoped) is imported from app/deploy-css.js.
 
 const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
-const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;let password='';if((typeof card!=='undefined'&&card&&card.dataset&&card.dataset.reauth==='1')||!window.__pwHasDeployPassword){password=prompt('Enter your domain password for deployment:');if(password===null)return}btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});const j=await r.json();output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
+const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';async function runDeploy(pw,save){const bd={option:opt};if(pw){bd.password=pw;if(save)bd.savePassword=true}const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});return r.json()}try{let j=await runDeploy('',false);if(!j.ok&&j.needPassword){const pw=prompt(j.error||'Enter your domain password for deployment:');if(!pw){output.textContent='Deployment cancelled.';return}const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');output.textContent='Running deployment script…';j=await runDeploy(pw,save)}output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
 
 const deployScript = `<script>
 (function(){
@@ -1306,15 +1617,26 @@ const deployScript = `<script>
    const isProd=target==='prod';
    const opt=(card.querySelector('.deploy-option')||{}).value||'';
    if((isProd||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;
-   let password='';
-   if((typeof card!=='undefined'&&card&&card.dataset&&card.dataset.reauth==='1')||!window.__pwHasDeployPassword){
-    password=prompt('Enter your domain password for deployment (or store it in Settings > Users):');
-    if(password===null)return;
-   }
    btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   async function runDeploy(pw,save){
+    const bd={option:opt};
+    if(pw){bd.password=pw;if(save)bd.savePassword=true}
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
+    return r.json();
+   }
    try{
-    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password,option:opt})});
-    const j=await r.json();
+    // Request first, exactly as the cockpit modal does: the server verifies the
+    // saved password itself and answers needPassword only when there is none or
+    // it no longer verifies. Prompting up-front here is what made a stored
+    // password useless on this page.
+    let j=await runDeploy('',false);
+    if(!j.ok&&j.needPassword){
+     const pw=prompt(j.error||'Enter your domain password for deployment:');
+     if(!pw){output.textContent='Deployment cancelled.';return}
+     const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
+     output.textContent='Running deployment script…';
+     j=await runDeploy(pw,save);
+    }
     if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');throw new Error(j.error||'deploy failed')}
     output.textContent='✅ SUCCESS ('+j.duration+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
     const vEl=card.querySelector('.current-version');
@@ -1961,7 +2283,7 @@ app.get(BASE + '/api/projects/status', requireAuth, async (req,res)=>{ try {
    await fs.writeFile(pendingMarkerPath(p), new Date().toISOString()+'\n').catch(()=>{});
    pend.pending = true; pend.since = new Date().toISOString();
   }
-  return { name: p.name, ...pend, bell: sig.bell, working: sig.working, pending: pend.pending || sig.bell };
+  return { name: p.name, ...pend, bell: sig.bell, working: sig.working, pending: pend.pending || sig.bell, credentialsStale: await credentialsStale(p) };
  }));
  res.json({ ok:true, projects: out });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
@@ -2043,6 +2365,20 @@ app.delete(BASE + '/api/term/:project/windows/:index', requireTerminalAccess, as
  res.json({ok:true,windows:await listTmuxWindows(p.name)});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
+// Explicit credential reconciliation. Panes inherit their environment at
+// creation, so a session started before PW_PER_USER_CLAUDE was enabled (or
+// before a project changed hands) keeps the old credentials until it is
+// recreated. That recreation is destructive — it discards every window's running
+// process — so it is never done implicitly: /api/projects/status reports
+// credentialsStale and an operator calls this.
+app.post(BASE + '/api/term/:project/recycle', requireTerminalAccess, async (req,res)=>{ try {
+ const p = await requireProject(req,res); if(!p) return;
+ await audit('session_recycle', { project: p.name, reason: 'credential reconciliation' }, req);
+ await tmux(['kill-session','-t',tmuxSession(p.name)]).catch(()=>{});
+ await ensureTmuxSession(p);
+ res.json({ ok:true, credentialsStale: await credentialsStale(p), windows: await listTmuxWindows(p.name) });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
 app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ await audit('terminal_open', { project: req.params.project }, req);
  const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); const projectJson = JSON.stringify(p.name).replace(/</g,'\\u003c');
  const railProjects = filterProjectsForUser(await loadProjects(), req.user);
@@ -2053,14 +2389,14 @@ app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ awai
  const cliTabsJson = JSON.stringify((_ws.enabledClis||[]).filter(k=>k in SUPPORTED_CLIS).map(k=>({label:SUPPORTED_CLIS[k].label,bin:SUPPORTED_CLIS[k].bin}))).replace(/</g,'\\u003c');
  await clearPending(p);
  let deployConfigured = false;
- let hasDeployPw = false;
  if(DEPLOY_CENTRE){
-  const [dCfg, users] = await Promise.all([loadDeployConfig(), loadUsers()]);
+  const dCfg = await loadDeployConfig();
   deployConfigured = hasDeployConfigFor(p.name, dCfg);
-  const currentUser = users.find(u => u.username === req.user?.username);
-  hasDeployPw = !!currentUser?.deployPassword;
  }
- const deployBits = DEPLOY_CENTRE && deployConfigured ? `<script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script>${deployModalHtml}${deployModalScript}` : '';
+ // No client-side "do we have a saved password?" hint: both deploy surfaces now
+ // request first and let the server answer needPassword, so a hint could only
+ // disagree with it.
+ const deployBits = DEPLOY_CENTRE && deployConfigured ? `${deployModalHtml}${deployModalScript}` : '';
  const [claudeVersion, updateStamp] = await Promise.all([getClaudeVersion(), getClaudeUpdateStamp()]);
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Workbench</title><style>${designTokensCss}${DEPLOY_CENTRE && deployConfigured ? deployCss : ''}${cockpitCss}${statusBarCss}${modalBaseCss}${previewCss}</style></head><body class="pw-cockpit"><div id="shell"><main id="stage"><div id="topBar"><span class="projChip" title="Current project: ${esc(p.name)}"><span class="pcMono" style="--h:${projHue(p.name)}">${esc(projMonogram(p.name))}</span><span class="pcName">${esc(p.name)}</span></span><div id="tabScroller" class="tabScroller"><button id="tabArrowL" class="tabArrow" type="button" aria-label="Scroll tabs left" tabindex="-1">‹</button><div id="tabStrip" class="tabStrip"></div><button id="tabArrowR" class="tabArrow" type="button" aria-label="Scroll tabs right" tabindex="-1">›</button></div><div class="tbActions"><button class="previewBtn" type="button" data-preview="${esc(p.name)}" title="Open live preview window"><span class="pbDot"></span>Preview</button><button id="fileBtn" type="button" title="Files — paste or drop into project"><span class="fileInfo">Files</span></button><button id="railBtn" class="railBtn" type="button" aria-label="Toggle project rail">☰</button></div></div><div id="tray"><div id="trayTabs" role="tablist" aria-label="Project files"><button id="trayTabInbox" class="trayTab" role="tab" aria-selected="true" aria-controls="trayInboxPanel" type="button">Inbox<span id="trayInboxCount" class="trayCount" hidden></span></button><button id="trayTabOutbox" class="trayTab" role="tab" aria-selected="false" aria-controls="trayOutboxPanel" tabindex="-1" type="button">Outbox<span id="trayOutboxCount" class="trayCount" hidden></span></button></div><div id="trayInboxPanel" class="trayPanel" role="tabpanel" aria-labelledby="trayTabInbox"><div id="drop" tabindex="0"><div>Paste/drop/select files here</div><div class="dropHint">PDF, txt, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status">Saved files go to <code>${esc(p.path)}/_inbox</code>. The path will be inserted into the terminal.</div><div id="preview"></div><div id="inboxHeader" class="inboxHeader"></div><div id="inboxList" class="inboxList"></div></div><div id="trayOutboxPanel" class="trayPanel" role="tabpanel" aria-labelledby="trayTabOutbox" hidden><div id="outboxHeader" class="inboxHeader"></div><div id="outboxList" class="inboxList"></div><div id="outboxStatus"></div></div><button class="close" id="close">Close</button></div><div id="trayShield" aria-hidden="true"></div><iframe id="term" allow="clipboard-write; clipboard-read" src="${BASE}/pty/${encodeURIComponent(p.name)}/"></iframe></main>${railHtml(railProjects, p.name, req.user, deployConfigured)}</div><script>const project=${projectJson};const tabPresets=${tabPresetsJson};let pwAuthRedirecting=false;window.pwAuthLost=function(){if(pwAuthRedirecting)return true;pwAuthRedirecting=true;location.href='${BASE}/login?next='+encodeURIComponent(location.pathname);return true};const cliTabs=${cliTabsJson};const tray=document.getElementById('tray'),drop=document.getElementById('drop'),file=document.getElementById('file'),status=document.getElementById('status'),preview=document.getElementById('preview'),inboxHeader=document.getElementById('inboxHeader'),inboxList=document.getElementById('inboxList'),frame=document.getElementById('term');let previewTimer=null;function pwRefitTerm(){try{var h=Math.round(frame.getBoundingClientRect().height);if(h<8)return;frame.style.maxHeight=(h-1)+'px';frame.getBoundingClientRect();requestAnimationFrame(function(){frame.style.maxHeight=''})}catch(e){}}frame.addEventListener('load',function(){setTimeout(pwRefitTerm,200);setTimeout(pwRefitTerm,700);setTimeout(pwRefitTerm,1500)});window.addEventListener('resize',function(){setTimeout(pwRefitTerm,80)});const hoverPanel=Object.assign(document.createElement('div'),{id:'pwHoverPreview'});document.body.appendChild(hoverPanel);function setStatus(t,bad=false){status.textContent=t;status.style.color=bad?'#fca5a5':'#bbf7d0'}function clearPreview(){preview.innerHTML='';document.body.classList.remove('has-preview');setStatus('');if(previewTimer){clearTimeout(previewTimer);previewTimer=null}}function showPreview(url,name,isImage){if(!url&&!name)return clearPreview();if(previewTimer){clearTimeout(previewTimer);previewTimer=null}document.body.classList.add('has-preview');const safeName=escHtml(name||'file');if(isImage&&url){preview.innerHTML='<div class="previewItem"><a href="'+url+'" target="_blank" rel="noopener"><img src="'+url+'" alt="'+safeName+'"></a><button class="previewClear" type="button" title="Clear preview">×</button></div>'}else{preview.innerHTML='<div class="previewItem"><div style="padding:18px;border:1px solid #334155;border-radius:8px;color:#cbd5e1;text-align:center;display:flex;align-items:center;justify-content:center;min-height:130px;word-break:break-all;background:#111827">'+safeName+'</div><button class="previewClear" type="button" title="Clear preview">×</button></div>'}preview.querySelector('.previewClear').onclick=clearPreview;previewTimer=setTimeout(closeTray,15000)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}async function refreshInbox(){try{const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const out=await r.json();if(!out?.ok){inboxHeader.innerHTML='';inboxList.innerHTML='';return}const files=out.files||[];setTrayCount(trayInboxCount,files.length);if(files.length===0){inboxHeader.innerHTML='<span>No saved files yet.</span>';inboxList.innerHTML='';return}inboxHeader.innerHTML='<span>'+files.length+' saved file'+(files.length===1?'':'s')+' — click a row to insert its path</span><button class="clear" type="button">Clear all</button>';inboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s inbox?'))return;await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{method:'DELETE'});refreshInbox()};inboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';row.title='Click to insert path: '+f.path;const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);row.innerHTML='<div class="thumb">'+(isImg?'<img src="'+f.url+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+'</div></div><button class="del" type="button" title="Delete">×</button>';row.onclick=ev=>{if(ev.target.closest('.del'))return;if(insertPath(f.path)){setStatus('Inserted:\\n'+f.path)}else{setStatus('Could not insert (no terminal focus)',true)}};row.onmouseenter=()=>{hoverPanel.innerHTML=isImg?'<img src="'+f.url+'">':'<div class="card">'+escHtml(f.name)+'<div class="meta">'+fmtSize(f.size)+'</div></div>';hoverPanel.style.display='block';const rct=row.getBoundingClientRect(),pw=hoverPanel.offsetWidth,ph=hoverPanel.offsetHeight,vw=window.innerWidth,vh=window.innerHeight;let lf=rct.right+10;if(lf+pw>vw-8)lf=Math.max(8,rct.left-pw-10);let tp=rct.top-4;if(tp+ph>vh-8)tp=Math.max(8,vh-ph-8);if(tp<8)tp=8;hoverPanel.style.left=lf+'px';hoverPanel.style.top=tp+'px'};row.onmouseleave=()=>{hoverPanel.style.display='none'};row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();hoverPanel.style.display='none';await fetch('${BASE}/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(f.name),{method:'DELETE'});refreshInbox()};inboxList.appendChild(row)}}catch{}}const trayTabInbox=document.getElementById('trayTabInbox'),trayTabOutbox=document.getElementById('trayTabOutbox'),trayInboxPanel=document.getElementById('trayInboxPanel'),trayOutboxPanel=document.getElementById('trayOutboxPanel'),trayInboxCount=document.getElementById('trayInboxCount'),trayOutboxCount=document.getElementById('trayOutboxCount'),outboxHeader=document.getElementById('outboxHeader'),outboxList=document.getElementById('outboxList'),outboxStatus=document.getElementById('outboxStatus');function setTrayCount(el,n){el.textContent=String(n);el.hidden=!n}function setOutboxStatus(t,bad=false){outboxStatus.textContent=t||'';outboxStatus.style.color=bad?'#fca5a5':'#bbf7d0'}function selectTrayTab(which){const inbox=which==='inbox';trayTabInbox.setAttribute('aria-selected',inbox?'true':'false');trayTabOutbox.setAttribute('aria-selected',inbox?'false':'true');trayTabInbox.tabIndex=inbox?0:-1;trayTabOutbox.tabIndex=inbox?-1:0;trayInboxPanel.hidden=!inbox;trayOutboxPanel.hidden=inbox;tray.classList.toggle('tray-outbox',!inbox);if(inbox)refreshInbox();else refreshOutbox()}trayTabInbox.addEventListener('click',()=>selectTrayTab('inbox'));trayTabOutbox.addEventListener('click',()=>selectTrayTab('outbox'));document.getElementById('trayTabs').addEventListener('keydown',e=>{const k=e.key;let which=null;if(k==='Home')which='inbox';else if(k==='End')which='outbox';else if(k==='ArrowLeft'||k==='ArrowRight')which=trayOutboxPanel.hidden?'outbox':'inbox';else return;e.preventDefault();selectTrayTab(which);(which==='inbox'?trayTabInbox:trayTabOutbox).focus()});async function refreshOutbox(){try{if(!outboxList.childElementCount)outboxList.innerHTML='<div class="trayEmpty">Loading…</div>';const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{cache:'no-store'});if(r.status===401)return void window.pwAuthLost();const out=await r.json().catch(()=>null);if(!out||!out.ok){outboxHeader.innerHTML='';outboxList.innerHTML='<div class="trayEmpty">'+escHtml((out&&out.error)||('Could not load outbox (HTTP '+r.status+')'))+'</div>';return}const files=out.files||[];setTrayCount(trayOutboxCount,files.length);if(files.length===0){outboxHeader.innerHTML='<span>No files from the agent yet — anything it saves to _outbox appears here.</span>';outboxList.innerHTML='';return}outboxHeader.innerHTML='<span>'+files.length+' file'+(files.length===1?'':'s')+' from the agent — download or clean up</span><button class="clear" type="button">Clear all</button>';outboxHeader.querySelector('.clear').onclick=async()=>{if(!confirm('Delete all '+files.length+' files in this project\\'s outbox?'))return;const rr=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{method:'DELETE'});const jj=await rr.json().catch(()=>null);setOutboxStatus(jj&&jj.ok?'Outbox cleared.':'Error: '+((jj&&jj.error)||('HTTP '+rr.status)),!(jj&&jj.ok));refreshOutbox()};outboxList.innerHTML='';for(const f of files){const row=document.createElement('div');row.className='row';const when=f.mtime?new Date(f.mtime).toLocaleString():'';row.innerHTML='<div class="thumb"><span>FILE</span></div><div class="nameCol"><div class="name">'+escHtml(f.name)+'</div><div class="meta">'+fmtSize(f.size)+(when?' · '+escHtml(when):'')+'</div></div><a class="dl" href="'+escHtml(f.url)+'" download>Download</a><button class="del" type="button" title="Delete">×</button>';row.querySelector('.del').onclick=async ev=>{ev.stopPropagation();if(!confirm('Delete "'+f.name+'" from the outbox?'))return;const rr=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project)+'/file/'+encodeURIComponent(f.name),{method:'DELETE'});const jj=await rr.json().catch(()=>null);setOutboxStatus(jj&&jj.ok?'Deleted '+f.name:'Error: '+((jj&&jj.error)||('HTTP '+rr.status)),!(jj&&jj.ok));refreshOutbox()};outboxList.appendChild(row)}}catch(e){outboxHeader.innerHTML='';outboxList.innerHTML='<div class="trayEmpty">'+escHtml(e.message||String(e))+'</div>'}}function openTray(msg){document.body.classList.add('shade-open');setTimeout(()=>{if(trayOutboxPanel.hidden)drop.focus();else trayTabOutbox.focus()},50);if(msg)setStatus(msg);refreshInbox();refreshOutbox()}function closeTray(){document.body.classList.remove('shade-open');clearPreview();focusTerminal()}function focusTerminal(){try{const ta=frame.contentDocument?.querySelector('textarea.xterm-helper-textarea');if(ta){ta.focus();return}}catch{}try{frame.contentWindow?.focus()}catch{}}function toggleTray(){document.body.classList.contains('shade-open')?closeTray():openTray()}document.getElementById('fileBtn').onclick=toggleTray;document.getElementById('close').onclick=closeTray;document.getElementById('trayShield').onclick=closeTray;document.addEventListener('keydown',e=>{if(e.key==='Escape'&&document.body.classList.contains('shade-open'))closeTray()});function insertPath(path){try{if(frame.contentWindow.__pwSendToTerminal?.(path))return true}catch{}try{const ta=frame.contentDocument.querySelector('textarea.xterm-helper-textarea')||frame.contentDocument.querySelector('textarea');if(!ta)return false;ta.focus();const dt=new DataTransfer();dt.setData('text/plain',path);ta.dispatchEvent(new ClipboardEvent('paste',{clipboardData:dt,bubbles:true,cancelable:true}));return true}catch{return false}}function uploadStream(blob,name){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','${BASE}/api/upload-stream/'+encodeURIComponent(project)+'?filename='+encodeURIComponent(name||'upload.bin'));x.setRequestHeader('Content-Type','application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable)setStatus('Uploading '+(name||'file')+'… '+Math.round(e.loaded/e.total*100)+'% ('+fmtSize(e.loaded)+' / '+fmtSize(e.total)+')')};x.onerror=()=>reject(new Error('Network error during upload'));x.onabort=()=>reject(new Error('Upload cancelled'));x.onload=()=>{let j=null;try{j=JSON.parse(x.responseText)}catch{}if(x.status>=200&&x.status<300&&j&&j.ok)resolve(j);else reject(new Error((j&&j.error)||('Upload failed (HTTP '+x.status+')')))};x.send(blob)})}async function upload(blob,name='clipboard-file'){if(!blob)return setStatus('No file received.',true);selectTrayTab('inbox');let out;if(blob.size>8*1024*1024){out=await uploadStream(blob,name)}else{setStatus('Saving file...');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const res=await fetch('${BASE}/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name,mime:blob.type||'application/octet-stream',data})});out=await res.json().catch(()=>null);if(!res.ok||!out?.ok)throw new Error(out?.error||'Upload failed')}const ok=insertPath(out.path);try{await navigator.clipboard.writeText(out.path)}catch{}showPreview(out.url,name||'file',(blob.type||'').startsWith('image/'));setStatus('Saved and '+(ok?'inserted':'copied')+':\\n'+out.path);refreshInbox()}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name).catch(e=>setStatus(e.message||String(e),true));drop.addEventListener('dragover',e=>{e.preventDefault();drop.style.borderColor='#60a5fa'});drop.addEventListener('dragleave',()=>drop.style.borderColor='#64748b');/* drop handler removed — the window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads because e.preventDefault() stops the browser default but not other listeners. */window.addEventListener('paste',e=>{const items=[...(e.clipboardData?.items||[])];const item=items.find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();openTray('Saving pasted file...');upload(f,f?.name||'clipboard-file').catch(err=>setStatus(err.message||String(err),true))},true);let dragDepth=0;window.addEventListener('dragenter',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();dragDepth++;openTray('Drop files here to save them into _inbox.')}},true);window.addEventListener('dragover',e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.style.borderColor='#60a5fa'}},true);window.addEventListener('dragleave',e=>{if(e.dataTransfer?.types?.includes('Files')){dragDepth=Math.max(0,dragDepth-1);if(dragDepth===0)drop.style.borderColor='#64748b'}},true);window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();dragDepth=0;drop.style.borderColor='#64748b';openTray();upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name).catch(err=>setStatus(err.message||String(err),true))}},true);window.addEventListener('message',e=>{const d=e.data;if(!d||typeof d!=='object')return;if(d.type==='pw-open-image-tray'){openTray(d.message||'Paste the file here.')}else if(d.type==='pw-paste-saved'){openTray();const base=(d.path||'').split('/').pop()||'file';showPreview(d.url,base,/\\.(png|jpe?g|webp|gif|bmp)$/i.test(base));setStatus('Saved and inserted:\\n'+d.path);refreshInbox()}else if(d.type==='pw-paste-error'){openTray();setStatus('Paste failed: '+d.error,true)}});const TAB_DEBUG=/[?&]tabdebug\b/.test(location.search)||localStorage.getItem('pwTabDebug')==='1';console.info('[pw-tabs] tab-attention diagnostics: window.__pwTabs = latest tmux window state; set localStorage.pwTabDebug=1 (or add ?tabdebug) then reload to trace bell flags every poll.'+(TAB_DEBUG?' [tracing ON]':''));const tabStrip=document.getElementById('tabStrip');const tabScroller=document.getElementById('tabScroller');const tabArrowL=document.getElementById('tabArrowL');const tabArrowR=document.getElementById('tabArrowR');function updateTabArrows(){const of=tabStrip.scrollWidth-tabStrip.clientWidth>1;tabScroller.classList.toggle('overflow',of);if(of){const mx=tabStrip.scrollWidth-tabStrip.clientWidth;tabArrowL.disabled=tabStrip.scrollLeft<=1;tabArrowR.disabled=tabStrip.scrollLeft>=mx-1}}function scrollTabs(dir){tabStrip.scrollBy({left:dir*Math.max(120,Math.round(tabStrip.clientWidth*0.6)),behavior:'smooth'})}tabArrowL.onclick=()=>scrollTabs(-1);tabArrowR.onclick=()=>scrollTabs(1);tabStrip.addEventListener('scroll',updateTabArrows,{passive:true});window.addEventListener('resize',updateTabArrows);const tabsBase='${BASE}/api/term/'+encodeURIComponent(project)+'/windows';let lastTabsKey='';let editingIdx=null;let editAfterRender=false;function startEdit(label,w){editingIdx=w.index;const original=label.textContent;label.contentEditable='true';label.classList.add('editing');label.focus();const sel=window.getSelection();const range=document.createRange();range.selectNodeContents(label);sel.removeAllRanges();sel.addRange(range);let done=false;const finish=async save=>{if(done)return;done=true;label.contentEditable='false';label.classList.remove('editing');label.removeEventListener('keydown',onKey);label.removeEventListener('blur',onBlur);const next=label.textContent.trim();editingIdx=null;if(save&&next&&next!==w.name){try{await fetch(tabsBase+'/'+w.index+'/rename',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:next})})}catch{}lastTabsKey='';refreshTabs()}else if(!save){label.textContent=original}};const onKey=ev=>{if(ev.key==='Enter'){ev.preventDefault();finish(true)}else if(ev.key==='Escape'){ev.preventDefault();finish(false)}};const onBlur=()=>finish(true);label.addEventListener('keydown',onKey);label.addEventListener('blur',onBlur)}function closeTabMenu(){document.querySelector('.tabMenu')?.remove();document.removeEventListener('click',closeTabMenu,true);document.removeEventListener('keydown',tabMenuKey,true)}function tabMenuKey(e){if(e.key==='Escape')closeTabMenu()}${uniqueTabNameClientSrc}async function spawnTab(name,cmd){editAfterRender=!name;await fetch(tabsBase,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name||'new task',cmd:cmd||''})});lastTabsKey='';refreshTabs()}function openTabMenu(anchor,windows){closeTabMenu();const menu=document.createElement('div');menu.className='tabMenu';menu.addEventListener('click',e=>e.stopPropagation());const existing=new Set((windows||[]).map(w=>w.name));const usable=(tabPresets||[]).filter(t=>t&&t.name&&!existing.has(t.name));for(const t of usable){const item=document.createElement('button');item.type='button';item.className='tabMenuItem';item.innerHTML='<span class="ti-name">'+escHtml(t.name)+'</span>'+(t.cmd?'<span class="ti-cmd">'+escHtml(t.cmd)+'</span>':'');item.onclick=()=>{spawnTab(t.name,t.cmd||'');closeTabMenu()};menu.appendChild(item)}const cliUsable=(cliTabs||[]);const hasAbove=(tabPresets||[]).length>0;for(let i=0;i<cliUsable.length;i++){const c=cliUsable[i];const item=document.createElement('button');item.type='button';item.className='tabMenuItem'+(i===0&&hasAbove?' blank':'');item.innerHTML='<span class="ti-name">'+escHtml(c.label)+'</span><span class="ti-cmd">'+escHtml(c.bin)+'</span>';item.onclick=()=>{spawnTab(uniqueTabName(c.label,existing),c.bin);closeTabMenu()};menu.appendChild(item)}const blank=document.createElement('button');blank.type='button';blank.className='tabMenuItem blank';blank.innerHTML='<span class="ti-name">+ Blank tab</span><span class="ti-cmd">plain bash, name it after creation</span>';blank.onclick=()=>{spawnTab('','');closeTabMenu()};menu.appendChild(blank);document.body.appendChild(menu);const r=anchor.getBoundingClientRect();const mw=menu.offsetWidth||220;let lf=r.left;if(lf+mw>window.innerWidth-8)lf=Math.max(8,window.innerWidth-mw-8);menu.style.left=lf+'px';menu.style.top=(r.bottom+4)+'px';setTimeout(()=>{document.addEventListener('click',closeTabMenu,true);document.addEventListener('keydown',tabMenuKey,true)},0)}async function refreshTabs(){if(editingIdx!=null)return;try{const r=await fetch(tabsBase,{cache:'no-store'});if(r.status===401)return void window.pwAuthLost();const out=await r.json();if(!out?.ok){tabStrip.innerHTML='';lastTabsKey='';return}window.__pwTabs=out.windows;if(TAB_DEBUG)console.debug('[pw-tabs]',new Date().toLocaleTimeString(),(out.windows||[]).map(w=>'#'+w.index+' '+(w.name||'')+' active='+(w.active?1:0)+' bell='+(w.bell?1:0)).join('  |  '));const key=JSON.stringify(out.windows);if(key===lastTabsKey)return;lastTabsKey=key;renderTabs(out.windows)}catch{}}function renderTabs(windows){tabStrip.innerHTML='';for(const w of windows){const tab=document.createElement('div');const needsAttention=w.bell&&!w.active;if(needsAttention&&TAB_DEBUG)console.log('[pw-tabs] ATTENTION \u2192 #'+w.index+' '+(w.name||''));tab.className='tab'+(w.active?' active':'')+(needsAttention?' attention':'');tab.title=w.active?'Click name to rename':(needsAttention?'Finished — click to view':'Window '+w.index+': '+(w.name||''));if(w.working){const lv=document.createElement('span');lv.className='live';lv.title='Working…';tab.appendChild(lv)}const label=document.createElement('span');label.className='name';label.textContent=w.name||('#'+w.index);label.onclick=ev=>{if(!w.active)return;ev.stopPropagation();startEdit(label,w)};tab.appendChild(label);if(windows.length>1){const x=document.createElement('span');x.className='x';x.textContent='×';x.title='Close window';x.onclick=async ev=>{ev.stopPropagation();if(!confirm('Close window "'+(w.name||w.index)+'"? Any running process in it will be killed.'))return;await fetch(tabsBase+'/'+w.index,{method:'DELETE'});lastTabsKey='';refreshTabs()};tab.appendChild(x)}tab.onclick=async()=>{if(w.active)return;await fetch(tabsBase+'/'+w.index+'/select',{method:'POST'});lastTabsKey='';refreshTabs()};tabStrip.appendChild(tab)}const plus=document.createElement('button');plus.className='newTab';plus.textContent='+';plus.title='New tab';plus.onclick=ev=>{ev.stopPropagation();openTabMenu(plus,windows)};tabStrip.appendChild(plus);const _act=tabStrip.querySelector('.tab.active');if(_act)try{_act.scrollIntoView({inline:'nearest',block:'nearest'})}catch{}requestAnimationFrame(updateTabArrows);if(editAfterRender){editAfterRender=false;const ai=windows.find(w=>w.active);if(ai){const tabs=tabStrip.querySelectorAll('.tab');const i=windows.indexOf(ai);const lbl=tabs[i]?.querySelector('.name');if(lbl)startEdit(lbl,ai)}}}refreshTabs();setInterval(()=>{if(!document.hidden)refreshTabs()},2000);async function pwHeartbeat(){if(document.hidden)return;try{await fetch('${BASE}/api/projects/'+encodeURIComponent(project)+'/clear-pending',{method:'POST'})}catch{}}pwHeartbeat();setInterval(pwHeartbeat,10000);document.addEventListener('visibilitychange',()=>{if(!document.hidden)pwHeartbeat()});</script>${railScript}${adminManage}${previewModalHtml}${previewScript}${deployBits}${footer}</body></html>`);
@@ -2302,11 +2638,11 @@ const settingsScript = `<script>(function(){const tabs=document.querySelectorAll
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
 let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">'+esc(e.message)+'</td></tr>'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '8' : '7'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '8' : '7'}" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
 function tokenCellHtml(u){return u.hasToken?'<td><span class="role-pill" style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)">✓ token</span></td>':'<td><span class="role-pill">none</span></td>'}
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '7' : '6'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '8' : '7'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Claude</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+(u.claudeSignedIn===true?'<span class="signed-in" title="This user completed their own Claude login">✓ signed in</span>':(u.claudeSignedIn===false?'<span class="muted" title="Owner has not completed their Claude login yet — they run claude once in a project they own">not yet</span>':'<span class="muted" title="Per-user Claude login is off (PW_PER_USER_CLAUDE)">·</span>'))+'</td>'+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
 uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
 // --- User modal (used for both Add and Edit) ---
 const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
@@ -2329,7 +2665,7 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
-<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed.</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
+<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed. When per-user Claude is enabled (<code>PW_PER_USER_CLAUDE</code>), the <b>Claude</b> column shows whether a user has completed their own Claude login — used automatically for the projects they own (their <code>primaryUser</code> assignment).</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
 <section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead">Install or update each assistant, then sign in. Tokens land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Sign-in terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
 <section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
@@ -2357,17 +2693,48 @@ app.post(BASE + '/api/auth/login', async (req,res) => {
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
   if(!username || !password){ await audit('login_fail', { reason:'missing-fields', username }, req); return res.status(400).json({ ok:false, error:'Username and password required' }); }
-  let u = null;
-  try { u = await authenticate(username, password); }
-  catch(e){ await audit('login_fail', { reason:'ldap-bind', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  if(!u){ await audit('login_fail', { reason:'invalid', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  const sid = await createSession(u.id);
-  setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
-  // Record lastLoginAt opportunistically (best-effort; re-load so we mutate the persisted record).
-  try { const list = await loadUsers(); const rec = list.find(x => x.id === u.id); if(rec){ rec.lastLoginAt = new Date().toISOString(); await saveUsers(list); } } catch {}
-  req.user = u;
+  // The ENTIRE login flow — authenticate (password verification against the
+  // CURRENT users.json), the lastLoginAt update, and session creation — runs
+  // inside ONE acquisition of the cross-process users lifecycle lock,
+  // nesting session creation inside it exactly like DELETE
+  // /api/users/:username already nests its own session purge (users lock
+  // outer, sessions lock inner: one consistent global order, never the
+  // reverse, never held across the other — rules out a login-vs-delete
+  // lock-ordering deadlock by construction).
+  //
+  // This closes a real orphaned-session race: authenticate() used to read
+  // users.json OUTSIDE any lock DELETE also respected, so a login racing a
+  // concurrent delete of the SAME account could authenticate against a
+  // user record that was about to be removed, and create a session AFTER
+  // DELETE's session-purge step had already run against an already-vacated
+  // victim. Now, whichever of the two critical sections runs first is
+  // authoritative for the other: if DELETE runs first, a subsequent login's
+  // authenticate() (reading users.json fresh, from inside the SAME lock)
+  // correctly fails closed with 401 and creates no session; if login runs
+  // first, it fully completes (session included) before DELETE can even
+  // start, so DELETE's own fresh read of sessions.json sees and purges that
+  // session too. Either ordering: no orphan, no revived session.
+  const outcome = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+   let u = null;
+   try { u = await authenticate(username, password); }
+   catch(e){ return { authError: 'ldap-bind' }; }
+   if(!u) return { authError: 'invalid' };
+   try {
+    const users = await loadUsers();
+    const rec = users.find(x => x.id === u.id);
+    if(rec){ rec.lastLoginAt = new Date().toISOString(); await saveUsers(users); }
+   } catch { /* best-effort; never fails the login itself */ }
+   const sid = await createSession(u.id);
+   return { user: u, sid };
+  });
+  if(outcome.authError){
+   await audit('login_fail', { reason: outcome.authError, username }, req);
+   return res.status(401).json({ ok:false, error:'Invalid username or password' });
+  }
+  setSessionCookie(req, res, outcome.sid, Math.floor(SESSION_TTL_MS / 1000));
+  req.user = outcome.user;
   await audit('login_ok', { username }, req);
-  res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
+  res.json({ ok:true, user: { username:outcome.user.username, role:outcome.user.role, projects:outcome.user.projects } });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
@@ -2430,7 +2797,11 @@ app.get(BASE + '/api/auth/check', async (req,res) => {
 // Last-admin guard prevents accidental lockout.
 // ============================================================================
 function safeUserShape(u){
- const out = { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null };
+ const out = { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken, createdAt: u.createdAt || null, lastLoginAt: u.lastLoginAt || null,
+  // Surfaced so a stuck rename reconciliation (see reconcileRenameCredentials)
+  // is visible — including WHICH operation, not just that one exists — to an
+  // admin rather than a hidden users.json-only field. Contains no secret.
+  pendingCredentialSync: u.pendingCredentialSync ? { opId: u.pendingCredentialSync.opId, fromUsername: u.pendingCredentialSync.fromUsername, toUsername: u.pendingCredentialSync.toUsername } : null };
  if(DEPLOY_CENTRE) out.hasDeployPassword = !!u.deployPassword;
  return out;
 }
@@ -2447,7 +2818,11 @@ function normalizeProjects(value){
 }
 
 app.get(BASE + '/api/users', requireAdmin, async (_req,res) => {
- try { const users = await loadUsers(); res.json({ ok:true, users: users.map(safeUserShape) }); }
+ try {
+  const users = await loadUsers();
+  const out = await Promise.all(users.map(async u => ({ ...safeUserShape(u), claudeSignedIn: PER_USER_CLAUDE ? await userClaudeSignedIn(u.username) : null })));
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, users: out });
+ }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
@@ -2463,8 +2838,9 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   if(AUTH_MODE !== 'ldap' && password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   let projects;
   try { projects = normalizeProjects(req.body?.projects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
-  const users = await loadUsers();
-  if(users.some(u => u.username === username)) return res.status(409).json({ ok:false, error:`User "${username}" already exists` });
+  // Hashing is slow by design; do it BEFORE acquiring the lifecycle lock so a
+  // create never holds the cross-process lock — blocking every other
+  // rename/delete/reconcile in the meantime — for the length of a scrypt hash.
   const passwordHash = AUTH_MODE === 'ldap' ? undefined : await hashPassword(password);
   const now = new Date().toISOString();
   const id = 'u-' + crypto.randomBytes(6).toString('base64url');
@@ -2472,51 +2848,190 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   if(passwordHash) rec.passwordHash = passwordHash;
   if(ghToken) rec.ghToken = encrypt(ghToken);
   if(deployPassword) rec.deployPassword = encrypt(deployPassword);
-  users.push(rec);
-  await saveUsers(users);
+  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+   const users = await loadUsers();
+   if(users.some(u => u.username === username)) return { failure:{ status:409, error:`User "${username}" already exists` } };
+   // A username still reserved by someone ELSE's unfinished rename (see
+   // reconcileRenameCredentials) must not be handed to a brand-new account —
+   // that account's credential tree would land on a namespace that may not
+   // have been pruned of the departing identity's OAuth/token material yet.
+   const reserveErr = reservedUsernameConflict(users, username, null);
+   if(reserveErr) return { failure:{ status:409, error: reserveErr } };
+   users.push(rec);
+   await saveUsers(users);
+   return { ok:true };
+  });
+  if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
   await audit('user_create', { username, role, projects, hasToken: !!ghToken }, req);
   res.json({ ok:true, user: safeUserShape(rec) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
+// Finish a rename's outstanding project-reference + credential-tree
+// reconciliation. Called from WITHIN a withLifecycleLock() critical section
+// by the PATCH route below (on the request that started — or is retrying —
+// a rename), by the explicit recovery endpoint (POST
+// /api/users/:username/reconcile), and by DELETE (to sweep a lingering
+// old-name reference an unfinished rename left behind). Every step here is
+// idempotent: it has to be, since any caller may be retrying after a partial
+// prior failure.
+//
+// Refuses — rather than reassigning or pruning — when `fromUsername` is now
+// held by a DIFFERENT current user than `userId`. That means the old
+// identity was reclaimed by someone else (reservedUsernameConflict is
+// supposed to prevent that at create/rename time; this is the defense-in-
+// depth check for when it's bypassed some other way — an out-of-band edit,
+// data older than that check). Blindly proceeding would hand that person's
+// projects, or their credential tree at the same path, to the renamed
+// account. This is the one case reconciliation cannot make progress on by
+// itself — it stays pending until an admin resolves the naming conflict.
+async function reconcileRenameCredentials({ userId, fromUsername, toUsername }){
+ const currentUsers = await loadUsers();
+ const claimant = currentUsers.find(u => u.username === fromUsername);
+ if(claimant && claimant.id !== userId){
+  throw new Error(`cannot reconcile: username "${fromUsername}" is now held by a different account — resolve the naming conflict before retrying`);
+ }
+ await withProjectsLock(async () => {
+  const projects = await loadProjects();
+  let changed = false;
+  for(const p of projects){ if(p.primaryUser === fromUsername){ p.primaryUser = toUsername; changed = true; } }
+  if(changed) await saveProjects(projects);
+ });
+ const projects = await loadProjects();
+ for(const p of projects){ if(p.primaryUser === toUsername) await syncProjectCredentials(p, currentUsers); }
+ await pruneUserCredentialTrees(currentUsers);
+}
+
 app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
-  const users = await loadUsers();
-  const u = users.find(x => x.username === target);
-  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
   const newUsername = req.body?.username !== undefined ? String(req.body.username).trim() : undefined;
   const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
   const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
   const newToken = req.body?.ghToken !== undefined ? String(req.body.ghToken || '').trim() : undefined;
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
-  if(newUsername !== undefined){
-   if(!validNewUsername(newUsername)) return res.status(400).json({ ok:false, error:'Invalid username' });
-   if(newUsername !== u.username && users.some(x => x.username === newUsername)) return res.status(409).json({ ok:false, error:`Username "${newUsername}" already exists` });
-  }
-  if(newRole !== undefined && !ROLES.includes(newRole)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
-  let projectsResolved = u.projects;
-  if(newProjects !== undefined){
-   try { projectsResolved = normalizeProjects(newProjects); } catch(e){ return res.status(400).json({ ok:false, error: e.message }); }
-  }
-  if(newRole !== undefined && newRole !== 'admin' && u.role === 'admin' && countAdmins(users) <= 1){
-   return res.status(409).json({ ok:false, error:'Refusing to demote the last admin (you would lock yourself out)' });
-  }
-  const before = { username: u.username, role: u.role, projects: u.projects };
-  if(newUsername !== undefined) u.username = newUsername;
-  if(newRole !== undefined) u.role = newRole;
-  if(newProjects !== undefined) u.projects = projectsResolved;
-  if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
-  if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
-  await saveUsers(users);
-  if(newToken !== undefined){
-   const projects = await loadProjects();
-   for(const p of projects){
-    if(p.primaryUser === u.username) await syncProjectCredentials(p, users);
+
+  // The ENTIRE operation — validating, mutating users.json, repointing
+  // project.primaryUser references, resyncing git credentials, pruning the
+  // old credential-tree namespace, and clearing the pending marker — runs
+  // inside ONE cross-process lock acquisition. That is what makes "read the
+  // marker, act on it, clear it" safe as a single atomic-feeling sequence: a
+  // concurrent rename replacing the marker between our read and our clear
+  // (the ABA this review round flagged) is now structurally impossible,
+  // because nothing else — not another request in this process, not another
+  // process — can be inside this same critical section at the same time.
+  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+   const users = await loadUsers();
+   // Resolve by exact current username first; only falls back to an
+   // unfinished rename's ORIGINAL name if there is no current match. This is
+   // what makes a LITERAL replay of PATCH /api/users/alice {username:
+   // "alicia"} idempotent even after users.json already committed the
+   // rename to "alicia" — the URL still names "alice", which no longer
+   // matches any current username, but does match the pending marker's
+   // fromUsername.
+   const u = resolveLifecycleTarget(users, target);
+   if(!u) return { failure: { status:404, error:`User "${target}" not found` } };
+   if(newUsername !== undefined){
+    if(!validNewUsername(newUsername)) return { failure: { status:400, error:'Invalid username' } };
+    if(newUsername !== u.username){
+     if(users.some(x => x.username === newUsername)) return { failure: { status:409, error:`Username "${newUsername}" already exists` } };
+     const reserveErr = reservedUsernameConflict(users, newUsername, u.id);
+     if(reserveErr) return { failure: { status:409, error: reserveErr } };
+    }
    }
-  }
-  await audit('user_update', { target, before, after: { username: u.username, role: u.role, projects: u.projects, hasToken: !!u.ghToken } }, req);
-  res.json({ ok:true, user: safeUserShape(u) });
+   if(newRole !== undefined && !ROLES.includes(newRole)) return { failure: { status:400, error:`role must be one of: ${ROLES.join(', ')}` } };
+   let projectsResolved = u.projects;
+   if(newProjects !== undefined){
+    try { projectsResolved = normalizeProjects(newProjects); } catch(e){ return { failure: { status:400, error: e.message } }; }
+   }
+   if(newRole !== undefined && newRole !== 'admin' && u.role === 'admin' && countAdmins(users) <= 1){
+    return { failure: { status:409, error:'Refusing to demote the last admin (you would lock yourself out)' } };
+   }
+   const before = { username: u.username, role: u.role, projects: u.projects };
+   const isNewRename = newUsername !== undefined && newUsername !== u.username;
+   if(newUsername !== undefined) u.username = newUsername;
+   if(newRole !== undefined) u.role = newRole;
+   if(newProjects !== undefined) u.projects = projectsResolved;
+   if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
+   if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
+   if(isNewRename){
+    // Chain from any UNFINISHED prior rename's original fromUsername (and
+    // keep its opId's provenance implicit — a fresh opId below still
+    // represents "the same logical rename operation, now including this
+    // further name change"), so renaming again before the first
+    // reconciliation ever succeeded still collapses to one reconciliation
+    // (old1 -> old2 -> new), not two.
+    u.pendingCredentialSync = { opId: crypto.randomUUID(), fromUsername: u.pendingCredentialSync?.fromUsername || before.username, toUsername: u.username };
+   }
+   // else: leave any existing u.pendingCredentialSync untouched — a retry
+   // with no new rename in THIS request body still carries forward whatever
+   // reconciliation was left unfinished, so the effect below can complete it.
+   const opId = u.pendingCredentialSync?.opId || null;
+   const tokenChanged = newToken !== undefined;
+   await saveUsers(users);
+
+   let stillPending = !!opId;
+   if(opId || tokenChanged){
+    try {
+     if(opId){
+      await reconcileRenameCredentials({ userId: u.id, fromUsername: u.pendingCredentialSync.fromUsername, toUsername: u.username });
+      // Re-read fresh and clear ONLY if the opId we started with is still
+      // the current one. Under this lock nothing else could have changed
+      // it — this is the same ABA guard as a defense-in-depth belt, proven
+      // in isolation by test/user-lifecycle-core.test.mjs.
+      const freshAfterEffect = await loadUsers();
+      const stillSame = freshAfterEffect.find(x => x.id === u.id);
+      if(reconciliationStillCurrent(stillSame, opId)){
+       delete stillSame.pendingCredentialSync;
+       await saveUsers(freshAfterEffect);
+       // Keep the record we're about to return to the caller (`u`, captured
+       // before the effect ran) consistent with what was just persisted —
+       // otherwise a successful same-request reconciliation would still
+       // report a marker in THIS response that the very next GET wouldn't.
+       delete u.pendingCredentialSync;
+       stillPending = false;
+      }
+     } else {
+      const projects = await loadProjects();
+      for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p, users); }
+     }
+    } catch(e){
+     throw new Error(`user "${u.username}" was updated in users.json, but syncing dependent project/credential state failed: ${e?.message || e}. users.json reflects the change${opId ? ' and a pending reconciliation marker was recorded' : ''}; retry this request${opId ? `, or POST ${BASE}/api/users/${encodeURIComponent(u.username)}/reconcile,` : ''} once the underlying issue is resolved.`);
+    }
+   }
+   return { after: u, before, pending: stillPending };
+  });
+
+  if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  await audit('user_update', { target, before: result.before, after: { username: result.after.username, role: result.after.role, projects: result.after.projects, hasToken: !!result.after.ghToken }, pendingCredentialSync: result.pending }, req);
+  res.json({ ok:true, user: safeUserShape(result.after) });
+ } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
+});
+
+// Explicit recovery for a rename whose reconciliation is stuck (surfaced via
+// GET /api/users' pendingCredentialSync) — lets an admin retry it without
+// having to reconstruct and resend the original rename request.
+app.post(BASE + '/api/users/:username/reconcile', requireAdmin, async (req,res) => {
+ try {
+  const target = req.params.username;
+  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+   const users = await loadUsers();
+   const u = resolveLifecycleTarget(users, target);
+   if(!u) return { failure: { status:404, error:`User "${target}" not found` } };
+   if(!u.pendingCredentialSync) return { pending:false, username: u.username };
+   const opId = u.pendingCredentialSync.opId;
+   await reconcileRenameCredentials({ userId: u.id, fromUsername: u.pendingCredentialSync.fromUsername, toUsername: u.username });
+   const fresh = await loadUsers();
+   const stillSame = fresh.find(x => x.id === u.id);
+   if(reconciliationStillCurrent(stillSame, opId)){
+    delete stillSame.pendingCredentialSync;
+    await saveUsers(fresh);
+   }
+   return { pending:false, reconciled:true, username: u.username };
+  });
+  if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  await audit('user_reconcile', { target: result.username }, req);
+  res.json({ ok:true, pending: result.pending, reconciled: !!result.reconciled });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
@@ -2527,10 +3042,12 @@ app.post(BASE + '/api/users/:username/password', requireAdmin, async (req,res) =
   const password = String(req.body?.password || '');
   if(password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   const users = await loadUsers();
-  const u = users.find(x => x.username === target);
-  if(!u) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
-  u.passwordHash = await hashPassword(password);
-  await saveUsers(users);
+  if(!users.some(x => x.username === target)) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
+  // Hash before opening the transaction — it is slow by design, and holding the
+  // store across it would serialize every other user write behind it.
+  const passwordHash = await hashPassword(password);
+  const updated = await withUsersLock((fresh)=>{ const rec = fresh.find(x => x.username === target); if(!rec) return false; rec.passwordHash = passwordHash; });
+  if(updated.result === false) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
   await audit('user_password_change', { target }, req);
   res.json({ ok:true });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
@@ -2539,33 +3056,93 @@ app.post(BASE + '/api/users/:username/password', requireAdmin, async (req,res) =
 app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
-  const users = await loadUsers();
-  const i = users.findIndex(u => u.username === target);
-  if(i < 0) return res.status(404).json({ ok:false, error:`User "${target}" not found` });
-  if(isAdmin(users[i]) && countAdmins(users) <= 1){
-   return res.status(409).json({ ok:false, error:'Refusing to delete the last admin (you would lock yourself out)' });
-  }
-  const [removed] = users.splice(i, 1);
-  await saveUsers(users);
-  // Revoke any on-disk git credentials this user seeded: for every project that
-  // named them primaryUser, drop the reference and re-sync (the user is already
-  // gone from `users`, so syncProjectCredentials takes the clear path — removes
-  // the 0600 cred file and unsets the local helper). Otherwise the deleted
-  // account's token would keep authenticating git in those workspaces.
-  try {
-   const projects = await loadProjects();
-   let changed = false;
-   for(const p of projects){
-    if(p.primaryUser === target){ delete p.primaryUser; await syncProjectCredentials(p, users); changed = true; }
+  // The ENTIRE operation — snapshot, cleanup, and the final irreversible
+  // removal — runs inside ONE cross-process lock acquisition, by the
+  // victim's IMMUTABLE id throughout (never by username again, which a
+  // concurrent rename or a recreate-under-the-vacated-name could otherwise
+  // make point at the wrong account by the time phase 3 runs).
+  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+   // Phase 1: validate against a current snapshot WITHOUT mutating anything.
+   // The identity itself is only removed in phase 3, once every dependent
+   // piece of state has actually been revoked — see the phase-2 comment.
+   const users = await loadUsers();
+   const victim = resolveLifecycleTarget(users, target);
+   if(!victim) return { failure: { status:404, error:`User "${target}" not found` } };
+   if(isAdmin(victim) && countAdmins(users) <= 1){
+    return { failure: { status:409, error:'Refusing to delete the last admin (you would lock yourself out)' } };
    }
-   if(changed) await saveProjects(projects);
-  } catch {}
-  try {
-   const sessions = await loadSessions();
-   const remaining = sessions.filter(s => s.userId !== removed.id);
-   if(remaining.length !== sessions.length){ sessionsCache = remaining; await saveSessions(); }
-  } catch {}
-  await audit('user_delete', { target }, req);
+   const remainingUsers = users.filter(u => u.id !== victim.id);
+   // An unfinished rename (see reconcileRenameCredentials) can leave a
+   // project still pointing at the OLD username while this record already
+   // carries the CURRENT one. Deleting the identity must revoke that
+   // reference too — but only if the old name has not since been reclaimed
+   // by a different account, which now legitimately owns whatever it names.
+   const oldName = victim.pendingCredentialSync?.fromUsername;
+   const oldNameStillOurs = oldName && !remainingUsers.some(u => u.username === oldName);
+   const namesToClear = new Set([victim.username, ...(oldNameStillOurs ? [oldName] : [])]);
+
+   // Phase 2: revoke project references, git credentials, the per-user
+   // credential tree, and sessions — BEFORE the irreversible identity
+   // removal, and with failures propagating rather than being swallowed. If
+   // any of this fails, the request aborts here: users.json is untouched,
+   // so the operation is safely retryable (this is the primary cleanup
+   // contract; boot-time pruning of orphaned credential trees remains
+   // defense in depth only, for trees orphaned some other way — a
+   // service-down window, an out-of-band edit of users.json).
+   try {
+    // Run every fallible step BEFORE persisting anything, so a later failure
+    // (e.g. the credential-tree prune) cannot leave projects.json
+    // half-revoked while the account still exists. syncProjectCredentials
+    // is given the project as if its reference were already cleared
+    // (remainingUsers already excludes the victim either way), so this is
+    // safe to repeat on a retry.
+    const projectsBeforeCleanup = await loadProjects();
+    for(const p of projectsBeforeCleanup){
+     if(namesToClear.has(p.primaryUser)) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers);
+    }
+    await pruneUserCredentialTrees(remainingUsers);
+
+    // Still holding the SAME (cross-process) lifecycle lock throughout, but
+    // also acquire the established in-process project/session locks around
+    // their own writes — belt and suspenders, and what keeps a completely
+    // unrelated plain project edit (/manage/update, which never touches the
+    // lifecycle lock) or a concurrent login/logout correctly serialized
+    // against these specific writes too.
+    await withProjectsLock(async () => {
+     const fresh = await loadProjects();
+     let changed = false;
+     for(const p of fresh){ if(namesToClear.has(p.primaryUser)){ delete p.primaryUser; changed = true; } }
+     if(changed) await saveProjects(fresh);
+    });
+    await withSessionsLock((sessions) => {
+     const before = sessions.length;
+     const kept = sessions.filter(s => s.userId !== victim.id);
+     if(kept.length === before) return false;
+     sessions.length = 0;
+     sessions.push(...kept);
+    });
+   } catch(e){
+    return { failure: { status:500, error:
+     `could not fully revoke "${victim.username}"'s project references, git credentials, credential tree, or sessions, so the account was NOT deleted — retry once the underlying issue is fixed: ${e?.message || e}` } };
+   }
+
+   // Phase 3: the irreversible step, by IMMUTABLE ID. Re-read fresh (still
+   // inside the lock — nothing else could have touched this record in the
+   // meantime, but re-reading rather than reusing the phase-1 snapshot costs
+   // nothing and defends against a future refactor that loosens that).
+   const finalUsers = await loadUsers();
+   const i = finalUsers.findIndex(u => u.id === victim.id);
+   if(i < 0) return { failure: { status:404, error:`User "${target}" not found` } };
+   if(isAdmin(finalUsers[i]) && countAdmins(finalUsers) <= 1){
+    return { failure: { status:409, error:'Refusing to delete the last admin (you would lock yourself out)' } };
+   }
+   finalUsers.splice(i, 1);
+   await saveUsers(finalUsers);
+   return { removedUsername: victim.username };
+  });
+
+  if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  await audit('user_delete', { target: result.removedUsername }, req);
   res.json({ ok:true });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
@@ -2709,13 +3286,10 @@ if(DEPLOY_CENTRE){
   const isAdmin = req.user?.role === 'admin';
   const projects = await loadProjects();
   const cfg = await loadDeployConfig();
-  const users = await loadUsers();
-  const currentUser = users.find(u => u.username === req.user?.username);
   const visibleProjects = filterProjectsForUser(projects, req.user);
   const cards = await Promise.all(visibleProjects.map(p => deployPageCard(p, cfg, isAdmin)));
   const noProjects = visibleProjects.length === 0 ? `<p class="muted">No projects configured. <a href="${BASE}/manage">Add a project</a> first.</p>` : '';
-  const hasDeployPw = !!currentUser?.deployPassword;
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><script>window.__pwHasDeployPassword=${hasDeployPw ? 'true' : 'false'};</script><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
  });
 
  app.post(BASE + '/api/deploy/config', requireAdmin, async (req,res)=>{
@@ -2758,19 +3332,36 @@ if(DEPLOY_CENTRE){
   const cfg = await loadDeployConfig();
   const tc = cfg[project]?.[target];
   if(!tc || !tc.script) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
-  if(tc.reauth){
-   const submitted = req.body?.password || '';
-   let reauthOk = false;
-   try { reauthOk = !!(await authenticate(req.user?.username, submitted)); } catch { reauthOk = false; }
-   if(!reauthOk){ await audit('deploy_reauth_failed', { project, target }, req); return res.status(401).json({ok:false,error:'Re-authentication failed: your password did not verify.'}); }
+  const users = await loadUsers();
+  const currentUser = users.find(u => u.username === req.user?.username);
+  const submitted = req.body?.password || '';
+  let storedPw = '';
+  if(currentUser?.deployPassword){ try { storedPw = decrypt(currentUser.deployPassword); } catch { storedPw = ''; } }
+  // Verify the saved password first (no prompt); the client only asks the user
+  // when the server answers needPassword. See app/deploy-reauth.js.
+  const decision = await resolveDeployReauth({
+   reauth: !!tc.reauth, submitted, stored: storedPw, savePassword: !!req.body?.savePassword,
+   verify: (pw) => authenticate(req.user?.username, pw),
+  });
+  if(!decision.ok){
+   await audit('deploy_reauth_failed', { project, target, staleStored: decision.staleStored }, req);
+   return res.status(401).json({ ok:false, needPassword:true, staleStored: decision.staleStored, error: decision.error });
+  }
+  const effectivePassword = decision.password;
+  // Persist a freshly-entered password if the user opted in (encrypted at rest).
+  // Re-resolve the record inside the store: `users` above was read before the
+  // directory bind and is now potentially stale.
+  if(decision.save){
+   try {
+    await withUsersLock((users)=>{ const rec = users.find(x => x.username === req.user?.username); if(!rec) return false; rec.deployPassword = encrypt(submitted); });
+   }
+   catch(e){ /* non-fatal: the deploy still proceeds if saving fails */ }
   }
   const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
   let option = String(req.body?.option || '').trim();
   if(allowedOpts.length){ if(!option) option = allowedOpts[0]; if(!allowedOpts.includes(option)) return res.status(400).json({ok:false,error:'Invalid option for this slot'}); }
   else option = '';
-  const users = await loadUsers();
-  const currentUser = users.find(u => u.username === req.user?.username);
-  const deployPassword = req.body?.password || (currentUser?.deployPassword ? decrypt(currentUser.deployPassword) : '');
+  const deployPassword = effectivePassword || '';
   const deployUser = currentUser?.deployUser || currentUser?.username || req.user?.username || '';
   const start = Date.now();
   let output = '', status = 'success', version = null;
@@ -2832,6 +3423,11 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const srv = app.listen(PORT,'127.0.0.1',()=>{
  console.log(`dashboard listening on 127.0.0.1:${PORT}`);
  console.log(`[deploy-mode] ${DEPLOY_MODE}`);
+ if(!ISOLATED && PER_USER_CLAUDE){
+  pruneUserCredentialTrees()
+   .then(r => { if(r.removed?.length) console.log(`[per-user-claude] pruned ${r.removed.length} orphaned credential tree(s)`); })
+   .catch(e => console.warn(`[per-user-claude] boot credential prune failed: ${e?.message || e}`));
+ }
  if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
  if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
  sweepOrphanTmuxSessions();

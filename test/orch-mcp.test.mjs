@@ -58,7 +58,11 @@ async function withMcp(fn) {
   const engine = new OrchestrationEngine({
     config, store, repo, backend, artifacts, projectStore,
     checkRunner: new CheckRunner({ config, repo, store, artifacts }),
-    sessionManager: { ensureSession: async () => ({ session_key: 'k' }), verifySession: async () => ({ effective: null }) },
+    sessionManager: {
+      ensureSession: async () => ({ session_key: 'k' }),
+      verifySession: async () => ({ effective: null }),
+      resolveCredentials: async () => ({ tokens: [] }),
+    },
   });
 
   const dispatch = createToolDispatcher({

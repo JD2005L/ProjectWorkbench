@@ -9,6 +9,7 @@
 // The recorded fixtures below are real output shapes captured from Claude Code 2.1.220.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 
 import { ClaudeCodeBackend, classifyBackendFailure } from '../app/orchestrator/runner/claude.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
@@ -382,6 +383,63 @@ test('runner: a successful phase returns structured facts, not the agent’s pro
   assert.match(result.summary, /Implemented the change/);
 });
 
+// ---------------------------------------------------------------------------
+// SECURITY: runPhase() must refuse an API-billed session exactly like
+// verifyConfiguration() already does — a real phase, not just the one-time
+// verification probe, is what actually spends money and does the work.
+//
+// CLAUDE_CONFIG_DIR (see phaseEnv()'s allowlist above) points at the SAME
+// per-user config directory a human's own interactive terminal uses (per
+// app/orchestrator/lane-credentials.js's own docs: "used by TWO independent
+// entrypoints"). A settings.json placed there with its own `env.
+// ANTHROPIC_API_KEY` is honored by the real CLI regardless of what
+// phaseEnv() stripped from the process environment — verified empirically
+// against the real installed claude binary. verifyConfiguration() already
+// refuses this via attestation.js's claimsSubscription check (init.
+// apiKeySource !== 'none'); nothing made runPhase() apply the identical
+// rule, so a phase could silently bill to that key with ok:true.
+// ---------------------------------------------------------------------------
+
+test('runner: SECURITY — a phase reporting non-subscription apiKeySource is refused, never ok:true', async () => {
+  const billed = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5',
+    apiKeySource: 'ANTHROPIC_API_KEY', session_id: 's1', permissionMode: 'acceptEdits',
+  });
+  const { backend } = backendWith({ stdout: `${billed}\n${RESULT_LINE}\n` });
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(result.ok, false, 'a phase that actually ran under API-key billing must never report ok:true, whatever the CLI itself reported about the task');
+  assert.equal(result.failure_kind, 'api_billed');
+});
+
+test('runner: SECURITY — a phase whose init event omits apiKeySource entirely is refused too — absence is not consent', async () => {
+  // Mirrors attestation.js's own claimsSubscription logic exactly: apiKeySource missing/non-string
+  // resolves to null, and null !== 'none', so it is refused — the real CLI has always reported this
+  // field (see the file-level comment on INIT_LINE), so its absence is itself suspicious.
+  const noField = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: 's1', permissionMode: 'acceptEdits',
+  });
+  const { backend } = backendWith({ stdout: `${noField}\n${RESULT_LINE}\n` });
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_kind, 'api_billed');
+});
+
+test('runner: a phase reporting the subscription (apiKeySource: "none") is unaffected by the new check', async () => {
+  const { backend } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(result.ok, true);
+  assert.notEqual(result.failure_kind, 'api_billed');
+});
+
 test('runner: a max-turn exit is a failure, never a success', async () => {
   const { backend } = backendWith({
     stdout: `${INIT_LINE}\n${JSON.stringify({
@@ -396,6 +454,223 @@ test('runner: a max-turn exit is a failure, never a success', async () => {
   assert.equal(result.ok, false);
   assert.equal(result.max_turns_reached, true);
   assert.equal(result.failure_kind, 'max_turns');
+});
+
+// ---------------------------------------------------------------------------
+// per-user credential environment
+//
+// A resolved per-user credential (see app/orchestrator/lane-credentials.js)
+// decides WHICH Claude identity a job runs under. The orchestrator's tmux
+// lane applies it to the pane's launch command (session.js), but runPhase()/
+// verifyConfiguration()/probeAuth() spawn the coding CLI directly — a
+// SEPARATE process that must receive the SAME resolved tokens or the actual
+// automated work runs under the shared/default login regardless of what the
+// pane (or a human attaching to it) would see.
+// ---------------------------------------------------------------------------
+
+test('runner: runPhase applies the resolved credential tokens to the spawned CLI\'s real environment', async () => {
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    credentialTokens: ['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal(phase.options.env.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude',
+    'the spawned process\'s own environment must carry the resolved per-user config dir');
+});
+
+test('runner: verifyConfiguration applies the resolved credential tokens to BOTH the auth probe and the verification phase', async () => {
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  await backend.verifyConfiguration({
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    phaseClass: PhaseClass.DISCOVERY,
+    sessionKey: 'o:w:Demo:pvi2-orchestrator',
+    cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    credentialTokens: ['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  const authProbe = calls.find((c) => c.args[0] === 'auth');
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal(authProbe.options.env.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude',
+    'the auth-status probe must check the SAME identity the phase itself will run under, not the shared one');
+  assert.equal(phase.options.env.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude');
+});
+
+test('runner: no credentialTokens means the spawned process env is byte-unchanged (disabled mode)', async () => {
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    // credentialTokens omitted entirely — the disabled-mode / no-primaryUser shape.
+  });
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal('CLAUDE_CONFIG_DIR' in phase.options.env, false);
+  // The base environment (process.env, minus the forbidden API-billing keys) must be otherwise
+  // untouched — the same object shape phaseEnv() always produced.
+  assert.equal(phase.options.env.PATH, process.env.PATH);
+});
+
+// ---------------------------------------------------------------------------
+// SECURITY: credentialTokens must never be able to reintroduce a forbidden
+// (API-billing) environment key.
+//
+// phaseEnv() strips FORBIDDEN_ENV from process.env FIRST, then applies
+// credentialTokens — a caller-supplied array of KEY=VALUE strings threaded
+// all the way from app/orchestrator/lane-credentials.js's resolver through
+// engine.js and session.js. Applying tokens AFTER the strip with no check on
+// what they name means any token naming a forbidden key (a bug in a future
+// resolver, or a malicious project registry entry) silently reintroduces it
+// — undoing this exact function's own stated contract ("every API-billing
+// escape hatch removed").
+// ---------------------------------------------------------------------------
+
+test('runner: SECURITY — credentialTokens can never reintroduce a forbidden API-billing key', () => {
+  const { backend } = backendWith({});
+  for (const forbidden of [
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'AWS_BEARER_TOKEN_BEDROCK',
+  ]) {
+    const env = backend.phaseEnv([`${forbidden}=reintroduced`, 'CLAUDE_CONFIG_DIR=/safe']);
+    assert.equal(forbidden in env, false, `${forbidden} must never be reintroducible via credentialTokens`);
+    // The legitimate token alongside it must still apply — this is not a blanket rejection of the
+    // whole token list, only of the specific forbidden key.
+    assert.equal(env.CLAUDE_CONFIG_DIR, '/safe');
+  }
+});
+
+test('runner: SECURITY — only the resolver-owned CLAUDE_CONFIG_DIR key may be set via credentialTokens, not an arbitrary key', () => {
+  const { backend } = backendWith({});
+  const env = backend.phaseEnv(['SOME_UNEXPECTED_KEY=value', 'CLAUDE_CONFIG_DIR=/safe', 'PATH=/hijacked']);
+  assert.equal('SOME_UNEXPECTED_KEY' in env, false, 'a key resolveLaneCredentials() never produces must be dropped, not trusted');
+  assert.equal(env.CLAUDE_CONFIG_DIR, '/safe');
+  assert.notEqual(env.PATH, '/hijacked', 'PATH is not a resolver-owned key and must not be overridable via credentialTokens');
+});
+
+test('runner: an empty or malformed credential token is dropped, never applied as an empty override', () => {
+  const { backend } = backendWith({});
+  // No '=' at all: already skipped by the pre-existing eq === -1 guard.
+  // An empty value ("KEY="): must not silently null out a real config dir.
+  // An empty key ("=value"): nonsensical, must not reach the allowlist.
+  const env = backend.phaseEnv(['CLAUDE_CONFIG_DIR=', '=orphan-value', 'not-a-token-at-all']);
+  assert.equal('CLAUDE_CONFIG_DIR' in env, false, 'an empty value must not be applied as an empty CLAUDE_CONFIG_DIR override');
+  assert.equal('' in env, false);
+});
+
+test('runner: SECURITY REGRESSION — a forbidden key smuggled via credentialTokens never reaches a REAL spawned process, while the legitimate key still does', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+    // The default backend privilege-drops via a REAL PrivilegeDropper (see below — this test spawns
+    // a live child process), which resolves PW_ORCHESTRATOR_TMUX_USER through the real passwd
+    // database. The config default ('admin') only exists on CT2115; portable across hosts (including
+    // GitHub's runners, which have no 'admin' account) means naming the account this process is
+    // actually running as, exactly like the INTEGRATION test below does.
+    PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username,
+  });
+  const exec = async (file, args, options) => {
+    if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+    if (args[0] === '--help') return { stdout: REAL_HELP, stderr: '' };
+    if (args[0] === 'auth') return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }), stderr: '' };
+    // A REAL child process — proves a forbidden key smuggled through credentialTokens really is
+    // absent from a live process's environment, not just from a JS object this test constructed.
+    const real = await execFileAsync('env', [], { env: options.env });
+    const lines = real.stdout.split('\n');
+    const apiKey = lines.find((l) => l.startsWith('ANTHROPIC_API_KEY=')) ?? '(absent)';
+    const configDir = lines.find((l) => l.startsWith('CLAUDE_CONFIG_DIR='))?.slice('CLAUDE_CONFIG_DIR='.length) ?? '';
+    return { stdout: `${INIT_LINE}\n${JSON.stringify({ ...JSON.parse(RESULT_LINE), result: `${apiKey}|${configDir}` })}\n`, stderr: '' };
+  };
+  const backend = new ClaudeCodeBackend({ config, exec, clock: () => new Date('2026-07-27T12:00:00.000Z') });
+  backend.fingerprint = async () => FINGERPRINT;
+
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    credentialTokens: ['ANTHROPIC_API_KEY=reintroduced', 'CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  assert.equal(result.summary, '(absent)|/srv/pw-users/alice/.claude',
+    'a REAL spawned process must never see the smuggled ANTHROPIC_API_KEY, while the legitimate CLAUDE_CONFIG_DIR must still reach it');
+});
+
+test('runner: INTEGRATION — CLAUDE_CONFIG_DIR survives the REAL PrivilegeDropper.dropEnv() pass, not just phaseEnv()\'s own stripping', async () => {
+  // Merge-integration regression, PR19 (host-mode privilege drop) x PR20 (per-user credential
+  // attribution). PR19 independently added CLAUDE_CONFIG_DIR to the SAME FORBIDDEN_ENV list this
+  // file's constructor hands to privilegeDropperFor() — for every OTHER launch, correctly: a
+  // settings.json anywhere the CLI would look carries its own env block and apiKeyHelper. But
+  // ClaudeCodeBackend.exec is `this.privilege.wrap(exec)` (the constructor, unmodified by this
+  // file's own changes), and PrivilegeDropper.dropEnv() (privilege.js) strips its OWN copy of
+  // `forbiddenEnv` a SECOND time, independently, on whatever env phaseEnv() already produced —
+  // AFTER phaseEnv() has already applied and defended CLAUDE_CONFIG_DIR via
+  // ALLOWED_CREDENTIAL_TOKEN_KEYS. Fixing only phaseEnv()'s own re-strip (this file's local
+  // FORBIDDEN_ENV) would still lose CLAUDE_CONFIG_DIR at THIS second, independent layer — the actual
+  // bypass this test exists to catch is PRIVILEGE_DROP_FORBIDDEN_ENV being reverted to the raw
+  // FORBIDDEN_ENV constant (or dropped) at the constructor call site.
+  //
+  // This constructs a REAL PrivilegeDropper (not a fake `privilege` object) against `deployMode:
+  // 'host'` — the default — so `dropEnv()` genuinely runs: even when this process already IS the
+  // configured account (`plan.mode === 'no_drop'`, the common case for a test sandbox), dropEnv() is
+  // still called; only `deployMode: 'container'` (`passthrough`) would skip it.
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+    PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username,
+  });
+  const backend = new ClaudeCodeBackend({ config });
+  // Confirm the plan this test actually exercises isn't the container passthrough that would make
+  // the rest of this test vacuous.
+  const plan = await backend.privilege.plan();
+  assert.notEqual(plan.mode, 'passthrough', 'sanity: this test must exercise a real dropEnv() call');
+
+  const wrappedEnv = await backend.privilege.invocation(
+    config.backendExecutable, [], { env: backend.phaseEnv(['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude']) },
+  ).then((invocation) => invocation.options.env);
+  assert.equal(wrappedEnv.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude',
+    'CLAUDE_CONFIG_DIR must survive PrivilegeDropper.dropEnv() — the independent, second stripping pass PR19 added — not just phaseEnv()\'s own');
+});
+
+test('runner: REGRESSION — the resolved credential env reaches a REAL spawned process, not just a JS options object', async () => {
+  // Unlike the spy above (which only proves this code CONSTRUCTS the right options.env), this
+  // drives a genuine child process through Node's own execFile and reads back what that process's
+  // real environment actually contained — the same class of proof test/project-terminal-start.test.mjs
+  // and test/orch-session-credentials.test.mjs use via /proc/<pid>/environ for the tmux pane side of
+  // this same feature.
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+    // See the SECURITY REGRESSION test above: this spawns a live child process through the real
+    // PrivilegeDropper, so the drop target must be an account that actually exists on whatever host
+    // runs this test — the account this process is running as, not the production default.
+    PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username,
+  });
+  const exec = async (file, args, options) => {
+    if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+    if (args[0] === '--help') return { stdout: REAL_HELP, stderr: '' };
+    if (args[0] === 'auth') return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }), stderr: '' };
+    // The REAL child process: `env` genuinely reads its own live environment, unrelated to
+    // anything this test file constructed as a JS object.
+    const real = await execFileAsync('env', [], { env: options.env });
+    const dir = real.stdout.split('\n').find((l) => l.startsWith('CLAUDE_CONFIG_DIR='))?.slice('CLAUDE_CONFIG_DIR='.length) ?? '';
+    return { stdout: `${INIT_LINE}\n${JSON.stringify({ ...JSON.parse(RESULT_LINE), result: dir })}\n`, stderr: '' };
+  };
+  const backend = new ClaudeCodeBackend({ config, exec, clock: () => new Date('2026-07-27T12:00:00.000Z') });
+  backend.fingerprint = async () => FINGERPRINT;
+
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    credentialTokens: ['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  assert.equal(result.summary, '/srv/pw-users/alice/.claude',
+    'a REAL spawned process must have actually seen CLAUDE_CONFIG_DIR in its own environment');
 });
 
 test('runner: an abort is classified as cancellation, not as a timeout', () => {

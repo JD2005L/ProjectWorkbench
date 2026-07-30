@@ -23,6 +23,8 @@ import {
 } from './contract.js';
 import { laneNaming } from './config.js';
 import { resolveWorkspacePath } from './projects.js';
+import { defaultLaneCredentialResolver } from './lane-credentials.js';
+import { sessionCredentialState } from '../user-credentials.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -31,6 +33,12 @@ const execFileAsync = promisify(execFile);
 // name and does not occur in a filesystem path in practice.
 const FIELD_SEP = '<|pwsep|>';
 
+// Same non-secret session-level fingerprint app/server.js stamps — a lane's
+// tmux session is shared with human windows and must be judged against the
+// exact same per-user-credential identity contract they are (see
+// app/orchestrator/lane-credentials.js).
+const CRED_KEY_OPTION = '@pw_cred_key';
+
 /**
  * Pane commands that count as "an idle shell".
  *
@@ -38,6 +46,28 @@ const FIELD_SEP = '<|pwsep|>';
  * running anything else belongs to whoever started it.
  */
 const IDLE_SHELLS = Object.freeze(new Set(['bash', 'sh', 'zsh', 'dash', 'fish', 'ksh', '-bash', '-sh', '-zsh']));
+
+/**
+ * The pane launch command carrying the resolved per-user credential
+ * environment — `null` when there is nothing to apply (disabled mode, or the
+ * legitimate no-primaryUser/off case, where `cred.tokens` is empty), so the
+ * caller passes no `command` at all and tmux spawns its ordinary default
+ * shell, byte-identical to before this existed.
+ *
+ * Resolving credentials (see app/orchestrator/lane-credentials.js) only
+ * decides WHAT the pane should run under; without this, that decision was
+ * never applied anywhere — only its fingerprint got stamped, so a session
+ * could look correctly attributed while its pane ran under the shared/
+ * default login the whole time. Mirrors app/server.js's
+ * ensureProjectTmuxSession's identical construction (same `env KEY=VAL...
+ * bash <shellArgs>` shape, same unquoted join — these tokens are
+ * server-computed paths, not external input).
+ */
+function laneLaunchCommand(cred) {
+  if (!cred?.tokens?.length) return null;
+  const shellArgs = cred.shellArgs?.length ? cred.shellArgs : ['--noprofile', '--norc'];
+  return ['env', ...cred.tokens].join(' ') + ' bash ' + shellArgs.join(' ');
+}
 
 /** tmux user options carrying the lane's identity. Only this service ever writes them. */
 const MARKER = Object.freeze({
@@ -177,19 +207,74 @@ export class TmuxAdapter {
     // as a command by the pane's shell.
     await this.raw(['display-message', '-t', `=${session}:=${window}`, '-p', text]).catch(() => {});
   }
+
+  /**
+   * Reads the SESSION-level (not per-window) credential fingerprint stamp —
+   * the same @pw_cred_key option app/server.js stamps on sessions it creates,
+   * since this lane lives inside a session shared with human windows and
+   * must be judged against the exact same identity contract they are.
+   *
+   * Mirrors app/server.js's readSessionCredKey: omits -q deliberately, since
+   * that flag makes tmux collapse a genuinely-unset option and every OTHER
+   * kind of failure (session vanished, control-plane error, corrupt server)
+   * into the same empty-stdout/exit-0 result. Only tmux's own "invalid
+   * option" error counts as a real "nothing stamped" signal; anything else
+   * resolves ok:false, which callers must fail closed on — never coerce into
+   * "unstamped".
+   */
+  async getSessionCredKey(session) {
+    try {
+      // Deliberately NOT `=${session}`: unlike has-session/list-windows
+      // (name lookups, where the = prefix disambiguates an exact name from
+      // a prefix match), tmux's show-options/set-option -t target parser
+      // does not resolve a session by its `=name` form and reports "no such
+      // session" even when the session plainly exists — confirmed directly
+      // against a real tmux server. A bare session name is what
+      // app/server.js's own (already-proven) readSessionCredKey uses too.
+      const { stdout } = await this.raw(['show-options', '-t', session, '-v', CRED_KEY_OPTION]);
+      return { ok: true, key: String(stdout || '').trim() };
+    } catch (e) {
+      const stderr = String(e?.stderr || e?.message || '');
+      if (/invalid option/i.test(stderr)) return { ok: true, key: '' };
+      return { ok: false, error: stderr.trim() || String(e) };
+    }
+  }
+
+  /**
+   * Stamps the fingerprint AND reads it back to confirm the write actually
+   * landed — mirrors app/server.js's stampSessionCredKey. Throws (fail
+   * closed) if the set fails, or if the read-back does not match exactly.
+   */
+  async setSessionCredKey(session, key) {
+    await this.raw(['set-option', '-t', session, CRED_KEY_OPTION, key]);
+    const verify = await this.getSessionCredKey(session);
+    if (!verify.ok || verify.key !== key) {
+      throw new Error(`could not verify credential fingerprint stamp on session "${session}" (wrote ${JSON.stringify(key)}, read back ${verify.ok ? JSON.stringify(verify.key) : `unreadable: ${verify.error}`})`);
+    }
+  }
 }
 
 /**
  * Owns the lane lifecycle and the model/effort verification that gates every phase.
  */
 export class OrchestratorSessionManager {
-  constructor({ config, store, repo, tmux, backend, clock = () => new Date() }) {
+  constructor({
+    config, store, repo, tmux, backend, clock = () => new Date(),
+    // Resolves { key, tokens } for a project id — see
+    // app/orchestrator/lane-credentials.js. Defaults to the cheap, safe
+    // resolver that reads PW_PER_USER_CLAUDE straight from the environment
+    // and costs nothing when it is not enabled (the common case for a test
+    // that does not care about per-user credentials at all); production
+    // wiring (app/orchestrator/index.js) always injects the real one.
+    credentials = defaultLaneCredentialResolver,
+  }) {
     this.config = config;
     this.store = store;
     this.repo = repo;
     this.tmux = tmux;
     this.backend = backend;
     this.clock = clock;
+    this.credentials = credentials;
     // Per-lane serialisation. Concurrent ensures raced through the exists-check and each created a
     // window with the same name, after which the lane could not be addressed or repaired at all.
     this._laneLocks = new Map();
@@ -233,6 +318,46 @@ export class OrchestratorSessionManager {
   }
 
   /**
+   * Resolves the per-project credential context — the SAME resolution `ensureSession()` uses to
+   * decide the fingerprint it stamps on the lane's tmux pane. Exposed so a caller that spawns a
+   * coding-CLI process directly (the engine's `_runPhase`/`_runReview`, and this class's own
+   * `verifySession()`, none of which go through the tmux pane) applies EXACTLY what the lane is
+   * attributed as, rather than resolving its own possibly-drifted answer.
+   *
+   * SECURITY: resolving fresh on every call (by design — a genuinely stale session must always be
+   * caught) means the underlying identity CAN change between `ensureSession()` and a later call in
+   * the same job — a token rotated, `primaryUser` reassigned, or the feature toggled OFF. This
+   * unconditionally compares the freshly resolved fingerprint against what is CURRENTLY stamped on
+   * the project's lane session — via `sessionCredentialState()`, the exact same staleness logic
+   * `_ensureSession()` itself already uses, so "legitimately never stamped and currently off" is
+   * still recognised as current rather than reported as a phantom mismatch — and throws
+   * (fail-closed) on any real mismatch or an unreadable stamp, exactly as it throws on a
+   * resolution/materialization failure.
+   *
+   * An earlier version of this check skipped itself entirely whenever the FRESH resolution had no
+   * tokens (`cred.tokens.length === 0`), on the theory that disabled mode has nothing real to
+   * protect. That reasoning has it backwards for the enable-to-disable direction: a lane stamped
+   * for a REAL per-user identity, with the feature then toggled off (or `primaryUser` removed)
+   * mid-job, resolves to "off" — exactly the case that early return let through unchecked, letting a
+   * real spawned process run under the shared/default login while the pane's own stamp still
+   * claimed per-user attribution. There is no shortcut here: every resolution, in every direction,
+   * is checked against the stamp.
+   */
+  async resolveCredentials(projectId) {
+    const cred = await this.credentials(projectId);
+    const lane = this.laneFor({ project_id: projectId }, {});
+    const stamped = await this.tmux.getSessionCredKey(lane.tmuxSession);
+    if (!stamped.ok) {
+      throw new Error(`project "${projectId}"'s lane session credential fingerprint could not be verified (${stamped.error}) — refusing to run under a possibly-mismatched identity`);
+    }
+    const state = sessionCredentialState({ perUserEnabled: true, desiredKey: cred.key, stampedKey: stamped.key });
+    if (state.stale) {
+      throw new Error(`project "${projectId}"'s credential context has changed since its lane session was last verified (${state.reason}: stamped "${stamped.key}", now resolves to "${cred.key}") — refusing to run under a possibly-mismatched identity`);
+    }
+    return cred;
+  }
+
+  /**
    * Create or adopt the project's orchestrator lane.
    *
    * Returns `status: missing` on first creation. A lane becomes `ready` only once
@@ -251,13 +376,84 @@ export class OrchestratorSessionManager {
     );
     const workspacePath = resolveWorkspacePath(this.config, project);
 
+    // Resolve the project's CURRENT per-user credential context (see
+    // app/orchestrator/lane-credentials.js) unconditionally, BEFORE touching
+    // the session at all — for a fresh session this is what must be stamped
+    // once it exists; for an existing one it is exactly what its stamped
+    // fingerprint must match before this lane is allowed to touch it. Throws
+    // (fail-closed) on any resolution/materialization failure — this lane
+    // never falls back to the shared login on a failure any more than
+    // app/server.js's own credentialContext() does.
+    let cred;
+    try {
+      cred = await this.credentials(project.project_id);
+    } catch (e) {
+      throw new ApiError(
+        ErrorCode.WORKBENCH_UNAVAILABLE,
+        `cannot resolve the current credential context for project "${project.project_id}": ${e?.message || e}`,
+      );
+    }
+
     // The project's tmux session is shared with human windows. Create it only if absent, and never
     // recreate it: doing so would kill every window an operator has open.
-    if (!(await this.tmux.hasSession(lane.tmuxSession))) {
-      await this.tmux.newSession(lane.tmuxSession, workspacePath);
+    const sessionExisted = await this.tmux.hasSession(lane.tmuxSession);
+    if (!sessionExisted) {
+      await this.tmux.newSession(lane.tmuxSession, workspacePath, laneLaunchCommand(cred));
       // The session's initial window is a plain shell, not the lane. Rename it so it cannot be
       // mistaken for one and so the lane is always created explicitly, marked, below.
       await this.tmux.raw(['rename-window', '-t', `=${lane.tmuxSession}:0`, 'shell']).catch(() => {});
+      // Stamp the fingerprint before ANY window (let alone the lane) is
+      // created in this brand-new session, and verify the read-back — a
+      // session whose stamp cannot be confirmed must not be used as though
+      // it were correctly attributed.
+      try {
+        await this.tmux.setSessionCredKey(lane.tmuxSession, cred.key);
+      } catch (e) {
+        throw new ApiError(
+          ErrorCode.WORKBENCH_UNAVAILABLE,
+          `project "${project.project_id}": could not verify the credential fingerprint stamp on its freshly created session: ${e?.message || e}`,
+        );
+      }
+    } else {
+      // An EXISTING session must have its stamp verified against the
+      // CURRENT credential context before this lane touches it at all —
+      // never mix identities. Unreadable/corrupt is fail-closed exactly like
+      // a resolution failure; a genuine mismatch (owner rotated a token, was
+      // reassigned, or the feature was toggled) is refused with an
+      // actionable conflict rather than silently proceeding under a stale
+      // identity.
+      const stamped = await this.tmux.getSessionCredKey(lane.tmuxSession);
+      if (!stamped.ok) {
+        throw new ApiError(
+          ErrorCode.WORKBENCH_UNAVAILABLE,
+          `project "${project.project_id}": the existing session's credential fingerprint could not be verified (${stamped.error})`,
+        );
+      }
+      // cred.key already reflects the fully-resolved desired state (a real
+      // fingerprint, or CREDENTIALS_OFF ONLY for the legitimate
+      // PW_PER_USER_CLAUDE-disabled case — this.credentials already fails
+      // closed on every other "off-looking" case, including no primaryUser)
+      // — perUserEnabled: true here just means "trust desiredKey as-is", not
+      // a re-statement of the feature flag.
+      const state = sessionCredentialState({ perUserEnabled: true, desiredKey: cred.key, stampedKey: stamped.key });
+      if (state.stale) {
+        throw new ApiError(
+          ErrorCode.CONFLICT,
+          `project "${project.project_id}"'s existing session credentials are stale (${state.reason}) relative to the current owner — refusing to touch it under a possibly-mismatched identity`,
+        );
+      }
+      if (!stamped.key) {
+        // Legitimately never stamped and nothing to be stale about (a
+        // session created before this feature existed, or genuinely off):
+        // adopt the stamp now, same upgrade-hygiene as app/server.js's
+        // ensureTmuxSession.
+        await this.tmux.setSessionCredKey(lane.tmuxSession, cred.key).catch((e) => {
+          throw new ApiError(
+            ErrorCode.WORKBENCH_UNAVAILABLE,
+            `project "${project.project_id}": could not verify the credential fingerprint stamp on its existing session: ${e?.message || e}`,
+          );
+        });
+      }
     }
 
     const existing = (await this.tmux.listWindows(lane.tmuxSession))
@@ -304,47 +500,63 @@ export class OrchestratorSessionManager {
           );
         }
 
-        // Re-mark in place rather than killing and recreating: the window is ours, and replacing it
-        // would be a gratuitous change to what the operator is looking at.
-        await this.tmux.setWindowOptionById(existing.id, MARKER.ROLE, lane.role);
-        await this.tmux.setWindowOptionById(existing.id, MARKER.PROJECT, project.project_id);
-        await this.tmux.setWindowOptionById(existing.id, MARKER.SESSION_KEY, sessionKey);
-        await this.tmux.setWindowOptionById(existing.id, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
+        if (cred.tokens.length > 0) {
+          // A restored plain shell cannot be carrying the per-user credential environment this
+          // project currently resolves to: pw-tmux-restore recreated this window from a saved
+          // manifest, before this lane ever launched it, so whatever process is running in it was
+          // never handed CLAUDE_CONFIG_DIR. Re-marking it in place would make it LOOK correctly
+          // attributed — the marker matches, and the session's own @pw_cred_key was already
+          // verified above — while the pane itself keeps running under the shared/default login.
+          // That gap is exactly what this feature exists to prevent, so a fresh relaunch through
+          // the SAME path a brand-new lane takes (below, via the shared replaced-record bookkeeping)
+          // is required here instead of the disabled-mode re-mark-in-place below.
+          await this.tmux.killWindowById(existing.id);
+          laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
+          replaced = true;
+        } else {
+          // Disabled mode (or the legitimate no-primaryUser case): a plain shell IS the correct
+          // environment, so re-marking in place — rather than a gratuitous kill+recreate — is
+          // exactly right, unchanged from before per-user credential application existed.
+          await this.tmux.setWindowOptionById(existing.id, MARKER.ROLE, lane.role);
+          await this.tmux.setWindowOptionById(existing.id, MARKER.PROJECT, project.project_id);
+          await this.tmux.setWindowOptionById(existing.id, MARKER.SESSION_KEY, sessionKey);
+          await this.tmux.setWindowOptionById(existing.id, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
 
-        const reclaimed = {
-          ...recorded,
-          // A restored shell has verified nothing: whatever the pre-reboot session knew is gone.
-          effective: null,
-          last_verified_at: null,
-          cli_session_id: null,
-          status: OrchestratorSessionStatus.MISSING,
-          last_used_at: this.now(),
-          lane_window_id: existing.id,
-          reclaimed_at: this.now(),
-        };
-        await this.store.transact((tx) => { this.repo.putSession(tx, reclaimed); });
-        return this._publicSession(reclaimed);
-      }
+          const reclaimed = {
+            ...recorded,
+            // A restored shell has verified nothing: whatever the pre-reboot session knew is gone.
+            effective: null,
+            last_verified_at: null,
+            cli_session_id: null,
+            status: OrchestratorSessionStatus.MISSING,
+            last_used_at: this.now(),
+            lane_window_id: existing.id,
+            reclaimed_at: this.now(),
+          };
+          await this.store.transact((tx) => { this.repo.putSession(tx, reclaimed); });
+          return this._publicSession(reclaimed);
+        }
+      } else {
+        if (existing.orchestrator && existing.orchestrator !== token.orchestrator_instance_id) {
+          // The lane belongs to a *different* orchestrator instance. Uniqueness is enforced on
+          // (orchestrator, workbench, project, role), so this is a conflict, not a takeover.
+          throw new ApiError(
+            ErrorCode.CONFLICT,
+            'the reserved window is held by a different orchestrator instance',
+          );
+        }
 
-      if (markedByUs && existing.orchestrator && existing.orchestrator !== token.orchestrator_instance_id) {
-        // The lane belongs to a *different* orchestrator instance. Uniqueness is enforced on
-        // (orchestrator, workbench, project, role), so this is a conflict, not a takeover.
-        throw new ApiError(
-          ErrorCode.CONFLICT,
-          'the reserved window is held by a different orchestrator instance',
-        );
-      }
-
-      const stale = !ownedByThisLane || existing.paneCurrentPath !== workspacePath;
-      if (stale || request.force_replace) {
-        // By id: the window was resolved from an exact-name match in listWindows, and killing by
-        // name would reintroduce the index ambiguity this whole path exists to avoid.
-        await this.tmux.killWindowById(existing.id);
-        laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token);
-        replaced = true;
+        const stale = !ownedByThisLane || existing.paneCurrentPath !== workspacePath;
+        if (stale || request.force_replace) {
+          // By id: the window was resolved from an exact-name match in listWindows, and killing by
+          // name would reintroduce the index ambiguity this whole path exists to avoid.
+          await this.tmux.killWindowById(existing.id);
+          laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
+          replaced = true;
+        }
       }
     } else {
-      laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token);
+      laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
     }
 
     const prior = this.store.get('sessions', sessionKey);
@@ -390,9 +602,9 @@ export class OrchestratorSessionManager {
    * touch forever, including under force_replace. Marking under a scratch name and renaming last
    * means the reserved name only ever appears on a window that is already marked.
    */
-  async _createLane(lane, workspacePath, project, sessionKey, token) {
+  async _createLane(lane, workspacePath, project, sessionKey, token, cred) {
     const scratch = `${lane.reservedWindow}_new`;
-    await this.tmux.newWindow(lane.tmuxSession, scratch, workspacePath);
+    await this.tmux.newWindow(lane.tmuxSession, scratch, workspacePath, laneLaunchCommand(cred));
     const created = await this.tmux.findWindow(lane.tmuxSession, scratch);
     if (!created) throw new ApiError(ErrorCode.CONFLICT, 'the orchestrator lane could not be created');
 
@@ -421,6 +633,20 @@ export class OrchestratorSessionManager {
       throw notFound('no such orchestrator session on this instance');
     }
 
+    // Resolved fresh via resolveCredentials() — the SAME resolution ensureSession() uses to decide
+    // the fingerprint stamped on the lane, cross-checked against that exact stamp — and applied to
+    // the verification probe itself: checking sign-in status and effective model/effort under a
+    // DIFFERENT identity than the one that will actually run the job would make "verified" attest
+    // to nothing. A resolution failure OR a drifted identity (the stamp no longer matches a fresh
+    // resolution) is reported exactly like a backend-query failure (below): unverifiable, never
+    // silently probed under a substituted login.
+    let cred;
+    try {
+      cred = await this.resolveCredentials(project.project_id);
+    } catch (e) {
+      return this._verificationResponse(record, null, `cannot resolve the current credential context: ${e?.message || e}`, null);
+    }
+
     let outcome;
     try {
       outcome = await this.backend.verifyConfiguration({
@@ -430,6 +656,7 @@ export class OrchestratorSessionManager {
         cliSessionId: record.cli_session_id,
         cwd: record.workspace_path,
         displayName: record.cli_display_name,
+        credentialTokens: cred.tokens,
         // The version the CALLER spoke. A peer that cannot express provenance is not told a setting
         // is effective when the only basis is launch enforcement.
         //
