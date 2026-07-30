@@ -1392,6 +1392,22 @@ export class OrchestrationEngine {
   // -------------------------------------------------------------------------
 
   /**
+   * Strip the fields a publication record carries only for this engine's own use before it reaches
+   * ANY caller — the happy path already excluded these from what gets persisted and returned;
+   * `steps` (raw-ish per-command output, redacted but still internal), `failure_reason` (present on
+   * every `_failed()`-shaped record but not part of the wire contract), and `terminationConfirmed`
+   * (an ephemeral verdict for THIS engine's own lease-fencing decision, never a fact about the
+   * publication itself) must never reach an MCP tool result or a REST response, regardless of which
+   * of `publish`'s several return paths produced the record — a lease denial and a cancellation
+   * raced mid-publish previously returned the raw record unstripped, on paths the happy-path
+   * destructuring never touched.
+   */
+  _publicPublicationRecord(record) {
+    const { steps: _steps, failure_reason: _failureReason, terminationConfirmed: _terminationConfirmed, ...rest } = record;
+    return rest;
+  }
+
+  /**
    * Publish under a recorded approval.
    *
    * Idempotent by key, because a retried publish must not produce a second commit. The approval is
@@ -1451,7 +1467,9 @@ export class OrchestrationEngine {
     const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
     if (!lease) {
       const blocked = this.repo.getJob(jobId);
-      return this.publisher.refusedRecord(blocked, blocked.detail ?? 'the project write lease could not be acquired');
+      return this._publicPublicationRecord(
+        this.publisher.refusedRecord(blocked, blocked.detail ?? 'the project write lease could not be acquired'),
+      );
     }
 
     // Registered exactly like a coding-phase worker: `cancelJob` finds this job in `_running` and
@@ -1517,7 +1535,7 @@ export class OrchestrationEngine {
     // that raced ahead and recorded `completed`/`blocked_project_state` here too would either
     // overwrite that verdict or claim a publication `cancelJob` never confirmed was safe to stop,
     // whichever transition happened to land last.
-    if (this._cancelled(jobId)) return record;
+    if (this._cancelled(jobId)) return this._publicPublicationRecord(record);
 
     const artifact = await this.artifacts.write({
       jobId, kind: ArtifactKind.LOG, name: 'publication.log',
@@ -1525,7 +1543,8 @@ export class OrchestrationEngine {
       summary: record.remote_sha_verified ? 'published and verified' : (record.failure_reason ?? 'publication incomplete'),
     });
 
-    const { steps: _steps, failure_reason: failureReason, terminationConfirmed, ...publicRecord } = record;
+    const { failure_reason: failureReason, terminationConfirmed } = record;
+    const publicRecord = this._publicPublicationRecord(record);
 
     await this.store.transact((tx, state) => {
       tx.put(KIND.PUBLICATIONS, publicRecord.publication_id, publicRecord);

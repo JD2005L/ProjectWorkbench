@@ -453,6 +453,11 @@ gitTest('publish: a competing lease blocks publication before any git runs — n
 
     const blocked = record instanceof ApiError || record.pushed === false;
     assert.ok(blocked, 'publication must not proceed while another job holds the write lease');
+    if (!(record instanceof ApiError)) {
+      assert.equal('terminationConfirmed' in record, false,
+        'an internal-only verdict must never reach an MCP/REST caller of publish');
+      assert.equal('steps' in record, false, 'raw per-command step output must never reach the wire either');
+    }
 
     // Nothing was staged or committed — the block happened before any git ran, not after a commit
     // that then failed to push.
@@ -562,13 +567,21 @@ gitTest('publish: cancelling mid-push fences the project rather than confirming 
       token: SUBMITTER, jobId,
       body: { workbench_job_id: jobId, reason: 'operator changed their mind mid-push' },
     });
-    await publishPromise;
+    const publishResult = await publishPromise;
 
     // Never a false "cancelled" while the push could not be confirmed dead.
     assert.notEqual(cancelled.status, JobStatus.CANCELLED,
       'cancellation must not be confirmed while an in-flight push could not be confirmed killed');
     assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
     assert.equal(repo.getJob(jobId).termination_confirmed, false);
+
+    // publish()'s own return value — what an MCP/REST caller actually receives — must not carry the
+    // internal verdict either, even on the path raced by a concurrent cancellation.
+    if (!(publishResult instanceof ApiError)) {
+      assert.equal('terminationConfirmed' in publishResult, false,
+        'a cancellation racing publish must not leak the internal verdict to the caller');
+      assert.equal('steps' in publishResult, false);
+    }
 
     // The project is fenced, not merely released — a later job must not be able to walk into the
     // same checkout while the aborted push is unaccounted for.
@@ -583,6 +596,67 @@ gitTest('publish: cancelling mid-push fences the project rather than confirming 
     // Nothing reached the remote — the push never actually completed.
     const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
     assert.equal(branches.stdout.trim(), '', 'an aborted push must not have landed on the remote');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: an unconfirmed kill re-staging the real index fences the project through the whole engine, not a false success', async () => {
+  // The exact production-shaped reproduction: the post-commit real-index `add` is a "best effort"
+  // call whose result Publisher used to discard outright, so a kill there was invisible all the way
+  // up — the record reported `terminationConfirmed: null, remote_sha_verified: true`, and the engine,
+  // having nothing to react to, released the lease instead of fencing it.
+  await withEngine(async ({
+    engine, repo, repoDir, remote, config, store, backend, sessionManager, artifacts, checkRunner, projectStore,
+  }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // The SECOND `add` invocation is the post-commit real-index re-stage; the first stages into the
+    // private index before the commit and must succeed normally.
+    let addCalls = 0;
+    const exec = async (file, argv, options) => {
+      if (argv[0] === 'add') {
+        addCalls += 1;
+        if (addCalls === 2) {
+          const err = new Error('killed, unconfirmed');
+          err.killed = true; err.signal = 'SIGTERM'; err.terminationConfirmed = false;
+          throw err;
+        }
+      }
+      return execFileAsync(file, argv, options);
+    };
+
+    const engineWithExec = new OrchestrationEngine({
+      config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, exec,
+    });
+
+    const record = await engineWithExec.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+
+    assert.equal(record.remote_sha_verified, false,
+      'the record must never claim a verified remote publication alongside an unconfirmed kill');
+    assert.equal(record.pushed, false, 'push must never run after an unconfirmed kill upstream of it');
+
+    const job = repo.getJob(jobId);
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'the engine must fence rather than release when publish reports an unconfirmed kill');
+
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
   }, { backendOptions: ATTESTING });
 });
 

@@ -556,6 +556,84 @@ code changed in this round's Parts A/B/C and the self-review fixes, all after 22
 * **Process hygiene.** `pgrep -af "sleep 60|sleep MARKER|setsid"` after the root runs found nothing —
   no leaked descendant from this round's adversarial real-process tests.
 
+## Round 5 — Publisher's own subprocesses still lost the verdict on three paths, and two return paths leaked it to the wire
+
+An independent final review reproduced a production-shaped case: the post-commit real-index `git add`
+(a "best effort" call whose result Part B's `_publishWithIndex` never even looked at) was killed and
+came back unconfirmed, and the record `Publisher.publish` returned still reported
+`{ terminationConfirmed: null, remote_sha_verified: true }` — the kill was invisible, so the engine's
+`_guardTermination` (checking for exactly `false`) had nothing to react to and released the lease
+instead of fencing it. Re-auditing every subprocess `Publisher` runs — not only the three named in the
+report — found exactly three untracked paths, all missed by Part B's `note()` accumulator because they
+sit outside `_publishWithIndex`'s main sequence or are treated as "best effort":
+
+1. `_privateIndex`'s `read-tree` (runs in `publish()`, before `_publishWithIndex` starts at all).
+2. The post-commit real-index re-stage `add` (result previously discarded outright — not even checked
+   for `.ok`, let alone a termination verdict).
+3. `_pullRequest`'s `gh pr create`/`gh pr view` — a wholly separate exec path whose own `catch` never
+   attached a termination verdict to begin with, so there was nothing for a caller to propagate even
+   if it had tried.
+
+* **Redesign, not a patch: stop immediately, never accumulate past a kill.** Rather than let every
+  subprocess run to completion and merely flag the record `terminationConfirmed: false` at the end (the
+  round-4 design, which is exactly how `remote_sha_verified: true` and `terminationConfirmed: false`
+  could coexist in the same record), `_publishWithIndex`'s `note()` now throws the moment ANY result —
+  git or `gh` — comes back unconfirmed, caught by a wrapping `try/catch` that immediately returns a
+  `_failed()`-shaped record (which is always `remote_sha_verified: false`, `pushed: false`). No later
+  command runs, and no later success can overwrite the verdict. `_privateIndex` now surfaces its own
+  verdict (previously it returned only the scratch path, discarding the `read-tree` result outright),
+  and `publish()` checks it before `_publishWithIndex` is ever entered. `_pullRequest`'s `gh()` closure
+  now reads `err?.terminationConfirmed` off a killed launch exactly like `runGit` already does, and
+  every one of its return paths (including the two "ordinary gh failure" early returns) carries the
+  accumulated verdict; `_publishWithIndex` folds it in via the same `note()` — meaning a kill in the
+  informational PR step, reached only AFTER push and remote-SHA verification already genuinely
+  succeeded, still forces the final record to refuse `remote_sha_verified: true`. The safest reading of
+  "never claim remote verification" is that ANY unconfirmed subprocess in the attempt disqualifies the
+  claim, not only one on the load-bearing path.
+* **Ordinary (non-kill) failures on all three paths remain tolerated, exactly as before** — an unborn
+  HEAD still seeds an empty index and proceeds, the re-stage `add`'s own failure is still best-effort
+  and does not stop a push that already succeeded, and `gh` being unavailable/unconfigured still
+  reports `null` PR fields rather than blocking anything. `note()` only reacts to
+  `terminationConfirmed === false`, never to an ordinary non-zero exit — the same discriminator every
+  other guard in this codebase already uses.
+* **Two return paths in `engine.js` leaked the internal verdict to the wire.** The happy path already
+  stripped `terminationConfirmed`/`failure_reason`/`steps` before persisting and returning a record, but
+  two OTHER return points in `publish`/`_runPublication` bypassed that destructuring entirely: a
+  lease-denial refusal (`return this.publisher.refusedRecord(...)`) and a cancellation racing publish
+  (`return record;`) both returned the raw `Publisher` record unstripped — and neither `mcp.js`'s
+  `pw_publish` handler nor `api.js`'s `POST /jobs/:id/publish` route does any stripping of its own, so
+  both would have reached an external MCP/REST caller directly. Extracted the existing exclusion set
+  into a shared `_publicPublicationRecord(record)` helper and applied it at both leak points, so every
+  return path — happy, lease-denied, cancelled-mid-publish, and the `_guardTermination`-fenced path —
+  goes through the same one place.
+* **RED, then GREEN.** 5 new `Publisher`-level unit tests in `orch-termination-verdict.test.mjs` (real
+  git repos, a fake `exec` killing exactly one targeted call): the three unconfirmed-kill paths each
+  stop immediately, propagate `terminationConfirmed: false`, and leave nothing on the remote; the two
+  ordinary-failure regression tests (unborn HEAD, `gh` unavailable) prove tolerance is unchanged. One
+  new engine-level integration test reproduces the reviewer's exact scenario end-to-end (kill the
+  second `add` call through the full engine) and confirms the fenced/released result directly — RED
+  against the pre-fix code (`remote_sha_verified: true` reproduced verbatim), GREEN after. Two more
+  assertions added to the existing competing-lease and mid-push-cancellation tests confirm neither
+  `terminationConfirmed` nor `steps` appears on `publish()`'s own return value — both RED against the
+  pre-fix `engine.js` (confirmed via `git stash` of just that file), GREEN after.
+* **GREEN.** `orch-termination-verdict.test.mjs` 23/23. `orch-p1-regressions.test.mjs` 36/36.
+  `orch-engine.test.mjs` 29/29.
+
+## Final verification, round 5
+
+App VERSION bumped `1.26.0730.0035` → `1.26.0730.0225` (forward; `publish.js`/`engine.js` changed again
+in this round). `test/release-version.test.mjs` 4/4.
+
+* **Full suite, as admin:** 514 pass, 3 skipped (identity-required), 0 fail, run twice clean. A third
+  admin run hit one flaky, timing-sensitive real-process test
+  (`orch-privilege-real.test.mjs`'s "wrapCommand kills a setsid-detached, SIGTERM-ignoring descendant a
+  repository check left behind") — unrelated to this round's `publish.js`/`engine.js` changes, passed
+  3/3 in isolation immediately after; consistent with the same shared-container contention already
+  documented in round 4's final verification, not a regression.
+* **Full suite, as real root, `PW_TEST_DROP_USER=admin`:** **517 pass, 0 skipped, 0 fail.**
+* **`git diff --check`** against the merge-base with `origin/main`: clean.
+* **Syntax.** `node --check` on `publish.js`, `engine.js`, and both changed test files: clean.
+
 ## Remaining limitations (stated, not fixed)
 
 1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no

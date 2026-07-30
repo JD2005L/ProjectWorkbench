@@ -77,7 +77,9 @@ export class Publisher {
       // An unborn HEAD (a repository with no commits) leaves an empty index, which is correct.
       try { fs.rmSync(scratch, { force: true }); } catch { /* nothing to remove */ }
     }
-    return scratch;
+    // Surfaced alongside the scratch path rather than swallowed here: this runs before
+    // `_publishWithIndex` even starts, so its own `terminationConfirmed` accumulator never saw it.
+    return { scratch, terminationConfirmed: seeded.terminationConfirmed };
   }
 
   /**
@@ -114,7 +116,13 @@ export class Publisher {
       return result;
     };
 
-    const index = await this._privateIndex(workspacePath, signal);
+    const { scratch: index, terminationConfirmed: indexVerdict } = await this._privateIndex(workspacePath, signal);
+    if (indexVerdict === false) {
+      // Nothing has been staged or committed yet — stop before `_publishWithIndex` ever starts,
+      // rather than proceed on an index whose own seeding could not be confirmed dead.
+      try { fs.rmSync(index, { force: true }); } catch { /* nothing to remove */ }
+      return this._failed(job, 'seeding the private index could not confirm a kill was actually dead', steps, false);
+    }
     try {
       return await this._publishWithIndex({
         job, project, workspacePath, request, steps, record, index, signal,
@@ -126,117 +134,135 @@ export class Publisher {
   }
 
   async _publishWithIndex({ job, project, workspacePath, request, steps, record, index, signal }) {
-    // Every git call this method makes is folded through here, so a single unconfirmed kill
-    // anywhere in the sequence — commit, push, the post-push verification, any of it — marks the
-    // whole publication attempt unconfirmed. The engine fences rather than releases on `false`; a
-    // `git push` is exactly as capable of backgrounding something of its own as any other command
-    // this subsystem runs, and a command aborted mid-push is the load-bearing case here.
+    // Every subprocess this method runs — every `_git` call AND every `gh` call inside
+    // `_pullRequest` — is folded through `note()`, and the FIRST one that comes back unconfirmed
+    // stops the whole attempt immediately: no later command runs, and no later success (a push that
+    // already landed, a remote SHA that already matched) can overwrite the verdict or let the record
+    // claim `remote_sha_verified: true` alongside it. A kill nobody could confirm is exactly as
+    // capable of leaving a live descendant mid-stage, mid-commit, mid-push, or mid-`gh` as anywhere
+    // else in this subsystem, and this is the one place all of it funnels through.
     let terminationConfirmed = null;
+    const UNCONFIRMED_KILL = Symbol('publisher-unconfirmed-kill');
     const note = (result) => {
-      if (result.terminationConfirmed === false) terminationConfirmed = false;
+      if (result.terminationConfirmed === false) {
+        terminationConfirmed = false;
+        throw UNCONFIRMED_KILL;
+      }
       return result;
     };
     const failed = (reason) => this._failed(job, reason, steps, terminationConfirmed);
 
-    // -- stage only the intended files ------------------------------------
-    // `--` separates paths from revisions, so a filename can never be read as a ref or an option.
-    const add = note(record('add', await this._git(['add', '--', ...request.intended_files], workspacePath, index, signal)));
-    if (!add.ok) return failed('the intended files could not be staged');
+    try {
+      // -- stage only the intended files ------------------------------------
+      // `--` separates paths from revisions, so a filename can never be read as a ref or an option.
+      const add = note(record('add', await this._git(['add', '--', ...request.intended_files], workspacePath, index, signal)));
+      if (!add.ok) return failed('the intended files could not be staged');
 
-    // -- verify what is actually staged -----------------------------------
-    // `-z` because git quotes non-ASCII paths in its default output ("caf\303\251.txt"), and
-    // `--no-renames` because a rename otherwise reports only the destination — both made the
-    // comparison fail for changes that were entirely legitimate.
-    const staged = note(await this._git(['diff', '--cached', '--name-only', '-z', '--no-renames'], workspacePath, index, signal));
-    const stagedFiles = staged.stdout.split('\0').filter(Boolean).sort();
-    const intended = [...new Set(request.intended_files)].sort();
+      // -- verify what is actually staged -----------------------------------
+      // `-z` because git quotes non-ASCII paths in its default output ("caf\303\251.txt"), and
+      // `--no-renames` because a rename otherwise reports only the destination — both made the
+      // comparison fail for changes that were entirely legitimate.
+      const staged = note(await this._git(['diff', '--cached', '--name-only', '-z', '--no-renames'], workspacePath, index, signal));
+      const stagedFiles = staged.stdout.split('\0').filter(Boolean).sort();
+      const intended = [...new Set(request.intended_files)].sort();
 
-    // The staged set must be a subset of the intended set. Equality is too strong: intending both
-    // sides of a rename is correct even though only one side may show as changed.
-    const unintended = stagedFiles.filter((f) => !intended.includes(f));
-    if (unintended.length) {
-      return failed(`${unintended.length} file(s) were staged that were not intended`);
+      // The staged set must be a subset of the intended set. Equality is too strong: intending both
+      // sides of a rename is correct even though only one side may show as changed.
+      const unintended = stagedFiles.filter((f) => !intended.includes(f));
+      if (unintended.length) {
+        return failed(`${unintended.length} file(s) were staged that were not intended`);
+      }
+      if (!stagedFiles.length) {
+        return failed('there is nothing to publish');
+      }
+
+      // -- commit -----------------------------------------------------------
+      // No -a: only the explicitly staged set is committed. An `-a` here would sweep up every other
+      // dirty file in the operator's checkout.
+      const commit = note(record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath, index, signal)));
+      if (!commit.ok) {
+        // Name the cause. "the commit failed" sent an operator hunting through artifacts for what was
+        // often a one-line git message.
+        const why = redactText(String(commit.stderr || commit.stdout || ''), { maxLength: 160 }).trim();
+        return failed(why ? `the commit failed: ${why}` : 'the commit failed');
+      }
+
+      const localHead = note(await this._git(['rev-parse', 'HEAD'], workspacePath, null, signal));
+      const localCommit = localHead.stdout.trim();
+      if (!FULL_SHA.test(localCommit)) return failed('the local commit could not be determined');
+
+      // The commit was made from a private index, so the repository's own index still holds the
+      // pre-publication version of the published files. Relative to the NEW HEAD that reads as a
+      // staged *reversion* — an operator running `git status` would see the change queued to be
+      // undone. Re-staging exactly the published paths against the real index brings it back into
+      // agreement with HEAD, and touches nothing else the operator had staged.
+      //
+      // Only on success. A failed publication still never touches the real index at all. This is a
+      // "best effort" tidy-up — its own ordinary failure does not stop publication, which already
+      // succeeded by this point — but an unconfirmed kill here is exactly as real as one anywhere
+      // else, and must not be dropped just because the call is otherwise best-effort.
+      note(await this._git(['add', '--', ...request.intended_files], workspacePath, null, signal));
+
+      // -- push -------------------------------------------------------------
+      // An explicit refspec, never a bare `git push`: what gets pushed must not depend on the
+      // repository's push configuration.
+      const push = note(record('push', await this._git(['push', 'origin', `HEAD:refs/heads/${request.branch}`], workspacePath, null, signal)));
+      const pushed = push.ok;
+
+      // -- verify the remote actually has it --------------------------------
+      let remoteCommit = null;
+      if (pushed) {
+        const lsRemote = note(await this._git(['ls-remote', 'origin', `refs/heads/${request.branch}`], workspacePath, null, signal));
+        const candidate = lsRemote.stdout.split(/\s+/)[0]?.trim() ?? '';
+        if (FULL_SHA.test(candidate)) remoteCommit = candidate;
+      }
+      // Only an exact full-SHA match counts. Abbreviations are refused by the type; a mismatch here
+      // means the branch on the remote is not the commit that was just made.
+      const remoteShaVerified = Boolean(pushed && remoteCommit && localCommit === remoteCommit);
+
+      // -- the live pull request --------------------------------------------
+      let pullRequest = { url: null, state: null, headSha: null, mergeable: null, ciState: CiState.NOT_STARTED };
+      if (remoteShaVerified && request.open_pull_request) {
+        // `note()` here means a kill in the informational PR step also stops the record from
+        // claiming `remote_sha_verified: true`, even though the push itself already genuinely
+        // succeeded — the safest reading of "never claim remote verification" once ANY subprocess
+        // this attempt ran could not be confirmed dead.
+        pullRequest = note(await this._pullRequest(workspacePath, request.branch, project, signal));
+      } else if (!project.has_ci) {
+        pullRequest.ciState = CiState.NOT_CONFIGURED;
+      }
+
+      // `-z` again: the published file list is compared against the intended one and shown to a
+      // human, so it must carry real filenames rather than git's quoted escapes.
+      const changed = note(await this._git(
+        ['show', '--numstat', '-z', '--no-renames', '--format=', localCommit], workspacePath, null, signal,
+      ));
+      const { files, insertions, deletions, changedFiles } = parseNumstatZ(changed.stdout);
+
+      return {
+        schema_version: SCHEMA_VERSION,
+        publication_id: newId('pwpub'),
+        job_id: job.workbench_job_id,
+        branch: request.branch,
+        local_commit: localCommit,
+        remote_commit: remoteCommit,
+        pushed,
+        remote_sha_verified: remoteShaVerified,
+        pull_request_url: pullRequest.url,
+        pull_request_state: pullRequest.state,
+        pull_request_head_sha: pullRequest.headSha,
+        mergeable: pullRequest.mergeable,
+        ci_state: pullRequest.ciState,
+        diff_stat: { schema_version: SCHEMA_VERSION, files, insertions, deletions },
+        changed_files: changedFiles.slice(0, 200),
+        recorded_at: this.clock().toISOString(),
+        terminationConfirmed,
+        steps,
+      };
+    } catch (err) {
+      if (err !== UNCONFIRMED_KILL) throw err;
+      return failed('a git or gh command could not be confirmed dead after a kill; publication stopped immediately');
     }
-    if (!stagedFiles.length) {
-      return failed('there is nothing to publish');
-    }
-
-    // -- commit -----------------------------------------------------------
-    // No -a: only the explicitly staged set is committed. An `-a` here would sweep up every other
-    // dirty file in the operator's checkout.
-    const commit = note(record('commit', await this._git(['commit', '-m', request.commit_message], workspacePath, index, signal)));
-    if (!commit.ok) {
-      // Name the cause. "the commit failed" sent an operator hunting through artifacts for what was
-      // often a one-line git message.
-      const why = redactText(String(commit.stderr || commit.stdout || ''), { maxLength: 160 }).trim();
-      return failed(why ? `the commit failed: ${why}` : 'the commit failed');
-    }
-
-    const localHead = note(await this._git(['rev-parse', 'HEAD'], workspacePath, null, signal));
-    const localCommit = localHead.stdout.trim();
-    if (!FULL_SHA.test(localCommit)) return failed('the local commit could not be determined');
-
-    // The commit was made from a private index, so the repository's own index still holds the
-    // pre-publication version of the published files. Relative to the NEW HEAD that reads as a
-    // staged *reversion* — an operator running `git status` would see the change queued to be
-    // undone. Re-staging exactly the published paths against the real index brings it back into
-    // agreement with HEAD, and touches nothing else the operator had staged.
-    //
-    // Only on success. A failed publication still never touches the real index at all.
-    await this._git(['add', '--', ...request.intended_files], workspacePath, null, signal);
-
-    // -- push -------------------------------------------------------------
-    // An explicit refspec, never a bare `git push`: what gets pushed must not depend on the
-    // repository's push configuration.
-    const push = note(record('push', await this._git(['push', 'origin', `HEAD:refs/heads/${request.branch}`], workspacePath, null, signal)));
-    const pushed = push.ok;
-
-    // -- verify the remote actually has it --------------------------------
-    let remoteCommit = null;
-    if (pushed) {
-      const lsRemote = note(await this._git(['ls-remote', 'origin', `refs/heads/${request.branch}`], workspacePath, null, signal));
-      const candidate = lsRemote.stdout.split(/\s+/)[0]?.trim() ?? '';
-      if (FULL_SHA.test(candidate)) remoteCommit = candidate;
-    }
-    // Only an exact full-SHA match counts. Abbreviations are refused by the type; a mismatch here
-    // means the branch on the remote is not the commit that was just made.
-    const remoteShaVerified = Boolean(pushed && remoteCommit && localCommit === remoteCommit);
-
-    // -- the live pull request --------------------------------------------
-    let pullRequest = { url: null, state: null, headSha: null, mergeable: null, ciState: CiState.NOT_STARTED };
-    if (remoteShaVerified && request.open_pull_request) {
-      pullRequest = await this._pullRequest(workspacePath, request.branch, project, signal);
-    } else if (!project.has_ci) {
-      pullRequest.ciState = CiState.NOT_CONFIGURED;
-    }
-
-    // `-z` again: the published file list is compared against the intended one and shown to a
-    // human, so it must carry real filenames rather than git's quoted escapes.
-    const changed = note(await this._git(
-      ['show', '--numstat', '-z', '--no-renames', '--format=', localCommit], workspacePath, null, signal,
-    ));
-    const { files, insertions, deletions, changedFiles } = parseNumstatZ(changed.stdout);
-
-    return {
-      schema_version: SCHEMA_VERSION,
-      publication_id: newId('pwpub'),
-      job_id: job.workbench_job_id,
-      branch: request.branch,
-      local_commit: localCommit,
-      remote_commit: remoteCommit,
-      pushed,
-      remote_sha_verified: remoteShaVerified,
-      pull_request_url: pullRequest.url,
-      pull_request_state: pullRequest.state,
-      pull_request_head_sha: pullRequest.headSha,
-      mergeable: pullRequest.mergeable,
-      ci_state: pullRequest.ciState,
-      diff_stat: { schema_version: SCHEMA_VERSION, files, insertions, deletions },
-      changed_files: changedFiles.slice(0, 200),
-      recorded_at: this.clock().toISOString(),
-      terminationConfirmed,
-      steps,
-    };
   }
 
   /**
@@ -249,6 +275,11 @@ export class Publisher {
    */
   async _pullRequest(workspacePath, branch, project, signal = undefined) {
     const base = project.default_branch ?? 'main';
+    // `null` unless a `gh` call actually carries a verdict — same convention as `runGit`: most `gh`
+    // failures here are ordinary (no host configured, no `gh` binary, a PR that already exists), not
+    // a kill, and only `false` means a signal ended the launch and its whole descendant tree could
+    // not be confirmed dead.
+    let terminationConfirmed = null;
     const gh = async (argv) => {
       try {
         const { stdout } = await (this.exec ?? (await import('util')).promisify((await import('child_process')).execFile))(
@@ -256,23 +287,31 @@ export class Publisher {
         );
         return { ok: true, stdout: String(stdout ?? '') };
       } catch (err) {
+        if (err?.terminationConfirmed === false) terminationConfirmed = false;
         return { ok: false, stdout: String(err?.stdout ?? ''), stderr: String(err?.stderr ?? err?.message ?? '') };
       }
     };
 
-    // Create if absent. An existing PR makes `gh pr create` fail, which is not an error here.
+    // Create if absent. An existing PR makes `gh pr create` fail, which is not an error here — its
+    // own termination verdict is still captured by the closure above regardless.
     await gh(['pr', 'create', '--head', branch, '--base', base, '--fill']);
 
     const view = await gh(['pr', 'view', branch, '--json', 'url,state,headRefOid,mergeable,statusCheckRollup']);
     if (!view.ok) {
-      return { url: null, state: null, headSha: null, mergeable: null, ciState: project.has_ci ? CiState.NOT_STARTED : CiState.NOT_CONFIGURED };
+      return {
+        url: null, state: null, headSha: null, mergeable: null,
+        ciState: project.has_ci ? CiState.NOT_STARTED : CiState.NOT_CONFIGURED,
+        terminationConfirmed,
+      };
     }
 
     let parsed;
     try {
       parsed = JSON.parse(view.stdout);
     } catch {
-      return { url: null, state: null, headSha: null, mergeable: null, ciState: CiState.NOT_STARTED };
+      return {
+        url: null, state: null, headSha: null, mergeable: null, ciState: CiState.NOT_STARTED, terminationConfirmed,
+      };
     }
 
     const rollup = Array.isArray(parsed.statusCheckRollup) ? parsed.statusCheckRollup : [];
@@ -295,6 +334,7 @@ export class Publisher {
       headSha,
       mergeable: parsed.mergeable === 'MERGEABLE' ? true : (parsed.mergeable === 'CONFLICTING' ? false : null),
       ciState,
+      terminationConfirmed,
     };
   }
 
