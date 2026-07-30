@@ -36,6 +36,7 @@ export const KIND = Object.freeze({
   IDEMPOTENCY: 'idempotency',
   LEASES: 'leases',
   FENCING: 'fencing',
+  LEASE_AUDIT: 'lease_audit',
 });
 
 const DEFAULT_LEASE_TTL_MS = 300_000;
@@ -298,7 +299,45 @@ export class OrchestratorRepository {
       fenced_by: owner,
     };
     tx.put(KIND.LEASES, resource, fenced);
+    this._appendFenceAudit(tx, {
+      resource, action: 'fenced', fencingToken, owner, operator: owner, reason,
+    });
     return fenced;
+  }
+
+  /**
+   * Append an immutable fence-set or fence-clear record, keyed by a per-resource sequence rather than
+   * by `resource` alone — the mutable lease row that `fenceLease`/`clearFence` also write is
+   * overwritten by the next acquisition on the same resource, which is exactly what makes it
+   * insufficient as an audit trail. This lives under its own kind so it is never touched by anything
+   * other than this method: not `acquireLease`, not `releaseLease`, not a later fence/clear cycle on
+   * the same resource.
+   */
+  _appendFenceAudit(tx, { resource, action, fencingToken, owner, operator, reason }) {
+    const sequence = tx.nextSequence(`lease-audit:${resource}`);
+    const record = {
+      schema_version: SCHEMA_VERSION,
+      resource,
+      sequence,
+      action,
+      fencing_token: fencingToken ?? null,
+      owner: owner ?? null,
+      // Free text an operator or a caught error typed in haste — redacted like every other such
+      // field this repository stores, on the same reasoning `fenced_reason`/`clear_reason` already
+      // apply to the mutable row: cheap here, and someone downstream may not re-check it later.
+      operator: operator ? redactText(String(operator), { maxLength: 200 }) : null,
+      reason: reason ? redactText(String(reason), { maxLength: 2_000 }) : null,
+      recorded_at: this.clock().toISOString(),
+    };
+    tx.put(KIND.LEASE_AUDIT, `${resource}:${String(sequence).padStart(12, '0')}`, record);
+    return record;
+  }
+
+  /** The full, append-only fence-set/fence-clear history for a resource, oldest first. */
+  listFenceAudit(resource) {
+    return this.store
+      .list(KIND.LEASE_AUDIT, (r) => r.resource === resource)
+      .sort((a, b) => a.sequence - b.sequence);
   }
 
   /**
@@ -328,6 +367,10 @@ export class OrchestratorRepository {
       expires_at: existing.acquired_at,
     };
     tx.put(KIND.LEASES, resource, cleared);
+    this._appendFenceAudit(tx, {
+      resource, action: 'cleared', fencingToken: existing.fencing_token, owner: existing.owner,
+      operator: clearedBy, reason,
+    });
     return cleared;
   }
 

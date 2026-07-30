@@ -448,6 +448,38 @@ not the lease check ever ran.
   require real-root privilege dropping, so no separate root run was needed for this part specifically —
   covered by the same full-suite root run recorded below).
 
+### Part C — `clearFence` and `fenceLease` only ever wrote the mutable lease row
+
+`fenceLease`/`clearFence` wrote `fenced_at`/`fenced_by`/`fenced_reason` and
+`cleared_at`/`cleared_by`/`clear_reason` onto the SAME lease row — the very next `acquireLease` for
+that resource replaces the row outright. A resource fenced and cleared twice retained no durable trace
+of the first incident at all once the second began; the durable store's own audit comment ("jobs,
+events, ... audit rows") described a guarantee the code did not yet provide for fencing specifically.
+
+* **Fix.** New `KIND.LEASE_AUDIT` kind and `_appendFenceAudit`/`listFenceAudit` on
+  `OrchestratorRepository`. Every `fenceLease` and `clearFence` call now ALSO appends an immutable
+  record — `resource`, a per-resource monotonic `sequence` (via `tx.nextSequence`, the same durable
+  counter mechanism `appendEvent` already relies on), `action` (`fenced`/`cleared`), `fencing_token`,
+  `owner`, `operator` (the job for a fence, the named human for a clear), a redacted `reason`, and
+  `recorded_at` — keyed by `${resource}:${sequence}` so no later acquire/fence/clear on the same
+  resource can ever overwrite an earlier entry, unlike the mutable row. `acquireLease`/`releaseLease`
+  are untouched: only a fence-set or fence-clear is audited here, and the existing lease schema and
+  every existing lease/fence test pass unchanged.
+* **`scripts/pw-orch-clear-fence.mjs`** now prints the audit history (`history (N record(s)):` plus one
+  line per record) alongside the current lease row, both for a plain status check and right before a
+  `--confirm`. An operator investigating a resource fenced more than once can now see every prior
+  incident, not only the one the mutable row happens to remember.
+* **RED, then GREEN.** 7 new tests in `orch-lease-fence.test.mjs`: fence appends a record; clear
+  appends its own, naming the operator and the same fencing token the fence used; the trail
+  accumulates (never overwritten) across two full fence→clear cycles, with strictly increasing
+  sequence numbers; the trail survives the lease's own TTL lapsing; survives a real store close and
+  reopen; survives compaction at a low `compactEveryRecords` threshold forced mid-sequence (asserted
+  all 10 records from 5 cycles survive, not just the last); and a secret pasted into either a fence or
+  a clear reason is redacted in the durable record, exactly as the existing mutable-row redaction
+  already required. One more test for the script's new history output. All failed against the
+  pre-fix code with `repo.listFenceAudit is not a function`; all pass now.
+* **GREEN.** `orch-lease-fence.test.mjs` 21/21. Full suite 502 pass/3 skip/0 fail.
+
 ## Remaining limitations (stated, not fixed)
 
 1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no

@@ -111,8 +111,19 @@ try {
   const resource = `project-write:${config.instanceId}:${args.project}`;
   const lease = repo.getLease(resource);
 
+  // The mutable lease row only ever shows the MOST RECENT fence/clear cycle — a resource fenced,
+  // cleared, and fenced again shows only the second incident there. The append-only trail is what
+  // lets an operator see the whole history before deciding this one is safe to clear too.
+  const formatHistory = () => {
+    const trail = repo.listFenceAudit(resource);
+    if (!trail.length) return '';
+    const lines = trail.map((e) => `  [${e.recorded_at}] ${e.action} — owner=${e.owner} operator=${e.operator ?? e.owner} reason=${e.reason}`);
+    return ['', `history (${trail.length} record(s)):`, ...lines, ''].join('\n');
+  };
+
   if (!lease?.fenced) {
     process.stdout.write(`${resource}\nnot fenced${lease ? ` (owner: ${lease.owner}, expires_at: ${lease.expires_at})` : ' (no lease record at all)'}\n`);
+    process.stdout.write(formatHistory());
     exitCode = 1;
   } else {
     process.stdout.write([
@@ -123,6 +134,7 @@ try {
       `  fenced_reason: ${lease.fenced_reason}`,
       '',
     ].join('\n'));
+    process.stdout.write(formatHistory());
 
     if (!args.confirm) {
       process.stdout.write(

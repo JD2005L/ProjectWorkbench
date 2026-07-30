@@ -174,6 +174,168 @@ test('fence: clearFence refuses when nothing is fenced — never a silent no-op'
 });
 
 // ---------------------------------------------------------------------------
+// durable, append-only audit trail for fence-set and fence-clear
+//
+// `clearFence` writes cleared_at/cleared_by/clear_reason onto the SAME mutable lease row that
+// `fenceLease` wrote fenced_at/fenced_by/fenced_reason onto — and the very next `acquireLease` for
+// that resource overwrites that row entirely. Nothing durable is left saying a fence ever happened,
+// once the resource has moved on. These records are separate, immutable, and keyed so a later
+// acquire/fence/clear on the same resource can never touch an earlier entry.
+// ---------------------------------------------------------------------------
+
+test('audit: fenceLease appends an immutable record distinct from the mutable lease row', async () => {
+  await withRepo(async ({ repo, store }) => {
+    const fencingToken = await acquireAndFence(repo, store, { owner: 'job-1', reason: 'unconfirmed termination' });
+
+    const trail = repo.listFenceAudit(RESOURCE);
+    assert.equal(trail.length, 1);
+    const [entry] = trail;
+    assert.equal(entry.resource, RESOURCE);
+    assert.equal(entry.action, 'fenced');
+    assert.equal(entry.fencing_token, fencingToken);
+    assert.equal(entry.owner, 'job-1');
+    assert.match(entry.reason, /unconfirmed termination/);
+    assert.ok(entry.recorded_at, 'the audit record must carry its own timestamp');
+  });
+});
+
+test('audit: clearFence appends its own immutable record, naming the operator', async () => {
+  await withRepo(async ({ repo, store }) => {
+    await acquireAndFence(repo, store, { owner: 'job-1', reason: 'unconfirmed termination' });
+    await store.transact((tx, state) => {
+      repo.clearFence(tx, state, {
+        resource: RESOURCE, clearedBy: 'operator:james', reason: 'verified no surviving descendant',
+      });
+    });
+
+    const trail = repo.listFenceAudit(RESOURCE);
+    assert.equal(trail.length, 2, 'both the fence and the clear must be recorded');
+    const [fenced, cleared] = trail;
+    assert.equal(fenced.action, 'fenced');
+    assert.equal(cleared.action, 'cleared');
+    assert.equal(cleared.operator, 'operator:james');
+    assert.match(cleared.reason, /verified no surviving descendant/);
+    // Both entries name the same lease token — the clear is auditably about the fence that preceded it.
+    assert.equal(cleared.fencing_token, fenced.fencing_token);
+  });
+});
+
+test('audit: the trail accumulates across clear -> reacquire -> re-fence, never overwritten', async () => {
+  await withRepo(async ({ repo, store }) => {
+    await acquireAndFence(repo, store, { owner: 'job-1', reason: 'first incident' });
+    await store.transact((tx, state) => {
+      repo.clearFence(tx, state, { resource: RESOURCE, clearedBy: 'operator:james', reason: 'cleared after review 1' });
+    });
+
+    // The resource is free again — a later job acquires and is itself later fenced.
+    await acquireAndFence(repo, store, { owner: 'job-2', reason: 'second incident' });
+    await store.transact((tx, state) => {
+      repo.clearFence(tx, state, { resource: RESOURCE, clearedBy: 'operator:maria', reason: 'cleared after review 2' });
+    });
+
+    const trail = repo.listFenceAudit(RESOURCE);
+    assert.equal(trail.length, 4, 'every fence and every clear across both incidents must still be present');
+    assert.deepEqual(trail.map((e) => e.action), ['fenced', 'cleared', 'fenced', 'cleared']);
+    assert.deepEqual(trail.map((e) => e.owner), ['job-1', 'job-1', 'job-2', 'job-2']);
+    assert.match(trail[0].reason, /first incident/);
+    assert.match(trail[2].reason, /second incident/);
+    assert.equal(trail[1].operator, 'operator:james');
+    assert.equal(trail[3].operator, 'operator:maria');
+    // Sequence numbers strictly increase — this is what makes "append-only" a checkable property
+    // rather than an assertion about intent.
+    for (let i = 1; i < trail.length; i++) assert.ok(trail[i].sequence > trail[i - 1].sequence);
+
+    // And the mutable lease row itself — exactly as before — only reflects the LATEST cycle.
+    const lease = repo.getLease(RESOURCE);
+    assert.equal(lease.fenced, false);
+    assert.equal(lease.cleared_by, 'operator:maria');
+  });
+});
+
+test('audit: the trail survives its own lease TTL expiring', async () => {
+  await withRepo(async ({ repo, store }) => {
+    await acquireAndFence(repo, store, { ttlMs: 5, reason: 'unconfirmed termination' });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    assert.equal(repo.listFenceAudit(RESOURCE).length, 1, 'a lapsed TTL must not affect the audit trail at all');
+  });
+});
+
+test('audit: the trail survives a close and reopen of the store', async () => {
+  const p = tempPaths();
+  try {
+    let store = await JournalStore.open({
+      journalPath: p.journalPath, snapshotPath: p.snapshotPath, lockPath: p.lockPath, compactEveryRecords: 1_000,
+    });
+    let repo = new OrchestratorRepository(store);
+    await acquireAndFence(repo, store, { owner: 'job-1', reason: 'unconfirmed termination' });
+    await store.transact((tx, state) => {
+      repo.clearFence(tx, state, { resource: RESOURCE, clearedBy: 'operator:james', reason: 'reviewed' });
+    });
+    await store.close();
+
+    store = await JournalStore.open({
+      journalPath: p.journalPath, snapshotPath: p.snapshotPath, lockPath: p.lockPath, compactEveryRecords: 1_000,
+    });
+    repo = new OrchestratorRepository(store);
+    const trail = repo.listFenceAudit(RESOURCE);
+    assert.equal(trail.length, 2);
+    assert.deepEqual(trail.map((e) => e.action), ['fenced', 'cleared']);
+    await store.close();
+  } finally {
+    p.cleanup();
+  }
+});
+
+test('audit: the trail survives compaction — every entry, not just the latest', async () => {
+  const p = tempPaths();
+  try {
+    let store = await JournalStore.open({
+      journalPath: p.journalPath, snapshotPath: p.snapshotPath, lockPath: p.lockPath, compactEveryRecords: 3,
+    });
+    let repo = new OrchestratorRepository(store);
+
+    // Enough fence/clear cycles, at a low compaction threshold, that at least one compaction must
+    // have happened mid-sequence — not merely once at the very end.
+    for (let i = 1; i <= 5; i++) {
+      // eslint-disable-next-line no-await-in-loop
+      await acquireAndFence(repo, store, { owner: `job-${i}`, reason: `incident ${i}` });
+      // eslint-disable-next-line no-await-in-loop
+      await store.transact((tx, state) => {
+        repo.clearFence(tx, state, { resource: RESOURCE, clearedBy: `operator:${i}`, reason: `reviewed ${i}` });
+      });
+    }
+    assert.ok(fs.existsSync(p.snapshotPath), 'compaction must have run at this threshold');
+    await store.close();
+
+    store = await JournalStore.open({
+      journalPath: p.journalPath, snapshotPath: p.snapshotPath, lockPath: p.lockPath, compactEveryRecords: 3,
+    });
+    repo = new OrchestratorRepository(store);
+    const trail = repo.listFenceAudit(RESOURCE);
+    assert.equal(trail.length, 10, 'all 5 fences and all 5 clears must survive compaction, not just the last cycle');
+    assert.deepEqual(trail.map((e) => e.owner), ['job-1', 'job-1', 'job-2', 'job-2', 'job-3', 'job-3', 'job-4', 'job-4', 'job-5', 'job-5']);
+    await store.close();
+  } finally {
+    p.cleanup();
+  }
+});
+
+test('audit: a secret pasted into the fence or clear reason is redacted in the durable record', async () => {
+  await withRepo(async ({ repo, store }) => {
+    const secret = 'sk-abcdefghijklmnopqrstuvwxyz012345';
+    await acquireAndFence(repo, store, { owner: 'job-1', reason: `unconfirmed termination, token was ${secret}` });
+    await store.transact((tx, state) => {
+      repo.clearFence(tx, state, { resource: RESOURCE, clearedBy: 'operator:james', reason: `checked, saw ${secret} in the log too` });
+    });
+
+    const trail = repo.listFenceAudit(RESOURCE);
+    for (const entry of trail) {
+      assert.ok(!entry.reason.includes(secret), 'a raw secret must never reach the durable audit record');
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
 // the operator recovery path: scripts/pw-orch-clear-fence.mjs
 // ---------------------------------------------------------------------------
 //
@@ -359,6 +521,45 @@ test('clear-fence script: clearing leaves a full auditable record — who fenced
     assert.equal(lease.fenced_by, 'job-1');
     assert.match(lease.fenced_reason, /unconfirmed termination/);
     assert.ok(lease.fenced_at, 'the original fencing must still be timestamped');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('clear-fence script: prints the durable audit history, not just the current lease row', async () => {
+  // The mutable lease row `fenced_by`/`fenced_reason`/`cleared_by`/`clear_reason` only ever shows the
+  // MOST RECENT cycle — an operator investigating a resource fenced and cleared more than once has no
+  // way to see the earlier incidents from the lease row alone. The script must surface the append-only
+  // trail, not just today's fields.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-clearfence-'));
+  try {
+    const { env, resource } = await fenceViaJs(dir);
+
+    const before = await execFileAsync(process.execPath, [CLEAR_FENCE_SCRIPT, '--project', 'Demo'], { env, timeout: 15_000 });
+    assert.match(before.stdout, /history/i);
+    assert.match(before.stdout, /fenced/);
+    assert.match(before.stdout, /job-1/);
+
+    await execFileAsync(process.execPath, [
+      CLEAR_FENCE_SCRIPT, '--project', 'Demo',
+      '--reason', 'verified no surviving descendant via ps -ef', '--by', 'james', '--confirm',
+    ], { env, timeout: 15_000 });
+
+    // Fence again, on a fresh acquisition, so there are now two full incidents in the trail.
+    const config = loadOrchestratorConfig(env);
+    const store = await openMigrated(config);
+    const repo = new OrchestratorRepository(store);
+    const acquired = await store.transact((tx, state) => repo.acquireLease(tx, state, { resource, owner: 'job-2' }));
+    await store.transact((tx, state) => repo.fenceLease(tx, state, {
+      resource, owner: 'job-2', fencingToken: acquired.fencing_token, reason: 'second incident',
+    }));
+    await store.close();
+
+    const after = await execFileAsync(process.execPath, [CLEAR_FENCE_SCRIPT, '--project', 'Demo'], { env, timeout: 15_000 });
+    // Both incidents' owners appear — the first fence/clear cycle is not lost once a second begins.
+    assert.match(after.stdout, /job-1/);
+    assert.match(after.stdout, /job-2/);
+    assert.match(after.stdout, /second incident/);
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
