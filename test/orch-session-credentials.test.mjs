@@ -363,3 +363,66 @@ tmuxTest('a credential resolution that has NOT drifted (repeated identical resol
     assert.deepEqual(cred.tokens, [`CLAUDE_CONFIG_DIR=${configDir}`]);
   });
 });
+
+tmuxTest('SECURITY REGRESSION: an enable-to-disable drift must fail closed too — a fresh "off" resolution is not exempt from the stamp check', async () => {
+  // The specific gap an independent exact-head review found: resolveCredentials() skipped its own
+  // drift check whenever the FRESH resolution had no tokens (i.e. resolved to "off"), on the theory
+  // that disabled mode has nothing real to protect. That reasoning has it backwards for THIS
+  // direction: if the lane is stamped for a REAL per-user identity (PW_PER_USER_CLAUDE was on when
+  // ensureSession() ran) and the feature is toggled off — or the project's primaryUser is removed —
+  // mid-job, a later resolution correctly resolves to "off" and MUST still be compared against the
+  // stamp: silently returning it lets a real spawned process run under the shared/default login
+  // while the lane's own pane and fingerprint stamp still claim to be attributed to the per-user
+  // owner.
+  const configDirA = '/tmp/pw-orch-drift-off-A-' + process.pid;
+  let enabled = true;
+  const credentials = async () => (enabled
+    ? { key: 'd333333333333333', tokens: [`CLAUDE_CONFIG_DIR=${configDirA}`], shellArgs: ['--noprofile', '--norc'] }
+    : { key: CREDENTIALS_OFF, tokens: [], shellArgs: ['--noprofile', '--norc'] });
+
+  await withLane({ credentials }, async ({ manager, project, token }) => {
+    await ensure(manager, project, token); // stamps the REAL per-user fingerprint
+
+    enabled = false; // PW_PER_USER_CLAUDE toggled off (or primaryUser removed) mid-job
+
+    await assert.rejects(
+      manager.resolveCredentials(project.project_id),
+      /drift|changed|stale|mismatch/i,
+      'a fresh "off" resolution against a lane stamped for a REAL per-user identity must still fail closed — never silently apply the shared/default login to a phase whose pane claims per-user attribution',
+    );
+  });
+});
+
+tmuxTest('SECURITY REGRESSION: an unreadable stamp must fail closed even when the fresh resolution is "off"', async () => {
+  // The same gap, for the OTHER field the old early-return skipped checking: stamp READABILITY.
+  // A control-plane failure reading the stamp is exactly as dangerous as a real mismatch — it means
+  // this code genuinely does not know what the lane is currently attributed to, and "off" being the
+  // fresh answer must not be treated as license to skip finding that out.
+  const credentials = async () => ({ key: CREDENTIALS_OFF, tokens: [] });
+  await withLane({ credentials }, async ({ tmux, manager, project, token }) => {
+    await ensure(manager, project, token);
+    const originalGet = tmux.getSessionCredKey.bind(tmux);
+    tmux.getSessionCredKey = async (session) => {
+      const real = await originalGet(session);
+      return { ok: false, error: 'simulated control-plane failure', key: real.key };
+    };
+    await assert.rejects(
+      manager.resolveCredentials(project.project_id),
+      /could not be verified|verify/i,
+      'an unreadable stamp must fail closed regardless of what the fresh resolution says',
+    );
+  });
+});
+
+tmuxTest('a disabled-mode resolution that has NOT drifted (stamped "off", resolves "off" again) still succeeds normally', async () => {
+  // The common, legitimate case for a project that has never used per-user credentials at all:
+  // stamped "off", resolves "off" again. Must not be treated as drift — this is what the previous
+  // (flawed) early-return was trying to protect, just via the wrong mechanism.
+  const credentials = async () => ({ key: CREDENTIALS_OFF, tokens: [] });
+  await withLane({ credentials }, async ({ manager, project, token }) => {
+    await ensure(manager, project, token);
+    const cred = await manager.resolveCredentials(project.project_id);
+    assert.equal(cred.key, CREDENTIALS_OFF);
+    assert.deepEqual(cred.tokens, []);
+  });
+});

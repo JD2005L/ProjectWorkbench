@@ -166,11 +166,38 @@ resolve_session_credentials() {
 		log "credential resolution failed for project '$name' (session $sess): ${cred_err:-$cred_json}"
 		return 1
 	fi
+	# A zero exit only means the helper's own PROCESS succeeded — its response is still untrusted
+	# data until its shape is validated against app/project-terminal-credentials.mjs's own success
+	# contract: exactly {ok:true, shared:true}, or {ok:true, shared:false, configDir, envFile,
+	# fingerprint}. A jq `// empty` filter never fails on a response missing those fields, so without
+	# this a malformed, truncated, or schema-drifted (but still valid JSON, still exit 0) response
+	# was silently treated as the legitimate shared/off case — mirrors scripts/project-terminal-
+	# start's identical validation. Refuse before this session's window loop ever runs.
+	local cred_response_ok cred_shape
+	cred_response_ok=$(printf '%s' "$cred_json" | jq -r 'if (type == "object") and (.ok == true) then "true" else "false" end' 2>/dev/null || echo false)
+	if [[ "$cred_response_ok" != "true" ]]; then
+		log "credential helper returned an unexpected response for project '$name' (session $sess): $cred_json"
+		return 1
+	fi
+	cred_shape=$(printf '%s' "$cred_json" | jq -r 'if .shared == true then "shared" elif .shared == false then "owned" else "invalid" end' 2>/dev/null || echo invalid)
+	if [[ "$cred_shape" == "invalid" ]]; then
+		log "credential helper response for project '$name' (session $sess) is missing a valid 'shared' field: $cred_json"
+		return 1
+	fi
 	local cred_config_dir cred_env_file
-	cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir // empty')
-	cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile // empty')
-	cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint // empty')
-	[[ -z "$cred_key" ]] && cred_key="off"
+	if [[ "$cred_shape" == "shared" ]]; then
+		cred_config_dir=""
+		cred_env_file=""
+		cred_key="off"
+	else
+		cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir // empty')
+		cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile // empty')
+		cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint // empty')
+		if [[ -z "$cred_config_dir" || -z "$cred_key" ]]; then
+			log "credential helper reported a per-user owner for project '$name' (session $sess) but its response is missing configDir/fingerprint: $cred_json"
+			return 1
+		fi
+	fi
 	if [[ -n "$cred_config_dir" ]]; then
 		local quoted_cfg quoted_rcfile
 		printf -v quoted_cfg '%q' "CLAUDE_CONFIG_DIR=$cred_config_dir"

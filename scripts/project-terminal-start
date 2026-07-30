@@ -84,10 +84,35 @@ if ! cred_json=$("$node_bin" "$app_dir/project-terminal-credentials.mjs" "$name"
   echo "[project-terminal-start] per-user credential resolution failed for '$name' (owner '$primary_user'): ${cred_err:-$cred_json}" >&2
   exit 1
 fi
-cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir // empty')
-cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile // empty')
-cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint // empty')
-[[ -z "$cred_key" ]] && cred_key="off"   # matches app/user-credentials.js's CREDENTIALS_OFF sentinel
+# A zero exit only means the helper's own PROCESS succeeded — its response is still untrusted data
+# until its shape is validated against app/project-terminal-credentials.mjs's own success contract:
+# exactly {ok:true, shared:true}, or {ok:true, shared:false, configDir, envFile, fingerprint}. A jq
+# `// empty` filter never fails on a response missing those fields, so without this a malformed,
+# truncated, or schema-drifted (but still valid JSON, still exit 0) response was silently treated as
+# the legitimate shared/off case — refuse before touching tmux at all instead.
+cred_ok=$(printf '%s' "$cred_json" | jq -r 'if (type == "object") and (.ok == true) then "true" else "false" end' 2>/dev/null || echo false)
+if [[ "$cred_ok" != "true" ]]; then
+  echo "[project-terminal-start] credential helper returned an unexpected response for '$name' (owner '$primary_user'): $cred_json" >&2
+  exit 1
+fi
+cred_shape=$(printf '%s' "$cred_json" | jq -r 'if .shared == true then "shared" elif .shared == false then "owned" else "invalid" end' 2>/dev/null || echo invalid)
+if [[ "$cred_shape" == "invalid" ]]; then
+  echo "[project-terminal-start] credential helper response for '$name' is missing a valid 'shared' field: $cred_json" >&2
+  exit 1
+fi
+if [[ "$cred_shape" == "shared" ]]; then
+  cred_config_dir=""
+  cred_env_file=""
+  cred_key="off"   # matches app/user-credentials.js's CREDENTIALS_OFF sentinel
+else
+  cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir // empty')
+  cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile // empty')
+  cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint // empty')
+  if [[ -z "$cred_config_dir" || -z "$cred_key" ]]; then
+    echo "[project-terminal-start] credential helper reported a per-user owner for '$name' but its response is missing configDir/fingerprint: $cred_json" >&2
+    exit 1
+  fi
+fi
 
 base_tab_env="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [[ -n "$cred_config_dir" ]]; then

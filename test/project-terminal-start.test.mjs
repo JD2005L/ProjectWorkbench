@@ -390,6 +390,66 @@ test('REGRESSION: a tmux control-plane failure reading an EXISTING session\'s fi
   } finally { await teardown(ctx); }
 });
 
+// ---------------------------------------------------------------------------
+// SECURITY: the credential helper's response schema is not trusted blindly.
+//
+// app/project-terminal-credentials.mjs's own contract (see its `ok()`/`fail()`
+// helpers) is: `{ok:true, shared:true}` for the legitimate shared/off case, or
+// `{ok:true, shared:false, configDir, envFile, fingerprint}` for a resolved
+// per-user owner — a NONZERO exit already means failure and is handled
+// separately above. But nothing checked `.ok`/`.shared` on a ZERO exit before
+// this fix: `cred_config_dir=$(... | jq -r '.configDir // empty')` silently
+// resolves to an empty string for ANY response missing that field, which is
+// indistinguishable from the genuine shared/off case — so a malformed,
+// truncated, or schema-drifted response (still valid JSON, still exit 0) was
+// silently treated as "use the shared login", never refused.
+// ---------------------------------------------------------------------------
+
+/** Replaces the credential helper the script shells out to with one that prints an ARBITRARY
+ * (possibly malformed) JSON string and exits 0 — proving the script's OWN schema validation, not
+ * anything about the real helper. Returns a PW_APP_DIR override pointing at it. */
+function makeFakeCredentialHelper(dir, jsonText) {
+  const fakeAppDir = fs.mkdtempSync(path.join(dir, 'fake-app-'));
+  fs.writeFileSync(
+    path.join(fakeAppDir, 'project-terminal-credentials.mjs'),
+    `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(jsonText)});\n`,
+    { mode: 0o755 },
+  );
+  return fakeAppDir;
+}
+
+for (const [label, malformed] of [
+  ['a completely empty object (no ok, no shared)', '{}'],
+  ['ok:true but no shared field at all', '{"ok":true}'],
+  ['shared:false but missing configDir AND fingerprint entirely', '{"ok":true,"shared":false}'],
+  ['shared:false with a fingerprint but no configDir', '{"ok":true,"shared":false,"fingerprint":"abc123"}'],
+  ['shared:false with a configDir but no fingerprint', '{"ok":true,"shared":false,"configDir":"/tmp/x"}'],
+  ['shared is a string, not a boolean', '{"ok":true,"shared":"false"}'],
+  ['ok is missing entirely', '{"shared":true}'],
+]) {
+  test(`SECURITY REGRESSION: a zero-exit credential helper response with ${label} is refused, never treated as shared/off`, { timeout: 15000 }, async () => {
+    const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+    ctx.env.PW_APP_DIR = makeFakeCredentialHelper(ctx.dir, malformed);
+    try {
+      const result = await runScript(ctx);
+      assert.notEqual(result.code, 0, `a malformed credential helper response (${label}) must not exit 0: ${JSON.stringify(result)}`);
+      assert.equal(result.timedOut, false, 'must fail before ever reaching the ttyd exec');
+      assert.equal(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]), false,
+        'no tmux session (and therefore no shared-login fallback) may be created from a malformed credential helper response');
+    } finally { await teardown(ctx); }
+  });
+}
+
+test('a genuinely well-formed shared:true response is still accepted normally', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  ctx.env.PW_APP_DIR = makeFakeCredentialHelper(ctx.dir, '{"ok":true,"shared":true}');
+  try {
+    const result = await runScript(ctx);
+    assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]));
+  } finally { await teardown(ctx); }
+});
+
 test('SECURITY: no secret ever appears in the script\'s own stdout/stderr', { timeout: 15000 }, async () => {
   const secretKey = crypto.randomBytes(32).toString('hex');
   const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });

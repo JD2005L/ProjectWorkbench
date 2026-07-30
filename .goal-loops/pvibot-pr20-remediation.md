@@ -1161,3 +1161,76 @@ missing) report. `engine.js`'s `_runPhase()` failure-kind map gained `api_billed
 - Full canonical suite, serial (`--test-concurrency=1`): **605/605**.
 - `node --check` clean on all 6 touched files.
 - `app/VERSION` bumped `1.26.0730.1643` → `1.26.0730.1732`; guard test passes.
+
+## Round: independent exact-head review of c6889bd — two further findings
+
+Independent exact-head review of the previous commit returned BLOCK despite GitHub CI success
+(605/605 canonical, focused 86/86). Two findings, both real, both repaired strict TDD.
+
+### Finding 1 — resolveCredentials()'s stamp check skipped itself for the disabled/off case
+
+`app/orchestrator/session.js`'s `resolveCredentials()` (from the immediately prior round) had
+`if (cred.tokens.length === 0) return cred;` before ever touching the tmux stamp. The reviewer's
+exact scenario: a lane stamped for a REAL per-user identity (feature was on when `ensureSession()`
+ran), then `PW_PER_USER_CLAUDE` disabled (or the project's `primaryUser` removed) mid-job. A later
+resolution correctly resolves to `"off"` — and the flawed gate let that through completely
+unchecked, so a real spawned process (a phase, or `verifySession()`'s probe) could run under the
+shared/default login while the lane's own pane and fingerprint stamp still claimed per-user
+attribution. The same gate also skipped checking whether the stamp was even READABLE at all whenever
+the fresh resolution happened to be "off".
+
+RED first: two new tests in `test/orch-session-credentials.test.mjs` — stamped-real-A-then-disabled
+(must throw), and stamped-unreadable-with-fresh-resolution-off (must throw) — both confirmed passing
+(i.e. wrongly succeeding) against the pre-fix code.
+
+Fix: removed the early return entirely. `resolveCredentials()` now unconditionally reads the tmux
+stamp and compares it via `sessionCredentialState()` — the SAME staleness-comparison helper
+`_ensureSession()` itself already uses — rather than a naive `!==`, so "legitimately never stamped
+and currently off" is still correctly recognised as current (not a phantom mismatch) while every
+real drift, in EITHER direction (on→off, off→on, A→B), and every unreadable-stamp case, fails closed.
+This broke `test/orch-provenance.test.mjs`'s `tmux: null` attestation-plumbing test (a pre-existing
+simplification, never true in production — confirmed via `index.js`'s wiring, which always
+constructs a real `TmuxAdapter`); fixed the TEST with a minimal working fake `tmux.getSessionCredKey`
+rather than adding a `!this.tmux` escape hatch to the security-critical method itself.
+
+### Finding 2 — neither host-mode script validated the credential helper's response schema
+
+`scripts/project-terminal-start` and `scripts/pw-tmux-restore` both shell out to
+`app/project-terminal-credentials.mjs` and, on a ZERO exit, parsed `.configDir`/`.envFile`/
+`.fingerprint` directly via `jq -r '... // empty'` — a filter that never fails, so a response missing
+those fields (or missing `.ok`/`.shared` entirely) silently produced empty strings, which both
+scripts' existing `[[ -n "$cred_config_dir" ]]` branching then treated as the legitimate shared/off
+case. A malformed, truncated, or schema-drifted (but still valid JSON, still exit 0) response was
+never distinguished from a genuine "no per-user owner" answer.
+
+RED first: 7 adversarial script-level tests in `test/project-terminal-start.test.mjs` and 5 in
+`test/pw-tmux-restore.test.mjs` — each shims `project-terminal-credentials.mjs` (via a `PW_APP_DIR`
+override pointing at a fake helper printing a specific malformed-but-valid JSON body: empty object,
+`ok` present but no `shared`, `shared:false` missing configDir and/or fingerprint, `shared` as a
+string instead of a boolean) and proves NO tmux session is created and the script exits nonzero.
+Confirmed RED for both scripts (`project-terminal-start`'s 7 tests failed before any script change;
+`pw-tmux-restore`'s 5 tests confirmed via a dedicated `git stash` revert-and-retest after the fact,
+restored byte-identical).
+
+Fix: both scripts now explicitly validate, via `jq`, that the response is `{ok:true}` at minimum, that
+`.shared` is exactly boolean `true` or `false` (not a truthy string, not missing), and — when
+`shared:false` — that BOTH `configDir` and `fingerprint` are non-empty before trusting them. Any other
+shape refuses with an actionable error (`exit 1` / `return 1`) before any tmux command runs. A
+genuinely well-formed `{ok:true,shared:true}` response is still accepted normally (new test for both
+scripts confirms this explicitly, guarding against an overly strict rewrite).
+
+### Verification evidence
+
+- `orch-session-credentials.test.mjs`: 13/13 (2 new drift-direction tests). `orch-provenance.test.mjs`:
+  41/41 (fixed fixture). `project-terminal-start.test.mjs`: 22/22 (7 new). `pw-tmux-restore.test.mjs`:
+  15/15 (5 new).
+- Full `orch-*` + both scripts (focused): 359/359.
+- Full canonical suite, `npm test` (default-concurrent): 622/622, confirmed clean on 4 of 5 runs this
+  round; one run hit a single flaky failure matching this project's own previously-documented
+  tmux-resource-contention flakiness pattern under default-concurrent mode (not the same test twice,
+  no leaked `pwprev-*` tmux servers found afterward) — re-ran 3× clean immediately after.
+- Full canonical suite, serial (`--test-concurrency=1`): 622/622.
+- `bash -n` clean on both scripts; `node --check` clean on all 5 touched `.js`/`.mjs` files.
+- `app/VERSION` bumped `1.26.0730.1732` → `1.26.0730.1800`; guard test passes.
+- All three fix areas independently confirmed via `git stash` revert-and-retest, tree restored
+  byte-identical each time.

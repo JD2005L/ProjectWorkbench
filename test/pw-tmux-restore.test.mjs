@@ -320,6 +320,64 @@ test('REGRESSION: restore never touches an unrelated tmux server, including one 
 // live project sessions. A properly PW_TMUX_SOCKET-isolated restore run must
 // leave that socket's session list byte-for-byte unchanged, whether or not
 // anything happens to be on it.
+// ---------------------------------------------------------------------------
+// SECURITY: the credential helper's response schema is not trusted blindly —
+// mirrors test/project-terminal-start.test.mjs's identical checks for the
+// same underlying gap in this script's own resolve_session_credentials().
+// ---------------------------------------------------------------------------
+
+/** Replaces the credential helper this script shells out to with one that prints an ARBITRARY
+ * (possibly malformed) JSON string and exits 0. Returns a PW_APP_DIR override pointing at it. */
+function makeFakeCredentialHelper(dir, jsonText) {
+  const fakeAppDir = fs.mkdtempSync(path.join(dir, 'fake-app-'));
+  fs.writeFileSync(
+    path.join(fakeAppDir, 'project-terminal-credentials.mjs'),
+    `#!/usr/bin/env node\nprocess.stdout.write(${JSON.stringify(jsonText)});\n`,
+    { mode: 0o755 },
+  );
+  return fakeAppDir;
+}
+
+for (const [label, malformed] of [
+  ['a completely empty object (no ok, no shared)', '{}'],
+  ['ok:true but no shared field at all', '{"ok":true}'],
+  ['shared:false but missing configDir AND fingerprint entirely', '{"ok":true,"shared":false}'],
+  ['shared:false with a fingerprint but no configDir', '{"ok":true,"shared":false,"fingerprint":"abc123"}'],
+  ['shared:false with a configDir but no fingerprint', '{"ok":true,"shared":false,"configDir":"/tmp/x"}'],
+]) {
+  test(`SECURITY REGRESSION: a zero-exit credential helper response with ${label} refuses to restore the session, never falls back to shared`, { timeout: 15000 }, async () => {
+    const secretKey = crypto.randomBytes(32).toString('hex');
+    const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+    await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+    await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+    ctx.env.PW_APP_DIR = makeFakeCredentialHelper(ctx.dir, malformed);
+    writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+      { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+    ]);
+    try {
+      await runScript(ctx);
+      assert.equal(await tmuxOk(ctx.sock, ['has-session', '-t', ctx.session]), false,
+        `no session (and therefore no shared-login fallback) may be created from a malformed credential helper response (${label})`);
+      const log = await fsp.readFile(ctx.env.PW_TMUX_LOG, 'utf8').catch(() => '');
+      assert.match(log, /credential helper|unexpected response|missing/i);
+    } finally { await teardown(ctx); }
+  });
+}
+
+test('a genuinely well-formed shared:true response still restores the session normally', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  ctx.env.PW_APP_DIR = makeFakeCredentialHelper(ctx.dir, '{"ok":true,"shared":true}');
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  try {
+    await runScript(ctx);
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', ctx.session]));
+    const stamped = (await tmux(ctx.sock, ['show-options', '-t', ctx.session, '-v', '@pw_cred_key'])).stdout.trim();
+    assert.equal(stamped, 'off');
+  } finally { await teardown(ctx); }
+});
+
 test('REGRESSION: a properly isolated restore run leaves the REAL default tmux socket exactly as it found it', { timeout: 15000 }, async () => {
   const ctx = await setup({ enabled: false });
   writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [

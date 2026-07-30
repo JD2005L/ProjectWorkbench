@@ -684,7 +684,15 @@ test('session: the attestation survives the REAL session manager and reaches the
       cli_session_id: null,
     };
     const store = { get: () => record, transact: async (fn) => fn({ put() {} }, { get: () => record }) };
-    const manager = new OrchestratorSessionManager({ config, store, repo: { putSession() {} }, tmux: null, backend });
+    // verifySession() cross-checks its fresh credential resolution against the lane's stamped
+    // fingerprint (app/orchestrator/session.js's resolveCredentials()) — with no `credentials`
+    // override here, resolution falls back to defaultLaneCredentialResolver, which resolves to the
+    // disabled/off sentinel ('off') as long as PW_PER_USER_CLAUDE is unset in this test's own
+    // process env (true in this suite). A real tmux session's stamp would already agree with that;
+    // this fake mirrors just enough of TmuxAdapter's interface to let that comparison succeed
+    // without standing up a real tmux server for what is otherwise a pure attestation-plumbing test.
+    const tmux = { getSessionCredKey: async () => ({ ok: true, key: 'off' }) };
+    const manager = new OrchestratorSessionManager({ config, store, repo: { putSession() {} }, tmux, backend });
 
     const out = await manager.verifySession({
       token: { orchestrator_instance_id: 'orch' }, project: { project_id: 'Demo' },

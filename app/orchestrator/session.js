@@ -321,27 +321,33 @@ export class OrchestratorSessionManager {
    *
    * SECURITY: resolving fresh on every call (by design — a genuinely stale session must always be
    * caught) means the underlying identity CAN change between `ensureSession()` and a later call in
-   * the same job — a token rotated, `primaryUser` reassigned, the feature toggled. Without a
-   * cross-check, a later call would silently hand back the NEW identity while the lane's pane (and
-   * its own fingerprint stamp) still reflect the OLD one — a real spawned process running under a
-   * different identity than the pane it is nominally attached to. So — ONLY when this resolution
-   * asserts a real per-user identity (`cred.tokens.length > 0`; disabled mode asserts nothing, so
-   * there is nothing to drift to except itself) — this compares the freshly resolved fingerprint
-   * against what is CURRENTLY stamped on the project's lane session and throws (fail-closed) on any
-   * mismatch, exactly as it throws on a resolution/materialization failure. A disabled-to-enabled
-   * transition is still caught: it is the newly-resolved (enabled) side of the comparison that
-   * triggers the check, not the stamped (disabled) side.
+   * the same job — a token rotated, `primaryUser` reassigned, or the feature toggled OFF. This
+   * unconditionally compares the freshly resolved fingerprint against what is CURRENTLY stamped on
+   * the project's lane session — via `sessionCredentialState()`, the exact same staleness logic
+   * `_ensureSession()` itself already uses, so "legitimately never stamped and currently off" is
+   * still recognised as current rather than reported as a phantom mismatch — and throws
+   * (fail-closed) on any real mismatch or an unreadable stamp, exactly as it throws on a
+   * resolution/materialization failure.
+   *
+   * An earlier version of this check skipped itself entirely whenever the FRESH resolution had no
+   * tokens (`cred.tokens.length === 0`), on the theory that disabled mode has nothing real to
+   * protect. That reasoning has it backwards for the enable-to-disable direction: a lane stamped
+   * for a REAL per-user identity, with the feature then toggled off (or `primaryUser` removed)
+   * mid-job, resolves to "off" — exactly the case that early return let through unchecked, letting a
+   * real spawned process run under the shared/default login while the pane's own stamp still
+   * claimed per-user attribution. There is no shortcut here: every resolution, in every direction,
+   * is checked against the stamp.
    */
   async resolveCredentials(projectId) {
     const cred = await this.credentials(projectId);
-    if (cred.tokens.length === 0) return cred;
     const lane = this.laneFor({ project_id: projectId }, {});
     const stamped = await this.tmux.getSessionCredKey(lane.tmuxSession);
     if (!stamped.ok) {
       throw new Error(`project "${projectId}"'s lane session credential fingerprint could not be verified (${stamped.error}) — refusing to run under a possibly-mismatched identity`);
     }
-    if (stamped.key !== cred.key) {
-      throw new Error(`project "${projectId}"'s credential context has changed since its lane session was last verified (stamped "${stamped.key}", now resolves to "${cred.key}") — refusing to run under a possibly-mismatched identity`);
+    const state = sessionCredentialState({ perUserEnabled: true, desiredKey: cred.key, stampedKey: stamped.key });
+    if (state.stale) {
+      throw new Error(`project "${projectId}"'s credential context has changed since its lane session was last verified (${state.reason}: stamped "${stamped.key}", now resolves to "${cred.key}") — refusing to run under a possibly-mismatched identity`);
     }
     return cred;
   }
