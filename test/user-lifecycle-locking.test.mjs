@@ -18,6 +18,19 @@ import { fileURLToPath } from 'node:url';
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
 
+// See test/user-lifecycle.test.mjs's identical helper for why: app/server.js's
+// tmux() (host mode) and credentialContext()/terminalOwner() both resolve the
+// real 'admin' account, and app/server.js spawns 'ttyd' bare (PATH-resolved) —
+// both only exist on the real PW host. PW_HOST_TERMINAL_USER points at
+// whichever account is actually running this test (explicit, real, sudo-able
+// — never a production fallback); the stub ttyd ahead on PATH just blocks
+// like the real one does.
+function makeFakeTtydDir(dir) {
+  const binDir = fs.mkdtempSync(path.join(dir, 'bin-shim-'));
+  fs.writeFileSync(path.join(binDir, 'ttyd'), '#!/usr/bin/env bash\nexec sleep infinity\n', { mode: 0o755 });
+  return binDir;
+}
+
 function makeInstance(port, extraEnv = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-lifelock-'));
   fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
@@ -27,7 +40,7 @@ function makeInstance(port, extraEnv = {}) {
   const secretKey = crypto.randomBytes(32).toString('hex');
   fs.writeFileSync(secretKeyPath, secretKey + '\n');
   const env = {
-    PATH: process.env.PATH,
+    PATH: `${makeFakeTtydDir(dir)}:${process.env.PATH}`,
     HOME: process.env.HOME,
     LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port),
@@ -40,6 +53,7 @@ function makeInstance(port, extraEnv = {}) {
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
+    PW_HOST_TERMINAL_USER: os.userInfo().username,
     ...extraEnv,
   };
   return { dir, env, secretKey };

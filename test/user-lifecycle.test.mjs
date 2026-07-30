@@ -17,6 +17,23 @@ import { fileURLToPath } from 'node:url';
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
 
+// app/server.js's tmux() (host mode) always runs `sudo -u <hostTerminalUser()>
+// tmux ...` regardless of PW_PER_USER_CLAUDE, and credentialContext()/
+// terminalOwner() resolve that SAME account via real getent/passwd — see
+// app/terminal-owner.js. The literal shipped 'admin' account, and a real
+// /usr/bin/ttyd (app/server.js spawns 'ttyd' bare, resolved via PATH), only
+// exist on the real PW host. Every instance gets PW_HOST_TERMINAL_USER
+// pointed at whichever account is actually running this test (an explicit,
+// real, sudo-able identity — never a production fallback) plus a stub ttyd
+// ahead on PATH that just blocks like the real one does, so the real
+// credential/terminal-launch code paths this file exercises are portable to
+// any host, CI included.
+function makeFakeTtydDir(dir) {
+  const binDir = fs.mkdtempSync(path.join(dir, 'bin-shim-'));
+  fs.writeFileSync(path.join(binDir, 'ttyd'), '#!/usr/bin/env bash\nexec sleep infinity\n', { mode: 0o755 });
+  return binDir;
+}
+
 function makeInstance(port, extraEnv = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-lifecycle-'));
   fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
@@ -30,7 +47,7 @@ function makeInstance(port, extraEnv = {}) {
   const secretKey = crypto.randomBytes(32).toString('hex');
   fs.writeFileSync(secretKeyPath, secretKey + '\n');
   const env = {
-    PATH: process.env.PATH,
+    PATH: `${makeFakeTtydDir(dir)}:${process.env.PATH}`,
     HOME: process.env.HOME,
     LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port),
@@ -43,6 +60,7 @@ function makeInstance(port, extraEnv = {}) {
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
+    PW_HOST_TERMINAL_USER: os.userInfo().username,
     ...extraEnv,
   };
   return { dir, env, secretKey };

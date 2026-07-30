@@ -18,6 +18,10 @@ primary_user=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .primaryUser // 
 # before this variable existed. Mirrors app/server.js's own PW_TMUX_SOCKET.
 tmux_sock_args=()
 [[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
+# Same pattern for the ttyd binary itself: unset (the default, always true in
+# production) means the real, shipped /usr/bin/ttyd, byte-identical to before
+# this variable existed. Lets a test point this at a controlled stand-in
+# binary instead of requiring ttyd to actually be installed on the host.
 mkdir -p "$path"
 real_path=$(readlink -f "$path")
 chown -R admin:admin "$real_path" 2>/dev/null || true
@@ -195,7 +199,7 @@ else
   done < <(jq -r --arg n "$name" '.[] | select(.name==$n) | .tabs // [] | .[] | select(.autoStart==true) | "\(.name)\t\(.cmd // "")"' "$json")
   tmux "${tmux_sock_args[@]}" select-window -t "$session:0" 2>/dev/null || true
 fi
-exec /usr/bin/ttyd \
+exec "${PW_TTYD_BIN:-/usr/bin/ttyd}" \
   --interface 127.0.0.1 \
   --port "$port" \
   --base-path "/pty/$name" \

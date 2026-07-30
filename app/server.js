@@ -12,7 +12,7 @@ import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-
 import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
-import { HOST_TERMINAL_USER, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
+import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
@@ -838,9 +838,9 @@ async function stopPreviewUnit(name){
 }
 async function tmux(args,opts={}){
  if(DEPLOY_MODE === 'container') return execFileAsync('tmux',['-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
- // HOST_TERMINAL_USER (not a literal) so the account panes run as and the account
+ // hostTerminalUser() (not a literal) so the account panes run as and the account
  // per-user credential files are chowned to cannot drift apart — see terminal-owner.js.
- return execFileAsync('sudo',['-u',HOST_TERMINAL_USER,'tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
+ return execFileAsync('sudo',['-u',hostTerminalUser(process.env),'tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
 }
 function parseTmuxWindows(stdout){
  return String(stdout || '').split('\n').filter(Boolean).map(line=>{

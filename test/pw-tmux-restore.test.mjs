@@ -98,6 +98,13 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
     PW_CLAUDE_SESSIONS_DIR: path.join(dir, 'claude-sessions'), // absent dir: no live-sid guard entries, fine
     PW_CLAUDE_PROJECTS_DIR: path.join(dir, 'claude-projects'),
     PW_TMUX_RESTORE_CLAUDE: '1',
+    // The real terminal-owner (getent/passwd + `sudo -n -u <account>`)
+    // resolution this script's credential path goes through via
+    // app/project-terminal-credentials.mjs — see app/terminal-owner.js. The
+    // literal shipped 'admin' account only exists on the real PW host;
+    // pointing this at whichever account is actually running this test makes
+    // that real path exercisable anywhere, never a fallback.
+    PW_HOST_TERMINAL_USER: os.userInfo().username,
   };
   return { dir, name, projPath, port, sock, env, session, stateDir };
 }

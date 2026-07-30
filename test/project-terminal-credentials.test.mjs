@@ -52,6 +52,12 @@ async function run(dir, { project = 'demo', primaryUser = '', enabled = true, ex
     PW_USERS_PATH: path.join(dir, 'users.json'),
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'),
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
+    // The real terminal-owner (getent/passwd + `sudo -n -u <account>`) resolution
+    // path — see app/terminal-owner.js. The literal shipped 'admin' account only
+    // exists on the real PW host; pointing this at whichever account is actually
+    // running this test makes the real resolution/sudo path exercisable anywhere,
+    // never falling back — an unset or unresolvable name still fails closed.
+    PW_HOST_TERMINAL_USER: os.userInfo().username,
     ...extraEnv,
   };
   try {
@@ -104,6 +110,20 @@ test('enabled + valid owner: materializes real credentials and reports non-secre
 
   assert.equal(stdout.includes('ghp_realtoken'), false, 'the token must never appear on stdout');
   assert.equal(stderr.includes('ghp_realtoken'), false, 'the token must never appear on stderr');
+});
+
+test('REGRESSION: a configured terminal user that does not resolve to any real account fails closed, portably', async () => {
+  const dir = await tmpDir();
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  await seed(dir, { users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_realtoken') }], secretKey });
+  const { code, stdout } = await run(dir, {
+    primaryUser: 'alice', enabled: true,
+    extraEnv: { PW_HOST_TERMINAL_USER: 'pw-test-nonexistent-account-793d' },
+  });
+  assert.notEqual(code, 0);
+  const body = JSON.parse(stdout);
+  assert.equal(body.ok, false);
+  await fsp.rm(dir, { recursive: true, force: true });
 });
 
 test('REGRESSION: an unreadable users.json fails closed — exits nonzero, prints an actionable error, never a secret', async () => {

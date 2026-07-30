@@ -47,6 +47,28 @@ function opts(dir, overrides = {}) {
   };
 }
 
+// resolveLaneCredentials resolves the terminal (OS-account) owner via
+// app/terminal-owner.js's hostTerminalUser(process.env) — real getent/passwd
+// and real `sudo -n -u <account>`, not injectable. Pointing PW_HOST_TERMINAL_USER
+// at the account genuinely running this test (never the literal 'admin', which
+// only exists on the real PW host) makes the REAL owner-resolution and
+// credential-materialization code paths exercisable on any machine — CI
+// included — while a test that wants to prove "the configured account does
+// not resolve" still can, by pointing this at a name that provably doesn't
+// exist (see the REGRESSION test below), portably rather than relying on the
+// current host's incidental account list.
+async function withHostTerminalUser(user, fn) {
+  const prev = process.env.PW_HOST_TERMINAL_USER;
+  process.env.PW_HOST_TERMINAL_USER = user;
+  try {
+    return await fn();
+  } finally {
+    if (prev === undefined) delete process.env.PW_HOST_TERMINAL_USER;
+    else process.env.PW_HOST_TERMINAL_USER = prev;
+  }
+}
+const REAL_ACCOUNT = os.userInfo().username;
+
 test('disabled feature: shared credentials, zero filesystem side effects', async () => {
   const dir = await tmpDir();
   await seed(dir, { registry: [{ name: 'demo', primaryUser: 'alice' }], users: [{ username: 'alice' }] });
@@ -75,9 +97,24 @@ test('enabled + valid owner: materializes real credentials and returns a real fi
     users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_realtoken') }],
     secretKey,
   });
-  const result = await resolveLaneCredentials({ ...opts(dir), projectId: 'demo', perUserEnabled: true });
+  const result = await withHostTerminalUser(REAL_ACCOUNT, () => resolveLaneCredentials({ ...opts(dir), projectId: 'demo', perUserEnabled: true }));
   assert.match(result.key, /^[0-9a-f]{16}$/);
   assert.deepEqual(result.tokens, ['CLAUDE_CONFIG_DIR=' + userClaudeConfigDir(path.join(dir, 'pw-users'), 'alice')]);
+  await fsp.rm(dir, { recursive: true, force: true });
+});
+
+test('REGRESSION: a configured terminal user that does not resolve to any real account fails closed, portably', async () => {
+  const dir = await tmpDir();
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  await seed(dir, {
+    registry: [{ name: 'demo', primaryUser: 'alice' }],
+    users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_realtoken') }],
+    secretKey,
+  });
+  await withHostTerminalUser('pw-test-nonexistent-account-793d', () => assert.rejects(
+    resolveLaneCredentials({ ...opts(dir), projectId: 'demo', perUserEnabled: true }),
+    /did not resolve|credential materialization failed/i,
+  ));
   await fsp.rm(dir, { recursive: true, force: true });
 });
 
@@ -116,9 +153,14 @@ test('REGRESSION: a materialization failure (cred base unusable) fails closed', 
   const dir = await tmpDir();
   await seed(dir, { registry: [{ name: 'demo', primaryUser: 'alice' }], users: [{ username: 'alice' }] });
   fs.writeFileSync(path.join(dir, 'pw-users'), 'not a directory');
-  await assert.rejects(
+  // REAL_ACCOUNT so the terminal-owner resolution this failure is supposed to
+  // get PAST actually succeeds — otherwise this would "pass" for the wrong
+  // reason (an unrelated owner-resolution error that happens to match the
+  // same /credential materialization failed/i regex), never exercising the
+  // cred-base-unusable path it claims to test.
+  await withHostTerminalUser(REAL_ACCOUNT, () => assert.rejects(
     resolveLaneCredentials({ ...opts(dir), projectId: 'demo', perUserEnabled: true }),
     /credential materialization failed/i,
-  );
+  ));
   await fsp.rm(dir, { recursive: true, force: true });
 });

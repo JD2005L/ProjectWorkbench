@@ -70,6 +70,21 @@ function encryptToken(secretKeyHex, plaintext) {
   return 'enc:' + Buffer.concat([iv, tag, enc]).toString('base64');
 }
 
+// Real production ttyd blocks forever serving the terminal — this script's
+// `exec ttyd ...` never returns while a session is live, which is exactly why
+// runScript() below has to time it out and treat that as success. A stub that
+// mimics the same "starts and blocks" shape (ignoring its args, which we
+// don't need — the tmux setup this script does happens entirely BEFORE the
+// ttyd exec) needs the same timeout-based proof, and needs no real ttyd
+// binary installed on the host at all. Fed to the script via PW_TTYD_BIN (see
+// scripts/project-terminal-start), never the real /usr/bin/ttyd path.
+function makeFakeTtyd(dir) {
+  const binDir = fs.mkdtempSync(path.join(dir, 'ttyd-shim-'));
+  const ttydBin = path.join(binDir, 'ttyd');
+  fs.writeFileSync(ttydBin, '#!/usr/bin/env bash\nexec sleep infinity\n', { mode: 0o755 });
+  return ttydBin;
+}
+
 async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
   const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pw-pts-'));
   const name = 'pw20test_' + crypto.randomBytes(4).toString('hex');
@@ -93,6 +108,15 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
     PW_APP_DIR: APP_DIR,
     PW_TMUX_SOCKET: sock,
     PW_PER_USER_CLAUDE: enabled ? 'true' : '',
+    // The real terminal-owner (getent/passwd + `sudo -n -u <account>`)
+    // resolution this script's credential path goes through via
+    // app/project-terminal-credentials.mjs — see app/terminal-owner.js. The
+    // literal shipped 'admin' account only exists on the real PW host;
+    // pointing this at whichever account is actually running this test makes
+    // that real path exercisable anywhere, never a fallback (see the
+    // dedicated REGRESSION test below for the unresolvable case).
+    PW_HOST_TERMINAL_USER: os.userInfo().username,
+    PW_TTYD_BIN: makeFakeTtyd(dir),
   };
   return { dir, name, projPath, sock, env };
 }
@@ -185,6 +209,38 @@ test('REGRESSION: a materialization failure (cred base unusable) fails closed be
     const result = await runScript(ctx);
     assert.notEqual(result.code, 0);
     assert.equal(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]), false);
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION: a configured terminal user that does not resolve to any real account fails closed before tmux/ttyd', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+  ctx.env.PW_HOST_TERMINAL_USER = 'pw-test-nonexistent-account-793d';
+  try {
+    const result = await runScript(ctx);
+    assert.notEqual(result.code, 0, JSON.stringify(result));
+    assert.equal(result.timedOut, false, 'must fail before ever reaching the ttyd exec');
+    assert.equal(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]), false,
+      'no tmux session (and therefore no shared-login fallback) may be created when the terminal owner cannot be resolved');
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION: a missing/unusable ttyd binary fails closed — never treated as success', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+  ctx.env.PW_TTYD_BIN = path.join(ctx.dir, 'no-such-ttyd-binary');
+  try {
+    const result = await runScript(ctx);
+    assert.notEqual(result.code, 0, 'a missing ttyd binary must not be treated as a successful launch');
+    assert.equal(result.timedOut, false, 'there is nothing to time out on — the exec itself must fail immediately');
+    // Everything BEFORE the ttyd exec (credential resolution, tmux session
+    // creation and stamping) still succeeded — only the final handoff failed.
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]),
+      'the tmux session this script sets up before the ttyd exec must still exist');
   } finally { await teardown(ctx); }
 });
 

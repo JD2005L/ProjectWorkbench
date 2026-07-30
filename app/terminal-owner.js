@@ -27,6 +27,18 @@ import { resolveTerminalPriv } from './terminal-priv.js';
 // ownership resolution below cannot drift apart — they must name the same user.
 export const HOST_TERMINAL_USER = 'admin';
 
+// PW_HOST_TERMINAL_USER is an explicit, opt-in override of HOST_TERMINAL_USER —
+// NOT a fallback. Unset (every real deployment), this returns the literal
+// 'admin' constant unconditionally, byte-identical to before this existed. It
+// exists so a test (or a deployment that genuinely runs panes as a different
+// account) can point host-mode resolution at a DIFFERENT but still real,
+// sudo-able account explicitly — it never activates itself when 'admin' fails
+// to resolve. server.js's tmux() must call this too (never re-read
+// HOST_TERMINAL_USER directly) so the two can never name different accounts.
+export function hostTerminalUser(env = {}) {
+  return env.PW_HOST_TERMINAL_USER || HOST_TERMINAL_USER;
+}
+
 function deployMode(env = {}) {
   return String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
 }
@@ -77,7 +89,7 @@ export function terminalOwnerPlan(env = {}) {
     return { kind: 'numeric', uid, gid, user: priv.user || String(uid) };
   }
   // Host mode always runs panes through `sudo -u <HOST_TERMINAL_USER> tmux`.
-  return { kind: 'named', user: HOST_TERMINAL_USER };
+  return { kind: 'named', user: hostTerminalUser(env) };
 }
 
 // Build a passwd lookup. getent is tried first because it answers through NSS and
