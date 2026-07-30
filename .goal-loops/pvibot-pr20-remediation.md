@@ -932,3 +932,139 @@ before committing, isolated and minimal.
 - `bash -n scripts/pw-tmux-restore` and `node --check` on every modified/new `.js` file: clean.
 - `app/VERSION` bumped `1.26.0730.0257` → `1.26.0730.0442`; `test/release-version.test.mjs` confirms
   the bump satisfies the forward-motion + deployable-content-requires-a-bump guard.
+
+## Round: orchestrator credential-env application (final reviewer BLOCK)
+
+A final immutable reviewer found: `app/orchestrator/lane-credentials.js` resolves and
+`app/orchestrator/session.js` stamps a per-user credential fingerprint (`@pw_cred_key`)
+on the orchestrator's tmux session, but the resolved `CLAUDE_CONFIG_DIR` token was never
+passed to `TmuxAdapter.newSession()` (fresh session) or `TmuxAdapter.newWindow()`
+(lane window, via `_createLane()`) — both accept an optional `command` argv element that
+was simply never supplied. A pane could look correctly attributed (stamp matches) while
+its process actually ran under the shared/default Claude login.
+
+RED first: `test/orch-session-credentials.test.mjs` gained a test reading the pane's REAL
+process env via `/proc/<pid>/environ` (real tmux server, skipped only if tmux is absent)
+for both the session's initial window and the lane window — confirmed failing against
+pre-fix code (`undefined` where `CLAUDE_CONFIG_DIR` was expected).
+
+Fix: `lane-credentials.js` now also returns `shellArgs` (it already computed
+`ensureUserCredentials()`'s `envFile` — the GitHub-token drop-in — and silently discarded
+it; now mirrors `app/server.js`'s `credentialContext()`'s `--rcfile` parity exactly).
+`session.js` gained `laneLaunchCommand(cred)` — `env TOKEN=VAL... bash <shellArgs>`,
+mirroring `app/server.js`'s `ensureProjectTmuxSession` construction exactly — passed to
+both `newSession` and both of `_createLane`'s call sites. Returns `null` (no forced
+command) when `cred.tokens` is empty, so disabled mode is byte-identical — verified by a
+strengthened test asserting `CLAUDE_CONFIG_DIR` is absent from both panes there.
+
+Caught mid-implementation: a `replace_all` edit missed one of `_createLane`'s two call
+sites (differing indentation broke the exact string match) — the RED test caught it
+immediately (session-window assertion passed, lane-window assertion still failed).
+
+Independent adversarial review (separate subagent) confirmed the fix via the strongest
+available check: reverted only the two production files via `git stash`, reproduced the
+original failure, restored, confirmed `git status` clean. It also independently surfaced
+the same deeper gap I'd already found and scoped out during Assess:
+
+**Flagged, NOT fixed (out of this finding's scope):** `app/orchestrator/runner/claude.js`'s
+`ClaudeCodeBackend.runPhase()` actually executes the coding CLI via a direct
+child-process exec (`phaseEnv()`, a clone of the orchestrator service's own
+`process.env`) that bypasses the tmux pane entirely — this is the path that runs
+*automated* phase work, and it has the identical credential-attribution gap this commit
+closes only for the visible pane. Also unaddressed: the pre-existing reboot-reclaim path
+(`session.js`, untouched by this diff) re-marks a `pw-tmux-restore`-recreated plain shell
+as the lane without applying any launch command. Both need their own follow-up.
+
+### Verification evidence
+- Focused suite: `node --test test/orch-session-credentials.test.mjs` — **6/6** (was 5/6 RED).
+- Full `orch-*` suite: **303/303**.
+- Full canonical suite, `npm test` (default-concurrent): **589/589**.
+- Full canonical suite, serial (`--test-concurrency=1`): **589/589**.
+- `node --check` clean on all 3 touched `.js`/`.mjs` files.
+- `app/VERSION` bumped `1.26.0730.1525` → `1.26.0730.1600`; guard test passes.
+- Committed on `pvibot/pr20-fixes` at `53394e670a48e4e2e44552bb5db4b4b0f212ee9f`.
+  Not pushed, not merged, not deployed.
+
+## Round: full-scope exact-head review — the two flagged follow-up gaps
+
+The previous round's own report flagged two gaps as explicitly out of scope. A follow-up
+full-scope review treated both as merge blockers. Closed both, strict RED→GREEN, same session.
+
+### Gap 1 — automated execution paths never received the credential environment either
+
+`app/orchestrator/runner/claude.js`'s `ClaudeCodeBackend` runs the coding CLI via a DIRECT
+child-process exec for real work — `runPhase()` (discovery/implementation/revision),
+`verifyConfiguration()` (model/effort attestation), and internally `probeAuth()` — completely
+bypassing the tmux pane the previous round fixed. `phaseEnv()` cloned `process.env` with zero
+per-project awareness, for every one of these.
+
+RED first: `test/orch-runner.test.mjs` gained three tests using the file's existing `backendWith()`
+spy pattern (asserting on `options.env` captured per call) PLUS one genuinely stronger test that
+routes a fake `exec` through a REAL nested `execFileAsync('env', [], {env: options.env})` child
+process, reading back what that live process's environment actually contained — not just a JS
+object comparison. Confirmed failing against pre-fix code (3 of 4 new tests failed; the
+disabled-mode one trivially passed since nothing was wired yet).
+
+Fix: `phaseEnv(credentialTokens = [])` now merges resolved `KEY=VALUE` tokens after stripping the
+forbidden API-billing keys. `probeAuth`, `verifyConfiguration`, `runPhase` all accept and thread
+`credentialTokens` (default `[]`, byte-identical when omitted). `session.js` gained a public
+`resolveCredentials(projectId)` wrapping the existing `this.credentials` resolver — the SAME
+resolution `ensureSession()` uses, so a phase's spawned process can never resolve to something
+different than what the pane is attributed as. `engine.js`'s `_runPhase()` and `_runReview()`
+resolve credentials fresh before each `backend.runPhase()` call (fail-closed:
+`BLOCKED_CONFIGURATION`/`BLOCKED_REVIEW` on resolution failure, never a silent fall-through with no
+tokens); `session.js`'s `verifySession()` does the same before `backend.verifyConfiguration()`
+(fail-closed via the existing "unverifiable" response path). Audited every `backend.runPhase`/
+`verifyConfiguration`/`probeAuth` call site in `app/orchestrator/*.js`: the three instance-level
+health surfaces (`api.js`'s `/health` and `/readiness`, `mcp.js`'s `pw_health`) have no project
+context and were correctly left untouched.
+
+Four hand-rolled `sessionManager` test-fixture stubs (`test/orch-engine.test.mjs`,
+`test/orch-mcp.test.mjs`, `test/orch-wire.test.mjs`, `test/orch-p1-regressions.test.mjs`) needed
+`resolveCredentials: async () => ({ tokens: [] })` added — the new production code path calling a
+method these stubs didn't have broke 27 previously-passing orch-* tests with `TypeError`, caught
+immediately by re-running the full orch-* suite after the engine/session wiring.
+
+### Gap 2 — a reboot-restored plain shell could be accepted while carrying a current fingerprint
+
+`session.js`'s reclaim branch (`_ensureSession`'s `!markedByUs` path) re-marked a
+`pw-tmux-restore`-recreated plain shell as the lane IN PLACE — the session's `@pw_cred_key` stamp
+was already correct (a prior round fixed `pw-tmux-restore` itself), and the window's role markers
+get set correctly by the reclaim — so it LOOKS exactly like a correctly-attributed lane, while the
+pane itself is whatever plain shell `pw-tmux-restore` actually launched, never handed
+`CLAUDE_CONFIG_DIR`.
+
+RED first: two new tests in `test/orch-session-credentials.test.mjs` simulate exactly what
+`pw-tmux-restore` leaves behind (kill the lane window, recreate an unmarked idle-shell window with
+the same name/cwd) then call `ensureSession()` again against a REAL tmux server. Confirmed RED via
+`git stash push -- app/orchestrator/session.js`: the enabled-credentials test failed against the
+pre-fix reclaim logic (disabled-mode test still passed, as expected since that path is untouched),
+then `git stash pop` restored the fix.
+
+Fix: when `cred.tokens.length > 0` (credentials enabled and resolved), the reclaim branch now
+kills the plain-shell window and relaunches it via `_createLane()` — the SAME path a brand-new lane
+takes, correctly applying the credential launch command — falling through to the shared
+bottom-of-function record-bookkeeping (`laneWindowId`/`replaced`) instead of the old early-return.
+When `cred.tokens.length === 0` (disabled/off), the original re-mark-in-place behavior is
+unchanged (a plain shell IS correct there; killing it would be gratuitous).
+
+### Independent adversarial verification
+
+A separate subagent reviewed both fixes skeptically and did real empirical verification, not just
+static reading: mutation-tested `phaseEnv()`'s token-merge loop (disabled it, confirmed all 3 new
+credential tests in `orch-runner.test.mjs` failed, restored it) and independently repeated the
+`git stash`/revert/retest for the reclaim fix. One low-severity confirmed nit: `orch-mcp.test.mjs`'s
+added `resolveCredentials` stub is technically unexercised (that file's tests never reach a job
+path that would call it) — harmless dead scaffolding, not a masked bug; left in place for
+consistency with the other three fixture files rather than re-touching a passing file.
+
+### Verification evidence
+
+- Focused: `orch-runner.test.mjs` **30/30**, `orch-session-credentials.test.mjs` **8/8**.
+- Full `orch-*` suite: **309/309**.
+- Full canonical suite, `npm test` (default-concurrent): **595/595**.
+- Full canonical suite, serial (`--test-concurrency=1`): **595/595**.
+- `node --check` clean on all 9 touched `.js`/`.mjs` files.
+- `app/VERSION` bumped `1.26.0730.1600` → `1.26.0730.1643`; guard test passes.
+- Working tree confirmed clean (no stray stashes, no untracked debris) after both revert-and-retest
+  passes (mine and the independent reviewer's).

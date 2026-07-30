@@ -141,10 +141,24 @@ export class ClaudeCodeBackend {
     return argv;
   }
 
-  /** A child environment with every API-billing escape hatch removed. */
-  phaseEnv() {
+  /**
+   * A child environment with every API-billing escape hatch removed, and the
+   * resolved per-user credential tokens applied (see
+   * app/orchestrator/lane-credentials.js / session.js's laneLaunchCommand —
+   * the SAME `KEY=VALUE` tokens applied to the lane's tmux pane, so a phase
+   * spawned directly by this backend can never run under a different
+   * identity than what the pane is attributed as). `credentialTokens`
+   * omitted or empty (disabled mode, or the legitimate no-primaryUser case)
+   * leaves the environment byte-identical to before this parameter existed.
+   */
+  phaseEnv(credentialTokens = []) {
     const env = { ...process.env };
     for (const key of FORBIDDEN_ENV) delete env[key];
+    for (const token of credentialTokens) {
+      const eq = token.indexOf('=');
+      if (eq === -1) continue;
+      env[token.slice(0, eq)] = token.slice(eq + 1);
+    }
     return env;
   }
 
@@ -159,14 +173,14 @@ export class ClaudeCodeBackend {
    * and also an email and an org id, which are deliberately *not* propagated: the contract's
    * `account_label` is a label, never an address.
    */
-  async probeAuth() {
+  async probeAuth(credentialTokens = []) {
     const checkedAt = this.clock().toISOString();
     const base = { schema_version: SCHEMA_VERSION, backend: this.name, checked_at: checkedAt };
 
     let stdout;
     try {
       ({ stdout } = await this.exec(this.config.backendExecutable, ['auth', 'status'], {
-        timeout: 15_000, env: this.phaseEnv(),
+        timeout: 15_000, env: this.phaseEnv(credentialTokens),
       }));
     } catch (err) {
       const kind = classifyBackendFailure(err);
@@ -276,6 +290,12 @@ export class ClaudeCodeBackend {
     // This build's own contract when no peer is in the picture — a direct caller is not a peer.
     // A peer's version always arrives explicitly, via session.js from the validated request.
     attestationContractVersion = ATTESTATION_CONTRACT_VERSION,
+    // The SAME resolved per-user credential tokens session.js applies to the lane's tmux pane (see
+    // app/orchestrator/lane-credentials.js) — omitted/empty means disabled mode, byte-identical to
+    // before this parameter existed. Applied to BOTH the auth probe and the verification phase
+    // itself: checking sign-in status under a DIFFERENT identity than the one that will actually run
+    // the job would make "verified" mean nothing.
+    credentialTokens = [],
   }) {
     const argv = this.buildPhaseArgv({
       prompt: 'Reply with exactly: ready',
@@ -290,13 +310,13 @@ export class ClaudeCodeBackend {
     // Fingerprint BEFORE launching. Taking it afterwards left a window in which the binary that ran
     // and the binary that was attested need not be the same file.
     const fingerprint = await this.fingerprint();
-    const probedAuth = await this.probeAuth().catch(() => null);
+    const probedAuth = await this.probeAuth(credentialTokens).catch(() => null);
 
     let stdout = '';
     let stderr = '';
     try {
       ({ stdout, stderr } = await this.exec(this.config.backendExecutable, argv, {
-        cwd, timeout: Math.min(this.config.backendTimeoutMs, 300_000), env: this.phaseEnv(),
+        cwd, timeout: Math.min(this.config.backendTimeoutMs, 300_000), env: this.phaseEnv(credentialTokens),
         maxBuffer: 8 * 1024 * 1024,
       }));
     } catch (err) {
@@ -366,7 +386,14 @@ export class ClaudeCodeBackend {
    * evidence of anything: whether the work was actually done is decided by the deterministic checks
    * and by git, never by what the model said about itself.
    */
-  async runPhase({ prompt, model, effort, maxTurns, phaseClass, cwd, resumeSessionId = null, sessionId = null, timeoutMs = null, signal = null }) {
+  async runPhase({
+    prompt, model, effort, maxTurns, phaseClass, cwd, resumeSessionId = null, sessionId = null,
+    timeoutMs = null, signal = null,
+    // The SAME resolved per-user credential tokens applied to the lane's tmux pane and to
+    // verifyConfiguration's probe — see phaseEnv()'s doc comment. Omitted/empty means disabled
+    // mode, byte-identical to before this parameter existed.
+    credentialTokens = [],
+  }) {
     const argv = this.buildPhaseArgv({ prompt, model, effort, maxTurns, phaseClass, resumeSessionId, sessionId });
     const permissionMode = PERMISSION_MODE_BY_PHASE[phaseClass];
 
@@ -376,7 +403,7 @@ export class ClaudeCodeBackend {
       ({ stdout, stderr } = await this.exec(this.config.backendExecutable, argv, {
         cwd,
         timeout: timeoutMs ?? this.config.backendTimeoutMs,
-        env: this.phaseEnv(),
+        env: this.phaseEnv(credentialTokens),
         maxBuffer: 32 * 1024 * 1024,
         // Cancellation has to reach the child process. Without this the agent kept editing while
         // the caller waited out the phase budget — up to half an hour by default.

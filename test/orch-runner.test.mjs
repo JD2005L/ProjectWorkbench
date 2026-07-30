@@ -392,6 +392,98 @@ test('runner: a max-turn exit is a failure, never a success', async () => {
   assert.equal(result.failure_kind, 'max_turns');
 });
 
+// ---------------------------------------------------------------------------
+// per-user credential environment
+//
+// A resolved per-user credential (see app/orchestrator/lane-credentials.js)
+// decides WHICH Claude identity a job runs under. The orchestrator's tmux
+// lane applies it to the pane's launch command (session.js), but runPhase()/
+// verifyConfiguration()/probeAuth() spawn the coding CLI directly — a
+// SEPARATE process that must receive the SAME resolved tokens or the actual
+// automated work runs under the shared/default login regardless of what the
+// pane (or a human attaching to it) would see.
+// ---------------------------------------------------------------------------
+
+test('runner: runPhase applies the resolved credential tokens to the spawned CLI\'s real environment', async () => {
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    credentialTokens: ['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal(phase.options.env.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude',
+    'the spawned process\'s own environment must carry the resolved per-user config dir');
+});
+
+test('runner: verifyConfiguration applies the resolved credential tokens to BOTH the auth probe and the verification phase', async () => {
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  await backend.verifyConfiguration({
+    requested: { model_alias: 'sonnet', effort: 'high' },
+    phaseClass: PhaseClass.DISCOVERY,
+    sessionKey: 'o:w:Demo:pvi2-orchestrator',
+    cwd: '/srv/workspaces/Demo',
+    runId: 'run-1', configGeneration: 1,
+    verificationNonce: 'a1b2c3d4e5f60718293a4b5c6d7e8f90',
+    credentialTokens: ['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  const authProbe = calls.find((c) => c.args[0] === 'auth');
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal(authProbe.options.env.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude',
+    'the auth-status probe must check the SAME identity the phase itself will run under, not the shared one');
+  assert.equal(phase.options.env.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude');
+});
+
+test('runner: no credentialTokens means the spawned process env is byte-unchanged (disabled mode)', async () => {
+  const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    // credentialTokens omitted entirely — the disabled-mode / no-primaryUser shape.
+  });
+  const phase = calls.find((c) => c.args.includes('-p'));
+  assert.equal('CLAUDE_CONFIG_DIR' in phase.options.env, false);
+  // The base environment (process.env, minus the forbidden API-billing keys) must be otherwise
+  // untouched — the same object shape phaseEnv() always produced.
+  assert.equal(phase.options.env.PATH, process.env.PATH);
+});
+
+test('runner: REGRESSION — the resolved credential env reaches a REAL spawned process, not just a JS options object', async () => {
+  // Unlike the spy above (which only proves this code CONSTRUCTS the right options.env), this
+  // drives a genuine child process through Node's own execFile and reads back what that process's
+  // real environment actually contained — the same class of proof test/project-terminal-start.test.mjs
+  // and test/orch-session-credentials.test.mjs use via /proc/<pid>/environ for the tmux pane side of
+  // this same feature.
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+  });
+  const exec = async (file, args, options) => {
+    if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+    if (args[0] === '--help') return { stdout: REAL_HELP, stderr: '' };
+    if (args[0] === 'auth') return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }), stderr: '' };
+    // The REAL child process: `env` genuinely reads its own live environment, unrelated to
+    // anything this test file constructed as a JS object.
+    const real = await execFileAsync('env', [], { env: options.env });
+    const dir = real.stdout.split('\n').find((l) => l.startsWith('CLAUDE_CONFIG_DIR='))?.slice('CLAUDE_CONFIG_DIR='.length) ?? '';
+    return { stdout: `${INIT_LINE}\n${JSON.stringify({ ...JSON.parse(RESULT_LINE), result: dir })}\n`, stderr: '' };
+  };
+  const backend = new ClaudeCodeBackend({ config, exec, clock: () => new Date('2026-07-27T12:00:00.000Z') });
+  backend.fingerprint = async () => FINGERPRINT;
+
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    credentialTokens: ['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  assert.equal(result.summary, '/srv/pw-users/alice/.claude',
+    'a REAL spawned process must have actually seen CLAUDE_CONFIG_DIR in its own environment');
+});
+
 test('runner: an abort is classified as cancellation, not as a timeout', () => {
   // Aborting execFile terminates the child with SIGTERM, which the timeout branch would otherwise
   // claim — sending a deliberately cancelled job to a blocked state instead of a cancelled one.

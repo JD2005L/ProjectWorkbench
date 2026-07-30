@@ -24,6 +24,7 @@ import { JournalStore } from '../app/orchestrator/store/journal.js';
 import { OrchestratorRepository } from '../app/orchestrator/store/repo.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { TmuxAdapter, OrchestratorSessionManager } from '../app/orchestrator/session.js';
+import { resolveWorkspacePath } from '../app/orchestrator/projects.js';
 import { FakeCodingBackend } from '../app/orchestrator/runner/fake.js';
 import { ApiError } from '../app/orchestrator/errors.js';
 import { CREDENTIALS_OFF } from '../app/user-credentials.js';
@@ -215,5 +216,90 @@ tmuxTest('REGRESSION: a credential resolution failure (not "off") never falls ba
       (err) => err instanceof ApiError && /cannot resolve the current credential context/i.test(err.message),
     );
     assert.equal(await tmux.hasSession('pw_Demo'), false, 'no session (and therefore no shared-login fallback) may be created on a resolution failure');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// reboot / restore / reclaim
+//
+// scripts/pw-tmux-restore recreates a project's tmux session and windows from
+// a saved manifest — including, when the orchestrator's lane window happened
+// to be idle at save time, a PLAIN unmarked shell sitting on the lane's
+// reserved window name. The FIRST ensureSession() call after a restart finds
+// that window, recognises it as provably its own (via the durable session
+// record — see session.js's `reclaimable` check) and "reclaims" it. Before
+// this fix, reclaiming meant re-marking the window in place: the session's
+// own @pw_cred_key stamp and the window's role markers both end up looking
+// exactly like a correctly-attributed lane, while the pane itself is still
+// whatever plain shell pw-tmux-restore actually launched it with — which was
+// never handed CLAUDE_CONFIG_DIR, because pw-tmux-restore ran before the
+// orchestrator ever got a chance to launch that window itself.
+// ---------------------------------------------------------------------------
+
+/** Simulates exactly what pw-tmux-restore leaves behind: an UNMARKED plain idle shell sitting on
+ * the lane's reserved window name, in the right directory — the one shape session.js's own
+ * `reclaimable` check is designed to recognise as "provably ours, just needs re-attributing". */
+async function simulateRebootRestoredLane(tmux, session, windowName, cwd) {
+  const before = await tmux.findWindow(session, windowName);
+  if (before) await tmux.killWindowById(before.id);
+  await tmux.newWindow(session, windowName, cwd);
+  const restored = await tmux.findWindow(session, windowName);
+  return restored.id;
+}
+
+tmuxTest('REGRESSION: a reboot-restored plain shell on the lane\'s window name is NOT accepted as-is when credentials are enabled — it is relaunched with the resolved environment', async () => {
+  const configDir = '/tmp/pw-orch-reclaim-probe-' + process.pid;
+  const credentials = async () => ({
+    key: 'eeeeeeeeeeeeeeee',
+    tokens: [`CLAUDE_CONFIG_DIR=${configDir}`],
+    shellArgs: ['--noprofile', '--norc'],
+  });
+  await withLane({ credentials }, async ({ config, tmux, manager, project, token, socket }) => {
+    // A normal first ensureSession(): real lane, real credential env, real fingerprint.
+    await ensure(manager, project, token);
+    const lane = manager.laneFor(project, {});
+    const workspacePath = resolveWorkspacePath(config, project);
+
+    // Simulate the reboot: pw-tmux-restore recreates the SAME-named window as a plain, unmarked,
+    // uncredentialed idle shell — the session's own @pw_cred_key stamp is untouched by this (a
+    // real restore, already fixed in an earlier round, keeps the SESSION-level stamp current; this
+    // test isolates the WINDOW-level gap specifically). Same cwd as the real lane, matching exactly
+    // what a real restore leaves (and what session.js's own `reclaimable` check requires).
+    const restoredWindowId = await simulateRebootRestoredLane(tmux, 'pw_Demo', lane.reservedWindow, workspacePath);
+    const restoredEnv = await paneEnvironByTarget(socket, restoredWindowId);
+    assert.equal('CLAUDE_CONFIG_DIR' in restoredEnv, false, 'sanity: the simulated restored shell must start uncredentialed, like a real restore leaves it');
+
+    // The next ensureSession() (what the engine calls before running any phase) must not silently
+    // accept this plain shell as the lane just because its name and the session's own stamp check
+    // out — it must relaunch it with the actual resolved credential environment.
+    await ensure(manager, project, token);
+
+    const reclaimedWindow = await tmux.findWindow('pw_Demo', lane.reservedWindow);
+    assert.ok(reclaimedWindow, 'sanity: the lane window must still exist under its reserved name');
+    assert.notEqual(reclaimedWindow.id, restoredWindowId,
+      'the plain restored shell must have been killed and replaced, not re-marked in place — its tmux window id must change');
+    const reclaimedEnv = await paneEnvironByTarget(socket, reclaimedWindow.id);
+    assert.equal(reclaimedEnv.CLAUDE_CONFIG_DIR, configDir,
+      'the relaunched lane window must carry the resolved per-user CLAUDE_CONFIG_DIR — a restored lane must never be accepted while still running the shared/default shell');
+  });
+});
+
+tmuxTest('a reboot-restored plain shell IS accepted as-is (re-marked, never killed) when credentials are disabled', async () => {
+  const credentials = async () => ({ key: CREDENTIALS_OFF, tokens: [] });
+  await withLane({ credentials }, async ({ config, tmux, manager, project, token }) => {
+    await ensure(manager, project, token);
+    const lane = manager.laneFor(project, {});
+    const workspacePath = resolveWorkspacePath(config, project);
+
+    // Same simulated restore, but for a project where a plain shell IS the correct environment —
+    // there is nothing to relaunch for, and killing/recreating it would be a gratuitous disruption
+    // to whatever the operator is looking at.
+    const restoredWindowId = await simulateRebootRestoredLane(tmux, 'pw_Demo', lane.reservedWindow, workspacePath);
+
+    await ensure(manager, project, token);
+
+    const reclaimedWindow = await tmux.findWindow('pw_Demo', lane.reservedWindow);
+    assert.equal(reclaimedWindow.id, restoredWindowId,
+      'disabled mode must re-mark the restored shell in place — unchanged from before per-user credential application existed');
   });
 });

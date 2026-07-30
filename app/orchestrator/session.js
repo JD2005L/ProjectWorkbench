@@ -313,6 +313,19 @@ export class OrchestratorSessionManager {
   }
 
   /**
+   * Resolves the per-project credential context — the SAME resolution `ensureSession()` uses to
+   * decide the fingerprint it stamps on the lane's tmux pane. Exposed so a caller that spawns a
+   * coding-CLI process directly (the engine's `_runPhase`/`_runReview`, which run headlessly and do
+   * not go through the tmux pane at all) applies EXACTLY what the lane is attributed as, rather than
+   * resolving its own possibly-drifted answer. Throws (fail-closed) on any resolution or
+   * materialization failure, exactly like `ensureSession()` — an automated phase must never run
+   * under a silently-substituted identity any more than the pane it is nominally attached to.
+   */
+  async resolveCredentials(projectId) {
+    return this.credentials(projectId);
+  }
+
+  /**
    * Create or adopt the project's orchestrator lane.
    *
    * Returns `status: missing` on first creation. A lane becomes `ready` only once
@@ -455,44 +468,60 @@ export class OrchestratorSessionManager {
           );
         }
 
-        // Re-mark in place rather than killing and recreating: the window is ours, and replacing it
-        // would be a gratuitous change to what the operator is looking at.
-        await this.tmux.setWindowOptionById(existing.id, MARKER.ROLE, lane.role);
-        await this.tmux.setWindowOptionById(existing.id, MARKER.PROJECT, project.project_id);
-        await this.tmux.setWindowOptionById(existing.id, MARKER.SESSION_KEY, sessionKey);
-        await this.tmux.setWindowOptionById(existing.id, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
+        if (cred.tokens.length > 0) {
+          // A restored plain shell cannot be carrying the per-user credential environment this
+          // project currently resolves to: pw-tmux-restore recreated this window from a saved
+          // manifest, before this lane ever launched it, so whatever process is running in it was
+          // never handed CLAUDE_CONFIG_DIR. Re-marking it in place would make it LOOK correctly
+          // attributed — the marker matches, and the session's own @pw_cred_key was already
+          // verified above — while the pane itself keeps running under the shared/default login.
+          // That gap is exactly what this feature exists to prevent, so a fresh relaunch through
+          // the SAME path a brand-new lane takes (below, via the shared replaced-record bookkeeping)
+          // is required here instead of the disabled-mode re-mark-in-place below.
+          await this.tmux.killWindowById(existing.id);
+          laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
+          replaced = true;
+        } else {
+          // Disabled mode (or the legitimate no-primaryUser case): a plain shell IS the correct
+          // environment, so re-marking in place — rather than a gratuitous kill+recreate — is
+          // exactly right, unchanged from before per-user credential application existed.
+          await this.tmux.setWindowOptionById(existing.id, MARKER.ROLE, lane.role);
+          await this.tmux.setWindowOptionById(existing.id, MARKER.PROJECT, project.project_id);
+          await this.tmux.setWindowOptionById(existing.id, MARKER.SESSION_KEY, sessionKey);
+          await this.tmux.setWindowOptionById(existing.id, MARKER.ORCHESTRATOR, token.orchestrator_instance_id);
 
-        const reclaimed = {
-          ...recorded,
-          // A restored shell has verified nothing: whatever the pre-reboot session knew is gone.
-          effective: null,
-          last_verified_at: null,
-          cli_session_id: null,
-          status: OrchestratorSessionStatus.MISSING,
-          last_used_at: this.now(),
-          lane_window_id: existing.id,
-          reclaimed_at: this.now(),
-        };
-        await this.store.transact((tx) => { this.repo.putSession(tx, reclaimed); });
-        return this._publicSession(reclaimed);
-      }
+          const reclaimed = {
+            ...recorded,
+            // A restored shell has verified nothing: whatever the pre-reboot session knew is gone.
+            effective: null,
+            last_verified_at: null,
+            cli_session_id: null,
+            status: OrchestratorSessionStatus.MISSING,
+            last_used_at: this.now(),
+            lane_window_id: existing.id,
+            reclaimed_at: this.now(),
+          };
+          await this.store.transact((tx) => { this.repo.putSession(tx, reclaimed); });
+          return this._publicSession(reclaimed);
+        }
+      } else {
+        if (existing.orchestrator && existing.orchestrator !== token.orchestrator_instance_id) {
+          // The lane belongs to a *different* orchestrator instance. Uniqueness is enforced on
+          // (orchestrator, workbench, project, role), so this is a conflict, not a takeover.
+          throw new ApiError(
+            ErrorCode.CONFLICT,
+            'the reserved window is held by a different orchestrator instance',
+          );
+        }
 
-      if (markedByUs && existing.orchestrator && existing.orchestrator !== token.orchestrator_instance_id) {
-        // The lane belongs to a *different* orchestrator instance. Uniqueness is enforced on
-        // (orchestrator, workbench, project, role), so this is a conflict, not a takeover.
-        throw new ApiError(
-          ErrorCode.CONFLICT,
-          'the reserved window is held by a different orchestrator instance',
-        );
-      }
-
-      const stale = !ownedByThisLane || existing.paneCurrentPath !== workspacePath;
-      if (stale || request.force_replace) {
-        // By id: the window was resolved from an exact-name match in listWindows, and killing by
-        // name would reintroduce the index ambiguity this whole path exists to avoid.
-        await this.tmux.killWindowById(existing.id);
-        laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
-        replaced = true;
+        const stale = !ownedByThisLane || existing.paneCurrentPath !== workspacePath;
+        if (stale || request.force_replace) {
+          // By id: the window was resolved from an exact-name match in listWindows, and killing by
+          // name would reintroduce the index ambiguity this whole path exists to avoid.
+          await this.tmux.killWindowById(existing.id);
+          laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
+          replaced = true;
+        }
       }
     } else {
       laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
@@ -572,6 +601,18 @@ export class OrchestratorSessionManager {
       throw notFound('no such orchestrator session on this instance');
     }
 
+    // Resolved fresh — the SAME resolution ensureSession() uses to decide the fingerprint stamped
+    // on the lane — and applied to the verification probe itself: checking sign-in status and
+    // effective model/effort under a DIFFERENT identity than the one that will actually run the
+    // job would make "verified" attest to nothing. A resolution failure is reported exactly like a
+    // backend-query failure (below): unverifiable, never silently probed under the shared login.
+    let cred;
+    try {
+      cred = await this.credentials(project.project_id);
+    } catch (e) {
+      return this._verificationResponse(record, null, `cannot resolve the current credential context: ${e?.message || e}`, null);
+    }
+
     let outcome;
     try {
       outcome = await this.backend.verifyConfiguration({
@@ -581,6 +622,7 @@ export class OrchestratorSessionManager {
         cliSessionId: record.cli_session_id,
         cwd: record.workspace_path,
         displayName: record.cli_display_name,
+        credentialTokens: cred.tokens,
         // The version the CALLER spoke. A peer that cannot express provenance is not told a setting
         // is effective when the only basis is launch enforcement.
         //

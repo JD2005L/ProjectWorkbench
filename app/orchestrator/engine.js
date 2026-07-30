@@ -812,6 +812,20 @@ export class OrchestrationEngine {
     const job = this.repo.getJob(jobId);
     await this._emit(jobId, { event_type: EventType.PHASE_STARTED, message: `${phaseClass} phase started` });
 
+    // Resolved fresh, right before spawning — the SAME resolution that decided the fingerprint
+    // stamped on this project's lane (see session.js's resolveCredentials/ensureSession). This
+    // phase runs as a directly-spawned process, not through the tmux pane, so without this it would
+    // run under the shared/default login regardless of what the pane is attributed as. A resolution
+    // failure blocks the job exactly like an unresolvable owner blocks ensureSession() — it must
+    // never silently fall through to backend.runPhase() with no credential tokens at all.
+    let cred;
+    try {
+      cred = await this.sessionManager.resolveCredentials(project.project_id);
+    } catch (err) {
+      await this._blockWith(jobId, JobStatus.BLOCKED_CONFIGURATION, `cannot resolve the current credential context for this phase: ${err.message}`);
+      return null;
+    }
+
     let result;
     try {
       result = await this.backend.runPhase({
@@ -826,6 +840,7 @@ export class OrchestrationEngine {
         // caller waited out the phase budget — up to half an hour — and the "working tree
         // preserved" comparison was taken around a still-running writer.
         signal: this._aborts.get(jobId)?.signal ?? null,
+        credentialTokens: cred.tokens,
       });
     } catch (err) {
       if (err?.kind === 'cancelled' || err?.name === 'AbortError' || this._cancelled(jobId)) {
@@ -961,6 +976,16 @@ export class OrchestrationEngine {
   async _runReview(jobId, { project, workspacePath, job }) {
     const implementationSessionId = job.cli_session_id ?? null;
 
+    // Same fail-closed resolution as _runPhase — an independent review run under the wrong identity
+    // is not independent of anything and must not be allowed to happen silently.
+    let cred;
+    try {
+      cred = await this.sessionManager.resolveCredentials(project.project_id);
+    } catch (err) {
+      await this._blockWith(jobId, JobStatus.BLOCKED_REVIEW, `cannot resolve the current credential context for the review: ${err.message}`);
+      return null;
+    }
+
     let result;
     try {
       result = await this.backend.runPhase({
@@ -975,6 +1000,7 @@ export class OrchestrationEngine {
         maxTurns: job.max_phase_turns,
         phaseClass: PhaseClass.ROUTINE_REVIEW,
         cwd: workspacePath,
+        credentialTokens: cred.tokens,
         // No resume: a fresh session id is what makes the isolation claim true.
         resumeSessionId: null,
       });

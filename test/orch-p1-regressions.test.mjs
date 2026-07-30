@@ -110,6 +110,7 @@ async function withEngine(fn, { backendOptions, envOverrides } = {}) {
         configGeneration: Number.isInteger(request.config_generation) ? request.config_generation : 0,
       })),
     }),
+    resolveCredentials: async () => ({ tokens: [] }),
   };
   const engine = new OrchestrationEngine({
     config, store, repo, backend, sessionManager, artifacts, projectStore,

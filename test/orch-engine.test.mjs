@@ -126,6 +126,7 @@ async function withEngine(fn, { backendOptions, projectOverrides } = {}) {
       });
       return { session_key: request.session_key, ...outcome };
     },
+    resolveCredentials: async () => ({ tokens: [] }),
   };
 
   const engine = new OrchestrationEngine({
