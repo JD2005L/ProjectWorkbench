@@ -811,3 +811,107 @@ in this round). `test/release-version.test.mjs` 4/4.
    any real kill after the child started) rather than closing the underlying gap, which is a
    containment primitive with provably-empty membership. Explicitly out of scope, per the reviewer's
    own framing of the trade-off as intentional.
+
+## Round 8 — CI caught a real abort-path discovery race in `_execTracked`, not test flakiness
+
+GitHub Actions job `90903757589` on HEAD `c74f5a2` (round 7's result) failed
+`orch-privilege-real.test.mjs`'s `"wrap kills a setsid-detached, SIGTERM-ignoring descendant when the
+launch is aborted, not just on timeout"`: the detached descendant survived the abort. The adjacent
+timeout-triggered version of the same test passed. ~35 local reproduction attempts under Node 20.18.1
+(isolated, full-suite default-concurrent, 2-core-constrained, CPU-starved) did not reproduce it —
+consistent with a narrow, real timing window rather than pure test-isolation noise, not proof either
+way on their own.
+
+### Root cause
+
+Direct instrumentation of `_execTracked`/`ensureTerminated` (temporary `console.error` timestamps,
+reverted before the fix) showed the periodic descendant poller (`DESCENDANT_POLL_MS` = 200ms) never
+ticks before a caller's `abort()` can complete the whole kill chain, and — the deeper finding —
+`ensureTerminated`'s own first rescan on entry *also* finds nothing, because by the time this module's
+JS-side code gets to look, the kernel has already relayed the signal through `sudo` to its child and
+reparented any `setsid`-detached grandchild away, breaking the `ppid` chain this module walks. A first
+fix attempt (racing an extra rescan against the same abort event, so it fires in the same synchronous
+turn as the trigger) measurably narrowed the gap but did not close it in ~9/10 focused runs: the
+kernel's own relay-then-reparent chain can complete before even a rescan started in that same turn
+finishes its first `/proc` read.
+
+Verified this is specific to `signal`, not `options.timeout`: Node's `execFile` handles the two
+through genuinely different code paths (`lib/child_process.js` v20.18.1 — `timeout` uses `execFile`'s
+own local `kill()` helper; `signal` is forwarded straight into the lower-level `spawn()`, which sets up
+its own, independent abort listener) — but the raw kill mechanism converges on the same `child.kill()`
+either way, so the discovery gap itself applies to both in principle. In practice only `signal` needed
+fixing here: a caller aborting a launch cannot choose a delay the way a caller picking a `timeout`
+value can, so an abort landing inside one poll interval is an ordinary production shape, not an
+adversarially short test value — the same distinction the existing 50ms test's own doc already draws
+for `timeout`.
+
+### Fix — hold the real kill behind a guaranteed rescan, for `signal` only
+
+`_execTracked` no longer hands `exec()` the caller's own `AbortSignal`. It creates an internal
+`AbortController` instead; the caller's `abort()` now triggers one guaranteed, fully-awaited rescan of
+the descendant tree *first*, and only then aborts the internal controller that `exec()` actually holds.
+This orders "look" strictly before "kill" instead of racing them, closing the gap rather than narrowing
+it — at the cost of at most one `/proc` read of added cancellation latency. `options.timeout` is left
+completely untouched: reimplementing it the same way would also change the shape of the resulting error
+(an `AbortError` instead of a `killed`/`SIGTERM` one), which `classifyBackendFailure` uses to tell a
+timeout from a cancellation — a real regression risk that was checked directly against Node's own
+source before ruling it out. The periodic poller's concurrent-rescan safety was hardened at the same
+time (coalescing an overlapping trigger into exactly one follow-up rescan rather than allowing two
+scans of `tracked` to race on differently-aged `/proc` snapshots).
+
+### RED → GREEN
+
+Two new deterministic tests in `orch-privilege-real.test.mjs` (`wrap` and `wrapCommand`, both via
+`signal`): a `setsid`/SIGTERM-ignoring descendant forks immediately, exactly as before, but the trigger
+is a *fixed, short* delay (150ms — comfortably under `DESCENDANT_POLL_MS`, comfortably past this launch
+shape's spawn latency) instead of being gated on an external `pgrep` confirmation, so "the kill lands
+before any poll tick" holds by construction instead of by host-speed luck — unlike the pre-existing CI
+test, which depends on real timing and is left unchanged as an additional, realistic check. Both new
+tests reliably failed (6/6, then 10/10 after a marker-format bug in the first attempt was fixed — see
+below) against the unfixed code, and reliably passed (10/10, plus 17/17 more across two combined-file
+stress batches) against the fix.
+
+Two bugs were found and fixed *in the new tests themselves* before they became reliable evidence:
+* The first RED attempt used a `<int>.<int>.<int>` marker (copied from `assertBetweenPollsUnconfirmed`,
+  which is safe there only because that helper never checks process survival). `sleep` rejects a value
+  with more than one decimal point outright, so the descendant exited immediately with an argument
+  error — making the "reaped" assertion pass for a completely unrelated reason. Caught by direct
+  instrumentation showing `ensureTerminated` never discovered anything on ANY run, yet the test still
+  passed; fixed by using the same single-decimal marker shape the file's other survival-asserting tests
+  already use.
+* The first fix attempt (racing a rescan against the trigger, see above) was empirically insufficient
+  and was replaced by the guaranteed-ordering design before the tests were declared reliably GREEN.
+
+Two existing hermetic tests asserted `options.signal` reaches the fake `exec` by strict object
+identity (`orch-privilege.test.mjs`, `orch-runner.test.mjs`) — an implementation detail this fix
+deliberately changes. Both updated to assert the actual property that matters (a live, un-aborted,
+real `AbortSignal` reaches the child) instead of reference equality, with a comment pointing at
+`privilege.js` for why.
+
+### Verification
+
+* **Focused, bounded (≤10 iterations per the task's own instruction):** new pre-poll tests 10/10;
+  original CI-failing test (real host timing, unmodified) 10/10; combined with the between-polls and
+  setsid-timeout tests, 17/17 across two batches after the margin fix (1 failure in an earlier batch
+  before widening `PRE_POLL_TRIGGER_MS`, traced to spawn-latency variance on this shared host, not a
+  fix defect — the fix's correctness does not depend on the trigger delay).
+* **Surrounding privilege suite** (`orch-privilege*.test.mjs`, `orch-termination-verdict.test.mjs`,
+  `orch-engine*.test.mjs`, `orch-session.test.mjs`, `orch-p1-regressions.test.mjs`,
+  `orch-lease-fence.test.mjs`), 3 repeated runs: 237/237 pass, 3 skipped (identity-required), 0 fail
+  every time.
+* **Complete canonical suite, Node 20.18.1, default concurrent** (`node --test ../test/*.test.mjs`,
+  matching CI's `npm test` exactly): 525 pass, 3 skipped, 0 fail — run twice, clean both times.
+* **Complete canonical suite, Node 20.18.1, serial diagnostic** (`--test-concurrency=1`): 525 pass, 3
+  skipped, 0 fail.
+* **Syntax.** `node --check` on `privilege.js` and all three changed test files: clean.
+* **`git diff --check`**: clean.
+* **Security self-review.** No argv/env/sudo-invocation change at all — this round touches only kill
+  sequencing. `killController` is a plain internal object never exposed externally; `options.signal`'s
+  identity leaving the module is the only observable behavior change, and every production call site
+  that reads a launch's `options.signal` back out was searched for and found to not exist (only
+  `engine.js` *constructs* the outgoing signal; nothing downstream inspects what reached `exec()`).
+  `ensureTerminated`'s fail-closed verdict (`terminationConfirmed` always `false` after a confirmed
+  kill) is untouched.
+* **Process hygiene.** One leaked marker-961 survivor from an earlier (pre-margin-fix) failing run
+  found and killed after verification; the pre-existing unrelated `948.94305.3` process noted in prior
+  rounds is still present and was left untouched, consistent with those rounds' own reasoning.

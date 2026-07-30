@@ -504,37 +504,83 @@ export class PrivilegeDropper {
    * how the invocation itself was built.
    */
   async _execTracked(exec, invocation, plan, options) {
-    const running = exec(invocation.file, invocation.argv, invocation.options);
+    // `execFile`'s own `signal` handling kills the direct child the instant the caller aborts, through
+    // a path this module cannot see or delay — and by the time that kill lands, the kernel has already
+    // reparented anything the direct child had started, unreachable from this pid at all. An earlier
+    // version of this fix tried to race an extra rescan against the SAME abort event; that narrowed the
+    // gap but did not close it, because the kernel's own relay-then-reparent chain can finish before
+    // even a rescan started in the very same synchronous turn as the abort completes its first `/proc`
+    // read. So the kill is not raced here — it is deliberately ordered behind a rescan instead: `exec()`
+    // is handed an internal controller, never the caller's own signal, and the caller's `abort()` is
+    // wired to run one guaranteed, fully-awaited rescan FIRST and only then abort the internal
+    // controller that actually reaches the child. This adds at most one `/proc` read of latency to a
+    // cancellation and removes the race entirely, rather than narrowing it. `options.timeout` is left
+    // untouched and still reaches `exec()` directly — reimplementing it the same way would also change
+    // the shape of the resulting error (an `AbortError` instead of a `killed`/`SIGTERM` one), which
+    // `classifyBackendFailure` uses to tell a timeout from a cancellation.
+    const killController = options.signal ? new AbortController() : null;
+    const execOptions = killController
+      ? { ...invocation.options, signal: killController.signal }
+      : invocation.options;
+    const running = exec(invocation.file, invocation.argv, execOptions);
     // `promisify(execFile)` exposes the child on the promise. Absent — an injected runner in a
     // test, say — there is nothing to reap and nothing to wait for.
     const child = running?.child ?? null;
 
     // Enumerated continuously from the moment the child exists, not only once the launch has
-    // already failed — `execFile`'s own `timeout`/`signal` handling kills the direct child through a
-    // path this module cannot see and does not control, and once that kill lands the kernel
-    // reparents whatever the child had started to init, unreachable from `pid` at all. Polling while
-    // the launch is still alive is what lets `ensureTerminated`'s best-effort kill reach as much of
-    // the tree as possible — but it does NOT make "confirmed" a provable claim; see there for why.
+    // already failed — `execFile`'s own `timeout` handling kills the direct child through a path this
+    // module cannot see and does not control, and once that kill lands the kernel reparents whatever
+    // the child had started to init, unreachable from `pid` at all. Polling while the launch is still
+    // alive is what lets `ensureTerminated`'s best-effort kill reach as much of the tree as possible —
+    // but it does NOT make "confirmed" a provable claim; see there for why.
     const tracked = child ? new Map() : null; // pid -> /proc start-time, for identity before signalling
-    // Tracks the currently-running tick's promise, if any, so a caller entering the catch block can
-    // await it rather than starting `ensureTerminated`'s own mutation of `tracked` while a tick is
-    // still in the middle of reading `/proc` and writing to the very same map.
+    // Tracks the currently-running rescan, if any, so a caller entering the catch block can await it
+    // rather than starting `ensureTerminated`'s own mutation of `tracked` while one is still in the
+    // middle of reading `/proc` and writing to the very same map. `rescanQueued` coalesces a trigger
+    // that lands while a rescan is already in flight into exactly one more once it finishes, rather
+    // than starting a second, overlapping one — two concurrent scans of `tracked` racing on their own
+    // (differently-aged) `/proc` snapshots could otherwise prune an entry the newer one just added.
     let pollInFlight = null;
-    const poller = tracked ? setInterval(() => {
-      pollInFlight = rescanTracked(tracked, [child.pid, ...tracked.keys()])
-        .catch(() => {})
-        .finally(() => { pollInFlight = null; });
-    }, DESCENDANT_POLL_MS) : null;
+    let rescanQueued = false;
+    const rescanOnce = () => rescanTracked(tracked, [child.pid, ...tracked.keys()]).catch(() => {});
+    const rescanCycle = async () => {
+      await rescanOnce();
+      if (rescanQueued) {
+        rescanQueued = false;
+        await rescanCycle();
+      }
+    };
+    const rescanNow = () => {
+      if (!tracked) return Promise.resolve();
+      if (pollInFlight) { rescanQueued = true; return pollInFlight; }
+      const cycle = rescanCycle().finally(() => { pollInFlight = null; });
+      pollInFlight = cycle;
+      return cycle;
+    };
+    const poller = tracked ? setInterval(rescanNow, DESCENDANT_POLL_MS) : null;
     if (typeof poller?.unref === 'function') poller.unref();
+
+    // The interception described above: the caller's OWN signal never reaches `exec()` — only
+    // `killController`'s does — so aborting it here, once the rescan it triggers has actually
+    // finished, is what delivers the real kill.
+    let unhookAbort = null;
+    if (killController && options.signal) {
+      const onAbort = () => { rescanNow().finally(() => killController.abort(options.signal.reason)); };
+      if (options.signal.aborted) onAbort();
+      else options.signal.addEventListener('abort', onAbort, { once: true });
+      unhookAbort = () => options.signal.removeEventListener('abort', onAbort);
+    }
 
     try {
       return await running;
     } catch (err) {
       if (poller) clearInterval(poller);
-      // Never let `ensureTerminated` start reading and mutating `tracked` while a poll tick already
-      // in flight is doing the same thing — the interval is stopped above, but a tick that started
-      // just before is still awaiting its own `/proc` reads and would otherwise race the rescan
-      // `ensureTerminated` is about to perform on the identical map.
+      if (unhookAbort) unhookAbort();
+      // Never let `ensureTerminated` start reading and mutating `tracked` while a rescan already in
+      // flight is doing the same thing — the poller/listener above are stopped by this point, but a
+      // rescan that started just before (including the guaranteed one an abort just triggered) is
+      // still awaiting its own `/proc` reads and would otherwise race the one `ensureTerminated` is
+      // about to perform on the identical map.
       if (pollInFlight) await pollInFlight;
       // Only a launch that was actually KILLED — by this module's own timeout/abort, or by anything
       // else that reaches the child as a signal — needs a termination verdict at all. A command that
@@ -565,6 +611,7 @@ export class PrivilegeDropper {
       throw err;
     } finally {
       if (poller) clearInterval(poller);
+      if (unhookAbort) unhookAbort();
     }
   }
 

@@ -324,7 +324,17 @@ test('cwd, timeout, buffer limit and the abort signal survive the drop', async (
   assert.equal(launch.options.cwd, PHASE.cwd);
   assert.equal(launch.options.timeout, 4_242);
   assert.equal(launch.options.maxBuffer, 32 * 1024 * 1024);
-  assert.equal(launch.options.signal, controller.signal, 'cancellation still reaches the child');
+  // Not the caller's own `AbortSignal` by reference: `_execTracked` hands `exec()` an internal
+  // controller instead, so a real kill can be held behind a guaranteed descendant-tree rescan rather
+  // than racing it (see privilege.js) — that internal controller is only ever aborted from the
+  // caller's own `abort()`, so what has to survive the drop is a live, not-yet-aborted signal
+  // reaching the child, not object identity with the caller's own controller. Cancellation actually
+  // propagating through a live launch is exercised for real, against a real process, in
+  // orch-privilege-real.test.mjs — this fake `exec` already resolved before `runPhase` returned, so
+  // there is no live launch left here for a post-hoc `controller.abort()` to reach.
+  assert.notEqual(launch.options.signal, controller.signal, 'the drop no longer hands out the caller\'s own signal');
+  assert.equal(typeof launch.options.signal?.addEventListener, 'function', 'the child still receives a real AbortSignal');
+  assert.equal(launch.options.signal.aborted, false, 'not aborted before the caller cancels anything');
   // Deliberately attached: a detached launch measurably survived an abort in the first
   // milliseconds, where an attached one did not.
   assert.equal(launch.options.detached, undefined, 'the launch stays in this process group');

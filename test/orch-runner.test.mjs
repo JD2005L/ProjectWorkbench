@@ -412,13 +412,19 @@ test('runner: an abort is classified as cancellation, not as a timeout', () => {
 test('runner: an abort signal is passed through to the child process', async () => {
   // The signal has to reach execFile. Previously only the test fake honoured it, so cancellation
   // was green in the suite and inert in production.
+  //
+  // Not the caller's own `AbortSignal` by reference: the privilege drop's `_execTracked` hands
+  // `exec()` an internal controller instead, aborted only once a guaranteed descendant-tree rescan
+  // has run — so a real kill is never raced against discovering what else the launch started (see
+  // privilege.js). What has to reach execFile is a live, real `AbortSignal`, not that specific object.
   const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
   const controller = new AbortController();
   await backend.runPhase({
     prompt: 'x', model: 'sonnet', effort: 'high', maxTurns: 5,
     phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo', signal: controller.signal,
   });
-  assert.equal(calls[0].options.signal, controller.signal);
+  assert.equal(typeof calls[0].options.signal?.addEventListener, 'function');
+  assert.equal(calls[0].options.signal.aborted, false);
 });
 
 test('runner: failures map to distinct kinds so each can reach its own safe state', () => {

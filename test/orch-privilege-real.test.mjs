@@ -484,6 +484,98 @@ test('between-polls regression: wrapCommand, already the target account (no_drop
   await assertBetweenPollsUnconfirmed(t, { dropper: alreadyTargetDropper({ terminationGraceMs: 1_500 }), method: 'wrapCommand', label: 'wrapCommand/already-admin' });
 });
 
+// ---------------------------------------------------------------------------
+// the pre-poll regression: a descendant alive well before the kill, reaped anyway
+// ---------------------------------------------------------------------------
+//
+// Distinct from both regressions above. The 50ms test only proves the verdict stays conservative
+// when zero ticks could physically occur before the kill; the between-polls tests only prove the
+// same for a descendant that forks in the gap between two ticks — neither asserts the descendant is
+// actually killed, because in those two scenarios it may genuinely be unreachable in time. This is
+// the case where it must be reachable: a `setsid`/SIGTERM-ignoring descendant that forked at the very
+// start of the launch and has been alive ever since, killed by a trigger that lands before the
+// periodic poller has happened to tick even once — the exact shape CI caught in `wrap`'s abort path.
+// The trigger delay here is fixed and short (well under DESCENDANT_POLL_MS, comfortably past normal
+// spawn latency) rather than gated on an external `pgrep` confirmation, so "the kill lands before any
+// poll tick" holds by construction instead of by host-speed luck.
+//
+// `signal`-triggered kills only, on both `wrap` and `wrapCommand`: a caller aborting a launch cannot
+// choose a delay the way a caller picking a `timeout` value can, so an abort landing inside one poll
+// interval is a real, un-avoidable production shape rather than an adversarially short test value —
+// the exact distinction the 50ms test's own doc already draws. `_execTracked` fixes this by holding
+// the real kill behind a guaranteed rescan for `signal` specifically (see privilege.js); `timeout`
+// keeps racing the poller exactly as before, unchanged, so a timeout shorter than one poll interval
+// remains the same accepted, documented limitation the 50ms test already covers.
+
+// Comfortably inside DESCENDANT_POLL_MS (200ms) — the fix itself no longer depends on beating that
+// interval, only on the rescan it forces actually running before the kill, so there is no reason to
+// cut this margin close to spawn latency and risk the descendant simply not existing yet on a loaded
+// host.
+const PRE_POLL_TRIGGER_MS = 150;
+
+function prePollScriptArgs(marker) {
+  return [
+    TOOLS.sh,
+    ['-c', `${TOOLS.setsid} ${TOOLS.sh} -c 'trap "" TERM; exec ${TOOLS.sleep} ${marker}' </dev/null >/dev/null 2>&1 & exec ${TOOLS.sleep} 60`],
+  ];
+}
+
+async function assertPrePollKillStillReapsDescendant(t, { dropper, method, label, launch }) {
+  // A plain `<int>.<int>` — not the three-part `<int>.<int>.<int>` some verdict-only markers in this
+  // file use — because this test, unlike those, asserts the descendant actually stops running:
+  // `sleep` rejects a value with more than one decimal point outright ('invalid time interval'),
+  // which would make it exit immediately on its own and pass this assertion for the wrong reason.
+  const marker = `961.${process.pid % 100000}`;
+  const wrapped = dropper[method](execFileAsync);
+
+  t.after(async () => {
+    const survivor = (await execFileAsync(TOOLS.pgrep, ['-x', '-f', `${TOOLS.sleep} ${marker}`]).catch(() => ({ stdout: '' }))).stdout.trim();
+    if (survivor) { try { process.kill(Number(survivor), 'SIGKILL'); } catch { /* already gone */ } }
+  });
+
+  const running = launch(wrapped, marker);
+  running.catch(() => {});
+
+  const err = await running.then(() => null, (e) => e);
+  assert.ok(err, `[${label}] the launch must fail`);
+  assert.equal(err.terminationConfirmed, false, `[${label}] must never report confirmed`);
+  assert.equal(await pgrepCount(marker), 0,
+    `[${label}] a descendant alive well before the kill, but not yet seen by any periodic poll tick, `
+    + 'must still be reaped');
+}
+
+test('pre-poll regression: wrap, abort fired before any poll tick', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertPrePollKillStillReapsDescendant(t, {
+    dropper: realDropper({ terminationGraceMs: 1_500 }),
+    method: 'wrap',
+    label: 'wrap/pre-poll-abort',
+    launch: (wrapped, marker) => {
+      const controller = new AbortController();
+      const [file, argv] = prePollScriptArgs(marker);
+      const promise = wrapped(file, argv, { signal: controller.signal, timeout: 60_000 });
+      setTimeout(() => controller.abort(), PRE_POLL_TRIGGER_MS);
+      return promise;
+    },
+  });
+});
+
+test('pre-poll regression: wrapCommand, abort fired before any poll tick', async (t) => {
+  if (!skipUnlessCapable(t)) return;
+  await assertPrePollKillStillReapsDescendant(t, {
+    dropper: realDropper({ terminationGraceMs: 1_500 }),
+    method: 'wrapCommand',
+    label: 'wrapCommand/pre-poll-abort',
+    launch: (wrapped, marker) => {
+      const controller = new AbortController();
+      const [file, argv] = prePollScriptArgs(marker);
+      const promise = wrapped(file, argv, { signal: controller.signal, timeout: 60_000 });
+      setTimeout(() => controller.abort(), PRE_POLL_TRIGGER_MS);
+      return promise;
+    },
+  });
+});
+
 test('a deadline behind sudo terminates the real process and reads as a timeout', async (t) => {
   if (!skipUnlessCapable(t)) return;
   const marker = `918.${process.pid}`;
