@@ -665,6 +665,35 @@ test('ClaudeCodeBackend.verifyConfiguration: an unconfirmed kill on the fingerpr
   });
 });
 
+test('ClaudeCodeBackend.verifyConfiguration: probeAuth must never run at all once fingerprint reports an unconfirmed kill', async () => {
+  // The prior fix guarded the CLI launch by checking BOTH probes' verdicts together, after both had
+  // already run — which stopped the launch, but not `probeAuth` itself: fingerprint's own descendant
+  // could still be alive, unconfirmed, while a second real process (`auth status`) was started
+  // anyway. The guard has to sit between the two probes, not just after them.
+  await withFakeBinary(async (binary) => {
+    let authStatusCalled = false;
+    const exec = async (file, args) => {
+      if (args[0] === '--version') throw killedErr();
+      if (args[0] === '--help') return { stdout: '--effort <level>\n(low, high)', stderr: '' };
+      if (args.includes('auth') && args.includes('status')) {
+        // Scripted to SUCCEED if it ever ran — deliberately, so a bug that let it run anyway reads as
+        // an ordinary probe, not a crash unrelated to what this test is actually about.
+        authStatusCalled = true;
+        return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max' }), stderr: '' };
+      }
+      return { stdout: '', stderr: '' };
+    };
+    const backend = new ClaudeCodeBackend({ config: CLAUDE_CONFIG(binary), exec });
+
+    await assert.rejects(
+      backend.verifyConfiguration(verifyCall()),
+      (err) => err.terminationConfirmed === false,
+    );
+    assert.equal(authStatusCalled, false,
+      'probeAuth must never launch a real process once fingerprint already could not confirm a kill was dead');
+  });
+});
+
 test('ClaudeCodeBackend.verifyConfiguration: an unconfirmed kill on probeAuth stops before the CLI is ever launched, even past a secondary ordinary error', async () => {
   await withFakeBinary(async (binary) => {
     let launchCalled = false;

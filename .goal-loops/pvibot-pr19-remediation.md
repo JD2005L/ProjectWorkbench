@@ -998,3 +998,41 @@ reads, with zero changes needed in `session.js` or `engine.js`.
   directly are diagnostic, hold no lease, and chain no further fallible work — out of scope, left
   untouched).
 * App VERSION bumped `1.26.0730.1610` → `1.26.0730.1630`.
+
+## Round 10 — round 9's own guard checked both probes together, one call too late
+
+An independent exact-head review of `83980fc` found the fix round 9 shipped was still incomplete: the
+combined guard (`fingerprint?.terminationConfirmed === false || probedAuth?.terminationConfirmed ===
+false`) ran only *after* both probes had already executed. It correctly stopped the CLI launch, but not
+`probeAuth` itself — if `fingerprint()` came back with an unconfirmed kill, `probeAuth()` still launched
+a second real process (`claude auth status`) in the same workspace regardless, exactly the "no later
+probe/CLI/artifact/persistence work after `terminationConfirmed:false`" property round 9 was supposed to
+establish, just checked in the wrong place.
+
+### Fix
+
+The single combined check after both probes is replaced with a new `_refuseIfProbeUnconfirmed(probe)`
+helper, called **between** the two probes, not only after them: once immediately after `fingerprint()`
+(before `probeAuth()` is even attempted) and again after `probeAuth()` (before the real CLI launch,
+exactly as round 9 already had). Same throw shape as before (`kind: 'phase_failed'`,
+`terminationConfirmed: false`), so `session.js`/`engine.js` still need no changes.
+
+### RED → GREEN
+
+New test in `orch-termination-verdict.test.mjs`: `--version` killed unconfirmed, `auth status` scripted
+to succeed (and record whether it was called) if it ever ran. Failed against the round-9 code
+(`authStatusCalled: true`); passes against the fix.
+
+### Verification
+
+* **Focused:** the new test plus the full `orch-termination-verdict.test.mjs`, 38/38; `orch-session`,
+  `orch-runner`, `orch-p1-regressions`, `orch-attestation`, `orch-provenance` together, 137/137.
+* **Complete canonical suite, Node 20.18.1, default concurrent:** 536 pass, 3 skipped, 0 fail.
+* **Complete canonical suite, Node 20.18.1, serial diagnostic** (`--test-concurrency=1`): one run hit an
+  unrelated `orch-smoke.test.mjs` network-level flake (`fetch failed` against a real spawned HTTP
+  server — no connection to this round's files); re-ran in isolation (3/3 clean) and re-ran the full
+  serial suite again (536 pass, 3 skipped, 0 fail, clean) to confirm it was transient host noise, not a
+  regression from this change.
+* **Syntax.** `node --check` on `claude.js` and the changed test file: clean.
+* **`git diff --check`**: clean.
+* App VERSION bumped `1.26.0730.1630` → `1.26.0730.1654`.

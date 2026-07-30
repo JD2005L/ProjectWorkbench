@@ -362,6 +362,20 @@ export class ClaudeCodeBackend {
   // -------------------------------------------------------------------------
 
   /**
+   * Stop `verifyConfiguration` in its tracks the instant a probe it just ran reports a kill it could
+   * not confirm dead — before anything else, probe or launch, gets a chance to run in the same
+   * workspace. Called between each probe and the next, not merely once after all of them, so an
+   * earlier probe's unconfirmed descendant can never still be alive while a later one starts.
+   */
+  _refuseIfProbeUnconfirmed(probe) {
+    if (probe?.terminationConfirmed !== false) return;
+    const error = new Error('a probe before the launch could not confirm a kill was actually dead');
+    error.kind = 'phase_failed';
+    error.terminationConfirmed = false;
+    throw error;
+  }
+
+  /**
    * Report the effective configuration of the lane.
    *
    * Deliberately runs a real, bounded, read-only phase rather than inspecting a config file: what
@@ -387,22 +401,19 @@ export class ClaudeCodeBackend {
 
     // Fingerprint BEFORE launching. Taking it afterwards left a window in which the binary that ran
     // and the binary that was attested need not be the same file.
+    //
+    // Each probe below runs a real process in this same workspace, exactly as capable of leaving an
+    // unconfirmed descendant as the launch that follows — and each already discards nothing now, per
+    // the fixes to `probeBinaryFingerprint`/`probeAuth` themselves. What matters here is checked
+    // between them, not only after both: a guard placed after both probes had already run stopped the
+    // CLI launch, but not `probeAuth` itself — fingerprint's own descendant could still be alive,
+    // unconfirmed, while a second real process started anyway. So the check happens immediately after
+    // EACH probe, before the next one is even attempted.
     const fingerprint = await this.fingerprint();
-    const probedAuth = await this.probeAuth().catch(() => null);
+    this._refuseIfProbeUnconfirmed(fingerprint);
 
-    // Both probes above run a real process in this same workspace, exactly as capable of leaving an
-    // unconfirmed descendant as the launch below — and each already discards nothing now, per the
-    // fixes to `probeBinaryFingerprint`/`probeAuth` themselves. What was still missing is this: never
-    // launch the actual CLI at all once either has already reported a kill it could not confirm dead.
-    // Without this, an unconfirmed probe carried on into a real launch and, on an ordinary success or
-    // failure there, reported a normal answer with no fence — exactly the same "false → fallible work
-    // → lost verdict" shape already closed for checks.js's artifact writes.
-    if (fingerprint?.terminationConfirmed === false || probedAuth?.terminationConfirmed === false) {
-      const error = new Error('a probe before the launch could not confirm a kill was actually dead');
-      error.kind = 'phase_failed';
-      error.terminationConfirmed = false;
-      throw error;
-    }
+    const probedAuth = await this.probeAuth().catch(() => null);
+    this._refuseIfProbeUnconfirmed(probedAuth);
 
     let stdout = '';
     let stderr = '';
