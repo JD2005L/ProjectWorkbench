@@ -467,6 +467,22 @@ export class OrchestrationEngine {
   }
 
   /**
+   * Whether this job's termination must be treated as unconfirmed — an explicit verdict from the
+   * IMMEDIATE error is not the only source of truth here. `_terminationUnconfirmed` (set the moment
+   * ANY step observes a real `false`) and the job's own durably persisted `termination_confirmed`
+   * field are both consulted as a backstop, so a LATER, unrelated exception — one that carries no
+   * verdict of its own, because it has nothing to do with any kill (a full disk, a transaction race)
+   * — can never downgrade an already-observed `false` back to "unknown" and release a project a live
+   * descendant might still be writing to. Once `false` is observed anywhere in this job's lifecycle,
+   * it is monotonic: nothing later may un-observe it.
+   */
+  _terminationIsUnconfirmed(jobId, explicitVerdict = null) {
+    if (explicitVerdict === false) return true;
+    if (this._terminationUnconfirmed.has(jobId)) return true;
+    return this.repo.getJob(jobId)?.termination_confirmed === false;
+  }
+
+  /**
    * Record an unexpected worker death.
    *
    * Blocked, not failed. `failed` is terminal, and an internal error says nothing about whether the
@@ -479,22 +495,23 @@ export class OrchestrationEngine {
    * correct — but `_runChecks`/`_runPublication` do not wrap every internal call in a try/catch of
    * their own, on the assumption that nothing on that path throws with a termination verdict
    * attached. If that assumption is ever wrong — a check runner or the publisher throwing directly
-   * rather than returning a result, exactly as an unrelated bug could — this is the one backstop
-   * standing between that and silently releasing a project a live descendant might still be writing
-   * to.
+   * rather than returning a result, exactly as an unrelated bug could — `_terminationIsUnconfirmed`'s
+   * backstop is what stands between that and silently releasing a project a live descendant might
+   * still be writing to.
    */
   async _failSafely(jobId, message, terminationConfirmed = null) {
     try {
       const job = this.repo.getJob(jobId);
       if (!job || TERMINAL_STATES.has(job.status)) return;
-      if (terminationConfirmed === false) {
+      const unconfirmed = this._terminationIsUnconfirmed(jobId, terminationConfirmed);
+      if (unconfirmed) {
         await this._fenceLease(jobId, message);
       } else {
         await this._releaseLease(jobId);
       }
       await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
         message, detail: message, eventType: EventType.BLOCKED,
-        patch: terminationConfirmed === false ? { termination_confirmed: false } : {},
+        patch: unconfirmed ? { termination_confirmed: false } : {},
       });
     } catch {
       /* nothing further can be done safely */
@@ -742,9 +759,15 @@ export class OrchestrationEngine {
       // An uncaught exception this far in is exactly as capable of carrying an unconfirmed kill as
       // any other rejection this engine handles — `_startWorker`'s own catch cannot tell, since by
       // the time it sees this error the lease would already be gone. Fence here, before re-throwing,
-      // rather than release over a kill nobody confirmed.
-      if (err?.terminationConfirmed === false) await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
-      else await this._releaseLease(jobId);
+      // rather than release over a kill nobody confirmed. `_terminationIsUnconfirmed` also consults
+      // `_terminationUnconfirmed`/the durable job record, so a SECOND, unrelated exception arriving
+      // after an earlier step already observed `false` cannot downgrade it back to unknown just
+      // because this particular error carries no verdict of its own.
+      if (this._terminationIsUnconfirmed(jobId, err?.terminationConfirmed)) {
+        await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
+      } else {
+        await this._releaseLease(jobId);
+      }
       throw err;
     } finally {
       clearInterval(renewal);
@@ -820,9 +843,13 @@ export class OrchestrationEngine {
     } catch (err) {
       // Mirrors `_run`'s own catch: an uncaught exception here is exactly as capable of carrying an
       // unconfirmed kill as any other rejection, and `_startWorker`'s catch cannot fence what this
-      // method has already released.
-      if (err?.terminationConfirmed === false) await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
-      else await this._releaseLease(jobId);
+      // method has already released. `_terminationIsUnconfirmed` backstops against a secondary,
+      // unrelated exception downgrading an already-observed `false`.
+      if (this._terminationIsUnconfirmed(jobId, err?.terminationConfirmed)) {
+        await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
+      } else {
+        await this._releaseLease(jobId);
+      }
       throw err;
     } finally {
       clearInterval(renewal);
@@ -1039,9 +1066,17 @@ export class OrchestrationEngine {
         resumeSessionId: null,
       });
     } catch (err) {
+      // The review launch runs in the same workspace the project's lease protects and is exactly as
+      // capable of an unconfirmed kill as `_runPhase`'s own coding-phase launch — `_blockWith` below
+      // releases unconditionally, which is wrong here for the same reason it is everywhere else.
+      if (await this._guardTermination(jobId, err?.terminationConfirmed, `the review could not confirm a kill was actually dead after it timed out: ${err.message}`)) return null;
       await this._blockWith(jobId, JobStatus.BLOCKED_REVIEW, `the review could not run: ${err.message}`);
       return null;
     }
+
+    // An ordinary backend timeout during review — reported as a normal `{ ok: false, ... }` return,
+    // never a throw — is just as capable of leaving an unconfirmed descendant as one that throws.
+    if (await this._guardTermination(jobId, result.terminationConfirmed, 'the review could not confirm a kill was actually dead after it timed out')) return null;
 
     const isolated = Boolean(result.session_id) && result.session_id !== implementationSessionId;
     const verdict = !result.ok
@@ -1537,13 +1572,26 @@ export class OrchestrationEngine {
     // whichever transition happened to land last.
     if (this._cancelled(jobId)) return this._publicPublicationRecord(record);
 
+    // Guarded BEFORE any fallible post-publish work — the artifact write and the recording
+    // transaction below both do real I/O and can throw for reasons that have nothing to do with any
+    // kill (a full disk, a store contention error). An unconfirmed kill must be durably fenced FIRST,
+    // immune to whatever runs after it: no artifact write, persistence, status transition, or lease
+    // release may precede it, and an unrelated secondary failure must never be able to downgrade an
+    // already-observed `false` back to "unknown" by racing ahead of the fence.
+    if (await this._guardTermination(
+      jobId, record.terminationConfirmed,
+      'publication could not confirm a git command was actually killed after a timeout or abort',
+    )) {
+      return this._publicPublicationRecord(record);
+    }
+
     const artifact = await this.artifacts.write({
       jobId, kind: ArtifactKind.LOG, name: 'publication.log',
       content: (record.steps ?? []).map((s) => `${s.step}: exit ${s.exit_code} ${s.stderr}`).join('\n'),
       summary: record.remote_sha_verified ? 'published and verified' : (record.failure_reason ?? 'publication incomplete'),
     });
 
-    const { failure_reason: failureReason, terminationConfirmed } = record;
+    const { failure_reason: failureReason } = record;
     const publicRecord = this._publicPublicationRecord(record);
 
     await this.store.transact((tx, state) => {
@@ -1567,16 +1615,6 @@ export class OrchestrationEngine {
       });
       this.repo.recordIdempotency(tx, scope, idempotencyKey, contentHash, publicRecord);
     });
-
-    // A commit/push/verification that could not be confirmed dead is fenced and quarantined, never
-    // just recorded as a failure — the same treatment every other integration point in this engine
-    // gives an unconfirmed kill.
-    if (await this._guardTermination(
-      jobId, terminationConfirmed,
-      'publication could not confirm a git command was actually killed after a timeout or abort',
-    )) {
-      return publicRecord;
-    }
 
     if (publicRecord.remote_sha_verified) {
       await this._releaseLease(jobId);

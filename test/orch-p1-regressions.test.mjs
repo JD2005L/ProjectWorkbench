@@ -20,7 +20,7 @@ import { FakeCodingBackend } from '../app/orchestrator/runner/fake.js';
 import { TmuxAdapter, OrchestratorSessionManager } from '../app/orchestrator/session.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { ApiError } from '../app/orchestrator/errors.js';
-import { JobStatus, ApprovalStatus } from '../app/orchestrator/contract.js';
+import { JobStatus, ApprovalStatus, PhaseClass } from '../app/orchestrator/contract.js';
 import { SCOPES } from '../app/orchestrator/auth.js';
 
 const execFileAsync = promisify(execFile);
@@ -657,6 +657,134 @@ gitTest('publish: an unconfirmed kill re-staging the real index fences the proje
 
     const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
     assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: an unconfirmed kill is fenced BEFORE any artifact write or persistence — a secondary disk error changes nothing', async () => {
+  // `_runPublication` recorded `record.terminationConfirmed === false` into `_terminationUnconfirmed`
+  // but then still wrote the publication artifact and persisted the record BEFORE ever calling
+  // `_guardTermination`. If that artifact write throws an ordinary, unrelated error (a full disk),
+  // the exception escapes to `publish()`'s outer catch carrying no verdict of its own
+  // (`err.terminationConfirmed` is `undefined`), and `_failSafely` — seeing nothing — released the
+  // lease instead of fencing it. Fencing must happen first, immune to whatever runs after it.
+  await withEngine(async ({ engine, repo, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    engine.publisher.publish = async () => ({
+      schema_version: '1.0', publication_id: 'pwpub_test', job_id: jobId,
+      branch: 'orch/x', local_commit: 'a'.repeat(40), remote_commit: null,
+      pushed: true, remote_sha_verified: false,
+      pull_request_url: null, pull_request_state: null, pull_request_head_sha: null,
+      mergeable: null, ci_state: 'not_started', diff_stat: null, changed_files: [],
+      recorded_at: new Date(0).toISOString(),
+      terminationConfirmed: false,
+      steps: [],
+    });
+
+    let artifactWriteCalled = false;
+    engine.artifacts.write = async () => {
+      artifactWriteCalled = true;
+      throw new Error('ENOSPC: no space left on device');
+    };
+
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+
+    assert.equal(artifactWriteCalled, false,
+      'fencing must happen before any artifact write is even attempted, not merely before it fails');
+    assert.equal(record.remote_sha_verified, false);
+
+    const job = repo.getJob(jobId);
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false, 'the durable job record must show false');
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'fenced=1');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'released=0: the resource must not be reusable by a later job',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('_failSafely: consults _terminationUnconfirmed as a backstop when the escaping error carries no verdict of its own', async () => {
+  // A defense-in-depth backstop, distinct from the ordering fix above: even if some future path lets
+  // an unrelated exception (a store/transaction error, say) escape AFTER this job's kill was already
+  // recorded as unconfirmed but BEFORE fencing itself completed, `_failSafely` must not release just
+  // because the specific error it caught happens not to carry `terminationConfirmed` itself.
+  await withEngine(async ({ engine, repo, store }) => {
+    const { jobId } = await driveToGate(engine);
+    // `_failSafely` is reached from `publishing` (via `publish()`'s own catch) or any other
+    // INTERRUPTIONS-reachable state (via `_startWorker`'s) — never from
+    // `waiting_for_publication_approval`, which `driveToGate` leaves the job in and which has no
+    // edge to `blocked_project_state` at all. Move it to `publishing` directly, as `publish()`'s own
+    // claim transaction would, to reproduce the state this backstop actually runs in.
+    await store.transact((tx, state) => {
+      const current = state.get('jobs', jobId);
+      engine.repo.putJob(tx, { ...current, status: JobStatus.PUBLISHING, phase: 'publication' });
+    });
+    engine._terminationUnconfirmed.add(jobId);
+    const lease = await engine._acquireLease(jobId, 'Demo');
+    assert.ok(lease, 'the lease must have been acquired for this reproduction to be meaningful');
+
+    await engine._failSafely(jobId, 'an unrelated internal error, no verdict of its own');
+
+    const job = repo.getJob(jobId);
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false,
+      '_failSafely must consult _terminationUnconfirmed even when its own explicit argument is null');
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'fenced=1: the backstop must fence, not release');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'released=0',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('review: a backend kill during the independent review that could not be confirmed fences, not releases', async () => {
+  // Found while re-auditing every catch that decides fence-vs-release: `_runReview` calls
+  // `this.backend.runPhase` directly (a SEPARATE call site from `_runPhase`, which Part A's
+  // self-review already guarded) and its own catch called `_blockWith` unconditionally — never
+  // checking `err.terminationConfirmed` at all. A review-phase launch runs in the same workspace the
+  // lease protects and is exactly as capable of an unconfirmed kill as any other phase.
+  await withEngine(async ({ engine, repo }) => {
+    const realRunPhase = engine.backend.runPhase.bind(engine.backend);
+    engine.backend.runPhase = async (request) => {
+      if (request.phaseClass === PhaseClass.ROUTINE_REVIEW) {
+        const err = new Error('the review CLI was killed, unconfirmed');
+        err.killed = true;
+        err.terminationConfirmed = false;
+        throw err;
+      }
+      return realRunPhase(request);
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'a kill during review that could not be confirmed must fence the project, not merely release it');
   }, { backendOptions: ATTESTING });
 });
 

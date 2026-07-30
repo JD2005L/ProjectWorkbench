@@ -291,12 +291,23 @@ export class Publisher {
         return { ok: false, stdout: String(err?.stdout ?? ''), stderr: String(err?.stderr ?? err?.message ?? '') };
       }
     };
+    const unconfirmed = () => ({
+      url: null, state: null, headSha: null, mergeable: null, ciState: CiState.NOT_STARTED,
+      terminationConfirmed: false,
+    });
 
     // Create if absent. An existing PR makes `gh pr create` fail, which is not an error here — its
-    // own termination verdict is still captured by the closure above regardless.
+    // own termination verdict is still captured by the closure above regardless. But a KILL that
+    // could not be confirmed dead is not "not an error" — `gh pr view` must never launch a second
+    // subprocess while the first one's fate is unknown, so this checks the verdict itself, not just
+    // `.ok`, before the next call runs. This is the general shape every multi-command helper in this
+    // module needs: each subprocess result passes through fail-fast verdict handling before any
+    // later subprocess in the same helper is allowed to start.
     await gh(['pr', 'create', '--head', branch, '--base', base, '--fill']);
+    if (terminationConfirmed === false) return unconfirmed();
 
     const view = await gh(['pr', 'view', branch, '--json', 'url,state,headRefOid,mergeable,statusCheckRollup']);
+    if (terminationConfirmed === false) return unconfirmed();
     if (!view.ok) {
       return {
         url: null, state: null, headSha: null, mergeable: null,

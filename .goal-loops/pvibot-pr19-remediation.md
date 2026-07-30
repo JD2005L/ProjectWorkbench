@@ -634,6 +634,87 @@ in this round). `test/release-version.test.mjs` 4/4.
 * **`git diff --check`** against the merge-base with `origin/main`: clean.
 * **Syntax.** `node --check` on `publish.js`, `engine.js`, and both changed test files: clean.
 
+## Round 6 — a multi-command helper still ran a second subprocess after the first was killed, and the engine could still lose the verdict to a secondary failure
+
+A final review found round 5's redesign was still incomplete in two ways, plus a third gap found by
+extending the same re-audit the review asked for.
+
+### `_pullRequest` awaited `gh pr create`'s result but never checked it before running `gh pr view`
+
+Round 5 gave `_pullRequest` its own `terminationConfirmed` tracking, but only the OUTER caller
+(`_publishWithIndex`'s `note()`) ever inspected it — and that caller only sees `_pullRequest`'s final,
+aggregate return, by which point BOTH `gh` calls have already run. Inside `_pullRequest` itself,
+`create`'s result was awaited and discarded without ever being checked, so `gh pr view` launched
+unconditionally regardless of whether `create` had just been killed unconfirmed.
+
+* **RED.** New test: `gh pr create` killed (`terminationConfirmed: false`), `gh pr view` wired to
+  succeed if it ever ran (so the test fails for the right reason — that it ran at all — not because it
+  would have failed anyway) and to set a flag. Failed against round-5 code: the flag was `true`.
+* **Fix.** `_pullRequest` now checks `terminationConfirmed === false` immediately after EACH `gh` call
+  and returns an unconfirmed-shaped result before the next one is allowed to start — the same
+  fail-fast discipline `_publishWithIndex` already applies to its own sequence, just one level down,
+  inside the one multi-command helper that had its own internal sequencing. No other helper in
+  `Publisher` runs more than one subprocess internally, so this closes the pattern completely.
+* **GREEN.** New test passes; `orch-termination-verdict.test.mjs` 24/24.
+
+### `_runPublication` recorded the verdict but still did fallible work before guarding it
+
+`_runPublication` set `record.terminationConfirmed === false` into `_terminationUnconfirmed` correctly,
+but then wrote the publication artifact and persisted the record to the store BEFORE ever calling
+`_guardTermination`. An ordinary, unrelated exception in either step (a full disk, a store contention
+error) would escape to `publish()`'s outer `.catch()` carrying no verdict of its own
+(`err.terminationConfirmed` is `undefined` for a plain I/O error) — and `_failSafely`, seeing nothing,
+released the lease instead of fencing it, even though the kill had already been recorded moments
+earlier.
+
+* **RED.** `engine.publisher.publish` stubbed to return `terminationConfirmed: false`;
+  `engine.artifacts.write` stubbed to throw an ordinary `ENOSPC` error. Failed against round-5 code:
+  the artifact write ran (and threw), and the lease was released rather than fenced.
+* **Fix — reorder, don't patch around it.** `_guardTermination` now runs immediately after the
+  cancellation check and BEFORE the artifact write, the persistence transaction, or any other
+  fallible step. When it fires, `_runPublication` returns immediately — no artifact write, no
+  persistence, no later command runs at all for this attempt.
+* **A second, independent backstop, per the review's explicit ask.** Extracted a new
+  `_terminationIsUnconfirmed(jobId, explicitVerdict)` that treats the verdict as unconfirmed if EITHER
+  the explicit argument is `false`, OR `_terminationUnconfirmed` already has the job, OR the job's own
+  durably persisted `termination_confirmed` is already `false` — monotonic, so a later, unrelated
+  exception that carries no verdict of its own can never downgrade an already-observed `false` back to
+  "unknown". Wired into `_failSafely`, and into `_run`'s and `_runRevision`'s own catch blocks (both of
+  which release/fence based on `err?.terminationConfirmed` directly and could have the same
+  secondary-failure blind spot). `cancelJob` already independently consulted `_terminationUnconfirmed`
+  in its own verdict computation and did not need the change.
+* **RED, then GREEN for the backstop specifically.** A `_failSafely`-focused test: mark a job's kill
+  unconfirmed via `_terminationUnconfirmed` directly, then call `_failSafely` with no explicit verdict
+  of its own (reproducing an unrelated secondary exception). Failed against round-5 code (released,
+  `termination_confirmed` stayed unset); passes now.
+* **GREEN.** Both new tests pass; `orch-p1-regressions.test.mjs` grew by 2 (then 3, see below).
+
+### Found while re-auditing every catch, per the review's explicit ask: `_runReview` had the identical gap `_runPhase` was already fixed for
+
+`_runReview` calls `this.backend.runPhase` directly — a separate call site from `_runPhase`'s own
+coding-phase launch, which an earlier self-review round (documented above, round 4) already guarded.
+`_runReview`'s catch called `_blockWith` unconditionally on any exception, and its ordinary
+(non-throwing) `{ ok: false, ... }` failure path never checked `result.terminationConfirmed` either — a
+review-phase launch runs in the exact same workspace the lease protects and is exactly as capable of an
+unconfirmed kill as any other phase.
+
+* **RED.** `engine.backend.runPhase` overridden to throw a kill-unconfirmed error specifically for
+  `PhaseClass.ROUTINE_REVIEW`, delegating to the real fake for every other phase class. Failed against
+  the code as it was: `blocked_review`, lease released.
+* **Fix.** Both the throw path and the ordinary-failure return path now call `_guardTermination` before
+  `_blockWith`, mirroring `_runPhase` exactly.
+* **GREEN.** New test passes; `orch-p1-regressions.test.mjs` 39/39.
+
+## Final verification, round 6
+
+App VERSION bumped `1.26.0730.0225` → `1.26.0730.0341` (forward; `publish.js`/`engine.js` changed again
+in this round). `test/release-version.test.mjs` 4/4.
+
+* **Full suite, as admin:** run twice, both clean — 518 pass, 3 skipped (identity-required), 0 fail.
+* **Full suite, as real root, `PW_TEST_DROP_USER=admin`:** **521 pass, 0 skipped, 0 fail.**
+* **`git diff --check`** against the merge-base with `origin/main`: clean.
+* **Syntax.** `node --check` on `publish.js`, `engine.js`, and both changed test files: clean.
+
 ## Remaining limitations (stated, not fixed)
 
 1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no

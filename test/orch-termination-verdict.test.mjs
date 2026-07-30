@@ -347,6 +347,42 @@ gitTest('Publisher.publish: an unconfirmed kill in gh pr create/view stops the r
   });
 });
 
+gitTest("Publisher.publish: gh pr create killed unconfirmed must fail fast — gh pr view must never run", async () => {
+  // `_pullRequest` runs `gh pr create` then, unconditionally, `gh pr view` — awaiting create's result
+  // but never checking it before view starts. A single shared `terminationConfirmed` closure variable
+  // captured create's kill correctly, but nothing read it before the SECOND subprocess launched: the
+  // "outer note()" in `_publishWithIndex` only ever sees `_pullRequest`'s final, aggregate return,
+  // by which point view has already run regardless of what create reported.
+  await withPublishRepo(async ({ workspacePath }) => {
+    fs.writeFileSync(path.join(workspacePath, 'src.js'), 'export const answer = 42;\n');
+    let viewCalled = false;
+    const exec = async (file, argv, options) => {
+      if (file === 'gh' && argv[1] === 'create') {
+        const err = new Error('killed, unconfirmed');
+        err.killed = true; err.signal = 'SIGTERM'; err.terminationConfirmed = false;
+        throw err;
+      }
+      if (file === 'gh' && argv[1] === 'view') {
+        // Would succeed if ever reached — proving the test fails for the right reason (view actually
+        // ran) rather than by coincidence (view would have failed anyway).
+        viewCalled = true;
+        return { stdout: JSON.stringify({ url: 'https://example.invalid/pr/1', state: 'OPEN' }), stderr: '' };
+      }
+      return execFileAsync(file, argv, options);
+    };
+    const publisher = new Publisher({ config: publisherConfig(), exec });
+
+    const record = await publisher.publish({
+      job: PUB_JOB, project: PUB_PROJECT, workspacePath, request: pubRequest({ open_pull_request: true }),
+    });
+
+    assert.equal(viewCalled, false, 'gh pr view must never run after gh pr create was killed unconfirmed');
+    assert.equal(record.terminationConfirmed, false);
+    assert.equal(record.remote_sha_verified, false);
+    assert.equal(record.pull_request_url, null);
+  });
+});
+
 gitTest('Publisher.publish: an ordinary (non-kill) read-tree failure — an unborn HEAD — is still tolerated', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-orch-publish-tv-'));
   try {
