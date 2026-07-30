@@ -454,7 +454,7 @@ export class OrchestrationEngine {
     entry.promise = this._run(jobId, project, options)
       .catch(async (err) => {
         // A worker must never die silently: an unexplained stall is worse than a recorded failure.
-        await this._failSafely(jobId, `the job stopped unexpectedly (${err?.code ?? 'internal'})`);
+        await this._failSafely(jobId, `the job stopped unexpectedly (${err?.code ?? 'internal'})`, err?.terminationConfirmed);
       })
       .finally(() => {
         if (this._running.get(jobId) === entry) {
@@ -472,14 +472,29 @@ export class OrchestrationEngine {
    * Blocked, not failed. `failed` is terminal, and an internal error says nothing about whether the
    * work is salvageable — the repository is untouched and an operator may well be able to resume.
    * Spending the job's only remaining state on a bug in this service is the wrong trade.
+   *
+   * `terminationConfirmed` is accepted here for the same reason `_runPhase` checks it before
+   * concluding a phase was merely cancelled: an internal error unrelated to any kill (a bug, a full
+   * disk) is the overwhelming majority of what reaches this method, and for those, releasing is
+   * correct — but `_runChecks`/`_runPublication` do not wrap every internal call in a try/catch of
+   * their own, on the assumption that nothing on that path throws with a termination verdict
+   * attached. If that assumption is ever wrong — a check runner or the publisher throwing directly
+   * rather than returning a result, exactly as an unrelated bug could — this is the one backstop
+   * standing between that and silently releasing a project a live descendant might still be writing
+   * to.
    */
-  async _failSafely(jobId, message) {
+  async _failSafely(jobId, message, terminationConfirmed = null) {
     try {
       const job = this.repo.getJob(jobId);
       if (!job || TERMINAL_STATES.has(job.status)) return;
-      await this._releaseLease(jobId);
+      if (terminationConfirmed === false) {
+        await this._fenceLease(jobId, message);
+      } else {
+        await this._releaseLease(jobId);
+      }
       await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
         message, detail: message, eventType: EventType.BLOCKED,
+        patch: terminationConfirmed === false ? { termination_confirmed: false } : {},
       });
     } catch {
       /* nothing further can be done safely */
@@ -574,6 +589,7 @@ export class OrchestrationEngine {
           correlationId: job.correlation_id,
         });
       } catch (err) {
+        if (await this._guardTermination(jobId, err?.terminationConfirmed, `verifying the effective configuration could not confirm a kill was actually dead after it timed out: ${err.message}`)) return;
         const target = {
           auth_expired: JobStatus.BLOCKED_AUTHENTICATION,
           rate_limited: JobStatus.BLOCKED_RATE_LIMIT,
@@ -583,6 +599,12 @@ export class OrchestrationEngine {
         await this._blockWith(jobId, target, `the effective configuration could not be verified (${err?.kind ?? 'unknown'})`);
         return;
       }
+
+      // `verifySession` runs a real, bounded CLI launch in the same workspace this job's lease
+      // protects — as capable of leaving an unconfirmed descendant as any other launch. It reports
+      // its own failures as a normal (non-throwing) response rather than an exception, so the guard
+      // belongs here too, not only in the catch above.
+      if (await this._guardTermination(jobId, verification.terminationConfirmed, 'verifying the effective configuration could not confirm a kill was actually dead after it timed out')) return;
 
       // The verdict is the attestation's, not this function's. An earlier version compared only
       // effort here — and compared it against a value copied from the request, so the check always
@@ -717,7 +739,12 @@ export class OrchestrationEngine {
       });
       await this._releaseLease(jobId);
     } catch (err) {
-      await this._releaseLease(jobId);
+      // An uncaught exception this far in is exactly as capable of carrying an unconfirmed kill as
+      // any other rejection this engine handles — `_startWorker`'s own catch cannot tell, since by
+      // the time it sees this error the lease would already be gone. Fence here, before re-throwing,
+      // rather than release over a kill nobody confirmed.
+      if (err?.terminationConfirmed === false) await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
+      else await this._releaseLease(jobId);
       throw err;
     } finally {
       clearInterval(renewal);
@@ -790,9 +817,15 @@ export class OrchestrationEngine {
         message: 'waiting for a recorded human decision before publishing',
         detail: 'publication requires a recorded approval',
       });
+    } catch (err) {
+      // Mirrors `_run`'s own catch: an uncaught exception here is exactly as capable of carrying an
+      // unconfirmed kill as any other rejection, and `_startWorker`'s catch cannot fence what this
+      // method has already released.
+      if (err?.terminationConfirmed === false) await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
+      else await this._releaseLease(jobId);
+      throw err;
     } finally {
       clearInterval(renewal);
-      await this._releaseLease(jobId);
     }
   }
 
@@ -845,6 +878,17 @@ export class OrchestrationEngine {
         const current = state.get(KIND.JOBS, jobId);
         this.repo.putJob(tx, { ...current, cli_session_id: result.session_id, updated_at: this.now() });
       });
+    }
+
+    // An ordinary backend timeout or process death — nothing to do with a user cancellation, so it
+    // never reaches the `cancelled` branch above — is exactly as capable of leaving an unconfirmed
+    // descendant behind as a cancelled one. `_blockWith` below releases unconditionally; this must
+    // run first, or a genuine kill nobody could confirm quietly frees the project for the next job.
+    if (await this._guardTermination(
+      jobId, result.terminationConfirmed,
+      `the ${phaseClass} phase could not confirm a kill was actually dead after it timed out`,
+    )) {
+      return null;
     }
 
     if (!result.ok) {
@@ -1418,6 +1462,15 @@ export class OrchestrationEngine {
     const entry = {};
     entry.promise = this._runPublication(jobId, project, workspacePath, request, {
       scope, idempotencyKey, contentHash,
+    }).catch(async (err) => {
+      // `_runPublication` only wraps `this.publisher.publish` itself in a try/catch — an unrelated
+      // failure in what follows (an artifact write, the recording transaction) would otherwise escape
+      // straight to this method's caller with the lease still held, un-released AND un-fenced, and the
+      // job stranded in `publishing` forever. `_failSafely` is the same backstop `_startWorker` uses
+      // for exactly this shape of failure, and fences rather than releases when the escaping error
+      // itself carries an unconfirmed kill.
+      await this._failSafely(jobId, `publication stopped unexpectedly (${err?.code ?? 'internal'})`, err?.terminationConfirmed);
+      throw err;
     }).finally(() => {
       if (this._running.get(jobId) === entry) {
         this._running.delete(jobId);

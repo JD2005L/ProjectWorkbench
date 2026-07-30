@@ -396,6 +396,11 @@ export class ClaudeCodeBackend {
       const error = new Error('the coding backend could not be queried');
       error.kind = classifyBackendFailure(err);
       if (error.kind === 'rate_limited') error.retryAfterSeconds = 60;
+      // This launch runs in the same workspace a job's write lease protects, and is exactly as
+      // capable of leaving an unconfirmed descendant as a coding phase. `null` unless `err` actually
+      // carries a verdict — most failures here are an ordinary "could not reach the backend", not a
+      // kill.
+      error.terminationConfirmed = err?.terminationConfirmed ?? null;
       throw error;
     }
 
@@ -500,6 +505,11 @@ export class ClaudeCodeBackend {
         summary: redactText(lastMeaningfulLine(err) || 'the phase failed', { maxLength: 200 }),
         turns_used: 0,
         max_turns_reached: false,
+        // `timeout`/`process_died` are exactly as capable of leaving an unconfirmed descendant as a
+        // cancellation is — an ordinary hard timeout has nothing to do with `cancelJob`, so it never
+        // takes the `cancelled` branch above, and previously carried no verdict at all here. `null`
+        // for every other failure kind: nothing was killed, so there is nothing to have confirmed.
+        terminationConfirmed: (kind === 'timeout' || kind === 'process_died') ? (err?.terminationConfirmed ?? null) : null,
       };
     }
 

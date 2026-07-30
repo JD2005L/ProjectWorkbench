@@ -451,7 +451,7 @@ export class OrchestratorSessionManager {
       // reach that decision.
       return this._verificationResponse(record, null, err?.kind
         ? `the coding backend could not be queried (${err.kind})`
-        : 'the coding backend could not be queried', null);
+        : 'the coding backend could not be queried', null, err?.terminationConfirmed ?? null);
     }
 
     const effective = outcome.effective ?? null;
@@ -481,8 +481,14 @@ export class OrchestratorSessionManager {
    * before the response reaches the wire — the contract model forbids extra fields — but dropping
    * them here entirely meant the engine never learned the session id (so the verified session was
    * never resumed) and the operator never saw *why* every job was blocking.
+   *
+   * `terminationConfirmed` is the same kind of internal-only rider: the verification launch runs in
+   * the project's own workspace and can fail to confirm a kill exactly like a coding phase can, and
+   * the engine must fence rather than release when it does. `null` for the overwhelming majority of
+   * calls (nothing was ever killed), so it is likewise stripped at every wire boundary rather than
+   * added to a contract that has nothing to do with lease safety.
    */
-  _verificationResponse(record, effective, detail, outcome = null) {
+  _verificationResponse(record, effective, detail, outcome = null, terminationConfirmed = null) {
     return {
       schema_version: SCHEMA_VERSION,
       session_key: record.session_key,
@@ -495,6 +501,7 @@ export class OrchestratorSessionManager {
       cli_session_id: outcome?.cli_session_id ?? record.cli_session_id ?? null,
       provenance: outcome?.provenance ?? null,
       settings_attestation: outcome?.settings_attestation ?? null,
+      terminationConfirmed,
     };
   }
 

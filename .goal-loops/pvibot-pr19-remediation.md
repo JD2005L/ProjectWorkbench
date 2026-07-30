@@ -480,6 +480,82 @@ events, ... audit rows") described a guarantee the code did not yet provide for 
   pre-fix code with `repo.listFenceAudit is not a function`; all pass now.
 * **GREEN.** `orch-lease-fence.test.mjs` 21/21. Full suite 502 pass/3 skip/0 fail.
 
+### Self-review — three more swallowed-verdict paths, found by auditing every `_releaseLease` call and every place a caught error could carry `terminationConfirmed`
+
+Traced every `_releaseLease` call site in `engine.js` and every catch block that could see an error
+from something `_execTracked` tracks, asking specifically: could this be reached with
+`terminationConfirmed: false` still attached, and does it release unconditionally regardless? Three
+were.
+
+1. **`_run`'s own catch, and `_runRevision`'s `finally`, released before `_startWorker`'s catch ever
+   saw the error.** `_startWorker`'s `.catch()` (which calls `_failSafely`) was the intended backstop
+   for a worker that dies unexpectedly — but `_run` had `catch (err) { await this._releaseLease(jobId);
+   throw err; }` of its own, and `_runRevision` released unconditionally in a bare `finally` with no
+   catch at all. Either one already released the lease before the error ever reached `_failSafely`,
+   making any fix there moot. Fixed both to fence when `err?.terminationConfirmed === false`, mirroring
+   `_run`'s own pattern. Also hardened `_failSafely` itself (and `publish`'s own new `.catch()` around
+   `_runPublication`, added for the same reason) to accept and act on a termination verdict, in case a
+   future internal error escapes a path that does not itself carry one through the layers above —
+   `_runChecks`/`_runPublication` do not wrap every internal call (an artifact write, a store
+   transaction) in a try/catch of their own, trusting that nothing on that path throws with a verdict
+   attached; this is the backstop if that trust is ever wrong.
+2. **An ordinary backend timeout (not a `cancelJob`-driven abort) dropped the verdict entirely.**
+   `classifyBackendFailure` correctly distinguishes `cancelled` from `timeout`/`process_died` — a hard
+   phase timeout that never touched `cancelJob`'s AbortSignal. But `claude.js`'s `runPhase` only ever
+   preserved `terminationConfirmed` on the `cancelled` branch; a `timeout`/`process_died` result carried
+   no verdict field at all, and `_runPhase`'s `!result.ok` branch called `_blockWith`, which releases
+   unconditionally. A genuine phase timeout whose descendant tree could not be confirmed dead released
+   the project for a later job to walk straight into — exactly the class of bug Part A's redesign
+   exists to prevent, just reached through a different door. Fixed: `runPhase` now threads
+   `terminationConfirmed` through for `timeout`/`process_died` too, and `_runPhase` guards on it before
+   ever reaching `_blockWith`.
+3. **`verifySession` swallowed the verdict entirely, one layer further down.** The backend-configuration
+   probe (`claude.js`'s `verifyConfiguration`) runs a real, bounded CLI launch in the SAME workspace the
+   lease protects, and is exactly as capable of an unconfirmed kill as a coding phase. `session.js`'s
+   `verifySession` catches ANY failure from it and converts it into a normal, non-throwing "unverifiable"
+   response (`_verificationResponse`) — correct for an ordinary "could not reach the backend", but the
+   conversion dropped any termination verdict on the floor, and `engine.js`'s own catch around
+   `verifySession` only ever called `_blockWith`. Fixed by threading `terminationConfirmed` through
+   `verifyConfiguration` → `_verificationResponse` → the engine, which now guards on it both in its catch
+   and on the ordinary (non-throwing) response. `terminationConfirmed` is `null` for every real caller
+   outside this one path (nothing was killed), and is stripped at both wire boundaries that expose
+   `verifySession`'s result today — `api.js`'s existing `SessionVerificationResponse` field-stripping
+   (which already removes several ProjectWorkbench-internal fields the ProjectWorkbench/engine side
+   needs but the ⩽1.0 contract forbids) and a new, equivalent strip added to `mcp.js`'s
+   `pw_verify_session_configuration` handler, which previously returned the raw result with no
+   stripping at all.
+
+RED, then GREEN for all three: 5 new tests in `orch-p1-regressions.test.mjs` (a worker crash carrying
+an unconfirmed kill fences rather than releases; an ordinary internal crash unrelated to any kill still
+just releases, proving the fix does not over-fence; an internal error after `publish`'s git work
+succeeded still fences when the escaping error carries an unconfirmed kill and the job is not left
+stranded in `publishing`; an ordinary backend timeout with an unconfirmed kill fences, one with a
+confirmed kill still just releases; a `verifySession` failure carrying an unconfirmed kill fences).
+Full suite re-run clean afterward: 508 pass/3 skip/0 fail as admin (511/0/0 as real root); `orch-wire`,
+`orch-mcp`, `orch-session`, `orch-runner`, `orch-api-auth` (88 tests) re-run specifically to confirm the
+`terminationConfirmed` wire-stripping changes broke nothing external.
+
+## Final verification, round 4
+
+`npm ci` re-run clean in `app/`. App VERSION bumped `1.26.0729.2230` → `1.26.0730.0035` (forward; app/
+code changed in this round's Parts A/B/C and the self-review fixes, all after 2230 was introduced).
+`test/release-version.test.mjs` 4/4.
+
+* **Full suite, as admin:** 508 pass, 3 skipped (identity-required), 0 fail. 511 total.
+* **Full suite, as real root, `PW_TEST_DROP_USER=admin`:** **511 pass, 0 skipped, 0 fail.**
+* **`git diff --check`** against the merge-base with `origin/main`: clean, no whitespace errors.
+* **Syntax.** `node --check` on every changed `.js` file and every test file; `bash -n` on every
+  shell script in the repository. All clean.
+* **One flaky, unrelated test observed and confirmed pre-existing:** `outbox API:
+  list/download/delete/clear CRUD, no POST route (root, soft mode)` (`test/cockpit-drawer.test.mjs`) —
+  about the cockpit dashboard's outbox drawer, untouched by any change this round — failed once under
+  root during a full-suite run alongside ~500 other tests, then passed 3/3 in isolation and on every
+  subsequent full-suite re-run (clean twice more, admin and root). Consistent with resource contention
+  on a shared container rather than a regression; not investigated further as out of scope for this
+  branch's orchestrator work.
+* **Process hygiene.** `pgrep -af "sleep 60|sleep MARKER|setsid"` after the root runs found nothing —
+  no leaked descendant from this round's adversarial real-process tests.
+
 ## Remaining limitations (stated, not fixed)
 
 1. **`reconcileOnStart` cannot do better than an unconditional fence.** No live descendant list, no
