@@ -9,15 +9,22 @@
 // The recorded fixtures below are real output shapes captured from Claude Code 2.1.220.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 
 import { ClaudeCodeBackend, classifyBackendFailure } from '../app/orchestrator/runner/claude.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { HealthState, AuthMethod, PhaseClass, Effort } from '../app/orchestrator/contract.js';
 
+// Container mode, explicitly. Every assertion below describes a launch with nothing in front of the
+// CLI, which is exactly what container mode must keep doing: the container already runs as the
+// unprivileged user, so there is nothing to drop. Host mode puts `sudo -n -H -u <user> --` in front
+// of the same argv and is covered on its own terms in orch-privilege.test.mjs — leaving this file's
+// mode implicit would have made this suite a test of whoever happened to run it.
 const CONFIG = loadOrchestratorConfig({
   PW_ORCHESTRATOR_ENABLED: 'true',
   PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
   PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+  PW_DEPLOY_MODE: 'container',
 });
 
 /** A recorded init event — the authoritative report of what a session is actually running. */
@@ -584,6 +591,42 @@ test('runner: SECURITY REGRESSION — a forbidden key smuggled via credentialTok
     'a REAL spawned process must never see the smuggled ANTHROPIC_API_KEY, while the legitimate CLAUDE_CONFIG_DIR must still reach it');
 });
 
+test('runner: INTEGRATION — CLAUDE_CONFIG_DIR survives the REAL PrivilegeDropper.dropEnv() pass, not just phaseEnv()\'s own stripping', async () => {
+  // Merge-integration regression, PR19 (host-mode privilege drop) x PR20 (per-user credential
+  // attribution). PR19 independently added CLAUDE_CONFIG_DIR to the SAME FORBIDDEN_ENV list this
+  // file's constructor hands to privilegeDropperFor() — for every OTHER launch, correctly: a
+  // settings.json anywhere the CLI would look carries its own env block and apiKeyHelper. But
+  // ClaudeCodeBackend.exec is `this.privilege.wrap(exec)` (the constructor, unmodified by this
+  // file's own changes), and PrivilegeDropper.dropEnv() (privilege.js) strips its OWN copy of
+  // `forbiddenEnv` a SECOND time, independently, on whatever env phaseEnv() already produced —
+  // AFTER phaseEnv() has already applied and defended CLAUDE_CONFIG_DIR via
+  // ALLOWED_CREDENTIAL_TOKEN_KEYS. Fixing only phaseEnv()'s own re-strip (this file's local
+  // FORBIDDEN_ENV) would still lose CLAUDE_CONFIG_DIR at THIS second, independent layer — the actual
+  // bypass this test exists to catch is PRIVILEGE_DROP_FORBIDDEN_ENV being reverted to the raw
+  // FORBIDDEN_ENV constant (or dropped) at the constructor call site.
+  //
+  // This constructs a REAL PrivilegeDropper (not a fake `privilege` object) against `deployMode:
+  // 'host'` — the default — so `dropEnv()` genuinely runs: even when this process already IS the
+  // configured account (`plan.mode === 'no_drop'`, the common case for a test sandbox), dropEnv() is
+  // still called; only `deployMode: 'container'` (`passthrough`) would skip it.
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+    PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username,
+  });
+  const backend = new ClaudeCodeBackend({ config });
+  // Confirm the plan this test actually exercises isn't the container passthrough that would make
+  // the rest of this test vacuous.
+  const plan = await backend.privilege.plan();
+  assert.notEqual(plan.mode, 'passthrough', 'sanity: this test must exercise a real dropEnv() call');
+
+  const wrappedEnv = await backend.privilege.invocation(
+    config.backendExecutable, [], { env: backend.phaseEnv(['CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude']) },
+  ).then((invocation) => invocation.options.env);
+  assert.equal(wrappedEnv.CLAUDE_CONFIG_DIR, '/srv/pw-users/alice/.claude',
+    'CLAUDE_CONFIG_DIR must survive PrivilegeDropper.dropEnv() — the independent, second stripping pass PR19 added — not just phaseEnv()\'s own');
+});
+
 test('runner: REGRESSION — the resolved credential env reaches a REAL spawned process, not just a JS options object', async () => {
   // Unlike the spy above (which only proves this code CONSTRUCTS the right options.env), this
   // drives a genuine child process through Node's own execFile and reads back what that process's
@@ -634,13 +677,19 @@ test('runner: an abort is classified as cancellation, not as a timeout', () => {
 test('runner: an abort signal is passed through to the child process', async () => {
   // The signal has to reach execFile. Previously only the test fake honoured it, so cancellation
   // was green in the suite and inert in production.
+  //
+  // Not the caller's own `AbortSignal` by reference: the privilege drop's `_execTracked` hands
+  // `exec()` an internal controller instead, aborted only once a guaranteed descendant-tree rescan
+  // has run — so a real kill is never raced against discovering what else the launch started (see
+  // privilege.js). What has to reach execFile is a live, real `AbortSignal`, not that specific object.
   const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
   const controller = new AbortController();
   await backend.runPhase({
     prompt: 'x', model: 'sonnet', effort: 'high', maxTurns: 5,
     phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo', signal: controller.signal,
   });
-  assert.equal(calls[0].options.signal, controller.signal);
+  assert.equal(typeof calls[0].options.signal?.addEventListener, 'function');
+  assert.equal(calls[0].options.signal.aborted, false);
 });
 
 test('runner: failures map to distinct kinds so each can reach its own safe state', () => {

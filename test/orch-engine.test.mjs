@@ -841,11 +841,16 @@ gitTest('engine: a restart reconciles a job that was mid-flight rather than assu
     const handle = await submit(engine);
     await engine.drain();
     const jobId = handle.workbench_job_id;
+    const resource = `project-write:${config.instanceId}:Demo`;
 
-    // Simulate a crash mid-implementation: the durable record says implementing, no worker exists.
+    // Simulate a crash mid-implementation: a REAL, un-released lease record (not merely a job field
+    // set by hand) and the durable job record still says implementing, no worker exists. A restart
+    // is exactly the case this project has no termination evidence for — the process that could have
+    // confirmed a descendant tree is dead is the one that just crashed.
+    const acquired = await store.transact((tx, state) => repo.acquireLease(tx, state, { resource, owner: jobId, ttlMs: 5_000 }));
     await store.transact((tx, state) => {
       const job = state.get(KIND.JOBS, jobId);
-      repo.putJob(tx, { ...job, status: JobStatus.IMPLEMENTING, lease_fencing_token: 1 });
+      repo.putJob(tx, { ...job, status: JobStatus.IMPLEMENTING, lease_fencing_token: acquired.fencing_token });
     });
 
     const fresh = new OrchestrationEngine({
@@ -860,7 +865,159 @@ gitTest('engine: a restart reconciles a job that was mid-flight rather than assu
     // Unknown partial state is blocked for reconciliation against the repository, never resumed on
     // an assumption about what the dead process had finished.
     assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
-    assert.equal(job.lease_fencing_token, null, 'the lease must be released');
+    assert.equal(job.termination_confirmed, false,
+      'a restart has no descendant evidence one way or the other and must say so durably');
+
+    // The lease must be FENCED, not released: a restart is an unknown-termination case exactly like
+    // an unconfirmed cancellation, and releasing it would let a later job start writing to a
+    // workspace a surviving pre-crash descendant might still be editing.
+    const lease = repo.getLease(resource);
+    assert.equal(lease.fenced, true, 'a restart must fence the project, not release its lease');
+    assert.notEqual(lease.owner, null, 'the fenced record is not simply cleared');
+  }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
+});
+
+gitTest('engine: a restart fence survives its own lease TTL — expiry is not a recovery path', async () => {
+  await withEngine(async ({ engine, store, repo, config, backend, artifacts, projectStore }) => {
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const resource = `project-write:${config.instanceId}:Demo`;
+
+    // A deliberately short TTL: if the fence were merely "leave the lease alone", this is exactly
+    // long enough for it to look free again by the time anyone checks.
+    const acquired = await store.transact((tx, state) => repo.acquireLease(tx, state, { resource, owner: jobId, ttlMs: 10 }));
+    await store.transact((tx, state) => {
+      const job = state.get(KIND.JOBS, jobId);
+      repo.putJob(tx, { ...job, status: JobStatus.IMPLEMENTING, lease_fencing_token: acquired.fencing_token });
+    });
+
+    const fresh = new OrchestrationEngine({
+      config, store, repo, backend, artifacts, projectStore,
+      checkRunner: null,
+      sessionManager: { ensureSession: async () => ({}), verifySession: async () => ({}) },
+    });
+    await fresh.reconcileOnStart();
+    assert.equal(repo.getLease(resource).fenced, true);
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    assert.ok(new Date(repo.getLease(resource).expires_at) < new Date(), 'the TTL used for this test must actually have lapsed');
+
+    await assert.rejects(
+      store.transact((tx, state) => repo.acquireLease(tx, state, { resource, owner: 'later-job', ttlMs: 5_000 })),
+      (err) => err instanceof ApiError && err.code === 'lease_lost',
+      'an expired TTL must not reopen a project a restart fenced',
+    );
+  }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
+});
+
+gitTest('engine: a restart fence survives a second restart — a genuine store close and reopen', async () => {
+  await withEngine(async ({ engine, store, repo, config, backend, artifacts, projectStore, dir }) => {
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const resource = `project-write:${config.instanceId}:Demo`;
+
+    const acquired = await store.transact((tx, state) => repo.acquireLease(tx, state, { resource, owner: jobId, ttlMs: 5_000 }));
+    await store.transact((tx, state) => {
+      const job = state.get(KIND.JOBS, jobId);
+      repo.putJob(tx, { ...job, status: JobStatus.IMPLEMENTING, lease_fencing_token: acquired.fencing_token });
+    });
+
+    const first = new OrchestrationEngine({
+      config, store, repo, backend, artifacts, projectStore,
+      checkRunner: null,
+      sessionManager: { ensureSession: async () => ({}), verifySession: async () => ({}) },
+    });
+    await first.reconcileOnStart();
+    assert.equal(repo.getLease(resource).fenced, true);
+
+    // A genuine restart, not merely a second engine instance sharing the live store: close the
+    // journal, reopen it from disk, and read the fence back from what was actually durable.
+    await store.close();
+    const reopened = await JournalStore.open({
+      journalPath: config.journalPath, snapshotPath: config.snapshotPath,
+      lockPath: config.lockPath, compactEveryRecords: 1_000,
+    });
+    const freshRepo = new OrchestratorRepository(reopened);
+    assert.equal(freshRepo.getLease(resource).fenced, true, 'the fence must be durable across a real process restart');
+    assert.equal(freshRepo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+
+    // A second reconcileOnStart against the reopened store must not find anything left to reconcile
+    // (the job is already blocked_project_state, not workspace-active) and must not disturb the fence.
+    const secondEngine = new OrchestrationEngine({
+      config, store: reopened, repo: freshRepo,
+      backend: new FakeCodingBackend({ effective: { model_alias: 'sonnet', effort: 'high' } }),
+      artifacts: new ArtifactStore({ config, repo: freshRepo, store: reopened }),
+      projectStore,
+      checkRunner: null,
+      sessionManager: { ensureSession: async () => ({}), verifySession: async () => ({}) },
+    });
+    const reconciledAgain = await secondEngine.reconcileOnStart();
+    assert.equal(reconciledAgain, 0);
+    assert.equal(freshRepo.getLease(resource).fenced, true);
+
+    await reopened.close();
+    // Leave a live store behind so the fixture's own close() is a no-op rather than an error.
+    const final = await JournalStore.open({
+      journalPath: config.journalPath, snapshotPath: config.snapshotPath,
+      lockPath: config.lockPath, compactEveryRecords: 1_000,
+    });
+    Object.assign(store, { _closed: false });
+    await final.close();
+  }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
+});
+
+gitTest('engine: a restart fence blocks a later job submission and a later revision, for the same project', async () => {
+  await withEngine(async ({ engine, store, repo, config, backend, artifacts, projectStore }) => {
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const resource = `project-write:${config.instanceId}:Demo`;
+
+    const acquired = await store.transact((tx, state) => repo.acquireLease(tx, state, { resource, owner: jobId, ttlMs: 5_000 }));
+    await store.transact((tx, state) => {
+      const job = state.get(KIND.JOBS, jobId);
+      repo.putJob(tx, { ...job, status: JobStatus.IMPLEMENTING, lease_fencing_token: acquired.fencing_token });
+    });
+
+    const fresh = new OrchestrationEngine({
+      config, store, repo, backend, artifacts, projectStore,
+      checkRunner: null,
+      sessionManager: { ensureSession: async () => ({}), verifySession: async () => ({}) },
+    });
+    await fresh.reconcileOnStart();
+    assert.equal(repo.getLease(resource).fenced, true);
+
+    // A brand new job for the same project must not be able to acquire the fenced workspace.
+    const second = await fresh.submitJob({
+      token: TOKEN,
+      body: submission({ idempotency_key: 'req-after-restart', orchestrator_job_id: 'job_after_restart' }),
+      idempotencyKey: 'req-after-restart',
+      correlationId: 'corr-2',
+    });
+    await fresh.drain();
+    assert.equal(repo.getJob(second.workbench_job_id).status, JobStatus.BLOCKED_PROJECT_STATE,
+      'a fresh submission must not acquire the project a restart fenced');
+
+    // Nor may a revision on a THIRD, unrelated job already parked at blocked_review for the same
+    // project — the revision path shares the same lease acquisition as a fresh submission, and the
+    // fence must not distinguish between them.
+    const stranded = repo.getJob(jobId);
+    const revisionJobId = 'pwjob_after_restart_revision';
+    await store.transact((tx) => {
+      repo.putJob(tx, {
+        ...stranded, workbench_job_id: revisionJobId, status: JobStatus.BLOCKED_REVIEW,
+        lease_fencing_token: null, revision_cycles_used: 0, max_revision_cycles: 1,
+      });
+    });
+    await fresh.requestRevision({
+      token: TOKEN, jobId: revisionJobId,
+      body: { workbench_job_id: revisionJobId, instructions: 'tighten the check' },
+    });
+    await fresh.drain();
+    assert.equal(repo.getJob(revisionJobId).status, JobStatus.BLOCKED_PROJECT_STATE,
+      'a revision for a different job on the same fenced project must not acquire the lease either');
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
 });
 

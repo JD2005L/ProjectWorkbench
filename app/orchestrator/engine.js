@@ -70,6 +70,8 @@ export class OrchestrationEngine {
     this._cancelRequested = new Set();
     /** One abort controller per running job, so a cancel reaches the child process. */
     this._aborts = new Map();
+    /** Jobs whose cancellation could not confirm all descendants are dead. */
+    this._terminationUnconfirmed = new Set();
   }
 
   now() { return this.clock().toISOString(); }
@@ -452,7 +454,7 @@ export class OrchestrationEngine {
     entry.promise = this._run(jobId, project, options)
       .catch(async (err) => {
         // A worker must never die silently: an unexplained stall is worse than a recorded failure.
-        await this._failSafely(jobId, `the job stopped unexpectedly (${err?.code ?? 'internal'})`);
+        await this._failSafely(jobId, `the job stopped unexpectedly (${err?.code ?? 'internal'})`, err?.terminationConfirmed);
       })
       .finally(() => {
         if (this._running.get(jobId) === entry) {
@@ -465,19 +467,51 @@ export class OrchestrationEngine {
   }
 
   /**
+   * Whether this job's termination must be treated as unconfirmed — an explicit verdict from the
+   * IMMEDIATE error is not the only source of truth here. `_terminationUnconfirmed` (set the moment
+   * ANY step observes a real `false`) and the job's own durably persisted `termination_confirmed`
+   * field are both consulted as a backstop, so a LATER, unrelated exception — one that carries no
+   * verdict of its own, because it has nothing to do with any kill (a full disk, a transaction race)
+   * — can never downgrade an already-observed `false` back to "unknown" and release a project a live
+   * descendant might still be writing to. Once `false` is observed anywhere in this job's lifecycle,
+   * it is monotonic: nothing later may un-observe it.
+   */
+  _terminationIsUnconfirmed(jobId, explicitVerdict = null) {
+    if (explicitVerdict === false) return true;
+    if (this._terminationUnconfirmed.has(jobId)) return true;
+    return this.repo.getJob(jobId)?.termination_confirmed === false;
+  }
+
+  /**
    * Record an unexpected worker death.
    *
    * Blocked, not failed. `failed` is terminal, and an internal error says nothing about whether the
    * work is salvageable — the repository is untouched and an operator may well be able to resume.
    * Spending the job's only remaining state on a bug in this service is the wrong trade.
+   *
+   * `terminationConfirmed` is accepted here for the same reason `_runPhase` checks it before
+   * concluding a phase was merely cancelled: an internal error unrelated to any kill (a bug, a full
+   * disk) is the overwhelming majority of what reaches this method, and for those, releasing is
+   * correct — but `_runChecks`/`_runPublication` do not wrap every internal call in a try/catch of
+   * their own, on the assumption that nothing on that path throws with a termination verdict
+   * attached. If that assumption is ever wrong — a check runner or the publisher throwing directly
+   * rather than returning a result, exactly as an unrelated bug could — `_terminationIsUnconfirmed`'s
+   * backstop is what stands between that and silently releasing a project a live descendant might
+   * still be writing to.
    */
-  async _failSafely(jobId, message) {
+  async _failSafely(jobId, message, terminationConfirmed = null) {
     try {
       const job = this.repo.getJob(jobId);
       if (!job || TERMINAL_STATES.has(job.status)) return;
-      await this._releaseLease(jobId);
+      const unconfirmed = this._terminationIsUnconfirmed(jobId, terminationConfirmed);
+      if (unconfirmed) {
+        await this._fenceLease(jobId, message);
+      } else {
+        await this._releaseLease(jobId);
+      }
       await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
         message, detail: message, eventType: EventType.BLOCKED,
+        patch: unconfirmed ? { termination_confirmed: false } : {},
       });
     } catch {
       /* nothing further can be done safely */
@@ -508,15 +542,8 @@ export class OrchestrationEngine {
     }
 
     // One writer per project. Everything from here to release is workspace-active.
-    const lease = await this._acquireLease(jobId, project.project_id);
-    if (!lease) {
-      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-        message: 'another job holds the write lease for this project',
-        detail: 'another job holds the write lease for this project',
-        eventType: EventType.BLOCKED,
-      });
-      return;
-    }
+    const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
+    if (!lease) return;
 
     // The lease TTL (default 5 minutes) is far shorter than a phase budget (default 30), so without
     // renewal it lapsed mid-implementation and a second job walked into the same checkout. The
@@ -542,6 +569,10 @@ export class OrchestrationEngine {
           correlationId: job.correlation_id,
         });
       } catch (err) {
+        // `TmuxAdapter.hasSession`/`listWindows` re-throw rather than swallow when tmux itself was
+        // killed without confirmation (as opposed to its ordinary "no such session" exit) — `_blockWith`
+        // below releases the lease unconditionally, which is exactly wrong here.
+        if (await this._guardTermination(jobId, err?.terminationConfirmed, `preparing the orchestrator lane could not confirm tmux was actually killed after it timed out: ${err.message}`)) return;
         await this._blockWith(jobId, JobStatus.BLOCKED_PROJECT_STATE, `the orchestrator lane could not be prepared: ${err.message}`);
         return;
       }
@@ -575,6 +606,7 @@ export class OrchestrationEngine {
           correlationId: job.correlation_id,
         });
       } catch (err) {
+        if (await this._guardTermination(jobId, err?.terminationConfirmed, `verifying the effective configuration could not confirm a kill was actually dead after it timed out: ${err.message}`)) return;
         const target = {
           auth_expired: JobStatus.BLOCKED_AUTHENTICATION,
           rate_limited: JobStatus.BLOCKED_RATE_LIMIT,
@@ -584,6 +616,12 @@ export class OrchestrationEngine {
         await this._blockWith(jobId, target, `the effective configuration could not be verified (${err?.kind ?? 'unknown'})`);
         return;
       }
+
+      // `verifySession` runs a real, bounded CLI launch in the same workspace this job's lease
+      // protects — as capable of leaving an unconfirmed descendant as any other launch. It reports
+      // its own failures as a normal (non-throwing) response rather than an exception, so the guard
+      // belongs here too, not only in the catch above.
+      if (await this._guardTermination(jobId, verification.terminationConfirmed, 'verifying the effective configuration could not confirm a kill was actually dead after it timed out')) return;
 
       // The verdict is the attestation's, not this function's. An earlier version compared only
       // effort here — and compared it against a value copied from the request, so the check always
@@ -620,7 +658,10 @@ export class OrchestrationEngine {
       });
 
       // ---- baseline ----
-      const baseline = await repositoryBaseline({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
+      const { terminationConfirmed: baselineVerdict, ...baseline } = await repositoryBaseline({
+        cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec,
+      });
+      if (await this._guardTermination(jobId, baselineVerdict, 'capturing the repository baseline could not confirm a git command was actually killed after it timed out')) return;
       await this.store.transact((tx, state) => {
         const current = state.get(KIND.JOBS, jobId);
         this.repo.putJob(tx, { ...current, baseline, updated_at: this.now() });
@@ -648,6 +689,7 @@ export class OrchestrationEngine {
 
       // What actually changed, according to git rather than the model.
       const observed = await diffStat({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
+      if (await this._guardTermination(jobId, observed.terminationConfirmed, 'observing the diff could not confirm a git command was actually killed after it timed out')) return;
       const diffArtifact = await this.artifacts.write({
         jobId, kind: ArtifactKind.DIFF, name: 'implementation.diff',
         content: observed.changed_files.join('\n'),
@@ -664,6 +706,7 @@ export class OrchestrationEngine {
       await this._transition(jobId, JobStatus.VERIFYING_TARGETED, { message: 'running targeted verification', phase: 'verification' });
       if (await this._stopIfCancelled(jobId, workspacePath)) return;
       const targeted = await this._runChecks(jobId, project, workspacePath, this._targetedChecks(job));
+      if (await this._guardTermination(jobId, targeted.terminationConfirmed, 'targeted verification could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (targeted.failed) {
         await this._transition(jobId, JobStatus.BLOCKED_VERIFICATION, {
           message: 'targeted verification failed', detail: 'targeted verification failed', eventType: EventType.BLOCKED,
@@ -675,6 +718,7 @@ export class OrchestrationEngine {
       await this._transition(jobId, JobStatus.VERIFYING_FULL, { message: 'running full verification', phase: 'verification' });
       if (await this._stopIfCancelled(jobId, workspacePath)) return;
       const full = await this._runChecks(jobId, project, workspacePath, this._fullChecks(job));
+      if (await this._guardTermination(jobId, full.terminationConfirmed, 'full verification could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (full.failed) {
         await this._transition(jobId, JobStatus.BLOCKED_VERIFICATION, {
           message: 'full verification failed', detail: 'full verification failed', eventType: EventType.BLOCKED,
@@ -712,7 +756,18 @@ export class OrchestrationEngine {
       });
       await this._releaseLease(jobId);
     } catch (err) {
-      await this._releaseLease(jobId);
+      // An uncaught exception this far in is exactly as capable of carrying an unconfirmed kill as
+      // any other rejection this engine handles — `_startWorker`'s own catch cannot tell, since by
+      // the time it sees this error the lease would already be gone. Fence here, before re-throwing,
+      // rather than release over a kill nobody confirmed. `_terminationIsUnconfirmed` also consults
+      // `_terminationUnconfirmed`/the durable job record, so a SECOND, unrelated exception arriving
+      // after an earlier step already observed `false` cannot downgrade it back to unknown just
+      // because this particular error carries no verdict of its own.
+      if (this._terminationIsUnconfirmed(jobId, err?.terminationConfirmed)) {
+        await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
+      } else {
+        await this._releaseLease(jobId);
+      }
       throw err;
     } finally {
       clearInterval(renewal);
@@ -727,15 +782,8 @@ export class OrchestrationEngine {
    * rescue it either.
    */
   async _runRevision(jobId, project, workspacePath) {
-    const lease = await this._acquireLease(jobId, project.project_id);
-    if (!lease) {
-      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-        message: 'another job holds the write lease for this project',
-        detail: 'another job holds the write lease for this project',
-        eventType: EventType.BLOCKED,
-      });
-      return;
-    }
+    const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
+    if (!lease) return;
     // The same renewal the main pipeline installs. Without it the lease (5 minutes by default)
     // lapsed inside a revision phase (30 minutes) and a second job walked into the same checkout.
     const renewal = setInterval(() => {
@@ -764,12 +812,14 @@ export class OrchestrationEngine {
 
       await this._transition(jobId, JobStatus.VERIFYING_TARGETED, { message: 'verifying the revision', phase: 'verification' });
       const targeted = await this._runChecks(jobId, project, workspacePath, this._targetedChecks(job));
+      if (await this._guardTermination(jobId, targeted.terminationConfirmed, 'verification after the revision could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (targeted.failed) {
         await this._blockWith(jobId, JobStatus.BLOCKED_VERIFICATION, 'verification failed after the revision');
         return;
       }
       await this._transition(jobId, JobStatus.VERIFYING_FULL, { message: 'running full verification', phase: 'verification' });
       const full = await this._runChecks(jobId, project, workspacePath, this._fullChecks(job));
+      if (await this._guardTermination(jobId, full.terminationConfirmed, 'full verification after the revision could not confirm a command was actually killed after it timed out or was aborted')) return;
       if (full.failed) {
         await this._blockWith(jobId, JobStatus.BLOCKED_VERIFICATION, 'full verification failed after the revision');
         return;
@@ -790,9 +840,19 @@ export class OrchestrationEngine {
         message: 'waiting for a recorded human decision before publishing',
         detail: 'publication requires a recorded approval',
       });
+    } catch (err) {
+      // Mirrors `_run`'s own catch: an uncaught exception here is exactly as capable of carrying an
+      // unconfirmed kill as any other rejection, and `_startWorker`'s catch cannot fence what this
+      // method has already released. `_terminationIsUnconfirmed` backstops against a secondary,
+      // unrelated exception downgrading an already-observed `false`.
+      if (this._terminationIsUnconfirmed(jobId, err?.terminationConfirmed)) {
+        await this._fenceLease(jobId, `an unexpected error could not confirm a kill: ${err.message}`);
+      } else {
+        await this._releaseLease(jobId);
+      }
+      throw err;
     } finally {
       clearInterval(renewal);
-      await this._releaseLease(jobId);
     }
   }
 
@@ -845,6 +905,10 @@ export class OrchestrationEngine {
     } catch (err) {
       if (err?.kind === 'cancelled' || err?.name === 'AbortError' || this._cancelled(jobId)) {
         // The phase was stopped on purpose. Cancellation records the terminal state itself.
+        // Surface terminationConfirmed so cancelJob knows whether descendants are dead.
+        if (err?.terminationConfirmed === false) {
+          this._terminationUnconfirmed.add(jobId);
+        }
         return null;
       }
       await this._blockWith(jobId, JobStatus.BLOCKED_CONNECTIVITY, `the coding backend failed: ${err.message}`);
@@ -858,6 +922,17 @@ export class OrchestrationEngine {
       });
     }
 
+    // An ordinary backend timeout or process death — nothing to do with a user cancellation, so it
+    // never reaches the `cancelled` branch above — is exactly as capable of leaving an unconfirmed
+    // descendant behind as a cancelled one. `_blockWith` below releases unconditionally; this must
+    // run first, or a genuine kill nobody could confirm quietly frees the project for the next job.
+    if (await this._guardTermination(
+      jobId, result.terminationConfirmed,
+      `the ${phaseClass} phase could not confirm a kill was actually dead after it timed out`,
+    )) {
+      return null;
+    }
+
     if (!result.ok) {
       // Each failure kind reaches a different safe state: they need different operator responses,
       // and only some are worth retrying.
@@ -866,6 +941,10 @@ export class OrchestrationEngine {
         rate_limited: JobStatus.BLOCKED_RATE_LIMIT,
         usage_limited: JobStatus.BLOCKED_USAGE_LIMIT,
         unavailable: JobStatus.BLOCKED_CONNECTIVITY,
+        // The launch was refused before it started: this host cannot run the CLI as the
+        // unprivileged account it is configured to use. Nothing about the project or the job is
+        // wrong, and a retry changes nothing until an operator fixes the configuration.
+        privilege_drop_failed: JobStatus.BLOCKED_CONFIGURATION,
         timeout: JobStatus.BLOCKED_PROJECT_STATE,
         process_died: JobStatus.BLOCKED_PROJECT_STATE,
         malformed_output: JobStatus.BLOCKED_VERIFICATION,
@@ -946,9 +1025,23 @@ export class OrchestrationEngine {
   async _runChecks(jobId, project, workspacePath, checkNames) {
     const records = [];
     let failed = false;
+    // `null` unless some check in this batch reports an unconfirmed kill — the caller must fence and
+    // stop rather than treat it as an ordinary check failure the moment this is `false`.
+    let terminationConfirmed = null;
     for (const checkName of checkNames) {
       // eslint-disable-next-line no-await-in-loop
-      const { check, artifact } = await this.checkRunner.run({ jobId, checkName, project, cwd: workspacePath });
+      const outcome = await this.checkRunner.run({ jobId, checkName, project, cwd: workspacePath });
+      if (outcome.terminationConfirmed === false) {
+        terminationConfirmed = false;
+        // Tracked before anything else below runs — the persistence transaction and the event emit
+        // are both fallible I/O of their own, and an unrelated secondary failure there must not be
+        // able to lose a verdict already observed. Nothing after this point is safe to do with a
+        // check we cannot confirm actually finished: no persistence, no event, no later check in
+        // this batch.
+        this._terminationUnconfirmed.add(jobId);
+        break;
+      }
+      const { check, artifact } = outcome;
       // eslint-disable-next-line no-await-in-loop
       await this.store.transact((tx) => { tx.put(KIND.CHECKS, check.check_id, check); });
       // eslint-disable-next-line no-await-in-loop
@@ -965,7 +1058,7 @@ export class OrchestrationEngine {
       records.push(check);
       if (check.outcome === CheckOutcome.FAILED || check.outcome === CheckOutcome.ERRORED) failed = true;
     }
-    return { records, failed };
+    return { records, failed, terminationConfirmed };
   }
 
   // -- review ----------------------------------------------------------------
@@ -1009,9 +1102,17 @@ export class OrchestrationEngine {
         resumeSessionId: null,
       });
     } catch (err) {
+      // The review launch runs in the same workspace the project's lease protects and is exactly as
+      // capable of an unconfirmed kill as `_runPhase`'s own coding-phase launch — `_blockWith` below
+      // releases unconditionally, which is wrong here for the same reason it is everywhere else.
+      if (await this._guardTermination(jobId, err?.terminationConfirmed, `the review could not confirm a kill was actually dead after it timed out: ${err.message}`)) return null;
       await this._blockWith(jobId, JobStatus.BLOCKED_REVIEW, `the review could not run: ${err.message}`);
       return null;
     }
+
+    // An ordinary backend timeout during review — reported as a normal `{ ok: false, ... }` return,
+    // never a throw — is just as capable of leaving an unconfirmed descendant as one that throws.
+    if (await this._guardTermination(jobId, result.terminationConfirmed, 'the review could not confirm a kill was actually dead after it timed out')) return null;
 
     const isolated = Boolean(result.session_id) && result.session_id !== implementationSessionId;
     const verdict = !result.ok
@@ -1362,6 +1463,22 @@ export class OrchestrationEngine {
   // -------------------------------------------------------------------------
 
   /**
+   * Strip the fields a publication record carries only for this engine's own use before it reaches
+   * ANY caller — the happy path already excluded these from what gets persisted and returned;
+   * `steps` (raw-ish per-command output, redacted but still internal), `failure_reason` (present on
+   * every `_failed()`-shaped record but not part of the wire contract), and `terminationConfirmed`
+   * (an ephemeral verdict for THIS engine's own lease-fencing decision, never a fact about the
+   * publication itself) must never reach an MCP tool result or a REST response, regardless of which
+   * of `publish`'s several return paths produced the record — a lease denial and a cancellation
+   * raced mid-publish previously returned the raw record unstripped, on paths the happy-path
+   * destructuring never touched.
+   */
+  _publicPublicationRecord(record) {
+    const { steps: _steps, failure_reason: _failureReason, terminationConfirmed: _terminationConfirmed, ...rest } = record;
+    return rest;
+  }
+
+  /**
    * Publish under a recorded approval.
    *
    * Idempotent by key, because a retried publish must not produce a second commit. The approval is
@@ -1412,13 +1529,96 @@ export class OrchestrationEngine {
 
     const workspacePath = resolveWorkspacePath(this.config, project);
 
+    // One writer per project — exactly the same rule the coding phases obey, and for the same
+    // reason: `git add`/`commit`/`push` run directly against the shared checkout. Acquired only now
+    // that the claim transaction has durably moved the job to `publishing`, so a denial here is
+    // reported as *this* job being blocked (a legal edge from `publishing`) rather than stranding it
+    // mid-transition. `_acquireLeaseOrBlock` already tells a competing holder from a durable fence
+    // apart and blocks the job itself; there is nothing left for `publish` to decide on denial.
+    const lease = await this._acquireLeaseOrBlock(jobId, project.project_id);
+    if (!lease) {
+      const blocked = this.repo.getJob(jobId);
+      return this._publicPublicationRecord(
+        this.publisher.refusedRecord(blocked, blocked.detail ?? 'the project write lease could not be acquired'),
+      );
+    }
+
+    // Registered exactly like a coding-phase worker: `cancelJob` finds this job in `_running` and
+    // `_aborts`, aborts the signal threaded into every publisher/git command below, and races this
+    // same promise against its grace window — without this, cancelling a job that is publishing was
+    // a pure no-op, and `cancelJob` recorded `cancelled` while `git push` kept running unattended.
+    this._aborts.set(jobId, new AbortController());
+    const entry = {};
+    entry.promise = this._runPublication(jobId, project, workspacePath, request, {
+      scope, idempotencyKey, contentHash,
+    }).catch(async (err) => {
+      // `_runPublication` only wraps `this.publisher.publish` itself in a try/catch — an unrelated
+      // failure in what follows (an artifact write, the recording transaction) would otherwise escape
+      // straight to this method's caller with the lease still held, un-released AND un-fenced, and the
+      // job stranded in `publishing` forever. `_failSafely` is the same backstop `_startWorker` uses
+      // for exactly this shape of failure, and fences rather than releases when the escaping error
+      // itself carries an unconfirmed kill.
+      await this._failSafely(jobId, `publication stopped unexpectedly (${err?.code ?? 'internal'})`, err?.terminationConfirmed);
+      throw err;
+    }).finally(() => {
+      if (this._running.get(jobId) === entry) {
+        this._running.delete(jobId);
+        this._aborts.delete(jobId);
+      }
+    });
+    this._running.set(jobId, entry);
+    return entry.promise;
+  }
+
+  /**
+   * Run the publication itself: the actual git work, its evidence, and the terminal transition.
+   *
+   * Split out of `publish` so the whole thing — not just the git calls — is the promise `cancelJob`
+   * races and `drain()` waits for, matching `_startWorker`/`_run`.
+   */
+  async _runPublication(jobId, project, workspacePath, request, { scope, idempotencyKey, contentHash }) {
+    // The lease TTL is far shorter than a publication can legitimately take (a slow push, a large
+    // diff), so without renewal it lapsed mid-push and a second job walked into the same checkout.
+    const renewal = setInterval(() => {
+      this._renewLease(jobId, project.project_id).catch(() => {});
+    }, Math.max(1_000, Math.floor(this.config.leaseTtlMs / 3)));
+    if (typeof renewal.unref === 'function') renewal.unref();
+
+    const job = this.repo.getJob(jobId);
     let record;
     try {
-      record = await this.publisher.publish({ job, project, workspacePath, request });
+      record = await this.publisher.publish({
+        job, project, workspacePath, request, signal: this._aborts.get(jobId)?.signal,
+      });
     } catch (err) {
-      // The job has already been moved to `publishing`, so an exception escaping here would strand
-      // it there with no legal way back. Any refusal becomes a recorded failed publication instead.
+      // The job is already `publishing`, so an exception escaping here would strand it there with
+      // no legal way back. Any refusal becomes a recorded failed publication instead.
       record = this.publisher.refusedRecord(job, err instanceof ApiError ? err.message : 'the publication was refused');
+    } finally {
+      clearInterval(renewal);
+    }
+
+    // Surface terminationConfirmed so cancelJob knows whether a descendant of some git invocation is
+    // still unaccounted for, exactly as `_runPhase` does for the coding backend.
+    if (record.terminationConfirmed === false) this._terminationUnconfirmed.add(jobId);
+
+    // Cancellation records its own terminal state, from its own fingerprint comparison — a worker
+    // that raced ahead and recorded `completed`/`blocked_project_state` here too would either
+    // overwrite that verdict or claim a publication `cancelJob` never confirmed was safe to stop,
+    // whichever transition happened to land last.
+    if (this._cancelled(jobId)) return this._publicPublicationRecord(record);
+
+    // Guarded BEFORE any fallible post-publish work — the artifact write and the recording
+    // transaction below both do real I/O and can throw for reasons that have nothing to do with any
+    // kill (a full disk, a store contention error). An unconfirmed kill must be durably fenced FIRST,
+    // immune to whatever runs after it: no artifact write, persistence, status transition, or lease
+    // release may precede it, and an unrelated secondary failure must never be able to downgrade an
+    // already-observed `false` back to "unknown" by racing ahead of the fence.
+    if (await this._guardTermination(
+      jobId, record.terminationConfirmed,
+      'publication could not confirm a git command was actually killed after a timeout or abort',
+    )) {
+      return this._publicPublicationRecord(record);
     }
 
     const artifact = await this.artifacts.write({
@@ -1427,7 +1627,8 @@ export class OrchestrationEngine {
       summary: record.remote_sha_verified ? 'published and verified' : (record.failure_reason ?? 'publication incomplete'),
     });
 
-    const { steps: _steps, failure_reason: failureReason, ...publicRecord } = record;
+    const { failure_reason: failureReason } = record;
+    const publicRecord = this._publicPublicationRecord(record);
 
     await this.store.transact((tx, state) => {
       tx.put(KIND.PUBLICATIONS, publicRecord.publication_id, publicRecord);
@@ -1452,17 +1653,17 @@ export class OrchestrationEngine {
     });
 
     if (publicRecord.remote_sha_verified) {
+      await this._releaseLease(jobId);
       await this._transition(jobId, JobStatus.COMPLETED, {
         message: 'the change is published and the remote SHA was verified',
         detail: 'published', eventType: EventType.COMPLETED,
       });
     } else {
       // Never claim publication from local output alone.
-      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
-        message: `publication did not complete: ${failureReason ?? 'the remote SHA was not verified'}`,
-        detail: failureReason ?? 'the remote SHA was not verified',
-        eventType: EventType.BLOCKED,
-      });
+      await this._blockWith(
+        jobId, JobStatus.BLOCKED_PROJECT_STATE,
+        `publication did not complete: ${failureReason ?? 'the remote SHA was not verified'}`,
+      );
     }
     return publicRecord;
   }
@@ -1497,32 +1698,64 @@ export class OrchestrationEngine {
     // whole phase budget while the agent carried on editing.
     this._aborts.get(jobId)?.abort();
 
-    // Bounded. An unbounded await here held the caller's request open for the entire remaining
-    // phase budget — up to half an hour — whenever a child ignored the signal. The job is recorded
-    // cancelled either way; a straggler finds `_cancelRequested` set and stops at its next boundary.
+    // Bounded, but the bound must never be mistaken for an answer. `inFlight.promise` is what
+    // eventually carries the real verdict (via `_terminationUnconfirmed`, set from the worker's own
+    // catch handler once `ensureTerminated` has actually run) — and that only happens once the
+    // promise settles. If the grace elapses first, nothing has settled, so nothing is known: that
+    // has to read as unconfirmed, not as a coin flip that happened to land on "fine". A straggler
+    // finds `_cancelRequested` set and stops at its next boundary regardless.
     const inFlight = this._running.get(jobId);
+    let settledInTime = !inFlight;
     if (inFlight) {
-      await Promise.race([
-        inFlight.promise.catch(() => {}),
-        new Promise((resolve) => { const t = setTimeout(resolve, this.config.cancelGraceMs); t.unref?.(); }),
+      const GRACE_ELAPSED = Symbol('cancel-grace-elapsed');
+      const outcome = await Promise.race([
+        inFlight.promise.then(() => 'settled', () => 'settled'),
+        new Promise((resolve) => { const t = setTimeout(() => resolve(GRACE_ELAPSED), this.config.cancelGraceMs); t.unref?.(); }),
       ]);
+      settledInTime = outcome !== GRACE_ELAPSED;
     }
 
     const after = await workingTreeFingerprint({ cwd: workspacePath, gitExecutable: this.config.gitExecutable, exec: this.exec });
     const preserved = workingTreePreserved(before, after);
+    // Confirmed only when the worker's own promise actually settled inside the grace window, it did
+    // not itself report an unconfirmed kill, AND the git commands used to take the fingerprint
+    // either side of the abort were not themselves killed without confirmation — a fingerprinting
+    // command is exactly as capable of backgrounding something of its own as any other. Anything
+    // else — including "the deadline won the race and we simply do not know yet" — is unconfirmed,
+    // never rounded up to cancelled.
+    const terminationConfirmed = settledInTime && !this._terminationUnconfirmed.has(jobId)
+      && before.terminationConfirmed !== false && after.terminationConfirmed !== false;
 
-    await this._releaseLease(jobId);
     const current = this.repo.getJob(jobId);
     if (!TERMINAL_STATES.has(current.status)) {
-      await this._transition(jobId, JobStatus.CANCELLED, {
-        message: `cancelled: ${request.reason}`,
-        detail: `cancelled: ${request.reason}`,
-        eventType: EventType.CANCELLED,
-        patch: { working_tree_preserved: preserved },
-      });
+      if (!terminationConfirmed) {
+        // Descendants may still be alive, or we simply do not yet know. The lease is fenced, not
+        // released: a plain release would let a later job acquire this project the moment the lease
+        // would otherwise have expired, exactly the window a live, unconfirmed writer needs to stay
+        // undetected in. Only an explicit, evidenced operator action (clearFence) takes the fence
+        // down — never a timer, and never this job settling late on its own.
+        await this._fenceLease(jobId, `cancellation could not confirm termination: ${request.reason}`);
+        await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
+          message: 'cancellation could not confirm all descendant processes are dead',
+          detail: `cancelled: ${request.reason} (termination unconfirmed — descendants may still be running)`,
+          eventType: EventType.BLOCKED,
+          patch: { working_tree_preserved: false, termination_confirmed: false },
+        });
+      } else {
+        await this._releaseLease(jobId);
+        await this._transition(jobId, JobStatus.CANCELLED, {
+          message: `cancelled: ${request.reason}`,
+          detail: `cancelled: ${request.reason}`,
+          eventType: EventType.CANCELLED,
+          patch: { working_tree_preserved: preserved, termination_confirmed: true },
+        });
+      }
     }
     this._cancelRequested.delete(jobId);
-    this._auditEvent('orchestrator.job.cancelled', { workbench_job_id: jobId, working_tree_preserved: preserved });
+    if (terminationConfirmed) this._terminationUnconfirmed.delete(jobId);
+    this._auditEvent('orchestrator.job.cancelled', {
+      workbench_job_id: jobId, working_tree_preserved: preserved, termination_confirmed: terminationConfirmed,
+    });
     return this._jobState(this.repo.getJob(jobId));
   }
 
@@ -1585,7 +1818,66 @@ export class OrchestrationEngine {
       this.repo.releaseLease(tx, state, { resource, owner: jobId, fencingToken: job.lease_fencing_token });
       const current = state.get(KIND.JOBS, jobId);
       this.repo.putJob(tx, { ...current, lease_fencing_token: null, updated_at: this.now() });
-    }).catch(() => { /* the lease was already taken over; nothing to release */ });
+    }).catch(() => { /* the lease was already taken over, or is fenced; nothing to release */ });
+  }
+
+  /**
+   * Durably fence the project this job holds the lease for, so no later job may acquire it until an
+   * operator clears the fence with evidence. A no-op if this job's lease has already lapsed and been
+   * taken over legitimately — there is nothing left for it to vouch for.
+   */
+  async _fenceLease(jobId, reason) {
+    const job = this.repo.getJob(jobId);
+    if (!job?.lease_fencing_token) return;
+    const resource = `project-write:${this.config.instanceId}:${job.project_id}`;
+    await this.store.transact((tx, state) => {
+      this.repo.fenceLease(tx, state, { resource, owner: jobId, fencingToken: job.lease_fencing_token, reason });
+    }).catch(() => { /* the lease was already taken over; nothing this job can fence */ });
+  }
+
+  /**
+   * Acquire the project's write lease, or block the job with the most honest reason available.
+   *
+   * Distinguishing "fenced" from "held by another job" matters to whoever reads the job's timeline:
+   * one is routine contention that clears on its own, the other needs an operator's evidenced
+   * decision before anything can write here again.
+   */
+  async _acquireLeaseOrBlock(jobId, projectId) {
+    const lease = await this._acquireLease(jobId, projectId);
+    if (lease) return lease;
+    const resource = `project-write:${this.config.instanceId}:${projectId}`;
+    const fenced = this.repo.getLease(resource)?.fenced;
+    const message = fenced
+      ? 'the project workspace is fenced pending operator review after a cancellation whose termination could not be confirmed'
+      : 'another job holds the write lease for this project';
+    await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, { message, detail: message, eventType: EventType.BLOCKED });
+    return null;
+  }
+
+  /**
+   * Fence and quarantine a job whenever a git or check operation reports a kill that could not be
+   * confirmed dead — the same treatment an unconfirmed cancellation gets, because a `git` invocation
+   * or a project's own verification command is exactly as capable of backgrounding something of its
+   * own as the coding CLI is. `terminationConfirmed` is `null` for the overwhelming majority of
+   * calls (nothing was ever killed — most git commands succeed, and most checks are simply allowed
+   * to fail), so this is a no-op unless it is specifically `false`.
+   *
+   * Returns `true` when this handled the situation — the caller must stop immediately, exactly like
+   * `_stopIfCancelled` — and `false` when there is nothing to act on.
+   */
+  async _guardTermination(jobId, terminationConfirmed, contextMessage) {
+    if (terminationConfirmed !== false) return false;
+    await this._fenceLease(jobId, contextMessage);
+    const current = this.repo.getJob(jobId);
+    if (!TERMINAL_STATES.has(current.status)) {
+      await this._transition(jobId, JobStatus.BLOCKED_PROJECT_STATE, {
+        message: 'a git or verification command could not be confirmed dead after a timeout or abort',
+        detail: contextMessage,
+        eventType: EventType.BLOCKED,
+        patch: { termination_confirmed: false },
+      });
+    }
+    return true;
   }
 
   /**
@@ -1620,20 +1912,29 @@ export class OrchestrationEngine {
    * Reconcile jobs left mid-flight by a restart.
    *
    * A job recorded as `implementing` when the process died is in an unknown state: the phase may
-   * have completed, partly completed, or never started. It is moved to `blocked_project_state` with
-   * its lease released, rather than resumed — resuming would mean guessing, and the repository's
-   * actual condition is the only thing that can settle it.
+   * have completed, partly completed, or never started — and so may whatever it launched. A restart
+   * is an unknown-termination case in exactly the same sense an unconfirmed cancellation is: nothing
+   * in this process ever confirmed a descendant tree is dead, because the process that could have is
+   * the one that just crashed. It is moved to `blocked_project_state`, but the project's lease is
+   * *fenced*, not released — releasing it would let a later job start writing to a workspace a
+   * pre-crash descendant might still be editing. Only an explicit, evidenced `clearFence` (via
+   * `scripts/pw-orch-clear-fence.mjs`) takes it down; resuming would mean guessing, and so would
+   * assuming a restart is proof of anything.
    */
   async reconcileOnStart() {
     const stranded = this.repo.listJobs((j) => WORKSPACE_ACTIVE_STATES.has(j.status));
     for (const job of stranded) {
       // eslint-disable-next-line no-await-in-loop
-      await this._releaseLease(job.workbench_job_id);
+      await this._fenceLease(
+        job.workbench_job_id,
+        'the workbench restarted while this job held the workspace; termination cannot be confirmed after a crash',
+      );
       // eslint-disable-next-line no-await-in-loop
       await this._transition(job.workbench_job_id, JobStatus.BLOCKED_PROJECT_STATE, {
         message: 'the workbench restarted while this job held the workspace; its state is unknown',
-        detail: 'reconciled after a restart: the workspace state is unknown',
+        detail: 'reconciled after a restart: the workspace state is unknown, and the project is fenced pending operator review',
         eventType: EventType.BLOCKED,
+        patch: { termination_confirmed: false },
       }).catch(() => { /* a job that already moved on needs no reconciliation */ });
     }
     return stranded.length;

@@ -20,7 +20,7 @@ import { FakeCodingBackend } from '../app/orchestrator/runner/fake.js';
 import { TmuxAdapter, OrchestratorSessionManager } from '../app/orchestrator/session.js';
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { ApiError } from '../app/orchestrator/errors.js';
-import { JobStatus, ApprovalStatus } from '../app/orchestrator/contract.js';
+import { JobStatus, ApprovalStatus, PhaseClass, ArtifactKind } from '../app/orchestrator/contract.js';
 import { SCOPES } from '../app/orchestrator/auth.js';
 
 const execFileAsync = promisify(execFile);
@@ -112,13 +112,16 @@ async function withEngine(fn, { backendOptions, envOverrides } = {}) {
     }),
     resolveCredentials: async () => ({ tokens: [] }),
   };
+  const checkRunner = new CheckRunner({ config, repo, store, artifacts });
   const engine = new OrchestrationEngine({
-    config, store, repo, backend, sessionManager, artifacts, projectStore,
-    checkRunner: new CheckRunner({ config, repo, store, artifacts }),
+    config, store, repo, backend, sessionManager, artifacts, projectStore, checkRunner,
   });
 
   try {
-    await fn({ engine, store, repo, config, backend, repoDir, git, remote, dir });
+    await fn({
+      engine, store, repo, config, backend, repoDir, git, remote, dir,
+      sessionManager, artifacts, projectStore, checkRunner,
+    });
   } finally {
     await engine.drain().catch(() => {});
     await store.close();
@@ -419,9 +422,14 @@ gitTest('publish: a failed commit says why, rather than reporting a bare failure
   }, { backendOptions: ATTESTING });
 });
 
-gitTest('publish: publication holds the project write lease while it runs', async () => {
-  await withEngine(async ({ engine, store, repo, config }) => {
+gitTest('publish: a competing lease blocks publication before any git runs — not just a no-op diff', async () => {
+  // Previously this test held no dirty file at all, so `publish` reported `pushed: false` for the
+  // *same* reason it always would have — "there is nothing to publish" — whether or not the lease
+  // check ran. It proved nothing about the lease. A real dirty, intended file is what makes "was
+  // this actually blocked by the competing lease" a question the test can answer.
+  await withEngine(async ({ engine, store, repo, config, repoDir, remote }) => {
     const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
     await engine.approveStage({
       token: APPROVER, jobId,
       body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
@@ -432,6 +440,8 @@ gitTest('publish: publication holds the project write lease while it runs', asyn
     // actively editing.
     const resource = `project-write:${INSTANCE}:Demo`;
     await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'other-job', ttlMs: 600_000 }));
+
+    const before = (await execFileAsync('git', ['rev-list', '--count', 'HEAD'], { cwd: repoDir })).stdout.trim();
 
     const record = await engine.publish({
       token: SUBMITTER, jobId,
@@ -444,6 +454,367 @@ gitTest('publish: publication holds the project write lease while it runs', asyn
 
     const blocked = record instanceof ApiError || record.pushed === false;
     assert.ok(blocked, 'publication must not proceed while another job holds the write lease');
+    if (!(record instanceof ApiError)) {
+      assert.equal('terminationConfirmed' in record, false,
+        'an internal-only verdict must never reach an MCP/REST caller of publish');
+      assert.equal('steps' in record, false, 'raw per-command step output must never reach the wire either');
+    }
+
+    // Nothing was staged or committed — the block happened before any git ran, not after a commit
+    // that then failed to push.
+    const after = (await execFileAsync('git', ['rev-list', '--count', 'HEAD'], { cwd: repoDir })).stdout.trim();
+    assert.equal(after, before, 'no commit may have been made while another job holds the lease');
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
+
+    // The job itself must not be stranded in `publishing` — it is blocked, on a legal edge, and the
+    // OTHER job's lease is still exactly what it was (still held, still unfenced by this refusal).
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    const lease = repo.getLease(resource);
+    assert.equal(lease.owner, 'other-job');
+    assert.notEqual(lease.fenced, true, 'a routine competing lease is contention, not a fence');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: a pre-existing fence blocks publication just like a competing lease', async () => {
+  await withEngine(async ({ engine, store, repo, repoDir, remote }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // A prior, unrelated cancellation left this project's workspace fenced pending operator review.
+    const resource = `project-write:${INSTANCE}:Demo`;
+    const fenceOwner = await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'earlier-job', ttlMs: 600_000 }));
+    await store.transact((tx, s) => repo.fenceLease(tx, s, {
+      resource, owner: 'earlier-job', fencingToken: fenceOwner.fencing_token, reason: 'an earlier cancellation could not confirm termination',
+    }));
+
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    }).catch((err) => err);
+
+    const blocked = record instanceof ApiError || record.pushed === false;
+    assert.ok(blocked, 'publication must not proceed against a fenced project');
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
+    assert.equal(repo.getLease(resource).fenced, true, 'the pre-existing fence must remain in place, not be cleared as a side effect');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: cancelling mid-push fences the project rather than confirming cancellation', async () => {
+  await withEngine(async ({
+    engine, repo, repoDir, remote, config, store, backend, sessionManager, artifacts, checkRunner, projectStore,
+  }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // A fake exec that runs every git subcommand for real EXCEPT `push`, which hangs until the
+    // AbortSignal `runGit` now threads through actually fires — standing in for a `git push` that
+    // is genuinely in flight (blocked on the network, or backgrounded) at the moment of cancellation.
+    // On abort it rejects the way `PrivilegeDropper._execTracked` would for a kill nobody could
+    // confirm: `terminationConfirmed: false`, never assumed true just because the signal fired.
+    let pushStarted;
+    const pushStartedPromise = new Promise((resolve) => { pushStarted = resolve; });
+    const exec = async (file, argv, options) => {
+      if (argv[0] === 'push') {
+        pushStarted();
+        return new Promise((resolve, reject) => {
+          const onAbort = () => {
+            const err = new Error('the push was aborted');
+            err.name = 'AbortError';
+            err.killed = true;
+            err.signal = 'SIGTERM';
+            err.terminationConfirmed = false;
+            reject(err);
+          };
+          if (options.signal?.aborted) return onAbort();
+          options.signal?.addEventListener('abort', onAbort, { once: true });
+        });
+      }
+      return execFileAsync(file, argv, options);
+    };
+
+    const engineWithExec = new OrchestrationEngine({
+      config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, exec,
+    });
+
+    const publishPromise = engineWithExec.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    }).catch((err) => err);
+
+    await pushStartedPromise;
+    const cancelled = await engineWithExec.cancelJob({
+      token: SUBMITTER, jobId,
+      body: { workbench_job_id: jobId, reason: 'operator changed their mind mid-push' },
+    });
+    const publishResult = await publishPromise;
+
+    // Never a false "cancelled" while the push could not be confirmed dead.
+    assert.notEqual(cancelled.status, JobStatus.CANCELLED,
+      'cancellation must not be confirmed while an in-flight push could not be confirmed killed');
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(repo.getJob(jobId).termination_confirmed, false);
+
+    // publish()'s own return value — what an MCP/REST caller actually receives — must not carry the
+    // internal verdict either, even on the path raced by a concurrent cancellation.
+    if (!(publishResult instanceof ApiError)) {
+      assert.equal('terminationConfirmed' in publishResult, false,
+        'a cancellation racing publish must not leak the internal verdict to the caller');
+      assert.equal('steps' in publishResult, false);
+    }
+
+    // The project is fenced, not merely released — a later job must not be able to walk into the
+    // same checkout while the aborted push is unaccounted for.
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource).fenced, true, 'an unconfirmed mid-push cancellation must fence the project');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'the workspace must not be reusable until an operator clears the fence with evidence',
+    );
+
+    // Nothing reached the remote — the push never actually completed.
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'an aborted push must not have landed on the remote');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: an unconfirmed kill re-staging the real index fences the project through the whole engine, not a false success', async () => {
+  // The exact production-shaped reproduction: the post-commit real-index `add` is a "best effort"
+  // call whose result Publisher used to discard outright, so a kill there was invisible all the way
+  // up — the record reported `terminationConfirmed: null, remote_sha_verified: true`, and the engine,
+  // having nothing to react to, released the lease instead of fencing it.
+  await withEngine(async ({
+    engine, repo, repoDir, remote, config, store, backend, sessionManager, artifacts, checkRunner, projectStore,
+  }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // The SECOND `add` invocation is the post-commit real-index re-stage; the first stages into the
+    // private index before the commit and must succeed normally.
+    let addCalls = 0;
+    const exec = async (file, argv, options) => {
+      if (argv[0] === 'add') {
+        addCalls += 1;
+        if (addCalls === 2) {
+          const err = new Error('killed, unconfirmed');
+          err.killed = true; err.signal = 'SIGTERM'; err.terminationConfirmed = false;
+          throw err;
+        }
+      }
+      return execFileAsync(file, argv, options);
+    };
+
+    const engineWithExec = new OrchestrationEngine({
+      config, store, repo, backend, sessionManager, artifacts, checkRunner, projectStore, exec,
+    });
+
+    const record = await engineWithExec.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+
+    assert.equal(record.remote_sha_verified, false,
+      'the record must never claim a verified remote publication alongside an unconfirmed kill');
+    assert.equal(record.pushed, false, 'push must never run after an unconfirmed kill upstream of it');
+
+    const job = repo.getJob(jobId);
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'the engine must fence rather than release when publish reports an unconfirmed kill');
+
+    const branches = await execFileAsync('git', ['ls-remote', '--heads', remote]);
+    assert.equal(branches.stdout.trim(), '', 'nothing may have reached the remote');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: an unconfirmed kill is fenced BEFORE any artifact write or persistence — a secondary disk error changes nothing', async () => {
+  // `_runPublication` recorded `record.terminationConfirmed === false` into `_terminationUnconfirmed`
+  // but then still wrote the publication artifact and persisted the record BEFORE ever calling
+  // `_guardTermination`. If that artifact write throws an ordinary, unrelated error (a full disk),
+  // the exception escapes to `publish()`'s outer catch carrying no verdict of its own
+  // (`err.terminationConfirmed` is `undefined`), and `_failSafely` — seeing nothing — released the
+  // lease instead of fencing it. Fencing must happen first, immune to whatever runs after it.
+  await withEngine(async ({ engine, repo, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    engine.publisher.publish = async () => ({
+      schema_version: '1.0', publication_id: 'pwpub_test', job_id: jobId,
+      branch: 'orch/x', local_commit: 'a'.repeat(40), remote_commit: null,
+      pushed: true, remote_sha_verified: false,
+      pull_request_url: null, pull_request_state: null, pull_request_head_sha: null,
+      mergeable: null, ci_state: 'not_started', diff_stat: null, changed_files: [],
+      recorded_at: new Date(0).toISOString(),
+      terminationConfirmed: false,
+      steps: [],
+    });
+
+    let artifactWriteCalled = false;
+    engine.artifacts.write = async () => {
+      artifactWriteCalled = true;
+      throw new Error('ENOSPC: no space left on device');
+    };
+
+    const record = await engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    });
+
+    assert.equal(artifactWriteCalled, false,
+      'fencing must happen before any artifact write is even attempted, not merely before it fails');
+    assert.equal(record.remote_sha_verified, false);
+
+    const job = repo.getJob(jobId);
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false, 'the durable job record must show false');
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'fenced=1');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'released=0: the resource must not be reusable by a later job',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('_failSafely: consults _terminationUnconfirmed as a backstop when the escaping error carries no verdict of its own', async () => {
+  // A defense-in-depth backstop, distinct from the ordering fix above: even if some future path lets
+  // an unrelated exception (a store/transaction error, say) escape AFTER this job's kill was already
+  // recorded as unconfirmed but BEFORE fencing itself completed, `_failSafely` must not release just
+  // because the specific error it caught happens not to carry `terminationConfirmed` itself.
+  await withEngine(async ({ engine, repo, store }) => {
+    const { jobId } = await driveToGate(engine);
+    // `_failSafely` is reached from `publishing` (via `publish()`'s own catch) or any other
+    // INTERRUPTIONS-reachable state (via `_startWorker`'s) — never from
+    // `waiting_for_publication_approval`, which `driveToGate` leaves the job in and which has no
+    // edge to `blocked_project_state` at all. Move it to `publishing` directly, as `publish()`'s own
+    // claim transaction would, to reproduce the state this backstop actually runs in.
+    await store.transact((tx, state) => {
+      const current = state.get('jobs', jobId);
+      engine.repo.putJob(tx, { ...current, status: JobStatus.PUBLISHING, phase: 'publication' });
+    });
+    engine._terminationUnconfirmed.add(jobId);
+    const lease = await engine._acquireLease(jobId, 'Demo');
+    assert.ok(lease, 'the lease must have been acquired for this reproduction to be meaningful');
+
+    await engine._failSafely(jobId, 'an unrelated internal error, no verdict of its own');
+
+    const job = repo.getJob(jobId);
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false,
+      '_failSafely must consult _terminationUnconfirmed even when its own explicit argument is null');
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'fenced=1: the backstop must fence, not release');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'released=0',
+    );
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('review: a backend kill during the independent review that could not be confirmed fences, not releases', async () => {
+  // Found while re-auditing every catch that decides fence-vs-release: `_runReview` calls
+  // `this.backend.runPhase` directly (a SEPARATE call site from `_runPhase`, which Part A's
+  // self-review already guarded) and its own catch called `_blockWith` unconditionally — never
+  // checking `err.terminationConfirmed` at all. A review-phase launch runs in the same workspace the
+  // lease protects and is exactly as capable of an unconfirmed kill as any other phase.
+  await withEngine(async ({ engine, repo }) => {
+    const realRunPhase = engine.backend.runPhase.bind(engine.backend);
+    engine.backend.runPhase = async (request) => {
+      if (request.phaseClass === PhaseClass.ROUTINE_REVIEW) {
+        const err = new Error('the review CLI was killed, unconfirmed');
+        err.killed = true;
+        err.terminationConfirmed = false;
+        throw err;
+      }
+      return realRunPhase(request);
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'a kill during review that could not be confirmed must fence the project, not merely release it');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: a restart while publishing is reconciled the same as any other mid-flight job', async () => {
+  // Simulates the moment right after a crash: the job record was durably left in `publishing`
+  // holding a real lease (this is exactly the gap Part B closes — before it, `publish` never
+  // acquired a lease at all, so a stranded `publishing` job held nothing for a restart to find).
+  await withEngine(async ({ engine, store, repo, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    const lease = await store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: jobId, ttlMs: 600_000 }));
+    await store.transact((tx, s) => {
+      const job = s.get('jobs', jobId);
+      repo.putJob(tx, { ...job, status: JobStatus.PUBLISHING, phase: 'publication', lease_fencing_token: lease.fencing_token });
+    });
+
+    const reconciled = await engine.reconcileOnStart();
+    assert.equal(reconciled, 1);
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(repo.getJob(jobId).termination_confirmed, false);
+    assert.equal(repo.getLease(resource).fenced, true,
+      'a job left publishing across a restart must fence the lease it held, not release it');
   }, { backendOptions: ATTESTING });
 });
 
@@ -776,13 +1147,230 @@ gitTest('cancel: does not hold the caller open for the whole phase budget', asyn
     }
 
     const started = Date.now();
-    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+    const state = await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
     const elapsed = Date.now() - started;
 
     // Grace is 1s; the phase takes 4s. Returning in well under 4s is the whole assertion.
     assert.ok(elapsed < 3_000, `cancel must be bounded by the grace period, took ${elapsed} ms`);
-    assert.equal(repo.getJob(jobId).status, JobStatus.CANCELLED);
+    // The worker had not yet told us anything when the grace elapsed — not "cancelled", which would
+    // be rounding an unknown up to a known-good answer. See the dedicated race tests below for the
+    // full contract this reflects.
+    assert.notEqual(state.status, JobStatus.CANCELLED);
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(repo.getJob(jobId).termination_confirmed, false);
   }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '1000' } });
+});
+
+// ---------------------------------------------------------------------------
+// cancellation: the cancelGraceMs race must never default to confirmed (round 2, criteria 3-5)
+// ---------------------------------------------------------------------------
+
+gitTest('cancel: a worker still unresolved when cancelGraceMs elapses is unconfirmed, never rounded up to cancelled', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    // The phase takes far longer to settle than the cancel grace — and, crucially, it WOULD report
+    // termination confirmed had the caller waited for it. The point under test is that the caller
+    // must not wait: a deadline that elapses before any answer has arrived has to read as "unknown",
+    // never as "it turned out fine".
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Object.assign(new Error('aborted'), {
+        name: 'AbortError', kind: 'cancelled', terminationConfirmed: true,
+      })), 3_000);
+      request.signal?.addEventListener('abort', () => {}); // acknowledged, genuinely slow to confirm
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+
+    const state = await engine.cancelJob({
+      token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' },
+    });
+
+    assert.notEqual(state.status, JobStatus.CANCELLED,
+      'a deadline that elapsed before confirmation arrived must never default to cancelled');
+    assert.equal(state.status, JobStatus.BLOCKED_PROJECT_STATE);
+    const job = repo.getJob(jobId);
+    assert.equal(job.termination_confirmed, false,
+      'termination_confirmed:false must be persisted when the deadline won the race');
+    assert.equal(job.working_tree_preserved, false);
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
+});
+
+gitTest('cancel: an unconfirmed termination fences the project lease — a later job cannot acquire it', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Object.assign(new Error('aborted'), {
+        name: 'AbortError', kind: 'cancelled', terminationConfirmed: false,
+      })), 3_000);
+      request.signal?.addEventListener('abort', () => {});
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+    assert.equal(repo.getJob(jobId).status, JobStatus.BLOCKED_PROJECT_STATE);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'the project resource must be fenced, not merely un-renewed');
+
+    // A second, independent job for the SAME project must not be able to acquire the workspace lease
+    // while the fence is up.
+    const second = await submit(engine, {}, 'req-2');
+    await engine.drain();
+    const secondJob = repo.getJob(second.workbench_job_id);
+    assert.equal(secondJob.status, JobStatus.BLOCKED_PROJECT_STATE,
+      'a later job must not acquire the fenced project lease');
+    assert.notEqual(secondJob.workbench_job_id, jobId);
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
+});
+
+gitTest('cancel: clearing the fence lets a later job acquire the project again', async () => {
+  await withEngine(async ({ engine, repo, backend, config }) => {
+    backend.runPhase = (request) => new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(Object.assign(new Error('aborted'), {
+        name: 'AbortError', kind: 'cancelled', terminationConfirmed: false,
+      })), 3_000);
+      request.signal?.addEventListener('abort', () => {});
+    });
+
+    const handle = await submit(engine);
+    const jobId = handle.workbench_job_id;
+    for (let i = 0; i < 200; i++) {
+      if (repo.getJob(jobId)?.status === JobStatus.DISCOVERING) break;
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    await engine.cancelJob({ token: SUBMITTER, jobId, body: { workbench_job_id: jobId, reason: 'stop' } });
+
+    const resource = `project-write:${config.instanceId}:Demo`;
+    await engine.store.transact((tx, state) => {
+      engine.repo.clearFence(tx, state, {
+        resource, clearedBy: 'operator:test', reason: 'manually verified no surviving process',
+      });
+    });
+    assert.equal(repo.getLease(resource)?.fenced, false);
+
+    delete backend.runPhase;
+    const second = await submit(engine, {}, 'req-2');
+    await engine.drain();
+    assert.notEqual(repo.getJob(second.workbench_job_id).status, JobStatus.BLOCKED_PROJECT_STATE,
+      'once cleared, a later job must be able to acquire the project again');
+  }, { backendOptions: ATTESTING, envOverrides: { PW_ORCHESTRATOR_CANCEL_GRACE_MS: '200' } });
+});
+
+// ---------------------------------------------------------------------------
+// checks.js / git.js unconfirmed kills must fence, not merely record a failure
+// ---------------------------------------------------------------------------
+
+gitTest('verification: a check killed without confirmation fences the project rather than merely failing it', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    // A real, non-zero-exit check failure must NOT reach this — only an actual unconfirmed kill,
+    // which `PrivilegeDropper._execTracked` marks with `terminationConfirmed: false` on the error it
+    // hands back. Injected directly onto the CheckRunner this engine already built, standing in for
+    // a verification command that timed out and could not confirm its own descendant tree was dead.
+    engine.checkRunner.exec = async () => {
+      const err = new Error('Command failed');
+      err.code = null;
+      err.killed = true;
+      err.signal = 'SIGTERM';
+      err.terminationConfirmed = false;
+      throw err;
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE,
+      'an unconfirmed kill must fence and quarantine, not merely record blocked_verification');
+    assert.equal(job.termination_confirmed, false);
+
+    const resource = `project-write:${engine.config.instanceId}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'the project must be durably fenced, exactly like an unconfirmed cancellation');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('verification: an ordinary failing check still just fails — no fence over a red test', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    engine.checkRunner.exec = async () => {
+      const err = new Error('Command failed');
+      err.code = 1; // a plain non-signal exit — the shape a red test actually has
+      throw err;
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_VERIFICATION,
+      'a red test is an ordinary, recoverable outcome and must not fence the project');
+    const resource = `project-write:${engine.config.instanceId}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced ?? false, false);
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('verification: a check killed without confirmation is fenced BEFORE any artifact write — a secondary disk error changes nothing', async () => {
+  // `checkRunner.run` observed the kill internally, but used to keep going anyway: parse the output,
+  // then call `this.artifacts.write` — real disk I/O plus a store transaction, both fallible for
+  // reasons that have nothing to do with the kill. If that write threw an ordinary ENOSPC, the
+  // exception escaped `_runChecks` (which has no try/catch of its own) carrying no verdict of its
+  // own, and `_run`'s outer catch — seeing nothing — released the lease instead of fencing it.
+  await withEngine(async ({ engine, repo }) => {
+    let execCalls = 0;
+    engine.checkRunner.exec = async () => {
+      execCalls += 1;
+      const err = new Error('Command failed');
+      err.code = null;
+      err.killed = true;
+      err.signal = 'SIGTERM';
+      err.terminationConfirmed = false;
+      throw err;
+    };
+    // `_run` writes its own `implementation.diff` artifact before verification ever starts — real,
+    // unrelated work that must keep succeeding. Only a check's *own* artifact write (never reached
+    // once a check reports an unconfirmed kill) is poisoned here.
+    let artifactWriteCalled = false;
+    const realWrite = engine.artifacts.write.bind(engine.artifacts);
+    engine.artifacts.write = async (opts) => {
+      if (opts.kind !== ArtifactKind.DIFF) {
+        artifactWriteCalled = true;
+        throw new Error('ENOSPC: no space left on device');
+      }
+      return realWrite(opts);
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(artifactWriteCalled, false,
+      'fencing must happen before any artifact write is even attempted, not merely before it fails');
+    assert.equal(execCalls, 1,
+      'no later check may run in the same batch once one has already been killed unconfirmed');
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false, 'the durable job record must show false');
+
+    const resource = `project-write:${engine.config.instanceId}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true, 'fenced=1');
+    await assert.rejects(
+      engine.store.transact((tx, s) => repo.acquireLease(tx, s, { resource, owner: 'later-job', ttlMs: 600_000 })),
+      /fenced/,
+      'released=0: the resource must not be reusable by a later job',
+    );
+  }, { backendOptions: ATTESTING });
 });
 
 gitTest('publish: a commit message beginning with a dash publishes, and never strands the job', async () => {
@@ -805,6 +1393,195 @@ gitTest('publish: a commit message beginning with a dash publishes, and never st
     });
     assert.equal(record.pushed, true, record.failure_reason ?? 'a dash-leading message must publish');
     assert.notEqual(repo.getJob(jobId).status, JobStatus.PUBLISHING);
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('phase: an ordinary backend timeout that could not confirm a kill fences, not releases', async () => {
+  // `claude.js`'s real `runPhase` only preserves `terminationConfirmed` on the `cancelled` branch of
+  // `classifyBackendFailure` — for `timeout`/`process_died` (an ordinary hard timeout, nothing to do
+  // with cancelJob) it returned `{ ok: false, failure_kind: 'timeout', ... }` with no verdict field at
+  // all. `_runPhase`'s `!result.ok` branch then called `_blockWith`, which releases unconditionally —
+  // so a genuine phase timeout whose descendant tree could not be confirmed dead released the lease
+  // for a later job to walk straight into, exactly the case Part A's redesign exists to prevent.
+  await withEngine(async ({ engine, repo, backend }) => {
+    backend.runPhase = async () => ({
+      ok: false,
+      failure_kind: 'timeout',
+      terminationConfirmed: false,
+      retry_after_seconds: null,
+      session_id: null,
+      model: null,
+      summary: 'the phase exceeded its time budget',
+      turns_used: 0,
+      max_turns_reached: false,
+    });
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'an ordinary phase timeout that could not confirm a kill must fence the project, exactly like an unconfirmed cancellation');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('phase: an ordinary backend timeout that WAS confirmed dead still just releases, as before', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    engine.backend.runPhase = async () => ({
+      ok: false,
+      failure_kind: 'timeout',
+      terminationConfirmed: true,
+      retry_after_seconds: null,
+      session_id: null,
+      model: null,
+      summary: 'the phase exceeded its time budget',
+      turns_used: 0,
+      max_turns_reached: false,
+    });
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.notEqual(job.termination_confirmed, false);
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.notEqual(repo.getLease(resource)?.fenced, true,
+      'a confirmed-dead timeout must not fence a project needlessly');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('session: a backend-configuration verification that could not confirm a kill fences, not releases', async () => {
+  // `verifySession` runs a real, bounded CLI launch to observe the effective model/effort — in the
+  // SAME workspace the project's write lease protects — and, like a phase, its launch can time out
+  // and fail to confirm every descendant died. `session.js`'s catch converts ANY failure into a
+  // normal `effective: null` response without a termination verdict at all, and engine.js's own catch
+  // around `verifySession` only ever called `_blockWith`, which releases unconditionally.
+  await withEngine(async ({ engine, repo }) => {
+    engine.sessionManager.verifySession = async () => ({
+      session_key: 'orch-test:wb-test-01:Demo:pvi2-orchestrator',
+      effective: null,
+      detail: 'the coding backend could not be queried (timeout)',
+      terminationConfirmed: false,
+    });
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'a verification launch that could not confirm a kill must fence the project, not merely release it');
+  }, { backendOptions: ATTESTING });
+});
+
+// ---------------------------------------------------------------------------
+// self-review: an unexpected internal error must not be a laundering path for a swallowed
+// termination verdict. `_runChecks`/`_runPublication` do not wrap every internal call (artifact
+// writes, store transactions) in a try/catch of their own, on the working assumption that nothing
+// in that path ever throws with a termination verdict attached — `checkRunner.run`/`runGit` never do.
+// These prove the one place that assumption could still be wrong (a check runner or the publisher
+// throwing directly, rather than returning a result object, exactly as an unrelated bug or a
+// mis-wired test double might) is not a way to slip an unconfirmed kill past every fence check this
+// round added.
+// ---------------------------------------------------------------------------
+
+gitTest('worker: a crash that could not confirm a kill fences the project rather than releasing it', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    // Standing in for a bug (or a future refactor) that lets `checkRunner.run` throw directly instead
+    // of returning `{ terminationConfirmed: false }` the way every real check outcome does — exactly
+    // the shape `_runChecks` does not itself catch, so this reaches `_startWorker`'s outer catch and
+    // `_failSafely` exactly as an actually-unrelated internal error would.
+    engine.checkRunner.run = async () => {
+      const err = new Error('an unrelated internal failure arriving right after an unconfirmed kill');
+      err.terminationConfirmed = false;
+      throw err;
+    };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false,
+      '_failSafely must not silently drop the verdict carried on the crash it is handling');
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'a crash that could not confirm a kill must fence the project, not merely release it as an ordinary internal failure');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('worker: an ordinary internal crash (unrelated to any kill) still just releases, as before', async () => {
+  await withEngine(async ({ engine, repo }) => {
+    engine.checkRunner.run = async () => { throw new Error('a bug in this service, nothing to do with any process'); };
+
+    const handle = await submit(engine);
+    await engine.drain();
+    const jobId = handle.workbench_job_id;
+    const job = repo.getJob(jobId);
+
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.notEqual(job.termination_confirmed, false);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.notEqual(repo.getLease(resource)?.fenced, true,
+      'an ordinary internal crash must not fence a project over nothing — that would block recovery for no reason');
+  }, { backendOptions: ATTESTING });
+});
+
+gitTest('publish: an internal error after the git work still leaves the project fenced when a kill went unconfirmed', async () => {
+  await withEngine(async ({ engine, repo, repoDir }) => {
+    const { jobId, approval } = await driveToGate(engine);
+    fs.writeFileSync(path.join(repoDir, 'src.js'), 'export const answer = 42;\n');
+    await engine.approveStage({
+      token: APPROVER, jobId,
+      body: { workbench_job_id: jobId, approval_id: approval.approval_id, stage: 'publication', approved: true, decided_by: 'james' },
+      idempotencyKey: 'a1',
+    });
+
+    // The git work itself succeeds; the failure is injected into the artifact write that follows it —
+    // standing in for an unrelated internal error (disk I/O, say) that happens to arrive carrying a
+    // kill this service could not confirm, from something else entirely in the same request.
+    const realWrite = engine.artifacts.write.bind(engine.artifacts);
+    let calls = 0;
+    engine.artifacts.write = async (opts) => {
+      calls += 1;
+      if (calls === 1) {
+        const err = new Error('an unrelated internal failure, but a kill went unconfirmed moments earlier');
+        err.terminationConfirmed = false;
+        throw err;
+      }
+      return realWrite(opts);
+    };
+
+    await assert.rejects(engine.publish({
+      token: SUBMITTER, jobId,
+      request: {
+        job_id: jobId, branch: 'orch/x', commit_message: 'fix', intended_files: ['src.js'],
+        open_pull_request: false, approval_id: approval.approval_id,
+      },
+      idempotencyKey: 'p1', correlationId: 'c',
+    }));
+
+    const job = repo.getJob(jobId);
+    assert.notEqual(job.status, JobStatus.PUBLISHING, 'the job must not be stranded publishing forever');
+    assert.equal(job.status, JobStatus.BLOCKED_PROJECT_STATE);
+    assert.equal(job.termination_confirmed, false);
+
+    const resource = `project-write:${INSTANCE}:Demo`;
+    assert.equal(repo.getLease(resource)?.fenced, true,
+      'the lease publish() held must be fenced, not silently abandoned, when the crash carries an unconfirmed kill');
   }, { backendOptions: ATTESTING });
 });
 

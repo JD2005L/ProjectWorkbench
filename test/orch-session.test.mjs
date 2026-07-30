@@ -353,6 +353,36 @@ tmuxTest('lane: a drifted session reports what is actually active, not what was 
   });
 });
 
+tmuxTest('lane: a verification probe that could not confirm a kill was dead is surfaced, not folded into an ordinary "unverifiable" answer', async () => {
+  // The real backend's `verifyConfiguration` throws exactly this shape (kind + terminationConfirmed)
+  // once its fingerprint/auth probe reports an unconfirmed kill — this proves `verifySession`'s
+  // existing catch, unmodified, still carries that verdict through to the caller rather than
+  // collapsing it into the same undifferentiated "the coding backend could not be queried" every
+  // other failure gets. `engine.js` reads exactly this field to decide whether to fence the project's
+  // lease instead of releasing it.
+  await withLane(async ({ manager, project, token, backend }) => {
+    const session = await ensure(manager, project, token);
+    backend.verifyConfiguration = async () => {
+      const error = new Error('a probe before the launch could not confirm a kill was actually dead');
+      error.kind = 'phase_failed';
+      error.terminationConfirmed = false;
+      throw error;
+    };
+
+    const result = await manager.verifySession({
+      token, project,
+      request: {
+        session_key: session.session_key, phase_class: 'implementation',
+        requested: { model_alias: 'sonnet', effort: 'high' },
+      },
+      correlationId: 'corr-verdict',
+    });
+
+    assert.equal(result.effective, null, 'an unconfirmed probe kill can never be reported as verified');
+    assert.equal(result.terminationConfirmed, false, 'the verdict must survive verifySession\'s own catch, not be dropped');
+  });
+});
+
 tmuxTest('lane: verifying an unknown or foreign session key is refused', async () => {
   await withLane(async ({ manager, project, token }) => {
     await assert.rejects(

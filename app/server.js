@@ -92,9 +92,14 @@ try {
  });
  if(orchestrator) console.log(`[orchestrator] mounted at ${orchestrator.config.basePath} as instance ${orchestrator.config.instanceId} (${orchestrator.reconciled} job(s) reconciled)`);
 } catch(err) {
- // A misconfigured orchestrator must not take the dashboard down with it: every human terminal,
- // preview and inbox on this instance is unrelated to it.
- console.error('[orchestrator] disabled — configuration error:', err?.message);
+ // The orchestrator failed to start. This is NOT silent: the error is logged at ERROR level and
+ // the orchestrator is NOT available. The dashboard continues because taking down every human
+ // terminal, preview and inbox over an orchestrator misconfiguration is disproportionate — but
+ // orchestration is refused, not degraded. No jobs can be submitted or run until an operator
+ // fixes the configuration and restarts. This is fail-open for terminals, fail-closed for
+ // orchestration: the subsystem does not silently fall back to running as root.
+ console.error('[orchestrator] REFUSED TO START — orchestration is unavailable until this is fixed:', err?.message);
+ console.error('[orchestrator] The orchestrator is disabled. No jobs will be accepted.');
 }
 
 app.use(express.json({ limit: '100mb' }));

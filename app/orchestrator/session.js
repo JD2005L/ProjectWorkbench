@@ -82,43 +82,44 @@ const MARKER = Object.freeze({
  *
  * `socket` selects an alternate tmux server, which is how the test suite stays entirely out of the
  * live tmux namespace: a private server, its own windows, killed on teardown.
+ *
+ * `exec` is what actually launches tmux, and in host mode it must be the *same*
+ * `PrivilegeDropper.wrapCommand`-wrapped function `git.js` and `checks.js` run through — never a
+ * privilege drop this class resolves for itself. Two independently-resolved drops for the same
+ * account can disagree (one keyed on the account name and re-resolved through NSS at exec time, the
+ * other pinned to the uid validated once at boot), and disagreeing here means talking to a
+ * *different* tmux socket namespace than the one everything else believes it is using — the exact
+ * failure mode this module's own docs warn about for the dashboard's root tmux server. Sharing one
+ * dropper instance makes that structurally impossible rather than merely unlikely. Defaults to a
+ * bare exec, which is what container mode — and every hermetic test — needs: nothing to drop.
  */
 export class TmuxAdapter {
-  constructor({ socket = '', executable = 'tmux', timeoutMs = 15_000, deployMode = 'container', user = '' } = {}) {
+  constructor({ socket = '', executable = 'tmux', timeoutMs = 15_000, exec = execFileAsync } = {}) {
     this.socket = socket;
     this.executable = executable;
     this.timeoutMs = timeoutMs;
-    // In host mode the dashboard runs as root but every project terminal runs as `admin`, so it
-    // execs `sudo -u admin tmux …`. The lane must take the same path: talking to root's tmux server
-    // would create a second session the dashboard cannot see or reap, and would run the coding CLI
-    // as root in a workspace whose human terminal, inbox and git all run as admin.
-    this.deployMode = deployMode;
-    this.user = user;
+    this.exec = exec;
   }
 
   args(rest) {
     return this.socket ? ['-L', this.socket, ...rest] : [...rest];
   }
 
-  /** The argv actually executed, exposed so a test can assert the privilege path. */
-  spawnArgs(argv) {
-    const tmuxArgv = this.args(argv);
-    if (this.deployMode === 'host' && this.user) {
-      return { file: 'sudo', argv: ['-u', this.user, this.executable, ...tmuxArgv] };
-    }
-    return { file: this.executable, argv: tmuxArgv };
-  }
-
   async raw(argv) {
-    const { file, argv: spawned } = this.spawnArgs(argv);
-    return execFileAsync(file, spawned, { timeout: this.timeoutMs });
+    return this.exec(this.executable, this.args(argv), { timeout: this.timeoutMs });
   }
 
   async hasSession(session) {
     try {
       await this.raw(['has-session', '-t', `=${session}`]);
       return true;
-    } catch {
+    } catch (err) {
+      // tmux exiting non-zero because the session genuinely does not exist yet is the ordinary,
+      // expected case here — swallowed into `false` as always. But a `false` this module cannot
+      // vouch for — tmux itself killed without confirming its own descendant tree died — must not
+      // be indistinguishable from "no such session": the caller needs to fence, not proceed as
+      // though nothing happened.
+      if (err?.terminationConfirmed === false) throw err;
       return false;
     }
   }
@@ -139,7 +140,11 @@ export class TmuxAdapter {
     let stdout;
     try {
       ({ stdout } = await this.raw(['list-windows', '-t', `=${session}`, '-F', format]));
-    } catch {
+    } catch (err) {
+      // Same distinction as `hasSession`: an ordinary tmux failure reads as "no windows", but a
+      // kill this module cannot confirm was actually carried out must reach the caller, not be
+      // rounded down to an empty, unremarkable list.
+      if (err?.terminationConfirmed === false) throw err;
       return [];
     }
     return stdout.split('\n').filter(Boolean).map((line) => {
@@ -673,7 +678,7 @@ export class OrchestratorSessionManager {
       // reach that decision.
       return this._verificationResponse(record, null, err?.kind
         ? `the coding backend could not be queried (${err.kind})`
-        : 'the coding backend could not be queried', null);
+        : 'the coding backend could not be queried', null, err?.terminationConfirmed ?? null);
     }
 
     const effective = outcome.effective ?? null;
@@ -703,8 +708,14 @@ export class OrchestratorSessionManager {
    * before the response reaches the wire — the contract model forbids extra fields — but dropping
    * them here entirely meant the engine never learned the session id (so the verified session was
    * never resumed) and the operator never saw *why* every job was blocking.
+   *
+   * `terminationConfirmed` is the same kind of internal-only rider: the verification launch runs in
+   * the project's own workspace and can fail to confirm a kill exactly like a coding phase can, and
+   * the engine must fence rather than release when it does. `null` for the overwhelming majority of
+   * calls (nothing was ever killed), so it is likewise stripped at every wire boundary rather than
+   * added to a contract that has nothing to do with lease safety.
    */
-  _verificationResponse(record, effective, detail, outcome = null) {
+  _verificationResponse(record, effective, detail, outcome = null, terminationConfirmed = null) {
     return {
       schema_version: SCHEMA_VERSION,
       session_key: record.session_key,
@@ -717,6 +728,7 @@ export class OrchestratorSessionManager {
       cli_session_id: outcome?.cli_session_id ?? record.cli_session_id ?? null,
       provenance: outcome?.provenance ?? null,
       settings_attestation: outcome?.settings_attestation ?? null,
+      terminationConfirmed,
     };
   }
 

@@ -31,6 +31,7 @@ import {
 import { redactText } from '../redact.js';
 import { buildAttestation } from '../attestation.js';
 import { FingerprintCache } from './fingerprint.js';
+import { privilegeDropperFor } from './privilege.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -53,10 +54,41 @@ const PERMISSION_MODE_BY_PHASE = Object.freeze({
   [PhaseClass.MECHANICAL_CORRECTION]: 'acceptEdits',
 });
 
-/** Environment variables that would move inference off the subscription and onto API billing. */
+/**
+ * Code injected into the process *before* its own `main` runs.
+ *
+ * This is the one class that defeats every identity control at once. `LD_PRELOAD` loads an
+ * attacker's constructor into the address space of the binary that was just realpath'd, ELF-checked
+ * and matched against its pinned SHA-256 — so the file that was hashed is not the behaviour that
+ * runs, and the attestation says "enforced" about a program that is no longer the program.
+ * `LD_AUDIT` and `LD_LIBRARY_PATH` reach the same place through the loader; `NODE_OPTIONS` reaches
+ * it through `--require`.
+ *
+ * These were stripped for free while the launch relied on sudo's `env_reset`. Naming the
+ * environment explicitly — which is what makes the scrub real rather than implied — turned them
+ * back into variables this service would deliberately re-apply, so they are named here.
+ */
+const FORBIDDEN_ENV_INJECTION = ['NODE_OPTIONS', 'NODE_REPL_EXTERNAL_MODULE', 'BUN_INSPECT', 'BUN_INSPECT_CONNECT_TO'];
+
+/**
+ * Environment variables that would move inference off the subscription, change the identity it is
+ * billed to, or quietly override a setting this service claims to have enforced.
+ *
+ * The list was originally the API-billing escape hatches alone, which left three other routes to
+ * the same place. `CLAUDE_CODE_OAUTH_TOKEN` substitutes the billing identity while still passing
+ * the `claude.ai` + `firstParty` check; `CLAUDE_CONFIG_DIR` repoints the whole credential and
+ * settings directory, and a settings file carries its own `env` block and `apiKeyHelper`; and
+ * `CLAUDE_EFFORT` / `ANTHROPIC_MODEL` override exactly the two settings the attestation is about —
+ * effort being the one with no runtime read-back at all, so an override there is undetectable
+ * afterwards.
+ */
 const FORBIDDEN_ENV = [
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
   'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'AWS_BEARER_TOKEN_BEDROCK',
+  'CLAUDE_CODE_SKIP_BEDROCK_AUTH', 'CLAUDE_CODE_SKIP_VERTEX_AUTH',
+  'CLAUDE_CODE_OAUTH_TOKEN', 'CLAUDE_CONFIG_DIR',
+  'CLAUDE_EFFORT', 'MAX_THINKING_TOKENS',
+  ...FORBIDDEN_ENV_INJECTION,
 ];
 
 /**
@@ -68,8 +100,45 @@ const FORBIDDEN_ENV = [
  * the resolver actually owns — is how a bug (or a malicious project registry entry) upstream could
  * reintroduce a forbidden API-billing key or override an unrelated variable like PATH. Keep this in
  * lockstep with resolveLaneCredentials() if it is ever extended to produce another key.
+ *
+ * `CLAUDE_CONFIG_DIR` is ALSO in FORBIDDEN_ENV above, deliberately: for every launch that does not
+ * go through this narrow, vetted mechanism, it is exactly the escape hatch that list exists to
+ * remove — a settings.json anywhere else the CLI would look carries its own `env` block and
+ * `apiKeyHelper`. `phaseEnv()` and `PRIVILEGE_DROP_FORBIDDEN_ENV` below both carve out an exception
+ * for it ONLY after routing it through this allowlist — never a blanket removal from FORBIDDEN_ENV
+ * itself, so every other reader of that constant keeps treating the key as forbidden.
  */
 const ALLOWED_CREDENTIAL_TOKEN_KEYS = new Set(['CLAUDE_CONFIG_DIR']);
+
+/**
+ * Whole families the CLI reads, removed by prefix.
+ *
+ * Enumerating `ANTHROPIC_*` names is a race this side cannot win — `ANTHROPIC_DEFAULT_OPUS_MODEL`
+ * and `ANTHROPIC_SMALL_FAST_MODEL` are both live in the shipped binary and were both absent from a
+ * list that looked complete. Nothing named `ANTHROPIC_*` has any business reaching a launch whose
+ * whole purpose is to be subscription-backed and attested. `LD_*` and `DYLD_*` are the loader
+ * families described above, removed wholesale for the same reason: the interesting ones are the
+ * ones nobody thought to list.
+ *
+ * `HTTPS_PROXY`, its lowercase form and `NODE_EXTRA_CA_CERTS` are deliberately NOT removed, and the
+ * reason is compatibility rather than safety: they are how a proxied deployment reaches the network
+ * at all, and there is nowhere else to set them once the child's environment is composed here. They
+ * *are* a route to redirecting and intercepting inference — that is stated plainly in
+ * docs/orchestrator-api.md as a limitation rather than implied to be harmless. A deployment that
+ * does not need them should not set them on the service.
+ */
+const FORBIDDEN_ENV_PREFIXES = ['ANTHROPIC_', 'LD_', 'DYLD_'];
+
+/**
+ * The forbidden-env list handed to the privilege dropper (see the constructor) — FORBIDDEN_ENV minus
+ * the keys `phaseEnv()` is narrowly, explicitly permitted to set via ALLOWED_CREDENTIAL_TOKEN_KEYS.
+ * `PrivilegeDropper.dropEnv()` (privilege.js) strips its OWN copy of `forbiddenEnv` independently, a
+ * second time, on the environment `phaseEnv()` already produced and handed to `this.exec` — without
+ * this exclusion, that second, unrelated strip would silently undo the one thing the credential-
+ * token mechanism exists to do, on every host-mode launch, with no error and no test able to catch
+ * it short of asserting on the real child's environment (which the regression tests below do).
+ */
+const PRIVILEGE_DROP_FORBIDDEN_ENV = FORBIDDEN_ENV.filter((key) => !ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key));
 
 /**
  * Classify a process failure into a distinct kind, so each can reach its own safe state.
@@ -79,6 +148,10 @@ const ALLOWED_CREDENTIAL_TOKEN_KEYS = new Set(['CLAUDE_CONFIG_DIR']);
  * is worth retrying automatically.
  */
 export function classifyBackendFailure(err) {
+  // A launch that could not drop privilege never started, and it is an operator fault rather than a
+  // backend one. Checked first: the refusal carries no exit code or signal, so every later rule
+  // would fall through to `phase_failed` and hide a configuration problem inside a phase failure.
+  if (err?.kind === 'privilege_drop_failed') return 'privilege_drop_failed';
   if (err?.code === 'ENOENT') return 'unavailable';
   // An abort is a deliberate cancellation, and must be checked BEFORE the kill/SIGTERM cases —
   // aborting execFile terminates the child with SIGTERM, which would otherwise read as a timeout
@@ -93,15 +166,44 @@ export function classifyBackendFailure(err) {
   return 'phase_failed';
 }
 
+/**
+ * The most informative line a failed launch left behind.
+ *
+ * `execFile`'s own message is `Command failed: <the entire argv>`; the interesting part is in
+ * stderr, and it is the *last* line of it — a stack or a usage block ends with the thing that went
+ * wrong. Falls back to the message with the argv preamble stripped.
+ */
+function lastMeaningfulLine(err) {
+  const lines = String(err?.stderr ?? '').split('\n').map((line) => line.trim()).filter(Boolean);
+  if (lines.length) return lines[lines.length - 1].slice(0, 200);
+  const message = String(err?.message ?? '').split('\n')[0];
+  return message.replace(/^Command failed: \S+(\s+\S+)*?(?=\s|$)/, 'the launch failed').slice(0, 200);
+}
+
 export class ClaudeCodeBackend {
-  constructor({ config, exec = execFileAsync, clock = () => new Date(), fingerprints = null } = {}) {
+  constructor({ config, exec = execFileAsync, clock = () => new Date(), privilege = null } = {}) {
     this.config = config;
-    this.exec = exec;
     this.clock = clock;
     this.name = CodingBackend.CLAUDE_CODE;
+    // In host mode the dashboard runs as root and the CLI must not. Wrapping the exec seam — rather
+    // than each of the four launch sites — is deliberate: the drop then applies to the auth probe,
+    // the fingerprint's `--version` and `--help`, verification and the phase itself by construction,
+    // and a launch added later cannot forget it. Container mode wraps to a passthrough.
+    this.privilege = privilege ?? privilegeDropperFor(config, {
+      forbiddenEnv: PRIVILEGE_DROP_FORBIDDEN_ENV, forbiddenEnvPrefixes: FORBIDDEN_ENV_PREFIXES,
+    });
+    this.exec = this.privilege.wrap(exec);
     // Cached per binary identity, so the ~1s hash of a 275 MB binary happens once and any change
-    // to the file misses the cache rather than being trusted.
-    this.fingerprints = fingerprints ?? new FingerprintCache({ exec });
+    // to the file misses the cache rather than being trusted. It fingerprints the *configured*
+    // file — realpath, stat, ELF header and SHA-256 are all taken here, as root, on the CLI itself.
+    // Only the `--version`/`--help` launches go through the drop, and they name the resolved
+    // realpath, so nothing about the identity check binds to sudo.
+    //
+    // Constructed here and not injectable. It was, and a caller that supplied its own cache got one
+    // holding an *undropped* exec — a documented seam straight past the control, taken by nothing
+    // but tests, which is the worst combination: the tests then proved something the service does
+    // not do.
+    this.fingerprints = new FingerprintCache({ exec: this.exec });
   }
 
   /** Fingerprint the configured CLI, for enforcement claims and for health reporting. */
@@ -154,26 +256,28 @@ export class ClaudeCodeBackend {
   }
 
   /**
-   * A child environment with every API-billing escape hatch removed, and the
-   * resolved per-user credential tokens applied (see
-   * app/orchestrator/lane-credentials.js / session.js's laneLaunchCommand —
-   * the SAME `KEY=VALUE` tokens applied to the lane's tmux pane, so a phase
-   * spawned directly by this backend can never run under a different
-   * identity than what the pane is attributed as). `credentialTokens`
-   * omitted or empty (disabled mode, or the legitimate no-primaryUser case)
-   * leaves the environment byte-identical to before this parameter existed.
+   * A child environment with every API-billing/identity-override escape hatch removed (FORBIDDEN_ENV
+   * and FORBIDDEN_ENV_PREFIXES — see both), and the resolved per-user credential tokens applied (see
+   * app/orchestrator/lane-credentials.js / session.js's laneLaunchCommand — the SAME `KEY=VALUE`
+   * tokens applied to the lane's tmux pane, so a phase spawned directly by this backend can never run
+   * under a different identity than what the pane is attributed as). `credentialTokens` omitted or
+   * empty (disabled mode, or the legitimate no-primaryUser case) leaves the environment byte-
+   * identical to before this parameter existed.
    *
-   * SECURITY: only ALLOWED_CREDENTIAL_TOKEN_KEYS may be set this way, and
-   * FORBIDDEN_ENV is stripped again AFTER applying tokens (not just before)
-   * — a token naming an unexpected or forbidden key is dropped outright,
-   * never trusted. Without both of these, a token like
-   * `ANTHROPIC_API_KEY=...` reaching this function (a resolver bug, or a
-   * malicious project registry entry) would silently reintroduce exactly
-   * the escape hatch this function's own contract says it removes.
+   * SECURITY: only ALLOWED_CREDENTIAL_TOKEN_KEYS may be set this way, and FORBIDDEN_ENV is stripped
+   * again AFTER applying tokens (not just before) — a token naming an unexpected or forbidden key is
+   * dropped outright, never trusted. Without both of these, a token like `ANTHROPIC_API_KEY=...`
+   * reaching this function (a resolver bug, or a malicious project registry entry) would silently
+   * reintroduce exactly the escape hatch this function's own contract says it removes. The final pass
+   * skips whatever ALLOWED_CREDENTIAL_TOKEN_KEYS just applied — otherwise this same "strip it all
+   * again" step would immediately erase the one thing this function exists to add.
    */
   phaseEnv(credentialTokens = []) {
     const env = { ...process.env };
     for (const key of FORBIDDEN_ENV) delete env[key];
+    for (const key of Object.keys(env)) {
+      if (FORBIDDEN_ENV_PREFIXES.some((prefix) => key.startsWith(prefix))) delete env[key];
+    }
     for (const token of credentialTokens) {
       const eq = token.indexOf('=');
       if (eq === -1) continue;
@@ -184,9 +288,12 @@ export class ClaudeCodeBackend {
       env[key] = value;
     }
     // Defense in depth: even if ALLOWED_CREDENTIAL_TOKEN_KEYS were ever misconfigured to include a
-    // forbidden key, this function's contract — no API-billing escape hatch, ever — must hold
-    // unconditionally.
-    for (const key of FORBIDDEN_ENV) delete env[key];
+    // forbidden key, this function's contract must hold unconditionally — EXCEPT for the keys just
+    // applied above through that narrow allowlist.
+    for (const key of FORBIDDEN_ENV) {
+      if (ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key)) continue;
+      delete env[key];
+    }
     return env;
   }
 
@@ -212,16 +319,27 @@ export class ClaudeCodeBackend {
       }));
     } catch (err) {
       const kind = classifyBackendFailure(err);
+      // The drop failure carries its own operator-facing message — which account, which helper, what
+      // was wrong with it. Reporting it as "could not report its authentication status" is what made
+      // the live symptom (backend down, method unknown) unactionable in the first place.
+      const privilegeDetail = kind === 'privilege_drop_failed'
+        ? `the coding CLI could not be run as the unprivileged account: ${String(err?.message ?? '').slice(0, 200)}`
+        : null;
       return {
         ...base,
         state: HealthState.DOWN,
         method: AuthMethod.UNKNOWN,
-        detail: kind === 'unavailable'
+        detail: privilegeDetail ?? (kind === 'unavailable'
           ? 'the coding CLI is not installed on this instance'
-          : 'the coding CLI could not report its authentication status',
+          : 'the coding CLI could not report its authentication status'),
         // Inconclusive: not a positive finding of API billing, so it must not override the session's
         // own report either way.
         auth_mode: null,
+        // This probe runs in the same workspace a job's write lease protects and is exactly as
+        // capable of leaving an unconfirmed descendant as the phase it precedes. Rebuilding a plain
+        // failure response without this would silently drop that verdict before `verifyConfiguration`
+        // ever saw it.
+        terminationConfirmed: err?.terminationConfirmed ?? null,
       };
     }
 
@@ -306,6 +424,20 @@ export class ClaudeCodeBackend {
   // -------------------------------------------------------------------------
 
   /**
+   * Stop `verifyConfiguration` in its tracks the instant a probe it just ran reports a kill it could
+   * not confirm dead — before anything else, probe or launch, gets a chance to run in the same
+   * workspace. Called between each probe and the next, not merely once after all of them, so an
+   * earlier probe's unconfirmed descendant can never still be alive while a later one starts.
+   */
+  _refuseIfProbeUnconfirmed(probe) {
+    if (probe?.terminationConfirmed !== false) return;
+    const error = new Error('a probe before the launch could not confirm a kill was actually dead');
+    error.kind = 'phase_failed';
+    error.terminationConfirmed = false;
+    throw error;
+  }
+
+  /**
    * Report the effective configuration of the lane.
    *
    * Deliberately runs a real, bounded, read-only phase rather than inspecting a config file: what
@@ -337,8 +469,19 @@ export class ClaudeCodeBackend {
 
     // Fingerprint BEFORE launching. Taking it afterwards left a window in which the binary that ran
     // and the binary that was attested need not be the same file.
+    //
+    // Each probe below runs a real process in this same workspace, exactly as capable of leaving an
+    // unconfirmed descendant as the launch that follows — and each already discards nothing now, per
+    // the fixes to `probeBinaryFingerprint`/`probeAuth` themselves. What matters here is checked
+    // between them, not only after both: a guard placed after both probes had already run stopped the
+    // CLI launch, but not `probeAuth` itself — fingerprint's own descendant could still be alive,
+    // unconfirmed, while a second real process started anyway. So the check happens immediately after
+    // EACH probe, before the next one is even attempted.
     const fingerprint = await this.fingerprint();
+    this._refuseIfProbeUnconfirmed(fingerprint);
+
     const probedAuth = await this.probeAuth(credentialTokens).catch(() => null);
+    this._refuseIfProbeUnconfirmed(probedAuth);
 
     let stdout = '';
     let stderr = '';
@@ -351,6 +494,11 @@ export class ClaudeCodeBackend {
       const error = new Error('the coding backend could not be queried');
       error.kind = classifyBackendFailure(err);
       if (error.kind === 'rate_limited') error.retryAfterSeconds = 60;
+      // This launch runs in the same workspace a job's write lease protects, and is exactly as
+      // capable of leaving an unconfirmed descendant as a coding phase. `null` unless `err` actually
+      // carries a verdict — most failures here are an ordinary "could not reach the backend", not a
+      // kill.
+      error.terminationConfirmed = err?.terminationConfirmed ?? null;
       throw error;
     }
 
@@ -441,7 +589,11 @@ export class ClaudeCodeBackend {
       const kind = classifyBackendFailure(err);
       if (kind === 'cancelled') {
         // Let the caller record the cancellation; this is not a backend failure to be blocked on.
-        throw Object.assign(new Error('the phase was cancelled'), { kind: 'cancelled' });
+        // Preserve terminationConfirmed so the engine knows whether descendants are confirmed dead.
+        throw Object.assign(new Error('the phase was cancelled'), {
+          kind: 'cancelled',
+          terminationConfirmed: err?.terminationConfirmed ?? undefined,
+        });
       }
       return {
         ok: false,
@@ -450,11 +602,19 @@ export class ClaudeCodeBackend {
         session_id: null,
         model: null,
         permission_mode: permissionMode,
-        // Bounded hard: an execFile failure message is `Command failed: <full argv>` followed by
-        // stderr, and redaction is pattern-based — a secret in an unusual shape would survive.
-        summary: redactText(String(err?.message ?? 'the phase failed').split('\n')[0].slice(0, 200), { maxLength: 200 }),
+        // The CLI's own last word, not `execFile`'s. Its message is `Command failed: <full argv>`,
+        // which with a privilege-drop prefix in front is entirely preamble — the actual failure fell
+        // off the end of the 200 characters, and the argv went into the durable job record in its
+        // place. Bounded hard either way: redaction is pattern-based, so a secret in an unusual
+        // shape would survive it.
+        summary: redactText(lastMeaningfulLine(err) || 'the phase failed', { maxLength: 200 }),
         turns_used: 0,
         max_turns_reached: false,
+        // `timeout`/`process_died` are exactly as capable of leaving an unconfirmed descendant as a
+        // cancellation is — an ordinary hard timeout has nothing to do with `cancelJob`, so it never
+        // takes the `cancelled` branch above, and previously carried no verdict at all here. `null`
+        // for every other failure kind: nothing was killed, so there is nothing to have confirmed.
+        terminationConfirmed: (kind === 'timeout' || kind === 'process_died') ? (err?.terminationConfirmed ?? null) : null,
       };
     }
 

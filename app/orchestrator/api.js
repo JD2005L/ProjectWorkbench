@@ -351,7 +351,7 @@ export function createOrchestratorRouter({
     const {
       observed_model: _observed, requirement: _requirement, cli_session_id: _cli,
       provenance: _provenance, settings_attestation: settingsAttestation,
-      effective: _effective, ...rest
+      effective: _effective, terminationConfirmed: _terminationConfirmed, ...rest
     } = result;
     const wire = { ...rest, attestation: settingsAttestation ?? null };
     if (result.requirement) {

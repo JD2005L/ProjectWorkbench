@@ -411,7 +411,7 @@ test('provenance: a nonce outside the contract alphabet is treated as unbound', 
     'nonce with spaces 0123456789ab',       // whitespace
     'nonce:with:colons:0123456789ab',       // an identifier, but not a nonce
     'nonce/with/slashes/0123456789',
-    'nonce with-a-nul-0123456789',
+    'nonce\u0000with-a-nul-0123456789',
   ]) {
     const result = build({ binding: { ...BINDING, verification_nonce: nonce } });
     assert.equal(result.settings_attestation, null, `a ${JSON.stringify(nonce)} nonce must not be attested`);
@@ -674,6 +674,11 @@ test('session: the attestation survives the REAL session manager and reaches the
     const config = loadOrchestratorConfig({
       PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: INSTANCE,
       PW_ORCHESTRATOR_DATA_DIR: path.join(dir, 'd'), PW_WORKSPACES: path.join(dir, 'ws'),
+      // Container mode, stated rather than inherited. This test is about attestation reaching the
+      // response; host mode would additionally require this machine to have the configured
+      // unprivileged account and a usable sudo, which would make the assertion below a statement
+      // about the host the suite runs on.
+      PW_DEPLOY_MODE: 'container',
     });
     const backend = new ClaudeCodeBackend({ config, exec });
     backend.fingerprint = async () => GOOD_FINGERPRINT;

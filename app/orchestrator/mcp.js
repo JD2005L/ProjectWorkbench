@@ -264,21 +264,28 @@ export function createToolDispatcher({ engine, sessionManager, backend, config, 
       correlationId: ctx.correlationId,
     }),
 
-    pw_verify_session_configuration: async (token, args, ctx) => sessionManager.verifySession({
-      token,
-      // The session key is `<orchestrator>:<workbench>:<project>:<role>`, so the project is
-      // recoverable from it. Resolution still goes through the grant check.
-      project: resolveProject.resolve(
-        config, projectStore, token,
-        args.project_id ?? String(requireArg(args, 'session_key')).split(':')[2],
-      ),
-      request: {
-        session_key: requireArg(args, 'session_key'),
-        phase_class: requireArg(args, 'phase_class'),
-        requested: requireArg(args, 'requested'),
-      },
-      correlationId: ctx.correlationId,
-    }),
+    pw_verify_session_configuration: async (token, args, ctx) => {
+      const result = await sessionManager.verifySession({
+        token,
+        // The session key is `<orchestrator>:<workbench>:<project>:<role>`, so the project is
+        // recoverable from it. Resolution still goes through the grant check.
+        project: resolveProject.resolve(
+          config, projectStore, token,
+          args.project_id ?? String(requireArg(args, 'session_key')).split(':')[2],
+        ),
+        request: {
+          session_key: requireArg(args, 'session_key'),
+          phase_class: requireArg(args, 'phase_class'),
+          requested: requireArg(args, 'requested'),
+        },
+        correlationId: ctx.correlationId,
+      });
+      // `terminationConfirmed` is an internal rider for the engine's own lease-fencing decision, not
+      // part of this tool's contract — stripped here exactly as `api.js` strips it from the REST
+      // response, rather than left to leak into an MCP client's result.
+      const { terminationConfirmed: _terminationConfirmed, ...wire } = result;
+      return wire;
+    },
 
     pw_submit_job: async (token, args, ctx) => engine.submitJob({
       token, body: args, idempotencyKey: ctx.idempotencyKey, correlationId: ctx.correlationId,
