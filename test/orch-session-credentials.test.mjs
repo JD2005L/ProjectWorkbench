@@ -79,6 +79,21 @@ const ensure = (manager, project, token) => manager.ensureSession({
   correlationId: 'corr-1',
 });
 
+// Reads a pane's REAL process environment directly — tmux's own "session
+// environment" (show-environment) is a separate tracked concept from what
+// actually reaches the pane's process; only /proc/<pid>/environ proves what
+// the launched shell actually saw. Mirrors test/project-terminal-start.test.mjs
+// and test/pw-tmux-restore.test.mjs's identical helper.
+async function paneEnvironByTarget(socket, target) {
+  const { stdout: pidOut } = await execFileAsync('tmux', ['-L', socket, 'list-panes', '-t', target, '-F', '#{pane_pid}']);
+  const pid = pidOut.trim().split('\n')[0];
+  const raw = await fs.promises.readFile(`/proc/${pid}/environ`, 'utf8');
+  return Object.fromEntries(raw.split('\0').filter(Boolean).map((kv) => {
+    const i = kv.indexOf('=');
+    return [kv.slice(0, i), kv.slice(i + 1)];
+  }));
+}
+
 tmuxTest('a fresh session is stamped with the resolved fingerprint before any window is created', async () => {
   let calls = 0;
   const credentials = async () => { calls += 1; return { key: 'aaaaaaaaaaaaaaaa', tokens: ['CLAUDE_CONFIG_DIR=/tmp/x'] }; };
@@ -91,13 +106,52 @@ tmuxTest('a fresh session is stamped with the resolved fingerprint before any wi
   });
 });
 
-tmuxTest('the disabled/off case is still stamped exactly "off", never left unstamped', async () => {
+tmuxTest('REGRESSION: the resolved per-user credential environment actually reaches BOTH the fresh session and the lane window — not just the fingerprint stamp', async () => {
+  const configDir = '/tmp/pw-orch-cred-probe-' + process.pid;
+  const credentials = async () => ({
+    key: 'dddddddddddddddd',
+    tokens: [`CLAUDE_CONFIG_DIR=${configDir}`],
+    shellArgs: ['--noprofile', '--norc'],
+  });
+  await withLane({ credentials }, async ({ tmux, manager, project, token, socket }) => {
+    await ensure(manager, project, token);
+
+    // The fingerprint stamp alone proves attribution was DECIDED — it says
+    // nothing about whether the pane's actual process ever received the
+    // credentials that decision resolved to. Read the real pane environment
+    // for both windows this call created: the session's initial window
+    // (`newSession`) and the reserved lane window (`newWindow`, via
+    // `_createLane`) — the reviewer's exact finding was that neither call
+    // is passed the resolved credential environment at all.
+    const lane = manager.laneFor(project, {});
+    const initialEnv = await paneEnvironByTarget(socket, 'pw_Demo:shell');
+    assert.equal(initialEnv.CLAUDE_CONFIG_DIR, configDir,
+      'the freshly created session\'s initial window must carry the resolved per-user CLAUDE_CONFIG_DIR, not the shared/default one');
+
+    const laneWindow = await tmux.findWindow('pw_Demo', lane.reservedWindow);
+    assert.ok(laneWindow, 'sanity: the lane window must exist');
+    const laneEnv = await paneEnvironByTarget(socket, laneWindow.id);
+    assert.equal(laneEnv.CLAUDE_CONFIG_DIR, configDir,
+      'the lane window — where the coding CLI actually runs — must carry the resolved per-user CLAUDE_CONFIG_DIR, not the shared/default one');
+  });
+});
+
+tmuxTest('the disabled/off case is still stamped exactly "off", never left unstamped, and the pane is unmodified', async () => {
   const credentials = async () => ({ key: CREDENTIALS_OFF, tokens: [] });
-  await withLane({ credentials }, async ({ tmux, manager, project, token }) => {
+  await withLane({ credentials }, async ({ tmux, manager, project, token, socket }) => {
     await ensure(manager, project, token);
     const stamped = await tmux.getSessionCredKey('pw_Demo');
     assert.equal(stamped.ok, true);
     assert.equal(stamped.key, CREDENTIALS_OFF);
+    // Disabled mode must be byte-identical to before the credential-env fix:
+    // no forced launch command at all, so no CLAUDE_CONFIG_DIR appears from
+    // this code path (whatever the pane's ordinary default shell env is).
+    const initialEnv = await paneEnvironByTarget(socket, 'pw_Demo:shell');
+    assert.equal('CLAUDE_CONFIG_DIR' in initialEnv, false, 'disabled mode must never set CLAUDE_CONFIG_DIR');
+    const lane = manager.laneFor(project, {});
+    const laneWindow = await tmux.findWindow('pw_Demo', lane.reservedWindow);
+    const laneEnv = await paneEnvironByTarget(socket, laneWindow.id);
+    assert.equal('CLAUDE_CONFIG_DIR' in laneEnv, false, 'disabled mode must never set CLAUDE_CONFIG_DIR');
   });
 });
 

@@ -39,6 +39,10 @@ import {
 const execFileAsync = promisify(execFile);
 const APP_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
+// Mirrors app/server.js's own DEFAULT_SHELL_ARGS exactly — the pane shell's
+// argv tail when there is no per-user GitHub-token env file to source.
+const DEFAULT_SHELL_ARGS = ['--noprofile', '--norc'];
+
 function readRegistryProject(registryPath, projectId) {
   let registry;
   try {
@@ -50,17 +54,22 @@ function readRegistryProject(registryPath, projectId) {
 }
 
 /**
- * Resolves `{ key, tokens }` for the given orchestrator project id — `key` is
- * the fingerprint to stamp on the shared tmux session (or CREDENTIALS_OFF),
- * `tokens` are `KEY=VALUE` environment entries to prefix new-session/
- * new-window commands with. THROWS (fail-closed) on any resolution or
+ * Resolves `{ key, tokens, shellArgs }` for the given orchestrator project id
+ * — `key` is the fingerprint to stamp on the shared tmux session (or
+ * CREDENTIALS_OFF), `tokens` are `KEY=VALUE` environment entries to prefix
+ * new-session/new-window commands with, `shellArgs` is the pane shell's argv
+ * tail (mirrors app/server.js's credentialContext()'s identical field — a
+ * `--rcfile` pointed at the owner's GitHub-token env file when one exists,
+ * DEFAULT_SHELL_ARGS otherwise). THROWS (fail-closed) on any resolution or
  * materialization failure — never falls back to shared credentials silently.
+ * Resolving this alone does nothing: app/orchestrator/session.js must still
+ * apply `tokens`/`shellArgs` to the actual tmux new-session/new-window call.
  */
 export async function resolveLaneCredentials({
   registryPath, projectId, perUserEnabled,
   usersPath, secretKeyPath, credBase, sharedClaudeJson,
 }) {
-  if (!perUserEnabled) return { key: CREDENTIALS_OFF, tokens: [] };
+  if (!perUserEnabled) return { key: CREDENTIALS_OFF, tokens: [], shellArgs: DEFAULT_SHELL_ARGS };
 
   const project = readRegistryProject(registryPath, projectId);
   if (!project) {
@@ -114,7 +123,8 @@ export async function resolveLaneCredentials({
       owner: terminalOwner, currentUid: process.getuid?.() ?? null, runJob,
     });
     const tokens = ['CLAUDE_CONFIG_DIR=' + cred.configDir];
-    return { key: cred.fingerprint, tokens };
+    const shellArgs = cred.envFile ? ['--noprofile', '--rcfile', cred.envFile] : DEFAULT_SHELL_ARGS;
+    return { key: cred.fingerprint, tokens, shellArgs };
   } catch (e) {
     throw new Error(`project "${projectId}" (owner "${owner.username}") credential materialization failed: ${e?.message || e}. Refusing to fall back to the shared Claude/GitHub login.`);
   }
@@ -132,7 +142,7 @@ export async function resolveLaneCredentials({
  */
 export async function defaultLaneCredentialResolver(projectId) {
   const perUserEnabled = String(process.env.PW_PER_USER_CLAUDE || '').toLowerCase() === 'true';
-  if (!perUserEnabled) return { key: CREDENTIALS_OFF, tokens: [] };
+  if (!perUserEnabled) return { key: CREDENTIALS_OFF, tokens: [], shellArgs: DEFAULT_SHELL_ARGS };
   return resolveLaneCredentials({
     registryPath: process.env.PW_REGISTRY_PATH || '/opt/project-workbench/projects.json',
     projectId,

@@ -47,6 +47,28 @@ const CRED_KEY_OPTION = '@pw_cred_key';
  */
 const IDLE_SHELLS = Object.freeze(new Set(['bash', 'sh', 'zsh', 'dash', 'fish', 'ksh', '-bash', '-sh', '-zsh']));
 
+/**
+ * The pane launch command carrying the resolved per-user credential
+ * environment — `null` when there is nothing to apply (disabled mode, or the
+ * legitimate no-primaryUser/off case, where `cred.tokens` is empty), so the
+ * caller passes no `command` at all and tmux spawns its ordinary default
+ * shell, byte-identical to before this existed.
+ *
+ * Resolving credentials (see app/orchestrator/lane-credentials.js) only
+ * decides WHAT the pane should run under; without this, that decision was
+ * never applied anywhere — only its fingerprint got stamped, so a session
+ * could look correctly attributed while its pane ran under the shared/
+ * default login the whole time. Mirrors app/server.js's
+ * ensureProjectTmuxSession's identical construction (same `env KEY=VAL...
+ * bash <shellArgs>` shape, same unquoted join — these tokens are
+ * server-computed paths, not external input).
+ */
+function laneLaunchCommand(cred) {
+  if (!cred?.tokens?.length) return null;
+  const shellArgs = cred.shellArgs?.length ? cred.shellArgs : ['--noprofile', '--norc'];
+  return ['env', ...cred.tokens].join(' ') + ' bash ' + shellArgs.join(' ');
+}
+
 /** tmux user options carrying the lane's identity. Only this service ever writes them. */
 const MARKER = Object.freeze({
   ROLE: '@pw_role',
@@ -331,7 +353,7 @@ export class OrchestratorSessionManager {
     // recreate it: doing so would kill every window an operator has open.
     const sessionExisted = await this.tmux.hasSession(lane.tmuxSession);
     if (!sessionExisted) {
-      await this.tmux.newSession(lane.tmuxSession, workspacePath);
+      await this.tmux.newSession(lane.tmuxSession, workspacePath, laneLaunchCommand(cred));
       // The session's initial window is a plain shell, not the lane. Rename it so it cannot be
       // mistaken for one and so the lane is always created explicitly, marked, below.
       await this.tmux.raw(['rename-window', '-t', `=${lane.tmuxSession}:0`, 'shell']).catch(() => {});
@@ -469,11 +491,11 @@ export class OrchestratorSessionManager {
         // By id: the window was resolved from an exact-name match in listWindows, and killing by
         // name would reintroduce the index ambiguity this whole path exists to avoid.
         await this.tmux.killWindowById(existing.id);
-        laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token);
+        laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
         replaced = true;
       }
     } else {
-      laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token);
+      laneWindowId = await this._createLane(lane, workspacePath, project, sessionKey, token, cred);
     }
 
     const prior = this.store.get('sessions', sessionKey);
@@ -519,9 +541,9 @@ export class OrchestratorSessionManager {
    * touch forever, including under force_replace. Marking under a scratch name and renaming last
    * means the reserved name only ever appears on a window that is already marked.
    */
-  async _createLane(lane, workspacePath, project, sessionKey, token) {
+  async _createLane(lane, workspacePath, project, sessionKey, token, cred) {
     const scratch = `${lane.reservedWindow}_new`;
-    await this.tmux.newWindow(lane.tmuxSession, scratch, workspacePath);
+    await this.tmux.newWindow(lane.tmuxSession, scratch, workspacePath, laneLaunchCommand(cred));
     const created = await this.tmux.findWindow(lane.tmuxSession, scratch);
     if (!created) throw new ApiError(ErrorCode.CONFLICT, 'the orchestrator lane could not be created');
 
