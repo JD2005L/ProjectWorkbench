@@ -14,10 +14,16 @@ import { ClaudeCodeBackend, classifyBackendFailure } from '../app/orchestrator/r
 import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
 import { HealthState, AuthMethod, PhaseClass, Effort } from '../app/orchestrator/contract.js';
 
+// Container mode, explicitly. Every assertion below describes a launch with nothing in front of the
+// CLI, which is exactly what container mode must keep doing: the container already runs as the
+// unprivileged user, so there is nothing to drop. Host mode puts `sudo -n -H -u <user> --` in front
+// of the same argv and is covered on its own terms in orch-privilege.test.mjs — leaving this file's
+// mode implicit would have made this suite a test of whoever happened to run it.
 const CONFIG = loadOrchestratorConfig({
   PW_ORCHESTRATOR_ENABLED: 'true',
   PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
   PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+  PW_DEPLOY_MODE: 'container',
 });
 
 /** A recorded init event — the authoritative report of what a session is actually running. */
@@ -406,13 +412,19 @@ test('runner: an abort is classified as cancellation, not as a timeout', () => {
 test('runner: an abort signal is passed through to the child process', async () => {
   // The signal has to reach execFile. Previously only the test fake honoured it, so cancellation
   // was green in the suite and inert in production.
+  //
+  // Not the caller's own `AbortSignal` by reference: the privilege drop's `_execTracked` hands
+  // `exec()` an internal controller instead, aborted only once a guaranteed descendant-tree rescan
+  // has run — so a real kill is never raced against discovering what else the launch started (see
+  // privilege.js). What has to reach execFile is a live, real `AbortSignal`, not that specific object.
   const { backend, calls } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
   const controller = new AbortController();
   await backend.runPhase({
     prompt: 'x', model: 'sonnet', effort: 'high', maxTurns: 5,
     phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo', signal: controller.signal,
   });
-  assert.equal(calls[0].options.signal, controller.signal);
+  assert.equal(typeof calls[0].options.signal?.addEventListener, 'function');
+  assert.equal(calls[0].options.signal.aborted, false);
 });
 
 test('runner: failures map to distinct kinds so each can reach its own safe state', () => {

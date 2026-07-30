@@ -6,8 +6,8 @@
     "test failure with nothing in this repository having moved.",
     "Update deliberately, as part of conforming to the change: node scripts/orch-contract-pin.mjs --write"
   ],
-  "revision": "8c323b663b3cd544e9f27cc0019e7008475e05a9",
-  "pinned_at": "2026-07-27T22:44:45.240Z",
+  "revision": "aff7a6053be620cc6e18b8c070010ba9ce924cad",
+  "pinned_at": "2026-07-28T01:24:39.963Z",
   "root": "/opt/project-workbench/workspaces/PVICodingOrchestrator",
   "files": {
     "src/pvi_orchestrator/contracts/policy.py": "55761eb33b37e464ff12018f2842b8aed06b4c07ed0635d71b3744fc89871c11",

@@ -264,7 +264,7 @@ test('validate: bounded text lengths match the contract primitives', () => {
 test('validate: relative paths reject absolute, traversing, backslash and NUL forms', () => {
   const schema = { name: 'S', fields: { p: { type: 'relativePath', required: true } } };
   assert.doesNotThrow(() => validate(schema, { p: 'app/orchestrator/api.js' }));
-  for (const bad of ['/etc/passwd', '../secret', 'a/../../b', 'a\\b', 'a b', './x/../../y']) {
+  for (const bad of ['/etc/passwd', '../secret', 'a/../../b', 'a\\b', 'a\u0000b', './x/../../y']) {
     assert.throws(() => validate(schema, { p: bad }), ValidationError, `path ${bad}`);
   }
 });

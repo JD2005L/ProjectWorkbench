@@ -98,6 +98,10 @@ export const FingerprintFailure = Object.freeze({
   UNREADABLE: 'unreadable',
   VERSION_UNAVAILABLE: 'version_unavailable',
   HELP_UNAVAILABLE: 'help_unavailable',
+  // The binary was never asked. In host mode the probe launches through a privilege drop, and a
+  // drop that cannot be made is an operator's configuration fault — reporting it as "the CLI did
+  // not report a version" sends them to look at the wrong thing entirely.
+  PRIVILEGE_DROP_FAILED: 'privilege_drop_failed',
   PINNED_MISMATCH: 'pinned_mismatch',
 });
 
@@ -216,8 +220,28 @@ export async function probeBinaryFingerprint({
   try {
     const { stdout } = await exec(realpath, ['--version'], { timeout: timeoutMs });
     version = String(stdout).trim().slice(0, 200);
-  } catch {
-    return { ok: false, failure: FingerprintFailure.VERSION_UNAVAILABLE, detail: 'the coding CLI did not report a version', realpath, sha256 };
+  } catch (err) {
+    if (err?.kind === 'privilege_drop_failed') {
+      return {
+        ok: false,
+        failure: FingerprintFailure.PRIVILEGE_DROP_FAILED,
+        detail: `the coding CLI could not be run as the unprivileged account: ${String(err.message ?? '').slice(0, 200)}`,
+        realpath,
+        sha256,
+      };
+    }
+    // This probe runs a real process exactly like the phase it is fingerprinting for, and can leave
+    // an unconfirmed descendant behind in the same way. Rebuilding a plain failure result below
+    // without this would silently drop that verdict — the caller (verifyConfiguration) would have no
+    // way to know a kill could not be confirmed, and would carry on into the actual CLI launch.
+    return {
+      ok: false,
+      failure: FingerprintFailure.VERSION_UNAVAILABLE,
+      detail: 'the coding CLI did not report a version',
+      realpath,
+      sha256,
+      terminationConfirmed: err?.terminationConfirmed ?? null,
+    };
   }
 
   let helpText;
@@ -225,6 +249,22 @@ export async function probeBinaryFingerprint({
     const { stdout } = await exec(realpath, ['--help'], { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 });
     helpText = String(stdout);
   } catch (err) {
+    // A kill this module could not confirm dead is refused outright, before even asking whether some
+    // output happened to survive it: "some CLIs print help to stderr and exit non-zero, and that is
+    // still a declaration" is a rule for an ORDINARY failure, and treating a real, unconfirmed kill as
+    // though it were one just because stdout/stderr were non-empty would report success over exactly
+    // the condition this verdict exists to catch.
+    if (err?.terminationConfirmed === false) {
+      return {
+        ok: false,
+        failure: FingerprintFailure.HELP_UNAVAILABLE,
+        detail: 'the coding CLI did not declare its options',
+        realpath,
+        sha256,
+        version,
+        terminationConfirmed: false,
+      };
+    }
     // Some CLIs print help to stderr and exit non-zero; that is still a declaration.
     helpText = String(err?.stdout ?? '') + String(err?.stderr ?? '');
     if (!helpText.trim()) {
@@ -268,11 +308,30 @@ async function hashFile(filePath) {
 export class FingerprintCache {
   constructor({ exec, ttlMs = 15 * 60 * 1_000 } = {}) {
     this._entries = new Map();
+    this._inFlight = new Map();
     this._exec = exec;
     this.ttlMs = ttlMs;
   }
 
-  async get({ executable, options, expectedSha256 = null }) {
+  async get(request) {
+    // Concurrent verifications of the same binary asked the same question N times over: N hashes of
+    // a 275 MB file and, now that the probe launches through a privilege drop, 2N helper processes
+    // as well. Callers that arrive while an answer is being computed wait for that answer instead.
+    // Keyed on the request, so a different binary or a different pin is never served this one.
+    const key = JSON.stringify([request.executable, [...(request.options ?? [])].sort(), request.expectedSha256 ?? null]);
+    const pending = this._inFlight.get(key);
+    if (pending) return pending;
+
+    const attempt = this._get(request);
+    this._inFlight.set(key, attempt);
+    try {
+      return await attempt;
+    } finally {
+      if (this._inFlight.get(key) === attempt) this._inFlight.delete(key);
+    }
+  }
+
+  async _get({ executable, options, expectedSha256 = null }) {
     // A pinned deployment never serves from cache. Identity is not content: an in-place write that
     // preserves inode, size and mtime (trivial with `touch -r`) collides with the key, and the pin
     // is the one control designed to catch exactly that substitution. Re-hashing costs ~1s and is

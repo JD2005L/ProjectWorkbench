@@ -92,6 +92,8 @@ defaults. A deployment with different conventions is *configured*, never patched
 | `PW_ORCHESTRATOR_TMUX_PREFIX` | `pw_` | tmux session prefix |
 | `PW_ORCHESTRATOR_DISPLAY_PREFIX` | `pvibot-orchestrator-` | CLI display-name prefix |
 | `PW_ORCHESTRATOR_TMUX_SOCKET` | _(empty)_ | Alternate tmux server; used by tests |
+| `PW_ORCHESTRATOR_TMUX_USER` | `admin` | Host mode only: the unprivileged account the lane **and every coding phase** run as. Validated at startup — a missing, malformed or superuser value stops the instance booting. See [§1.5](#15-host-mode-runs-the-cli-as-an-unprivileged-account) |
+| `PW_ORCHESTRATOR_SUDO_BIN` | _(auto)_ | Absolute path to the privilege-drop helper. Left unset, `/usr/bin/sudo` then `/bin/sudo` are tried and vetted; never resolved through `PATH` |
 | `PW_ORCHESTRATOR_CLAUDE_BIN` | `claude` | Coding CLI executable. Must be an **absolute path to the real binary** for launch enforcement — not the PW wrapper on `PATH`, which rewrites argv |
 | `PW_ORCHESTRATOR_GIT_BIN` / `_GH_BIN` | `git` / `gh` | Git and GitHub CLI |
 | `PW_ORCHESTRATOR_MAX_BODY_BYTES` | `1048576` | Request body ceiling |
@@ -106,6 +108,126 @@ defaults. A deployment with different conventions is *configured*, never patched
 
 The subsystem reuses the dashboard's existing `PW_WORKSPACES` for the workspace root, so there is
 one source of truth for where project checkouts live.
+
+### 1.5 Host mode runs the CLI as an unprivileged account
+
+A host-mode deployment runs the dashboard as root — it binds a privileged port and manages other
+users' terminals — while every project terminal runs as `PW_ORCHESTRATOR_TMUX_USER`. The coding CLI
+runs as that account too, and this is not a detail:
+
+* **A subscription sign-in is a file in that account's home directory.** A root process cannot see
+  it, so a directly-launched CLI reports itself signed out and `/health` publishes
+  `state: down, method: unknown` while the subscription is perfectly healthy.
+* **A phase writes into a workspace the human terminal owns.** Run as root it would leave
+  root-owned files in the working tree and in `.git`, which the operator's own terminal then cannot
+  write.
+
+So in host mode every launch — the auth probe, the fingerprint's `--version` and `--help`,
+verification, and the phase itself — goes through a fixed argv with no shell:
+
+```
+/usr/bin/sudo -n -H -u '#<uid>' --preserve-env=HTTPS_PROXY,… -- <PW_ORCHESTRATOR_CLAUDE_BIN> …
+```
+
+`-n` so a sudoers policy that would prompt fails immediately instead of hanging until the phase
+deadline. The runas target is the **uid** the account resolved to, not the name: sudo re-resolves a
+name through NSS at launch time, and a directory change that repointed the name at uid 0 in between
+would be obeyed.
+
+Two things the sudoers policy must therefore allow: running as the configured account **without a
+password**, and `--preserve-env=<list>`. A policy that refuses either fails the launch closed with
+sudo's own message, reported as `privilege_drop_failed` rather than as a broken phase.
+
+The child's environment is sudo's `env_reset` — `HOME`, `USER`, `LOGNAME` and `SHELL` from the
+target's passwd entry, `PATH` from sudoers' vetted `secure_path` — plus a short list of names
+carried across explicitly: proxy settings, CA bundle locations and locale. **Names, not values.**
+The values travel in sudo's own environment, which lives in `/proc/<pid>/environ` (mode 0400);
+naming them as `NAME=value` arguments would publish the service's entire environment — service
+tokens included — through `/proc/<pid>/cmdline`, which is mode 0444 and readable by every local
+user for the whole length of a phase. Nothing outside that list crosses, so a variable a deployment
+genuinely needs is added to it deliberately rather than inherited by accident.
+
+The scrub still runs over what this service composes, and covers two families beyond the
+API-billing switches: `LD_*`/`DYLD_*` and `NODE_OPTIONS` load code *inside* the process whose
+SHA-256 was just checked — which would make the pin a statement about a file rather than about the
+behaviour that ran — and the model/effort overrides (`ANTHROPIC_*`, `CLAUDE_EFFORT`,
+`CLAUDE_CONFIG_DIR`, `CLAUDE_CODE_OAUTH_TOKEN`) would change the very settings §4 attests.
+
+**A known limitation, stated rather than implied:** the preserved list contains `HTTPS_PROXY` and
+`NODE_EXTRA_CA_CERTS`. Together they are a route to redirecting inference through an endpoint of the
+operator's choosing and making the CLI trust its certificate — the same class of control as
+`ANTHROPIC_BASE_URL`, which *is* removed. The difference is compatibility, not safety: a proxied
+deployment has nowhere else to set them. A deployment that does not need them should not set them on
+the service.
+
+Cancellation is confirmed rather than assumed. `execFile` rejects the moment it *calls* kill, which
+with a helper in front left a cancelled phase still running — the job recorded as stopped while the
+agent kept editing. A cancelled or timed-out launch is now signalled, watched, and escalated to
+`SIGKILL` after a bounded grace, and the caller is not told the phase stopped until it has.
+
+This adds nothing to the trust chain. Both helpers are taken from absolute paths, never `PATH`:
+`sudo` must be a root-owned setuid binary that is not group- or world-writable, and `env` must be a
+root-owned file nobody else can rewrite (it needs no privilege — by the time it runs, privilege has
+already been dropped). `PW_ORCHESTRATOR_CLAUDE_BIN` must be absolute in host mode, so neither `PATH`
+nor sudo's `secure_path` chooses the program; and the fingerprint continues to realpath, stat,
+ELF-check and SHA-256 **the CLI** — never a helper.
+
+It fails closed. A missing, malformed or superuser account, an account that resolves to uid or gid
+0, one absent from the passwd database, one answered by two different passwd entries, one whose
+entry is not seven plain fields, one without an absolute home, an unusable helper, or the helper
+refusing the launch at runtime (`sudo: a password is required`) — all refuse the launch outright:
+the failure is reported as `privilege_drop_failed`, jobs reach `blocked_configuration`, and there is
+deliberately no path that falls back to running as root. The one exception is a process that is
+*already* the configured account, which needs no helper — and is still held to every other rule:
+the account is validated and resolved, the CLI must still be absolute, and the environment is still
+corrected and scrubbed.
+
+A lookup that *failed* is treated differently from an account that was *refused*. A refusal is
+decided once and held, because a re-probed refusal is how a flapping check eventually lets something
+through; a passwd query that timed out decided nothing and is asked again, so one unanswered
+directory request does not disable the coding backend for the life of the process.
+
+The coding CLI is not the only launch this covers. `git.js`, `checks.js` and the tmux lane
+(`TmuxAdapter`) all run through the identical resolved plan — one `PrivilegeDropper` instance, shared
+rather than each resolving its own — so they cannot disagree about which uid a workspace-affecting
+command runs as. That matters specifically for the tmux lane: an earlier version built its own
+`sudo -u <name> tmux …`, both `sudo` and `tmux` resolved through PATH and keyed on the account *name*
+rather than the numeric uid pinned at boot. A name re-resolved through NSS at a different moment than
+everything else's pinned uid is how two commands touching the same project could end up as two
+different effective users — and, since tmux's default socket directory is keyed on the caller's real
+uid, addressing two different tmux socket namespaces without either side knowing it.
+
+Every launch through this plan — not only the CLI — also tracks and confirms its whole descendant
+tree before a timeout or an abort reaches the caller: a check command that backgrounds or `setsid`s
+something of its own gets exactly the same tree-confirmation as a coding-CLI phase that starts a
+build or a test run, because both share the tracking, not just the drop.
+
+**A documented limitation, not a silent one: polling cannot prove a negative.** The tree is watched
+by periodically re-reading `/proc` while the launch is alive, not by a kernel-enforced guarantee. If
+`execFile`'s own `timeout` or `signal` handling kills the direct child before even one poll has
+completed — a launch shorter than the poll interval guarantees this, and it is not the only way to
+reach it — nothing has actually been observed, and an empty search afterward proves nothing: a
+descendant that forked and `setsid`-detached in that same window is structurally indistinguishable
+from one that never existed. Shortening the poll interval does not close this; it only raises the bar
+for an adversary that forks and detaches faster than whatever interval is chosen. So this is handled
+by being honest about it rather than by pretending a shorter interval is a proof: this specific case —
+the launch failed before the tree was ever looked at even once — is reported as **unconfirmed**,
+unconditionally, whatever the (necessarily incomplete) survivor search finds. That is what routes it
+to the durable project fence below rather than letting it round up to a false "confirmed". An
+ordinary cancellation, with a normal phase budget and many poll cycles behind it, is unaffected and
+still reports confirmed once everything it saw is actually dead.
+
+The durable fence is therefore standing in for a stronger guarantee this module does not attempt: a
+kernel-level containment primitive — a dedicated PID namespace, where the kernel itself kills every
+process in it the moment the namespace's own init exits, or a cgroup with `cgroup.kill`/
+`cgroup.procs`, which (unlike `/proc` ppid-chasing) tracks membership independently of reparenting —
+would close this structurally rather than statistically. That is a materially larger, more
+platform-specific undertaking than this fix (namespace/cgroup delegation, permission and container-
+runtime interaction, a new dependency on kernel features that may not be uniformly available across
+every host and container this product runs on) and is tracked as a known follow-up rather than
+attempted here.
+
+Container mode has nothing to drop and is unchanged.
 
 ---
 
@@ -171,13 +293,33 @@ correctly instead of failing as a spurious mismatch.
 
 **Cancellation stops the work.** The running phase is signalled, not waited out, and the working-tree
 fingerprints are taken either side of that — so `working_tree_preserved` reflects what happened
-rather than racing a still-running writer.
+rather than racing a still-running writer. If the descendant tree cannot be *confirmed* dead within
+`PW_ORCHESTRATOR_CANCEL_GRACE_MS`, the job is never recorded as cancelled — a deadline that elapses
+before an answer arrives is unconfirmed, not a coin flip that happened to land on "fine". The job is
+blocked instead, `termination_confirmed: false` is persisted, and the project's write lease is
+**fenced**: held past its own expiry, refusing every later acquisition — including by the job that set
+it — until an operator clears it with `scripts/pw-orch-clear-fence.mjs` (see [§7](#7-operating-it)).
+Nothing clears a fence on a timer.
 
 **Crash safety.** State lives in an append-only write-ahead journal with a CRC per transaction. A
 torn final record is discarded as a crash; a bad record with good records after it is corruption, and
 the store refuses to open rather than silently losing durable evidence. On start, any job recorded as
-holding the workspace is moved to `blocked_project_state` with its lease released — reconciled
-against reality, never resumed on an assumption about what a dead process had finished.
+holding the workspace is moved to `blocked_project_state` — reconciled against reality, never resumed
+on an assumption about what a dead process had finished. Its project's write lease is **fenced**, not
+released: a restart is an unknown-termination case in exactly the same sense an unconfirmed
+cancellation is, since nothing in the new process ever confirmed the old one's descendants were dead,
+and releasing the lease would let a later job start writing to a workspace a pre-crash descendant
+might still be editing. **This means a routine restart that catches a job mid-flight now blocks that
+project until an operator explicitly clears the fence** (`scripts/pw-orch-clear-fence.mjs`, [§7](#7-operating-it))
+— a deliberate trade of operational convenience for never silently resuming into an unproven state.
+Deploy tooling that restarts the service should expect this and plan to check for stranded jobs.
+
+**A documented limitation, not a silent one, part two: `reconcileOnStart` cannot do better than
+"unconfirmed" for a crashed process.** Unlike an in-process cancellation, a restart has no live
+descendant list and no per-launch pid record to check at all — there is no live process left in
+memory to enumerate a tree from. So every job reconciled this way is unconditionally fenced, with no
+attempt to prove the tree actually survived; that would need durable pid tracking across a restart,
+which is a materially larger feature than reconciliation itself and is left as a known follow-up.
 
 **Human windows are never touched.** A window is the orchestrator's lane only if it carries the role
 marker this service set. A window merely *named* `orch_pvibot` is refused — including under
@@ -519,7 +661,10 @@ Migrations are append-only: never edit a released one.
    `$PW_ORCHESTRATOR_DATA_DIR` aside to start clean, keeping the old directory for forensics.
 
 In-flight jobs are safe across all of this: on the next start every job recorded as holding the
-workspace is reconciled to `blocked_project_state` with its lease released.
+workspace is reconciled to `blocked_project_state`, and its project's write lease is **fenced** (see
+[§3](#3-guarantees-worth-knowing-before-you-rely-on-them)) rather than released — so a rollback or
+upgrade that catches a job mid-flight will require clearing that fence
+(`scripts/pw-orch-clear-fence.mjs`) before the project can be worked again.
 
 ### Backup
 
@@ -558,6 +703,27 @@ tmux list-windows -t pw_<Project> -F '#{window_name} #{@pw_role}'
 ```
 
 A window with an empty `@pw_role` is a human's and is never touched by this subsystem.
+
+### Clearing a fenced project
+
+A cancellation whose termination could not be confirmed within the grace period fences the project's
+write lease — every job for that project blocks at `blocked_project_state` until it is cleared. There
+is no automatic path: clearing a fence is exactly the claim "I have looked and nothing is still
+writing to this workspace", and only a human can make that claim.
+
+```bash
+# stop the service first — the durable store takes a single-writer lock, and this opens it directly
+sudo systemctl stop project-workbench
+
+node scripts/pw-orch-clear-fence.mjs --project <id>                 # status only, changes nothing
+
+# after checking for a surviving process in that project's workspace (ps -ef, or an OS-level scan
+# for the account the launch would have dropped to), clear it:
+node scripts/pw-orch-clear-fence.mjs --project <id> \
+  --reason "verified no surviving descendant via ps -ef" --by <you> --confirm
+
+sudo systemctl start project-workbench
+```
 
 ### MCP over stdio
 
