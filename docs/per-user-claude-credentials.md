@@ -260,8 +260,19 @@ A pane inherits its environment when it is created, so enabling
 does **not** re-key a session that is already running.
 
 PW stamps a non-secret fingerprint of the credentials on the tmux session at
-creation (`@pw_cred_key`) and compares it on every status poll.
-`GET /api/projects/status` reports `credentialsStale: true` when they diverge.
+creation (`@pw_cred_key`). Every seam that would hand a terminal to a caller —
+`ensureTmuxSession`, `ensureProjectTmuxSession` (the PVIKPBot base session),
+and `scripts/project-terminal-start`'s host-mode equivalent — resolves the
+CURRENT owner and compares it against that stamp EVERY time, not just on
+`GET /api/projects/status`'s read-only poll. The underlying tmux session may
+keep running either way (none of these ever kill one), but attaching to — or
+handing off ttyd to — an existing session is refused, with an actionable
+recycle-required error, unless the fingerprint matches exactly (or the
+session was legitimately never stamped because credentials are genuinely
+off/shared). A stale or unresolvable owner is never silently attached to:
+attribution safety is not traded for continuity of an already-open terminal.
+`GET /api/projects/status` still separately reports `credentialsStale: true`
+for visibility even when nothing has tried to attach yet.
 
 Recreating the session is destructive — it discards whatever is running in every
 window — so it is never done implicitly. Reconcile it deliberately:
@@ -272,8 +283,9 @@ curl -X POST -b cookies.txt -H "Origin: $HOST" \
 ```
 
 The call is audited as `session_recycle`. New tabs opened with
-`newTmuxWindow` always get current credentials, so a long-lived session can end
-up mixed; recycling is what makes it uniform.
+`newTmuxWindow` always get current credentials (also fail-closed on
+resolution failure), so a long-lived session can end up mixed; recycling is
+what makes it uniform.
 
 ## Scope & limitations
 
@@ -328,7 +340,12 @@ up mixed; recycling is what makes it uniform.
   `sudo -u` argument so the two cannot drift apart.
 - `app/user-credentials.js` — creating and owning the credential material
   (`ensureUserCredentials`), the non-secret session stamp
-  (`credentialFingerprint`), and the drift decision (`sessionCredentialState`).
+  (`credentialFingerprint`), the drift decision (`sessionCredentialState`),
+  and the sign-in status check (`userSignedIn`/`checkUserSignedIn`) — the
+  latter uses `lstat`, never `stat`, and runs through the SAME
+  privilege-dropped helper as every write into the tree, so a symlink
+  planted at `.credentials.json` can't be used to probe an arbitrary path's
+  existence/size through the dashboard's (often root) filesystem access.
 - `app/project-owner.js`, `app/secret-crypto.js`, `app/users-file.js` — the
   owner-resolution decision, the AES-256-GCM token encryption, and the
   users.json reader, each extracted into its own small module so BOTH

@@ -222,3 +222,201 @@ from reattaching to a session that is otherwise running fine, since a live sessi
 creation and doesn't need fresh credentials at all. This is a real latent gap introduced by round
 1's fail-closed fix, but it is not either of the two named blockers and was not fixed here to avoid
 further scope expansion; flagging it explicitly rather than leaving it silently undiscovered.
+
+**Round 3 note:** the round-2 observation above was superseded — round 3's adversarial review (item 6)
+explicitly required the OPPOSITE of what round 2 assumed: an existing session must be fail-closed too
+(verified every attach, not just every create). See below; the "out-of-scope" framing no longer applies.
+
+---
+
+## Round 3: 9-item adversarial review — lifecycle concurrency, durability, and session-attach correctness
+
+Independent adversarial review blocked commit `ec163bd`. Nine items across three tiers (P0 lifecycle
+protocol, P1 launch/session protocol, durability/security). Full detail in code comments at each site
+named below; this is the map + the evidence.
+
+### P0-1 — immutable opId + one serialized lifecycle (was: read marker → effects outside userStore → clear by id)
+
+`pendingCredentialSync` now carries an `opId` (`crypto.randomUUID()`). `app/lifecycle-lock.js` is a new
+cross-process lockfile (O_EXCL create, PID-liveness-based stale-break — never a bare timer, so a live-but-
+slow holder's lock is never broken out from under it, only a genuinely dead PID's is, immediately). PATCH/
+POST-create/DELETE/POST-reconcile each run their ENTIRE body — read, validate, mutate users.json, repoint
+`project.primaryUser`, resync git credentials, prune the old credential-tree namespace, clear the marker —
+inside ONE `withLifecycleLock()` acquisition. `app/user-lifecycle.js` holds the extracted pure decisions
+(`resolveLifecycleTarget`, `reservedUsernameConflict`, `reconciliationStillCurrent`) so the ABA guard is
+unit-tested in isolation, not just implied by the lock.
+
+**Self-caught during implementation:** the first cut cleared the marker via a second `userStore` call
+from inside the same `update()`'s effect — re-entering the store's OWN serialization tail while still
+inside it, a self-deadlock. A timeout-guarded test in `test/user-store.test.mjs` caught it before it
+reached a silent hang. Fixed by giving `effect()` a `resave()` callback that persists a follow-up mutation
+without re-queuing (see `app/user-store.js`). Once the cross-process lock existed, `userStore` (round 1/2's
+in-process-only serialization) was retired from `server.js` ENTIRELY — not just for rename/delete, but for
+password-change, login's `lastLoginAt`, and the deploy-password save too (`withUsersLock()`), because
+leaving those on the OLD mechanism while lifecycle ops moved to the NEW one would have reintroduced the
+exact split-brain race both were built to prevent. `app/user-store.js` itself is untouched and still
+tested standalone — just no longer wired into `server.js`.
+
+**Also caught by the production probe (see below), not by a written test first:** the PATCH route's
+immediate JSON response echoed a stale, already-cleared `pendingCredentialSync` marker when reconciliation
+succeeded within the SAME request (the returned record was a closure over the pre-reconciliation object,
+never updated to match what was just persisted). RED confirmed by reverting the two-line fix and re-running
+`test/user-lifecycle.test.mjs`; fixed by syncing the in-memory record with the on-disk one at the exact
+point the marker is cleared.
+
+RED→GREEN: `test/user-lifecycle-core.test.mjs` (10 unit tests for the 3 pure functions, including the ABA
+guard with a deliberately mismatched opId), `test/user-store.test.mjs` (+1 deadlock regression),
+`test/atomic-file.test.mjs` (5), `test/lifecycle-lock.test.mjs` (6, including two REAL node processes
+racing the same lock with a deliberate read-then-write window — zero lost increments across 40×2 iterations).
+
+### P0-2 — literal-URL/body replay must be idempotent
+
+`resolveLifecycleTarget(users, target)` resolves the EXACT current username first (unambiguous); only
+when there is no current match does it fall back to a user whose unfinished rename's ORIGINAL name was
+`target`. `test/user-lifecycle-locking.test.mjs`'s first two tests replay the VERBATIM original
+`PATCH /api/users/alice {"username":"alicia"}` and `DELETE /api/users/alice` — same URL, same body, no
+adjustment for the rename that already happened — after a forced post-commit failure, and both succeed.
+
+### P0-3 — DELETE reworked as an immutable-ID staged operation
+
+Phase 1 (snapshot by `resolveLifecycleTarget`, still keyed to `victim.id` from there on) → phase 2
+(cleanup: project refs + git resync + credential-tree prune, all pre-persistence; project-ref commit
+under `withProjectsLock`, session purge under `withSessionsLock` — NOT bypassed anymore) → phase 3 (the
+irreversible splice, re-read fresh and matched by `victim.id`, never by username again). All three phases
+run inside the SAME `withLifecycleLock()` acquisition as phase 1's snapshot.
+
+RED→GREEN (`test/user-lifecycle-locking.test.mjs`): rename+recreate race (DELETE by the renamed identity's
+current name never touches the new account that reclaimed the old one), a concurrent login racing DELETE's
+session purge (10 concurrent login attempts + a delete, `withSessionsLock` serializes correctly, no lost/
+corrupt session), project-save-stage failure + replay, credential-prune-stage failure + replay, and a
+replay after full success (clean 404, no resurrection/double-act).
+
+### P0-4 — username reuse must not inherit a prior identity's credential tree
+
+Chose "reserve names while pending" over full ID-keyed credential namespace re-migration — documented
+tradeoff: the codebase has exactly two ways a username becomes free (rename-away, delete), both already
+actively prune the vacated name's tree at the SAME commit as freeing it (round 2), so reservation only
+needs to close the WINDOW while a rename is pending-but-unreconciled. Re-keying the entire credential tree
+by immutable id would be strictly more robust but requires a live-migration path for every already-deployed
+username-keyed tree — assessed as disproportionate additional risk/scope for the marginal safety gap it
+would close beyond what reservation + active-prune-at-free-time already covers for this codebase's actual
+mutation paths. `reservedUsernameConflict()` rejects CREATE/RENAME into any username that is the `from` side
+of a DIFFERENT account's still-pending marker; `reconcileRenameCredentials()`'s existing claimant check
+(round 2) remains as a defense-in-depth backstop for a reservation-layer bypass (an out-of-band edit).
+
+RED→GREEN: reservation rejection at CREATE, the defense-in-depth claimant check via an out-of-band edit
+(the round-2 "no mistaken takeover" test, kept but its setup corrected — see below), and an end-to-end
+test seeding a departed user's real OAuth (`.credentials.json`), GitHub token (`session-env.sh`), and MCP
+config, deleting them, recreating the SAME username, and asserting NONE of the old material — not the
+OAuth token string, not the GitHub token, not even the stale files' presence — survives into the new
+identity's directory after her own materialization.
+
+**Self-caught while adjusting round-2's takeover test:** with reservation now enforced, that test's OWN
+premise (create a conflicting account via the API) started failing CORRECTLY — the create is now rejected,
+which is the fix working, not a regression. Split into two tests: one asserting the create IS rejected
+(the new primary defense), and one exercising the claimant-check backstop via an out-of-band file edit
+(what the original test was actually trying to prove, now with an accurate setup).
+
+### P1-5/6 — unified credential + existing-session-attach policy
+
+`ensureProjectTmuxSession()` (the PVIKPBot base session) now routes through `credentialContext()` (fail-
+closed materialization) and stamps `@pw_cred_key`, exactly like `ensureTmuxSession()` — round 1 left it on
+static shared-login env unconditionally; item 5 closed that.
+
+**Correction mid-round, from the user directly:** round 3's first pass at item 6 misread "never alternately
+block valid sessions and attach stale identities" as "never block an existing session" — i.e., the
+underlying tmux session is fine to KEEP RUNNING, which is true, but a live test I'd just written asserted
+that RE-ATTACHING to it after credentials broke should still succeed, which is the wrong half of the
+sentence. The user corrected this directly: continuity of an already-open terminal is not a reason to
+attach under an unverified or stale identity — attribution safety comes first. Both `ensureTmuxSession()`
+and `ensureProjectTmuxSession()` (and `scripts/project-terminal-start`, in bash) now resolve the CURRENT
+owner UNCONDITIONALLY (not gated on session existence) and, for an existing session, compare its stamped
+fingerprint against that current owner EXACTLY — matching or the legitimate "never stamped, genuinely
+shared" case attaches; anything else (unresolvable owner, or a resolved owner whose fingerprint no longer
+matches — a rotated token, a reassignment) refuses to attach with an actionable recycle-required error,
+WITHOUT killing the underlying session. The wrongly-designed test was inverted into the correct one (plus
+a sibling for the fingerprint-mismatch case) before being kept.
+
+RED→GREEN: `test/project-terminal-start.test.mjs` (+3: unchanged-owner-reattaches, unresolvable-owner-
+refuses, rotated-token-refuses, all against the real script + a real tmux server), plus 4 new server-side
+tests in `test/user-lifecycle-locking.test.mjs` (a `/manage/update` fail-closed-create-path check — that
+route always kills the session first via `stopProject`, so it cannot exercise the existing-session branch
+itself, and is labeled accordingly; a genuinely existing-session test via the PVIKPBot handoff endpoint,
+which does NOT kill first, discriminating a fast fail-closed refusal from reaching the ~30s
+no-real-claude-binary wait by elapsed time).
+
+### P2-7 — crash-safe files + cross-process lock (see P0-1 above for the lock; this is the write path)
+
+`app/atomic-file.js`: temp file in the SAME directory + `fsync` + atomic `rename()` + directory `fsync`,
+mode set explicitly (not left to umask). `saveUsers`/`saveProjects`/`saveSessions` all route through it now
+— a source-guard test asserts none of them ALSO plain-`fs.writeFile`s. `withProjectsLock`/`withSessionsLock`
+are UNCHANGED and still used for their existing (now also lock-nested-under-the-lifecycle-lock, where
+relevant) purposes — not weakened, not replaced.
+
+RED→GREEN: `test/atomic-file.test.mjs` (5, including a real child process SIGKILLed mid-write with the
+original file surviving byte-for-byte).
+
+### P2-8 — root traversal in `userClaudeSignedIn`
+
+`fs.stat()` follows a symlink at the final path component; a pane user could plant one at
+`<base>/<victim>/claude/.credentials.json` pointing anywhere root-readable and use the boolean
+`claudeSignedIn` API field as a 1-bit oracle for an arbitrary path's existence/size. `userSignedIn()`
+(`lstat`, never follows) + `checkUserSignedIn()` (same in-process-or-dropped-helper shape as
+`ensureUserCredentials`/`pruneCredentials`) replace it; `credential-writer.mjs` gained a `"status"` action
+on the SAME stdin/stdout protocol — no new privilege-drop mechanism, the existing one reused.
+
+RED→GREEN: `test/user-credentials.test.mjs` (+6: value correctness, planted-symlink regression, drop-vs-
+in-process delegation, the helper's new protocol action, a source guard that server.js no longer
+`fs.stat()`s inside the tree), `test/user-lifecycle.test.mjs` (+1 HTTP-level: real completed login reported
+true, a planted symlink at a DIFFERENT user's path reported false, through `GET /api/users`).
+
+### Round 3 verification evidence
+
+- Focused security suite (17 files incl. all round-3 additions): **192/192 pass**.
+- Full suite (`cd app && npm test`): **538/538 pass**, 0 failures (round 2 was 491/491; round 3 added 47
+  new tests across 5 new files + extensions to 4 existing ones, plus the 1 test that caught the
+  same-request stale-marker bug above).
+- Third production-shaped root-to-admin probe: dashboard spawned as uid 0 again, exercising recycle,
+  rename (under the cross-process lock, `pendingCredentialSync` with a real `opId` in the live response),
+  `GET /api/users` (through `checkUserSignedIn`'s dropped-helper path), and DELETE (immutable-ID staged) —
+  all against a REAL lifecycle lock file at a real path (confirmed released — absent — between requests).
+  Credential tree and its ownership verified admin-owned throughout (never root), pruned correctly on
+  delete. users.json/projects.json confirmed root:root-owned (root owning ITS OWN files is correct and
+  expected; only the shared pane-credential tree must avoid root touches) with no stray atomic-write temp
+  artifacts left behind and correct modes (`users.json` 0600). This probe is what actually caught the
+  same-request stale-marker bug fixed above — an unscripted, real-request exploration, not a pre-written
+  test. Production instance at `/opt/project-workbench/app/server.js` (different PID, untouched) verified
+  unaffected throughout; probe temp dir and its private tmux socket cleaned up afterward.
+- `app/VERSION` bumped to `1.26.0730.0018` (round 3 is a third substantive change to `app/` since the
+  round-2 bump; date rolled over to 2026-07-30 during this round).
+
+### Self-review (crash windows, marker ABA, PID/process boundaries, migration, stale sessions, GOA compat)
+
+- **Crash windows.** users/projects/sessions files are now atomic-write crash-safe. A process crashing
+  WHILE HOLDING the lifecycle lock leaves a lock file stamped with its (now-dead) PID — the very next
+  acquisition attempt detects non-liveness and breaks it immediately (no `staleMs` wait for this, the
+  common case). A crash between the lock file's `open()` and its pid/timestamp `write()` landing leaves an
+  unparseable lock; that path falls back to `lockFileAgeMs` against a bounded `staleMs` (default 60s) — an
+  extremely narrow window, and still self-healing, just slower.
+- **Marker ABA.** Closed structurally by the single cross-process lock (two lifecycle operations on the
+  same identity literally cannot interleave anymore) AND redundantly by the `opId` equality check
+  (`reconciliationStillCurrent`), unit-tested against a deliberately mismatched marker so the guard's
+  correctness doesn't rest on the lock alone.
+- **PID/process boundaries.** `process.kill(pid, 0)` distinguishes dead (ESRCH, break immediately) from
+  alive-but-inaccessible (EPERM, treated as alive — never guess a foreign process is dead). Residual,
+  undocumented-elsewhere limitation: PID reuse racing the exact staleness-check window (an extremely
+  low-probability event on a single admin-panel host) could make a live unrelated process look like the
+  original holder; the failure mode is a bounded `timeoutMs` error on the NEW acquisition attempt, not
+  silent corruption.
+- **Backward migration.** None required — item 4's reservation approach deliberately keeps the existing
+  username-keyed credential-tree layout unchanged; every already-deployed `pw-users/<username>/` directory
+  continues to work exactly as before.
+- **Stale sessions.** tmux sessions: covered by items 5/6's stricter attach policy end to end. Auth
+  sessions (`sessions.json`): DELETE's purge now goes through `withSessionsLock`, closing the exact
+  concurrent-login-vs-delete race a bypass would have allowed; login/logout are unaffected.
+- **GOA compatibility.** `pendingCredentialSync`'s API shape changed (boolean → object-or-null) but is not
+  referenced anywhere in the embedded admin UI's client-side JS (`renderUsers` and friends) — confirmed by
+  grep — so this is additive, not breaking, for the current UI. `PW_PER_USER_CLAUDE` remains default-off;
+  none of the atomic-write/lifecycle-lock changes are gated by it (they apply unconditionally, as a general
+  durability/correctness improvement, transparent to a GOA deployment that never touches per-user
+  credentials at all).

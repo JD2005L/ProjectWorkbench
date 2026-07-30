@@ -20,6 +20,12 @@ const appDir = path.dirname(serverJs);
 function makeInstance(port, extraEnv = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-lifecycle-'));
   fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
+  // registry/ and users/ each get their OWN directory so a test can chmod one
+  // read-only (forcing writeFileAtomic's temp-file creation to fail there —
+  // it no longer touches the TARGET file's own permissions, only the
+  // containing directory's) without also blocking the other store.
+  fs.mkdirSync(path.join(dir, 'registry'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'users'), { recursive: true });
   const secretKeyPath = path.join(dir, '.secret-key');
   const secretKey = crypto.randomBytes(32).toString('hex');
   fs.writeFileSync(secretKeyPath, secretKey + '\n');
@@ -29,8 +35,8 @@ function makeInstance(port, extraEnv = {}) {
     LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port),
     PW_ISOLATED: '1',
-    PW_REGISTRY_PATH: path.join(dir, 'projects.json'),
-    PW_USERS_PATH: path.join(dir, 'users.json'),
+    PW_REGISTRY_PATH: path.join(dir, 'registry', 'projects.json'),
+    PW_USERS_PATH: path.join(dir, 'users', 'users.json'),
     PW_SESSIONS_PATH: path.join(dir, 'sessions.json'),
     PW_WORKSPACES: path.join(dir, 'workspaces'),
     PW_SECRET_KEY_PATH: secretKeyPath,
@@ -567,16 +573,20 @@ test('pendingCredentialSync is surfaced via GET /api/users so an admin can see i
   writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
   await withServer(inst, port, async (base) => {
     let users = await getUsersRaw(base);
-    assert.equal(users[0].pendingCredentialSync, false);
+    assert.equal(users[0].pendingCredentialSync, null);
 
-    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o555);
     try {
       const patch = await patchUser(base, 'alice', { username: 'alicia' });
       assert.equal(patch.ok, false);
-    } finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+    } finally { fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o755); }
 
     users = await getUsersRaw(base);
-    assert.equal(users.find((u) => u.username === 'alicia').pendingCredentialSync, true, 'a stuck reconciliation must be visible, not a hidden file-only state');
+    const pending = users.find((u) => u.username === 'alicia').pendingCredentialSync;
+    assert.ok(pending, 'a stuck reconciliation must be visible, not a hidden file-only state');
+    assert.equal(pending.fromUsername, 'alice');
+    assert.equal(pending.toUsername, 'alicia');
+    assert.match(pending.opId, /^[0-9a-f-]{36}$/, 'the marker must carry an immutable operation id');
   });
 });
 
@@ -587,11 +597,11 @@ test('REGRESSION: retrying the IDENTICAL rename PATCH finishes reconciliation af
   writeProjects(inst, [{ name: 'demo', path: proj, port: 7820, primaryUser: 'alice' }]);
   writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*', ghToken: encryptToken(inst.secretKey, 'ghp_x') }]);
   await withServer(inst, port, async (base) => {
-    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444); // saveProjects() will fail: EACCES
+    fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o555); // saveProjects() will fail: EACCES
     try {
       const first = await patchUser(base, 'alice', { username: 'alicia' });
       assert.equal(first.ok, false, 'a project-reference-reassignment failure must not be reported as success');
-    } finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+    } finally { fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o755); }
 
     // users.json already committed the rename (the identity change is not
     // rolled back); the project reference must NOT have moved yet.
@@ -605,7 +615,7 @@ test('REGRESSION: retrying the IDENTICAL rename PATCH finishes reconciliation af
     assert.equal(retry.ok, true, JSON.stringify(retry));
     assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, 'alicia');
     assert.equal(readGhTokenFromCredFile(proj), 'ghp_x');
-    assert.equal((await getUsersRaw(base)).find((u) => u.username === 'alicia').pendingCredentialSync, false);
+    assert.equal((await getUsersRaw(base)).find((u) => u.username === 'alicia').pendingCredentialSync, null);
   });
 });
 
@@ -650,7 +660,7 @@ test('REGRESSION: retrying finishes reconciliation after the credential-tree-pru
 
     const retry = await patchUser(base, 'alicia', { username: 'alicia' });
     assert.equal(retry.ok, true, JSON.stringify(retry));
-    assert.equal((await getUsersRaw(base)).find((u) => u.username === 'alicia').pendingCredentialSync, false);
+    assert.equal((await getUsersRaw(base)).find((u) => u.username === 'alicia').pendingCredentialSync, null);
   });
 });
 
@@ -661,9 +671,9 @@ test('REGRESSION: the explicit recovery endpoint finishes a stuck reconciliation
   writeProjects(inst, [{ name: 'demo', path: proj, port: 7822, primaryUser: 'alice' }]);
   writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*', ghToken: encryptToken(inst.secretKey, 'ghp_x') }]);
   await withServer(inst, port, async (base) => {
-    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o555);
     try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
-    finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+    finally { fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o755); }
 
     const recovered = await reconcileUser(base, 'alicia');
     assert.equal(recovered.ok, true, JSON.stringify(recovered));
@@ -676,29 +686,53 @@ test('REGRESSION: the explicit recovery endpoint finishes a stuck reconciliation
   });
 });
 
-test('REGRESSION: no mistaken takeover — reconciliation refuses when the old username has been reclaimed by a different account', { timeout: 30000 }, async () => {
+test('REGRESSION: creating a user with a username reserved by a pending rename is rejected outright', { timeout: 30000 }, async () => {
   const port = 3913;
   const inst = makeInstance(port);
-  const projAlicia = seedProject(inst, 'aliciaProj', { git: true });
-  const projNewAlice = seedProject(inst, 'newAliceProj', { git: true });
-  writeProjects(inst, [
-    { name: 'aliciaProj', path: projAlicia, port: 7823, primaryUser: 'alice' },
-    { name: 'newAliceProj', path: projNewAlice, port: 7824 },
-  ]);
+  const proj = seedProject(inst, 'demo', { git: true });
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7823, primaryUser: 'alice' }]);
   writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
   await withServer(inst, port, async (base) => {
-    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o555);
     try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
-    finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
-    // aliciaProj still points at "alice" (unreconciled) at this point.
-
-    // A brand new, DIFFERENT person takes the now-vacant username "alice" and
-    // is deliberately given ownership of a different project.
+    finally { fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o755); }
+    // "alice" is now only referenced as a PENDING rename's origin, not any
+    // current username — but it must still be refused, not treated as free.
     const created = await fetch(`${base}/api/users`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: 'alice', role: 'developer', password: 'aB1!aB1!aB1!', projects: '*' }),
     }).then((r) => r.json());
-    assert.equal(created.ok, true);
+    assert.equal(created.ok, false, 'a reserved (pending-rename) username must not be handed to a brand-new account');
+    assert.match(created.error, /reserved|pending/i);
+  });
+});
+
+test('REGRESSION: no mistaken takeover — reconcile refuses when the old username is now held by a different account (defense in depth against the reservation check)', { timeout: 30000 }, async () => {
+  // Simulates the reservation guard being bypassed some OTHER way (an
+  // out-of-band edit of users.json, or data that predates this check) —
+  // reconcileRenameCredentials's own claimant check must independently catch
+  // the conflict rather than assuming the reservation layer is infallible.
+  const port = 3917;
+  const inst = makeInstance(port);
+  const projAlicia = seedProject(inst, 'aliciaProj', { git: true });
+  const projNewAlice = seedProject(inst, 'newAliceProj', { git: true });
+  writeProjects(inst, [
+    { name: 'aliciaProj', path: projAlicia, port: 7827, primaryUser: 'alice' },
+    { name: 'newAliceProj', path: projNewAlice, port: 7828 },
+  ]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  await withServer(inst, port, async (base) => {
+    fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o555);
+    try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
+    finally { fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o755); }
+    // aliciaProj still points at "alice" (unreconciled) at this point.
+
+    // Out-of-band: a DIFFERENT, brand-new identity reuses the vacated
+    // username directly in the file, bypassing the API's reservation check
+    // entirely (exactly what the defense-in-depth check must still catch).
+    const current = JSON.parse(fs.readFileSync(inst.env.PW_USERS_PATH, 'utf8'));
+    current.users.push({ id: 'u-new-alice', username: 'alice', role: 'developer', projects: '*' });
+    fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify(current, null, 2));
     await withProjectsLockTestHelper(inst, 'newAliceProj', 'alice');
 
     // Retrying alicia's reconciliation must refuse — reassigning
@@ -733,14 +767,84 @@ test('REGRESSION: deleting a user with an unfinished rename also revokes the lin
     { id: 'u-admin', username: 'admin0', role: 'admin', projects: '*' },
   ]);
   await withServer(inst, port, async (base) => {
-    fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o444);
+    fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o555);
     try { assert.equal((await patchUser(base, 'alice', { username: 'alicia' })).ok, false); }
-    finally { fs.chmodSync(inst.env.PW_REGISTRY_PATH, 0o644); }
+    finally { fs.chmodSync(path.dirname(inst.env.PW_REGISTRY_PATH), 0o755); }
     // demo.primaryUser is still "alice" (the rename never finished reconciling).
 
     const del = await fetch(`${base}/api/users/alicia`, { method: 'DELETE' }).then((r) => r.json());
     assert.equal(del.ok, true, JSON.stringify(del));
     assert.equal((await readProjectsConfig(base)).projects.find((p) => p.name === 'demo').primaryUser, '',
       'the reference under the OLD name must be revoked too, not just one under the current name');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial review round 2, item 7: users.json/projects.json/sessions.json
+// must be written crash-safely (temp write + fsync + atomic rename + dir
+// fsync — see app/atomic-file.js), not with a plain in-place fs.writeFile().
+// The primitive itself is exhaustively covered by test/atomic-file.test.mjs;
+// this just confirms server.js's save paths actually route through it and
+// never leave a stray temp file behind after a real HTTP-triggered write.
+// ---------------------------------------------------------------------------
+
+test('SECURITY: saveUsers/saveProjects/saveSessions route through the crash-safe atomic writer, not a plain in-place fs.writeFile', () => {
+  const src = fs.readFileSync(path.join(appDir, 'server.js'), 'utf8');
+  for (const name of ['saveUsers', 'saveProjects', 'saveSessions']) {
+    const start = src.indexOf(`async function ${name}(`);
+    assert.notEqual(start, -1, `${name} must still exist under this name`);
+    const body = extractFunctionSource(src, `async function ${name}(`);
+    assert.ok(body, `could not extract ${name}'s body`);
+    assert.match(body, /writeFileAtomic/, `${name} must write via writeFileAtomic (app/atomic-file.js), not fs.writeFile directly — a crash mid-write must never corrupt or truncate the previous good file`);
+    assert.equal(/\bfs\.writeFile\(/.test(body), false, `${name} must not ALSO plain-write — that would defeat the atomic guarantee`);
+  }
+});
+
+test('GET /api/users reports claudeSignedIn accurately, and a planted symlink at the credentials path never reports signed-in', { timeout: 30000 }, async () => {
+  const port = 3918;
+  const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true' });
+  writeUsers(inst, [
+    { id: 'u-alice', username: 'alice', role: 'developer', projects: '*' },
+    { id: 'u-mallory', username: 'mallory', role: 'developer', projects: '*' },
+  ]);
+  await withServer(inst, port, async (base) => {
+    let users = await getUsers(base);
+    assert.equal(users.find((u) => u.username === 'alice').claudeSignedIn, false);
+
+    const aliceDir = path.join(inst.env.PW_USER_CRED_BASE, 'alice', 'claude');
+    fs.mkdirSync(aliceDir, { recursive: true });
+    fs.writeFileSync(path.join(aliceDir, '.credentials.json'), '{"claudeAiOauth":{}}');
+
+    // Mallory plants a symlink at her own credentials path pointing at a
+    // real, non-empty file elsewhere — if the check ever followed it, she'd
+    // read back claudeSignedIn:true for a path she doesn't actually control
+    // a login for, and (more importantly) the mechanism would be usable as
+    // an oracle for the target's existence/size.
+    const outside = path.join(inst.dir, 'outside-sentinel');
+    fs.writeFileSync(outside, 'x'.repeat(200));
+    const malloryDir = path.join(inst.env.PW_USER_CRED_BASE, 'mallory', 'claude');
+    fs.mkdirSync(malloryDir, { recursive: true });
+    fs.symlinkSync(outside, path.join(malloryDir, '.credentials.json'));
+
+    users = await getUsers(base);
+    assert.equal(users.find((u) => u.username === 'alice').claudeSignedIn, true, 'a real completed login must be reported');
+    assert.equal(users.find((u) => u.username === 'mallory').claudeSignedIn, false, 'a planted symlink must never be reported as a completed login');
+  });
+});
+
+test('REGRESSION: a PATCH rename whose reconciliation succeeds within the SAME request reports pendingCredentialSync cleared in its OWN immediate response, not stale', { timeout: 30000 }, async () => {
+  const port = 3919;
+  const inst = makeInstance(port);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  await withServer(inst, port, async (base) => {
+    const patch = await fetch(`${base}/api/users/alice`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'alicia' }),
+    }).then((r) => r.json());
+    assert.equal(patch.ok, true, JSON.stringify(patch));
+    // Nothing was forced to fail — this rename's reconciliation must have
+    // succeeded within THIS SAME request. The response's own `user` must
+    // already reflect that, not a snapshot from before the marker cleared.
+    assert.equal(patch.user.pendingCredentialSync, null,
+      'the immediate PATCH response must not report a marker that was already cleared on disk moments earlier in the same request');
   });
 });

@@ -37,6 +37,8 @@ import {
   spawnCredentialJob,
   ensureUserCredentials,
   CREDENTIALS_OFF,
+  userSignedIn,
+  checkUserSignedIn,
 } from '../app/user-credentials.js';
 
 const APP_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'app');
@@ -401,6 +403,93 @@ test('session drift is reported only when it is actionable', () => {
   assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: off, stampedKey: '' }).stale, false);
   assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: '' }).stale, true);
   assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: '' }).reason, 'unstamped');
+});
+
+// ---------------------------------------------------------------------------
+// Adversarial review round 2, item 8: the Claude sign-in STATUS check
+// (server.js's userClaudeSignedIn, feeding GET /api/users' claudeSignedIn
+// field) used to fs.stat() a path inside the credential tree directly as
+// root — a stat() FOLLOWS a symlink at the final component, so a pane user
+// could plant one at <base>/<victim>/claude/.credentials.json pointing
+// anywhere on the filesystem and use the boolean claudeSignedIn field as a
+// 1-bit oracle for "does this arbitrary root-readable path exist, is it a
+// regular file, is it non-empty" — exactly the confused-deputy class every
+// other write into this tree was already fixed to avoid. userSignedIn() is
+// the no-follow, non-root-touching replacement.
+// ---------------------------------------------------------------------------
+
+test('userSignedIn is true only for a real, non-empty .credentials.json', async () => {
+  const base = await tmpBase();
+  assert.equal(await userSignedIn({ fsp, base, username: 'nobody' }), false, 'no directory at all -> not signed in');
+
+  const configDir = userClaudeConfigDir(base, 'alice');
+  await fsp.mkdir(configDir, { recursive: true });
+  assert.equal(await userSignedIn({ fsp, base, username: 'alice' }), false, 'directory exists but no credentials file yet');
+
+  await fsp.writeFile(path.join(configDir, '.credentials.json'), '');
+  assert.equal(await userSignedIn({ fsp, base, username: 'alice' }), false, 'an empty file is not a completed login');
+
+  await fsp.writeFile(path.join(configDir, '.credentials.json'), '{"claudeAiOauth":{}}');
+  assert.equal(await userSignedIn({ fsp, base, username: 'alice' }), true);
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
+test('REGRESSION: userSignedIn never follows a symlink planted at the credentials path', async () => {
+  const base = await tmpBase();
+  const outside = await tmpBase();
+  await fsp.writeFile(path.join(outside, 'sentinel'), 'x'.repeat(100)); // real, non-empty, would read "signed in" if followed
+
+  const configDir = userClaudeConfigDir(base, 'mallory');
+  await fsp.mkdir(configDir, { recursive: true });
+  await fsp.symlink(path.join(outside, 'sentinel'), path.join(configDir, '.credentials.json'));
+
+  assert.equal(await userSignedIn({ fsp, base, username: 'mallory' }), false,
+    'a symlink must never be treated as a completed login, and must not be followed to inspect its target');
+  await fsp.rm(base, { recursive: true, force: true });
+  await fsp.rm(outside, { recursive: true, force: true });
+});
+
+test('checkUserSignedIn delegates to the helper exactly when a drop is required, mirroring ensureUserCredentials', async () => {
+  const base = await tmpBase();
+  const configDir = userClaudeConfigDir(base, 'alice');
+  await fsp.mkdir(configDir, { recursive: true });
+  await fsp.writeFile(path.join(configDir, '.credentials.json'), '{"a":1}');
+
+  const calls = [];
+  const runJob = async (job, plan) => { calls.push({ job, plan }); return { signedIn: true }; };
+
+  const inProc = await checkUserSignedIn({ fsp, base, username: 'alice', owner: { uid: 1001 }, currentUid: 1001, runJob });
+  assert.equal(calls.length, 0, 'same account: must run in-process, never touching the helper');
+  assert.equal(inProc, true);
+
+  const dropped = await checkUserSignedIn({ fsp, base, username: 'alice', owner: { uid: 1001, source: 'passwd', user: 'admin' }, currentUid: 0, runJob });
+  assert.equal(calls.length, 1, 'different account: must delegate to the dropped helper, never stat as this (possibly root) process');
+  assert.equal(calls[0].job.action, 'status');
+  assert.equal(dropped, true);
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
+test('the credential-writer helper answers a "status" job over stdin/stdout, same protocol as "ensure"/"prune"', async () => {
+  const base = await tmpBase();
+  const helper = path.join(APP_DIR, 'credential-writer.mjs');
+  const configDir = userClaudeConfigDir(base, 'alice');
+  await fsp.mkdir(configDir, { recursive: true });
+  await fsp.writeFile(path.join(configDir, '.credentials.json'), '{"a":1}');
+
+  const result = await spawnCredentialJob({ spawn, argv: [process.execPath, helper], job: { action: 'status', base, username: 'alice' } });
+  assert.equal(result.signedIn, true);
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
+test('SECURITY: userClaudeSignedIn (server.js) no longer fs.stat()s inside the credential tree directly', async () => {
+  const src = await fsp.readFile(path.join(APP_DIR, 'server.js'), 'utf8');
+  const start = src.indexOf('async function userClaudeSignedIn(');
+  assert.notEqual(start, -1);
+  let depth = 0, i = src.indexOf('{', start);
+  for (; i < src.length; i++) { if (src[i] === '{') depth++; else if (src[i] === '}') { depth--; if (depth === 0) { i++; break; } } }
+  const body = src.slice(start, i);
+  assert.equal(/\bfs\.stat\(/.test(body), false, 'must not stat inside the credential tree as this (possibly root) process — see checkUserSignedIn');
+  assert.match(body, /checkUserSignedIn|runCredentialJob/, 'must route through the privilege-dropped helper, like every other write into that tree');
 });
 
 // ---------------------------------------------------------------------------

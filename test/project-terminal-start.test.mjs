@@ -188,6 +188,71 @@ test('REGRESSION: a materialization failure (cred base unusable) fails closed be
   } finally { await teardown(ctx); }
 });
 
+test('REGRESSION (item 6, unified existing-session policy): re-attaching to an existing session with UNCHANGED credentials succeeds', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+  try {
+    const first = await runScript(ctx);
+    assert.ok(first.timedOut || first.code === 0, JSON.stringify(first));
+    const session = 'pw_' + ctx.name;
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'sanity: the session must exist');
+
+    // Re-run with the SAME (unchanged) owner/token — this must attach fine.
+    const second = await runScript(ctx);
+    assert.ok(second.timedOut || second.code === 0, `an unchanged owner must still be able to attach: ${JSON.stringify(second)}`);
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]));
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION (item 6, unified existing-session policy): an EXISTING session must NOT be attached to once its owner becomes unresolvable — fail closed, actionable, session left running', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+  try {
+    const first = await runScript(ctx);
+    assert.ok(first.timedOut || first.code === 0, JSON.stringify(first));
+    const session = 'pw_' + ctx.name;
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'sanity: the session must exist before the credential break');
+
+    // Now break credential resolution entirely: corrupt users.json.
+    await fsp.writeFile(ctx.env.PW_USERS_PATH, '{ not valid json');
+
+    const second = await runScript(ctx);
+    assert.notEqual(second.code, 0, 'an existing session must not be attached to once its owner cannot be verified');
+    assert.equal(second.timedOut, false, 'must refuse before ever reaching the ttyd exec');
+    assert.match(second.stderr, /stale|credential|owner/i);
+    // The underlying tmux session is left exactly as it was — this refuses
+    // to ATTACH to it, it does not destroy it.
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'the existing session itself must be left running, untouched');
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION (item 6, unified existing-session policy): an EXISTING session must NOT be attached to once its owner\'s fingerprint changes (token rotation) — fail closed', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_old') }] }));
+  try {
+    const first = await runScript(ctx);
+    assert.ok(first.timedOut || first.code === 0, JSON.stringify(first));
+    const session = 'pw_' + ctx.name;
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]));
+
+    // Rotate alice's token — the owner still resolves fine, but the
+    // fingerprint the session was stamped with no longer matches.
+    await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_new') }] }));
+
+    const second = await runScript(ctx);
+    assert.notEqual(second.code, 0, 'a stamped fingerprint that no longer matches the current owner must refuse to attach');
+    assert.equal(second.timedOut, false);
+    assert.match(second.stderr, /stale|fingerprint/i);
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'the existing session must be left running, untouched');
+  } finally { await teardown(ctx); }
+});
+
 test('SECURITY: no secret ever appears in the script\'s own stdout/stderr', { timeout: 15000 }, async () => {
   const secretKey = crypto.randomBytes(32).toString('hex');
   const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });

@@ -406,3 +406,30 @@ export async function pruneCredentials({ fsp, base, keep = [], owner = null, cur
   const plan = credentialExecutionPlan({ owner, currentUid });
   return plan.drop ? runJob(job, plan) : pruneUserCredentials({ fsp, base, keep });
 }
+
+// Has this user completed their own Claude login? Used ONLY to render a
+// status column (GET /api/users' claudeSignedIn) — never a security
+// decision — but it still must not let whoever's asking (possibly the root
+// dashboard) follow a symlink planted at this path into an arbitrary target.
+// lstat() (never stat()) is what makes that true: a symlink here is neither
+// followed nor ever considered "signed in".
+export async function userSignedIn({ fsp, base, username }) {
+  try {
+    const st = await fsp.lstat(path.join(userClaudeConfigDir(base, username), '.credentials.json'));
+    return st.isFile() && st.size > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Same in-process-or-dropped-helper shape as ensureUserCredentials/
+// pruneCredentials: when the dashboard is NOT the credential-tree's owning
+// account, this check runs inside the SAME privilege-dropped helper
+// (credential-writer.mjs) as every other read of that tree, rather than the
+// dashboard (often root) touching a pane-controlled path itself.
+export async function checkUserSignedIn({ fsp, base, username, owner = null, currentUid = null, runJob = null }) {
+  const job = { action: 'status', base, username };
+  const plan = credentialExecutionPlan({ owner, currentUid });
+  const result = plan.drop ? await runJob(job, plan) : { signedIn: await userSignedIn({ fsp, base, username }) };
+  return !!result.signedIn;
+}

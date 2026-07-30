@@ -11,6 +11,7 @@
 //
 //   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…}
 //         {"action":"prune","base":…,"keep":[…]}
+//         {"action":"status","base":…,"username":…}
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
 //
 // The job travels on stdin specifically so the GitHub token never appears in
@@ -20,7 +21,7 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
-import { applyCredentialJob, pruneUserCredentials } from './user-credentials.js';
+import { applyCredentialJob, pruneUserCredentials, userSignedIn } from './user-credentials.js';
 
 async function readStdin() {
   const chunks = [];
@@ -49,6 +50,8 @@ async function main() {
   try {
     const result = job.action === 'prune'
       ? await pruneUserCredentials({ fsp, base: job.base, keep: Array.isArray(job.keep) ? job.keep : [] })
+      : job.action === 'status'
+      ? { signedIn: await userSignedIn({ fsp, base: job.base, username: job.username }) }
       : await applyCredentialJob({
         fsp,
         base: job.base,
