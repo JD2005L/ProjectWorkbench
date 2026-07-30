@@ -1,12 +1,12 @@
-// Threading `terminationConfirmed` through git.js and checks.js.
+// Threading `terminationConfirmed` through git.js, checks.js, fingerprint.js and claude.js.
 //
 // `PrivilegeDropper._execTracked` attaches `terminationConfirmed` to an error only when the launch
 // was actually killed by a signal — never for an ordinary non-zero exit, which every check and most
-// git invocations are perfectly capable of on a red test or a missing ref. Both modules used to
-// discard whatever the exec layer attached, rebuilding a plain `{exitCode, stdout, stderr}` (or
-// `{ok, exitCode, ...}`) object from the caught error and dropping every other property. These tests
-// assert the field survives that rebuild — `false` only when a real kill could not be confirmed,
-// `null` for a check or a git command that simply failed on its own account.
+// git invocations are perfectly capable of on a red test or a missing ref. Several modules used to
+// discard whatever the exec layer attached, rebuilding a plain result object from the caught error
+// and dropping every other property. These tests assert the field survives that rebuild — `false`
+// only when a real kill could not be confirmed, `null` for a command that simply failed on its own
+// account.
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -19,6 +19,10 @@ import { runGit, repositoryBaseline, workingTreeFingerprint } from '../app/orche
 import { CheckRunner, diffStat } from '../app/orchestrator/checks.js';
 import { TmuxAdapter } from '../app/orchestrator/session.js';
 import { Publisher } from '../app/orchestrator/publish.js';
+import { probeBinaryFingerprint, FingerprintFailure } from '../app/orchestrator/runner/fingerprint.js';
+import { ClaudeCodeBackend } from '../app/orchestrator/runner/claude.js';
+import { loadOrchestratorConfig } from '../app/orchestrator/config.js';
+import { HealthState } from '../app/orchestrator/contract.js';
 
 const execFileAsync = promisify(execFile);
 const HAVE_GIT = await execFileAsync('git', ['--version']).then(() => true).catch(() => false);
@@ -492,5 +496,219 @@ gitTest('Publisher.publish: an ordinary gh failure (no remote PR host) is still 
     assert.notEqual(record.terminationConfirmed, false, 'gh being unavailable is an ordinary case, not a kill');
     assert.equal(record.remote_sha_verified, true, 'the push itself was real and must still be reported');
     assert.equal(record.pull_request_url, null);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fingerprint.js / claude.js — probing the CLI before a launch is exactly as capable of leaving an
+// unconfirmed descendant as the launch itself. `verifyConfiguration` runs its fingerprint probe, its
+// auth probe, and then a REAL bounded CLI launch, all in the SAME project workspace a job's write
+// lease protects. `probeBinaryFingerprint`'s `--version`/`--help` catches and `probeAuth`'s catch
+// discarded whatever verdict the exec layer attached — the identical "rebuild a plain result object,
+// drop everything else" pattern already fixed above for git.js/checks.js — so a probe that timed out
+// with a live, unconfirmed descendant let verification carry on into the actual CLI launch and, on an
+// ordinary success or failure there, report a normal answer with no fence at all.
+// ---------------------------------------------------------------------------
+
+/**
+ * A minimal *loadable* ELF header, followed by whatever body a test wants — a stand-in for a real
+ * binary, so `probeBinaryFingerprint`'s realpath/stat/ELF/hash checks all pass and only the injected
+ * `exec` controls what `--version`/`--help` (and, through `ClaudeCodeBackend`, `auth status` and the
+ * phase launch itself) report.
+ */
+function elfBinary(body) {
+  const header = Buffer.alloc(64);
+  header.write('\x7fELF', 0, 'latin1');
+  header[4] = 2; // EI_CLASS = ELFCLASS64
+  header[5] = 1; // EI_DATA = little-endian
+  header[6] = 1; // EI_VERSION
+  header.writeUInt16LE(2, 16); // e_type = ET_EXEC
+  return Buffer.concat([header, Buffer.from(body)]);
+}
+
+async function withFakeBinary(fn) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-fp-tv-'));
+  try {
+    const binary = path.join(dir, 'cli');
+    fs.writeFileSync(binary, elfBinary('fake binary contents'), { mode: 0o755 });
+    await fn(binary, dir);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function killedErr({ stdout = undefined, stderr = undefined } = {}) {
+  const err = new Error('killed, unconfirmed');
+  err.killed = true;
+  err.signal = 'SIGTERM';
+  err.terminationConfirmed = false;
+  if (stdout !== undefined) err.stdout = stdout;
+  if (stderr !== undefined) err.stderr = stderr;
+  return err;
+}
+
+// ---- probeBinaryFingerprint ----
+
+test('probeBinaryFingerprint: an unconfirmed kill on --version propagates terminationConfirmed:false, and --help never runs', async () => {
+  await withFakeBinary(async (binary) => {
+    let helpCalled = false;
+    const exec = async (file, args) => {
+      if (args[0] === '--help') { helpCalled = true; return { stdout: '--effort <level>\n(low, high)', stderr: '' }; }
+      throw killedErr();
+    };
+    const result = await probeBinaryFingerprint({ executable: binary, options: ['--effort'], exec });
+    assert.equal(result.ok, false);
+    assert.equal(result.terminationConfirmed, false, 'the verdict must survive the failure result being rebuilt');
+    assert.equal(helpCalled, false, '--help must never run once --version could not be confirmed dead');
+  });
+});
+
+test('probeBinaryFingerprint: an unconfirmed kill on --help propagates terminationConfirmed:false, even with partial output captured', async () => {
+  // The exact shape that previously fell through to `ok: true`: some CLIs print help to stderr and
+  // exit non-zero, which this module reads as a declaration for an ORDINARY failure — but a kill this
+  // module could not confirm dead must not be treated as that same shape just because some output
+  // happened to survive it.
+  await withFakeBinary(async (binary) => {
+    const exec = async (file, args) => {
+      if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+      throw killedErr({ stdout: '  --effort <level>   Effort\n                     (low, high)\n', stderr: '' });
+    };
+    const result = await probeBinaryFingerprint({ executable: binary, options: ['--effort'], exec });
+    assert.equal(result.ok, false, 'partial output must not be read as a successful declaration once the launch could not be confirmed dead');
+    assert.equal(result.terminationConfirmed, false);
+  });
+});
+
+test('probeBinaryFingerprint: an ordinary --version failure carries no termination verdict (control)', async () => {
+  await withFakeBinary(async (binary) => {
+    const exec = async () => { const err = new Error('Command failed'); err.code = 1; throw err; };
+    const result = await probeBinaryFingerprint({ executable: binary, options: ['--effort'], exec });
+    assert.equal(result.ok, false);
+    assert.equal(result.failure, FingerprintFailure.VERSION_UNAVAILABLE);
+    assert.equal(result.terminationConfirmed ?? null, null, 'an ordinary failure is not a kill and has no verdict to report');
+  });
+});
+
+test('probeBinaryFingerprint: an ordinary --help failure with partial output is still read as a declaration (control, unchanged)', async () => {
+  await withFakeBinary(async (binary) => {
+    const exec = async (file, args) => {
+      if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+      const err = new Error('Command failed');
+      err.code = 1; // ordinary, not a kill
+      err.stdout = '  --effort <level>   Effort\n                     (low, high)\n';
+      throw err;
+    };
+    const result = await probeBinaryFingerprint({ executable: binary, options: ['--effort'], exec });
+    assert.equal(result.ok, true, 'an ordinary non-zero exit with real help text on stdout is still a declaration');
+    assert.equal(result.terminationConfirmed ?? null, null);
+  });
+});
+
+// ---- ClaudeCodeBackend.probeAuth / verifyConfiguration ----
+
+const CLAUDE_CONFIG = (executable) => loadOrchestratorConfig({
+  PW_ORCHESTRATOR_ENABLED: 'true',
+  PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+  PW_ORCHESTRATOR_CLAUDE_BIN: executable,
+  // Container mode: nothing in front of the launch, so the injected `exec` sees the call directly —
+  // host-mode privilege dropping is covered on its own terms in orch-privilege.test.mjs.
+  PW_DEPLOY_MODE: 'container',
+});
+
+test('ClaudeCodeBackend.probeAuth: an unconfirmed kill propagates terminationConfirmed:false', async () => {
+  await withFakeBinary(async (binary) => {
+    const backend = new ClaudeCodeBackend({ config: CLAUDE_CONFIG(binary), exec: async () => { throw killedErr(); } });
+    const result = await backend.probeAuth();
+    assert.equal(result.state, HealthState.DOWN);
+    assert.equal(result.terminationConfirmed, false, 'the verdict must survive the failure response being rebuilt');
+  });
+});
+
+test('ClaudeCodeBackend.probeAuth: an ordinary failure carries no termination verdict (control)', async () => {
+  await withFakeBinary(async (binary) => {
+    const backend = new ClaudeCodeBackend({
+      config: CLAUDE_CONFIG(binary),
+      exec: async () => { const err = new Error('ENOENT'); err.code = 'ENOENT'; throw err; },
+    });
+    const result = await backend.probeAuth();
+    assert.equal(result.terminationConfirmed ?? null, null);
+  });
+});
+
+/** Everything `verifyConfiguration` needs beyond the fingerprint/auth probes it runs first. */
+function verifyCall(overrides = {}) {
+  return { requested: { model_alias: 'sonnet', effort: 'high' }, cwd: '/tmp', ...overrides };
+}
+
+test('ClaudeCodeBackend.verifyConfiguration: an unconfirmed kill on the fingerprint --version probe stops before the CLI is ever launched', async () => {
+  await withFakeBinary(async (binary) => {
+    let launchCalled = false;
+    const exec = async (file, args) => {
+      if (args[0] === '--version') throw killedErr();
+      if (args[0] === '--help') return { stdout: '--effort <level>\n(low, high)', stderr: '' };
+      if (args.includes('auth') && args.includes('status')) {
+        return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max' }), stderr: '' };
+      }
+      // The actual phase/CLI launch. Scripted to SUCCEED if it ever ran — deliberately, so a bug that
+      // let it run anyway would read as "verification worked", not be masked by an unrelated failure.
+      launchCalled = true;
+      return { stdout: '', stderr: '' };
+    };
+    const backend = new ClaudeCodeBackend({ config: CLAUDE_CONFIG(binary), exec });
+
+    await assert.rejects(
+      backend.verifyConfiguration(verifyCall()),
+      (err) => err.terminationConfirmed === false,
+      'verifyConfiguration must reject carrying the unconfirmed verdict, not proceed as though nothing happened',
+    );
+    assert.equal(launchCalled, false, 'the CLI must never be launched once an earlier probe could not confirm a kill was dead');
+  });
+});
+
+test('ClaudeCodeBackend.verifyConfiguration: an unconfirmed kill on probeAuth stops before the CLI is ever launched, even past a secondary ordinary error', async () => {
+  await withFakeBinary(async (binary) => {
+    let launchCalled = false;
+    const exec = async (file, args) => {
+      if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+      if (args[0] === '--help') return { stdout: '--effort <level>\n(low, high)', stderr: '' };
+      if (args.includes('auth') && args.includes('status')) throw killedErr();
+      // The actual phase/CLI launch, never reached — scripted to fail with an ORDINARY (non-kill)
+      // error if it somehow ran, so the sticky verdict from the probe is proven not to be replaceable
+      // by a later, unrelated failure reaching the caller instead.
+      launchCalled = true;
+      const err = new Error('Command failed');
+      err.code = 1;
+      throw err;
+    };
+    const backend = new ClaudeCodeBackend({ config: CLAUDE_CONFIG(binary), exec });
+
+    await assert.rejects(
+      backend.verifyConfiguration(verifyCall()),
+      (err) => err.terminationConfirmed === false,
+      'the probe kill must reach the caller, not be masked by a later ordinary failure',
+    );
+    assert.equal(launchCalled, false, 'the CLI must never be launched once probeAuth could not confirm a kill was dead');
+  });
+});
+
+test('ClaudeCodeBackend.verifyConfiguration: nothing killed anywhere still launches the CLI exactly once (control)', async () => {
+  await withFakeBinary(async (binary) => {
+    let launchCalls = 0;
+    const exec = async (file, args) => {
+      if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+      if (args[0] === '--help') return { stdout: '--effort <level>\n(low, high)', stderr: '' };
+      if (args.includes('auth') && args.includes('status')) {
+        return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty', subscriptionType: 'max' }), stderr: '' };
+      }
+      launchCalls += 1;
+      const init = JSON.stringify({ type: 'system', subtype: 'init', session_id: 's1', model: 'claude-sonnet-5', permissionMode: 'plan', apiKeySource: 'none' });
+      const result = JSON.stringify({ type: 'result', subtype: 'success', is_error: false, session_id: 's1', result: 'ready' });
+      return { stdout: `${init}\n${result}\n`, stderr: '' };
+    };
+    const backend = new ClaudeCodeBackend({ config: CLAUDE_CONFIG(binary), exec });
+
+    const outcome = await backend.verifyConfiguration(verifyCall());
+    assert.equal(launchCalls, 1, 'a probe with nothing unconfirmed must still reach the real launch, exactly once');
+    assert.ok(outcome);
   });
 });

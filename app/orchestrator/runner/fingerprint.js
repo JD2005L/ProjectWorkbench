@@ -230,7 +230,18 @@ export async function probeBinaryFingerprint({
         sha256,
       };
     }
-    return { ok: false, failure: FingerprintFailure.VERSION_UNAVAILABLE, detail: 'the coding CLI did not report a version', realpath, sha256 };
+    // This probe runs a real process exactly like the phase it is fingerprinting for, and can leave
+    // an unconfirmed descendant behind in the same way. Rebuilding a plain failure result below
+    // without this would silently drop that verdict — the caller (verifyConfiguration) would have no
+    // way to know a kill could not be confirmed, and would carry on into the actual CLI launch.
+    return {
+      ok: false,
+      failure: FingerprintFailure.VERSION_UNAVAILABLE,
+      detail: 'the coding CLI did not report a version',
+      realpath,
+      sha256,
+      terminationConfirmed: err?.terminationConfirmed ?? null,
+    };
   }
 
   let helpText;
@@ -238,6 +249,22 @@ export async function probeBinaryFingerprint({
     const { stdout } = await exec(realpath, ['--help'], { timeout: timeoutMs, maxBuffer: 8 * 1024 * 1024 });
     helpText = String(stdout);
   } catch (err) {
+    // A kill this module could not confirm dead is refused outright, before even asking whether some
+    // output happened to survive it: "some CLIs print help to stderr and exit non-zero, and that is
+    // still a declaration" is a rule for an ORDINARY failure, and treating a real, unconfirmed kill as
+    // though it were one just because stdout/stderr were non-empty would report success over exactly
+    // the condition this verdict exists to catch.
+    if (err?.terminationConfirmed === false) {
+      return {
+        ok: false,
+        failure: FingerprintFailure.HELP_UNAVAILABLE,
+        detail: 'the coding CLI did not declare its options',
+        realpath,
+        sha256,
+        version,
+        terminationConfirmed: false,
+      };
+    }
     // Some CLIs print help to stderr and exit non-zero; that is still a declaration.
     helpText = String(err?.stdout ?? '') + String(err?.stderr ?? '');
     if (!helpText.trim()) {

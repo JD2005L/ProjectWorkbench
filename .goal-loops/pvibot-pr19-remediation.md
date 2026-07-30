@@ -915,3 +915,86 @@ real `AbortSignal` reaches the child) instead of reference equality, with a comm
 * **Process hygiene.** One leaked marker-961 survivor from an earlier (pre-margin-fix) failing run
   found and killed after verification; the pre-existing unrelated `948.94305.3` process noted in prior
   rounds is still present and was left untouched, consistent with those rounds' own reasoning.
+
+## Round 9 — an independent exact-head review of 839a20c found the same "false → fallible work →
+## lost verdict" pattern one layer earlier: the probes BEFORE a launch, not just the launch itself
+
+Round 7 closed this pattern for `checks.js`'s artifact write and `engine.js`'s own persistence. The
+review found it was still open one call earlier, in the probes `verifyConfiguration` runs before the
+real CLI launch it protects with a lease: `probeBinaryFingerprint`'s `--version`/`--help` catches
+(`fingerprint.js`) and `ClaudeCodeBackend.probeAuth`'s catch (`claude.js`) both rebuilt a plain failure
+result from the caught error and dropped `terminationConfirmed` entirely — and `verifyConfiguration`
+never checked either probe's verdict before proceeding straight into the actual, lease-protected CLI
+launch. A probe that timed out with a live, unconfirmed descendant could not stop anything: the launch
+ran anyway, and on an ordinary outcome there, reported a normal answer with no fence at all — engine.js's
+own guards (`_guardTermination` at both call sites around `verifySession`) were already wired and
+already correctly tested (a round-3 regression), but had nothing to act on, because nothing upstream
+ever produced a `false` for them to see.
+
+### Audit
+
+Grepped every exec call site in both files (5 total: `fingerprint.js` `--version`/`--help`; `claude.js`
+`probeAuth`, `verifyConfiguration`'s own launch, `runPhase`'s own launch). Confirmed the review's claim
+exactly — the 3 it named were broken, the other 2 (`verifyConfiguration`'s and `runPhase`'s own launch
+catches) already propagated the verdict correctly from round 4. No further adjacent catches found.
+Traced the full downstream chain (`session.js`'s `verifySession`, `engine.js`'s guards) and found both
+already correct and already tested — `session.js`'s catch already does `err?.terminationConfirmed ??
+null`, so throwing (rather than returning normally) from `verifyConfiguration` reuses that existing,
+correct machinery with no changes needed there or in `engine.js`.
+
+### Fix
+
+* **`fingerprint.js` — `--version` catch.** Now returns `terminationConfirmed: err?.terminationConfirmed
+  ?? null` alongside the existing failure shape.
+* **`fingerprint.js` — `--help` catch.** A kill reported unconfirmed now returns failure immediately,
+  `terminationConfirmed: false` — *before* the existing "some CLIs print help to stderr and exit
+  non-zero, and that is still a declaration" fallback gets a chance to read partial stdout/stderr
+  captured despite the kill as though it were an ordinary declaration and report `ok: true` over it.
+  An ordinary (non-kill) failure with partial output is unchanged and still succeeds, proven by a
+  dedicated control test.
+* **`claude.js` — `probeAuth` catch.** Same addition: `terminationConfirmed: err?.terminationConfirmed
+  ?? null` on the existing `DOWN`/`UNKNOWN` response.
+* **`claude.js` — `verifyConfiguration`.** After computing `fingerprint` and `probedAuth` (both now
+  honest), a new check: if either reports `terminationConfirmed === false`, throw immediately —
+  `kind: 'phase_failed'`, `terminationConfirmed: false` — before the real CLI launch. Reuses the exact
+  shape the function's own existing launch-failure catch already produces, so every downstream consumer
+  (`session.js`'s catch, `engine.js`'s guard) needed no changes at all.
+
+### RED → GREEN
+
+9 new tests in `orch-termination-verdict.test.mjs`: `--version`/`--help` unconfirmed-kill propagation
+(the `--help` one specifically with partial output captured, proving the fallthrough is closed, not
+merely narrowed) plus their ordinary-failure controls; `probeAuth` unconfirmed-kill propagation plus its
+control; `verifyConfiguration` stopping before the CLI launch for an unconfirmed `--version` kill (the
+launch scripted to *succeed* if reached, so a regression would read as "verification worked", not be
+caught by an unrelated failure) and for an unconfirmed `probeAuth` kill (the launch scripted to fail with
+an *ordinary* error if reached — the adversarial "secondary ordinary error" case the review named
+explicitly, proving the sticky verdict cannot be masked by a later, unrelated failure reaching the
+caller instead); and a happy-path control proving the CLI still launches exactly once when nothing was
+ever killed. All 5 non-control tests failed against the pre-fix code with exactly the gaps described;
+all 9 pass against the fix. One integration test added to `orch-session.test.mjs`, exercising
+`session.js`'s real (unmodified) `verifySession` against a fake backend that throws the exact shape
+`verifyConfiguration`'s fix now produces — proving the full chain through to the response `engine.js`
+reads, with zero changes needed in `session.js` or `engine.js`.
+
+### Verification
+
+* **Focused:** the 9 new tests plus the 1 new integration test, 10/10 pass; full
+  `orch-termination-verdict.test.mjs` 37/37; full `orch-session.test.mjs` 13/13;
+  `orch-p1-regressions.test.mjs` (round 3's own engine-guard regression for this exact call path)
+  40/40, unaffected.
+* **Complete canonical suite, Node 20.18.1, default concurrent:** 535 pass, 3 skipped, 0 fail — run
+  twice, clean both times.
+* **Complete canonical suite, Node 20.18.1, serial diagnostic** (`--test-concurrency=1`): 535 pass, 3
+  skipped, 0 fail.
+* **Syntax.** `node --check` on `fingerprint.js`, `claude.js`, and both changed test files: clean.
+* **`git diff --check`**: clean.
+* **Security self-review.** Every change propagates a value `_execTracked` already computes — no new
+  exec call, no new argv/env surface, no change to what runs or how. `verifyConfiguration`'s new throw
+  reuses the identical `{kind, terminationConfirmed}` shape its own existing catch already produces, so
+  no new error shape reaches any consumer. Confirmed by grep that nothing else reads `fingerprint.
+  terminationConfirmed`/`probedAuth.terminationConfirmed` in a way this change could regress (the two
+  read-only health/attestation endpoints in `api.js` that call `backend.fingerprint()`/`probeAuth()`
+  directly are diagnostic, hold no lease, and chain no further fallible work — out of scope, left
+  untouched).
+* App VERSION bumped `1.26.0730.1610` → `1.26.0730.1630`.

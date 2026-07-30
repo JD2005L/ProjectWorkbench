@@ -273,6 +273,11 @@ export class ClaudeCodeBackend {
         // Inconclusive: not a positive finding of API billing, so it must not override the session's
         // own report either way.
         auth_mode: null,
+        // This probe runs in the same workspace a job's write lease protects and is exactly as
+        // capable of leaving an unconfirmed descendant as the phase it precedes. Rebuilding a plain
+        // failure response without this would silently drop that verdict before `verifyConfiguration`
+        // ever saw it.
+        terminationConfirmed: err?.terminationConfirmed ?? null,
       };
     }
 
@@ -384,6 +389,20 @@ export class ClaudeCodeBackend {
     // and the binary that was attested need not be the same file.
     const fingerprint = await this.fingerprint();
     const probedAuth = await this.probeAuth().catch(() => null);
+
+    // Both probes above run a real process in this same workspace, exactly as capable of leaving an
+    // unconfirmed descendant as the launch below — and each already discards nothing now, per the
+    // fixes to `probeBinaryFingerprint`/`probeAuth` themselves. What was still missing is this: never
+    // launch the actual CLI at all once either has already reported a kill it could not confirm dead.
+    // Without this, an unconfirmed probe carried on into a real launch and, on an ordinary success or
+    // failure there, reported a normal answer with no fence — exactly the same "false → fallible work
+    // → lost verdict" shape already closed for checks.js's artifact writes.
+    if (fingerprint?.terminationConfirmed === false || probedAuth?.terminationConfirmed === false) {
+      const error = new Error('a probe before the launch could not confirm a kill was actually dead');
+      error.kind = 'phase_failed';
+      error.terminationConfirmed = false;
+      throw error;
+    }
 
     let stdout = '';
     let stderr = '';
