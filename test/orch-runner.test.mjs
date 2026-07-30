@@ -566,6 +566,12 @@ test('runner: SECURITY REGRESSION — a forbidden key smuggled via credentialTok
   const config = loadOrchestratorConfig({
     PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
     PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+    // The default backend privilege-drops via a REAL PrivilegeDropper (see below — this test spawns
+    // a live child process), which resolves PW_ORCHESTRATOR_TMUX_USER through the real passwd
+    // database. The config default ('admin') only exists on CT2115; portable across hosts (including
+    // GitHub's runners, which have no 'admin' account) means naming the account this process is
+    // actually running as, exactly like the INTEGRATION test below does.
+    PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username,
   });
   const exec = async (file, args, options) => {
     if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
@@ -640,6 +646,10 @@ test('runner: REGRESSION — the resolved credential env reaches a REAL spawned 
   const config = loadOrchestratorConfig({
     PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
     PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+    // See the SECURITY REGRESSION test above: this spawns a live child process through the real
+    // PrivilegeDropper, so the drop target must be an account that actually exists on whatever host
+    // runs this test — the account this process is running as, not the production default.
+    PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username,
   });
   const exec = async (file, args, options) => {
     if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
