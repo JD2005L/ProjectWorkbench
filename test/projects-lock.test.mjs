@@ -71,9 +71,20 @@ async function waitUp(inst) {
 }
 
 async function killAll(procs) {
+  const pids = procs.map((p) => p.pid);
   for (const p of procs) { try { p.kill('SIGTERM'); } catch { /* already gone */ } }
   await new Promise((r) => setTimeout(r, 200));
   for (const p of procs) { if (p.exitCode === null) { try { p.kill('SIGKILL'); } catch { /* fine */ } } }
+  // PW_ISOLATED auto-derives a tmux socket ('pwprev-' + each server's own
+  // pid) the instant a route touches tmux (e.g. /manage/add's startProject);
+  // nothing else ever cleaned those servers up, so they leaked indefinitely
+  // across every run — a real contributor to "fork failed: No space left on
+  // device" under load. Harmless no-op for a run that never touched tmux.
+  await Promise.all(pids.map((pid) => new Promise((resolve) => {
+    const tk = spawn('tmux', ['-L', `pwprev-${pid}`, 'kill-server']);
+    tk.on('exit', resolve);
+    tk.on('error', resolve);
+  })));
 }
 
 test('REGRESSION: two REAL dashboard processes creating DIFFERENT projects concurrently never lose one to a cross-process last-write-wins race', { timeout: 60000 }, async () => {

@@ -76,6 +76,14 @@ async function withServer(inst, port, fn) {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 150));
     if (child.exitCode === null) child.kill('SIGKILL');
+    // See test/deploy-route.test.mjs's identical cleanup for why: PW_ISOLATED
+    // auto-derives a tmux socket keyed to this server's own pid, and nothing
+    // else ever cleans that server up.
+    await new Promise((resolve) => {
+      const tk = spawn('tmux', ['-L', `pwprev-${child.pid}`, 'kill-server']);
+      tk.on('exit', resolve);
+      tk.on('error', resolve);
+    });
     fs.rmSync(inst.dir, { recursive: true, force: true });
   }
 }

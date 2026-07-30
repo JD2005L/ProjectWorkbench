@@ -2688,26 +2688,48 @@ app.post(BASE + '/api/auth/login', async (req,res) => {
   const username = String(req.body?.username || '').trim();
   const password = String(req.body?.password || '');
   if(!username || !password){ await audit('login_fail', { reason:'missing-fields', username }, req); return res.status(400).json({ ok:false, error:'Username and password required' }); }
-  let u = null;
-  try { u = await authenticate(username, password); }
-  catch(e){ await audit('login_fail', { reason:'ldap-bind', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  if(!u){ await audit('login_fail', { reason:'invalid', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  // Record lastLoginAt opportunistically (best-effort; the store re-reads so this
-  // cannot revert a change made while the directory bind above was in flight).
-  // Deliberately BEFORE createSession(): the users lock and the sessions lock
-  // are two separate cross-process locks (app/lifecycle-lock.js), and
-  // DELETE /api/users/:username holds the users lock for its ENTIRE
-  // operation while nesting a sessions-lock acquisition inside it (to purge
-  // the deleted user's sessions). One consistent global order — users lock
-  // always before sessions lock, never the reverse, never held across the
-  // other — rules out a login-vs-delete lock-ordering deadlock by
-  // construction rather than by coincidence.
-  try { await withUsersLock((users)=>{ const rec = users.find(x => x.id === u.id); if(!rec) return false; rec.lastLoginAt = new Date().toISOString(); }); } catch {}
-  const sid = await createSession(u.id);
-  setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
-  req.user = u;
+  // The ENTIRE login flow — authenticate (password verification against the
+  // CURRENT users.json), the lastLoginAt update, and session creation — runs
+  // inside ONE acquisition of the cross-process users lifecycle lock,
+  // nesting session creation inside it exactly like DELETE
+  // /api/users/:username already nests its own session purge (users lock
+  // outer, sessions lock inner: one consistent global order, never the
+  // reverse, never held across the other — rules out a login-vs-delete
+  // lock-ordering deadlock by construction).
+  //
+  // This closes a real orphaned-session race: authenticate() used to read
+  // users.json OUTSIDE any lock DELETE also respected, so a login racing a
+  // concurrent delete of the SAME account could authenticate against a
+  // user record that was about to be removed, and create a session AFTER
+  // DELETE's session-purge step had already run against an already-vacated
+  // victim. Now, whichever of the two critical sections runs first is
+  // authoritative for the other: if DELETE runs first, a subsequent login's
+  // authenticate() (reading users.json fresh, from inside the SAME lock)
+  // correctly fails closed with 401 and creates no session; if login runs
+  // first, it fully completes (session included) before DELETE can even
+  // start, so DELETE's own fresh read of sessions.json sees and purges that
+  // session too. Either ordering: no orphan, no revived session.
+  const outcome = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+   let u = null;
+   try { u = await authenticate(username, password); }
+   catch(e){ return { authError: 'ldap-bind' }; }
+   if(!u) return { authError: 'invalid' };
+   try {
+    const users = await loadUsers();
+    const rec = users.find(x => x.id === u.id);
+    if(rec){ rec.lastLoginAt = new Date().toISOString(); await saveUsers(users); }
+   } catch { /* best-effort; never fails the login itself */ }
+   const sid = await createSession(u.id);
+   return { user: u, sid };
+  });
+  if(outcome.authError){
+   await audit('login_fail', { reason: outcome.authError, username }, req);
+   return res.status(401).json({ ok:false, error:'Invalid username or password' });
+  }
+  setSessionCookie(req, res, outcome.sid, Math.floor(SESSION_TTL_MS / 1000));
+  req.user = outcome.user;
   await audit('login_ok', { username }, req);
-  res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
+  res.json({ ok:true, user: { username:outcome.user.username, role:outcome.user.role, projects:outcome.user.projects } });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 

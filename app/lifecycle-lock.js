@@ -1,252 +1,144 @@
 // Cross-process serialization for the user lifecycle (rename / delete /
-// reconcile). app/user-store.js's `tail` promise chain only ever serialized
-// requests handled by ONE Node process; two dashboard processes (a rolling
-// restart overlapping the old and new instance, a second instance, a CLI
-// tool) racing the same users.json + projects.json + credential-tree
-// read-modify-write had no coordination at all across that boundary.
+// reconcile), and now also for sessions.json and projects.json (rounds 4-5).
 //
-// This is a plain lockfile — no native deps, matching the rest of this
-// codebase (no better-sqlite3, no flock binding). It went through two
-// designs:
+// This has gone through three designs:
 //
-//   v1 (round 3) recorded a bare "pid\ntimestamp\n" and released/reclaimed by
-//   blindly unlinking whatever was at the lock path. That is an ABA/TOCTOU
-//   bug: the staleness *decision* (read the path, judge dead-or-old) and the
-//   *action* (unlink the path) are two separate steps with an unbounded gap
-//   between them. Empirically (see .goal-loops/pvibot-pr20-remediation.md,
-//   round 4), a waiter could observe an ambiguous/absent lock file during the
-//   narrow window where a holder had just released and was already
-//   reacquiring for its next iteration, judge it "stale", and then its
-//   *delayed* unlink executed only once that holder's brand-new, fully valid
-//   successor lock was in place — deleting a live lock out from under its
-//   legitimate owner and producing a real lost update (confirmed: two real
-//   node processes racing lost up to 7 of 80 increments).
+//   v1 (round 3): a bare "pid\ntimestamp\n" lockfile, released/reclaimed by
+//   blindly unlinking whatever was at the lock path. ABA/TOCTOU: the
+//   staleness DECISION and the unlink ACTION were separate steps with a gap
+//   between them, so a waiter could delete a brand-new successor lock.
 //
-//   v2 (this file) closes that gap with three changes:
-//     1. Publication is atomic: the full {pid, startTicks, token,
-//        acquiredAt} record is written to a private temp file first, then
-//        published with link() (an atomic, exclusive-create op). A lock file
-//        is therefore NEVER visible half-written — any reader sees either
-//        nothing or a complete, parseable record.
-//     2. Every acquisition carries an unguessable owner token (random bytes)
-//        plus the owning process's PID *and* start time (from
-//        /proc/<pid>/stat, ticks since boot) so a liveness check can't be
-//        fooled by PID reuse (dead pid recycled by an unrelated live one).
-//     3. Removal — both a holder's own release and a waiter's stale-lock
-//        reclaim — never unlinks by path. It first rename()s the lock path
-//        to a private, uniquely-named claim file. rename() is atomic: of any
-//        number of concurrent renamers of the same source path, exactly one
-//        succeeds and the rest get ENOENT — so exactly one actor ever ends up
-//        exclusively holding the file that WAS there, decoupled from
-//        whatever gets published at that path next. Only after that exclusive
-//        claim does the code inspect the content and decide to delete it
-//        (this exact instance, verified) or restore it (link() it back,
-//        itself exclusive/atomic, so it can never clobber a fresh successor
-//        that legitimately republished at the path in the meantime).
-import crypto from 'node:crypto';
+//   v2 (round 4): closed that specific gap with an owner token + pid/start-
+//   time identity, atomic tmp-file+link publication, and rename()-based
+//   "claim, then decide" reclaim. That closed the ORIGINAL empty-file
+//   misjudgment bug, but round 6's adversarial review found the design was
+//   still fundamentally unsound: `tryReclaim()`'s rename() ALWAYS vacates the
+//   lock path the instant it runs, even against a lock that turns out to be
+//   perfectly live — and during that vacancy, a third party's fresh
+//   acquisition can slip into the now-empty path and run concurrently with
+//   the still-active original holder. Confirmed directly: calling
+//   `tryReclaim()` against a genuinely active holder produces a real,
+//   reproducible critical-section overlap. Any "quarantine by rename, decide
+//   after" design has this hole structurally — the moment the path is
+//   vacated, ANYTHING can fill it, and "restore if the path is still free"
+//   only prevents clobbering the interloper, not the interloper existing
+//   concurrently with the original holder in the first place.
+//
+//   v3 (this file): abandons path-based staleness/quarantine entirely in
+//   favor of a real kernel flock(2) lock, which has no "vacancy window" by
+//   construction — flock is a property of an open file description, not of
+//   the path, and the kernel enforces mutual exclusion directly. No PID
+//   liveness heuristic, no start-time/PID-reuse guard, no stale-timeout
+//   guess: none of that machinery is needed, because there is no userspace
+//   staleness JUDGMENT to get wrong. A crashed holder's lock releases
+//   automatically the instant the kernel reclaims its file descriptors —
+//   including on SIGKILL — with zero code on our side.
+//
+// Node has no flock(2) binding without a native addon (disallowed here — no
+// native deps, matching the rest of this codebase). The trick: open the lock
+// file ourselves (O_NOFOLLOW, refusing a symlink; reject anything that isn't
+// a plain regular file), then spawn the external `flock(1)` binary
+// (util-linux, present on every target host) with that already-open file
+// descriptor INHERITED — not a path. flock(1) given a bare fd number (no
+// command to run) calls flock(2) on it and exits; the lock is then held by
+// whichever open file description that fd refers to — which is OUR fd, not
+// the short-lived child's — for as long as we keep it open. Closing it (or
+// the whole process dying, for ANY reason, including SIGKILL) is what
+// releases the lock; the kernel guarantees this, we do not implement it.
+// flock(1) never touches the lock PATH itself in this design (it only ever
+// sees a bare fd number), so it cannot be tricked by a symlink either — that
+// risk is fully handled by our own O_NOFOLLOW open before flock ever runs.
+import { constants as fsConstants } from 'node:fs';
 import fsp from 'node:fs/promises';
+import { spawn } from 'node:child_process';
 import path from 'node:path';
 
-function isProcessAlive(pid) {
+const FLOCK_CANDIDATES = ['/usr/bin/flock', '/bin/flock'];
+let resolvedFlockBinaryPromise;
+
+// Validate the flock(1) binary itself: a real, non-symlinked, regular,
+// executable file at one of a fixed set of absolute paths. Refusing a
+// symlink here closes off substituting the helper binary itself.
+function resolveFlockBinary() {
+  if (!resolvedFlockBinaryPromise) {
+    resolvedFlockBinaryPromise = (async () => {
+      for (const candidate of FLOCK_CANDIDATES) {
+        let st;
+        try {
+          st = await fsp.lstat(candidate);
+        } catch {
+          continue;
+        }
+        if (!st.isFile()) continue; // false for a symlink (lstat, not stat) and for any non-regular type
+        if (!(st.mode & 0o111)) continue;
+        return candidate;
+      }
+      throw new Error(`lifecycle lock: no usable flock(1) binary found (checked ${FLOCK_CANDIDATES.join(', ')})`);
+    })();
+  }
+  return resolvedFlockBinaryPromise;
+}
+
+// Opens (creating if needed) the lock file, refusing to follow a symlink at
+// the final path component (O_NOFOLLOW) and refusing anything that is not a
+// plain regular file once opened. The file's CONTENT is never read or
+// written by this module — it exists purely as a flock(2) target; the
+// lock's identity is the kernel's open-file-description, not anything
+// stored in the file, so a "persistent unlocked inode" between acquisitions
+// is expected and harmless.
+async function openValidatedLockFile(lockPath) {
+  const flags = fsConstants.O_RDWR | fsConstants.O_CREAT | fsConstants.O_NOFOLLOW;
+  const fh = await fsp.open(lockPath, flags, 0o600);
   try {
-    process.kill(pid, 0);
-    return true;
+    const st = await fh.stat();
+    if (!st.isFile()) throw new Error(`lifecycle lock: refusing a non-regular-file lock target: ${lockPath}`);
+    return fh;
   } catch (e) {
-    // ESRCH: no such process. EPERM: it exists but we can't signal it —
-    // still alive. Anything else, assume alive rather than guess wrong.
-    return e.code !== 'ESRCH';
-  }
-}
-
-// Ticks since boot the given pid started at, from /proc — the same
-// signal-free liveness-identity source used by scripts/pw-tmux-save. Field 22
-// of /proc/<pid>/stat (starttime); parsing skips past the "(comm)" field,
-// which can itself contain spaces/parens, exactly like that script does.
-// Returns null (never throws) if unavailable — non-Linux, pid gone, or
-// malformed content — callers must treat null as "can't verify further"
-// rather than as a mismatch.
-async function getStartTicks(pid) {
-  try {
-    const raw = await fsp.readFile(`/proc/${pid}/stat`, 'utf8');
-    const rest = raw.slice(raw.lastIndexOf(') ') + 2);
-    const fields = rest.trim().split(/\s+/);
-    const ticks = Number(fields[19]);
-    return Number.isFinite(ticks) ? ticks : null;
-  } catch {
-    return null;
-  }
-}
-
-let ownStartTicksPromise;
-function getOwnStartTicks() {
-  if (!ownStartTicksPromise) ownStartTicksPromise = getStartTicks(process.pid);
-  return ownStartTicksPromise;
-}
-
-// Is the recorded owner still THE SAME live process — not merely a live
-// process that happens to reuse a recycled pid? startTicks may be null (older
-// record, or /proc was unavailable when it was written); in that case we
-// fall back to pid liveness alone, same as before.
-async function isOwnerAlive(pid, startTicks) {
-  if (!isProcessAlive(pid)) return false;
-  if (startTicks == null) return true;
-  const current = await getStartTicks(pid);
-  if (current == null) return true; // can't verify further; trust liveness
-  return current === startTicks;
-}
-
-async function readLockInfo(lockPath) {
-  let raw;
-  try {
-    raw = await fsp.readFile(lockPath, 'utf8');
-  } catch {
-    return null;
-  }
-  try {
-    const info = JSON.parse(raw);
-    if (!info || !Number.isFinite(info.pid) || typeof info.token !== 'string' || !info.token) return null;
-    return info;
-  } catch {
-    return null;
-  }
-}
-
-// Publish `info` at `lockPath`, failing EEXIST if something is already there.
-// Content is written to a private temp file FIRST and made visible with a
-// single atomic link() — lockPath never exists half-written.
-async function publish(lockPath, info) {
-  const tmpPath = `${lockPath}.tmp-${info.token}`;
-  await fsp.writeFile(tmpPath, JSON.stringify(info), { mode: 0o600 });
-  try {
-    await fsp.link(tmpPath, lockPath);
-  } finally {
-    await fsp.rm(tmpPath, { force: true }).catch(() => {});
-  }
-}
-
-// Atomically claim exclusive ownership of whatever is currently at
-// `lockPath`, moving it to a private path only this call knows about.
-// Returns the claim path, or null if lockPath was already gone (someone else
-// got there first — nothing for the caller to act on).
-async function claimExclusive(lockPath) {
-  const claimPath = `${lockPath}.claim-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
-  try {
-    await fsp.rename(lockPath, claimPath);
-  } catch (e) {
-    if (e.code === 'ENOENT') return null;
+    await fh.close().catch(() => {});
     throw e;
   }
-  return claimPath;
 }
 
-// Put a claimed file back at lockPath, but only if lockPath is still free —
-// link() is exclusive/atomic, so this can never clobber a fresh lock that a
-// legitimate new holder published while we held the claim.
-async function restoreIfFree(claimPath, lockPath) {
-  try {
-    await fsp.link(claimPath, lockPath);
-  } catch (e) {
-    if (e.code !== 'EEXIST') throw e;
-  } finally {
-    await fsp.rm(claimPath, { force: true }).catch(() => {});
-  }
-}
-
-// A holder releasing its OWN lock: claim whatever is at lockPath, and delete
-// it ONLY if it is verified to be the exact instance (matching token) this
-// call acquired. Anything else — however that could happen — is restored,
-// never destroyed.
-async function releaseOwned(lockPath, token) {
-  const claimPath = await claimExclusive(lockPath);
-  if (!claimPath) return; // already gone; nothing of ours to release
-  const info = await readLockInfo(claimPath);
-  if (info && info.token === token) {
-    await fsp.rm(claimPath, { force: true }).catch(() => {});
-  } else {
-    await restoreIfFree(claimPath, lockPath);
-  }
-}
-
-// A waiter attempting to reclaim what LOOKS like a stale lock: claim
-// exclusively first, then make the stale/not-stale decision fresh on the
-// exact instance now held — never on an earlier, separately-read snapshot.
-// If it turns out to still be live (or a fresh successor already replaced
-// it), restore it untouched.
-async function tryReclaim(lockPath) {
-  const claimPath = await claimExclusive(lockPath);
-  if (!claimPath) return;
-  const info = await readLockInfo(claimPath);
-  const stale = info ? !(await isOwnerAlive(info.pid, info.startTicks)) : true;
-  if (stale) {
-    await fsp.rm(claimPath, { force: true }).catch(() => {});
-  } else {
-    await restoreIfFree(claimPath, lockPath);
-  }
-}
-
-export async function withLifecycleLock(lockPath, fn, { staleMs = 60000, retryMs = 20, timeoutMs = 15000 } = {}) {
-  const start = Date.now();
-  await fsp.mkdir(path.dirname(lockPath), { recursive: true });
-  const token = crypto.randomBytes(16).toString('hex');
-  const startTicks = await getOwnStartTicks();
-
-  for (;;) {
+// Runs flock(1) against an inherited fd (never a path — see module notes)
+// and resolves once the CHILD exits: exit 0 means the flock(2) call
+// succeeded, meaning `fd`'s open file description is now locked and stays
+// locked for as long as the caller keeps `fd` open, regardless of this
+// short-lived child having already exited.
+function acquireViaChild(flockBin, fd, timeoutSec) {
+  return new Promise((resolve, reject) => {
+    let child;
     try {
-      await publish(lockPath, { pid: process.pid, startTicks, token, acquiredAt: new Date().toISOString() });
-      break;
+      child = spawn(flockBin, ['-x', '-w', String(timeoutSec), '3'], { stdio: ['ignore', 'ignore', 'pipe', fd] });
     } catch (e) {
-      if (e.code !== 'EEXIST') throw e;
-
-      // Cheap, non-destructive read to decide whether reclaiming is even
-      // worth attempting. Because publish() is atomic, a visible lock file is
-      // NEVER half-written, so this read is reliable — but a live holder's
-      // lock is still never touched based on it alone: only the exclusive
-      // claim-and-reverify in tryReclaim() is allowed to actually remove
-      // anything.
-      const info = await readLockInfo(lockPath);
-      let candidateStale;
-      if (info) {
-        candidateStale = !(await isOwnerAlive(info.pid, info.startTicks));
-      } else {
-        const st = await fsp.stat(lockPath).catch(() => null);
-        if (!st) continue; // vanished since our failed publish(); just retry
-        // Genuinely unparseable AND present is corruption, not a writer
-        // mid-flight (publish() can't leave that state) — age-gate it
-        // conservatively rather than assume it's ours to break.
-        candidateStale = Date.now() - st.mtimeMs > staleMs;
-      }
-
-      if (candidateStale) {
-        await tryReclaim(lockPath);
-        continue; // reclaimed, restored, or already gone — retry publish()
-      }
-
-      if (Date.now() - start > timeoutMs) {
-        throw new Error(`lifecycle lock timed out waiting for ${lockPath} (held by pid ${info?.pid ?? '?'})`);
-      }
-      await new Promise((r) => setTimeout(r, retryMs));
+      reject(e);
+      return;
     }
-  }
+    let stderr = '';
+    child.stderr.on('data', (d) => { stderr += d; });
+    child.on('error', reject);
+    child.on('exit', (code, signal) => resolve({ code, signal, stderr }));
+  });
+}
 
+export async function withLifecycleLock(lockPath, fn, { timeoutMs = 15000 } = {}) {
+  await fsp.mkdir(path.dirname(lockPath), { recursive: true });
+  const flockBin = await resolveFlockBinary();
+  const fh = await openValidatedLockFile(lockPath);
   try {
+    const timeoutSec = Math.max(1, Math.ceil(timeoutMs / 1000));
+    const { code, signal, stderr } = await acquireViaChild(flockBin, fh.fd, timeoutSec);
+    if (code !== 0) {
+      throw new Error(
+        `lifecycle lock timed out or failed waiting for ${lockPath} ` +
+        `(flock exit ${code}${signal ? `, signal ${signal}` : ''}${stderr.trim() ? `: ${stderr.trim()}` : ''})`,
+      );
+    }
     return await fn();
   } finally {
-    await releaseOwned(lockPath, token);
+    // Releasing is just closing our fd: flock(2) is scoped to the open file
+    // description, so this is the ENTIRE release step — no unlink, no
+    // rename, no separate "am I still the owner" check, because there was
+    // never a userspace ownership record to get out of sync with reality.
+    await fh.close().catch(() => {});
   }
 }
-
-// Test-only internals. NOT part of this module's public contract — exported
-// solely so test/lifecycle-lock.test.mjs can construct exact, deterministic
-// races (e.g. a successor publishing at a path the instant a stale instance
-// is claimed away from it) instead of relying purely on real-world timing.
-export const _internal = {
-  isProcessAlive,
-  getStartTicks,
-  isOwnerAlive,
-  readLockInfo,
-  publish,
-  claimExclusive,
-  restoreIfFree,
-  releaseOwned,
-  tryReclaim,
-};

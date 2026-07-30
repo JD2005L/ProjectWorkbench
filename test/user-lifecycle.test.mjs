@@ -113,6 +113,14 @@ async function withServer(inst, port, fn) {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 150));
     if (child.exitCode === null) child.kill('SIGKILL');
+    // See test/deploy-route.test.mjs's identical cleanup for why: PW_ISOLATED
+    // auto-derives a tmux socket keyed to this server's own pid, and nothing
+    // else ever cleans that server up.
+    await new Promise((resolve) => {
+      const tk = spawn('tmux', ['-L', `pwprev-${child.pid}`, 'kill-server']);
+      tk.on('exit', resolve);
+      tk.on('error', resolve);
+    });
     fs.rmSync(inst.dir, { recursive: true, force: true });
   }
 }
@@ -311,45 +319,76 @@ function decryptToken(secretKeyHex, ciphertext) {
   return decipher.update(enc, null, 'utf8') + decipher.final('utf8');
 }
 
-test('REGRESSION: two racing token updates deterministically leave the NEWER one (B) in both users.json and the derived credential file', { timeout: 30000 }, async () => {
-  // update()'s effect runs inside the SAME serialized tail as the commit
-  // (app/user-store.js), so whichever request's handler calls
-  // userStore.update() SECOND cannot even start its own commit until the
-  // FIRST request's entire commit+effect has finished — there is no window
-  // for the two to interleave. Firing A then B back-to-back (same tick, no
-  // await between) without awaiting A first reliably reproduces "A is still
-  // the one in flight when B arrives", i.e. exactly the scenario a
-  // stale-snapshot bug would get wrong; empirically 30/30 locally. This is
-  // the ordering claim itself; the exact "delayed A must not clobber B"
-  // mechanism is proven with a fully controlled clock in
-  // test/user-store.test.mjs.
+test('REGRESSION: two racing token updates deterministically leave the LATER commit in both users.json and the derived credential file', { timeout: 30000 }, async () => {
+  // Round 6, item E: the previous version of this test fired A then B
+  // "back-to-back, same tick" and simply ASSUMED that issue order predicts
+  // commit order — i.e. that A necessarily arrives at, and is committed by,
+  // the server before B. Nothing enforces that for two genuinely concurrent
+  // HTTP requests: under load (a busy shared host, GC pause, scheduler
+  // jitter) B can easily reach the server's handler first, in which case A
+  // commits last and the hardcoded "must be ghp_B" assertion fails — not
+  // because the lock lost an update, but because the test predicted the
+  // wrong winner. This is exactly the "racing token update expected B but
+  // got A" flake.
+  //
+  // Fixed with a REAL barrier instead of a timing assumption: the "later"
+  // request's body is sent via a stream that withholds its bytes until the
+  // "earlier" request's response has been fully received. express.json()
+  // cannot even begin parsing — let alone invoke the route handler — before
+  // a request's body is complete, so the withheld request's commit is
+  // provably unable to start until the other one's has entirely finished.
+  // This was verified directly against a minimal http.createServer() probe
+  // before being applied here: the deliberately-withheld request's handler
+  // always runs strictly after the other's, regardless of which fetch() call
+  // appears first in the source.
   const port = 3907;
   const inst = makeInstance(port);
   const proj = seedProject(inst, 'demo', { git: true });
   writeProjects(inst, [{ name: 'demo', path: proj, port: 7818, primaryUser: 'alice' }]);
   writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
   await withServer(inst, port, async (base) => {
-    const patch = (ghToken) => fetch(`${base}/api/users/alice`, {
+    const fastPatch = (ghToken) => fetch(`${base}/api/users/alice`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ghToken }),
     }).then((r) => r.json());
 
-    const pA = patch('ghp_A');
-    const pB = patch('ghp_B'); // fired immediately after, NOT awaited between
-    const [a, b] = await Promise.all([pA, pB]);
-    assert.ok(a.ok && b.ok, JSON.stringify({ a, b }));
+    // The withheld request: its body only completes once `gate` resolves,
+    // so its commit is guaranteed to start after whatever the caller awaits
+    // before resolving that gate.
+    function withheldPatch(ghToken, gate) {
+      const payload = JSON.stringify({ ghToken });
+      const stream = new ReadableStream({
+        async start(controller) {
+          await gate;
+          controller.enqueue(new TextEncoder().encode(payload));
+          controller.close();
+        },
+      });
+      return fetch(`${base}/api/users/alice`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: stream, duplex: 'half',
+      }).then((r) => r.json());
+    }
+
+    let openGate;
+    const gate = new Promise((resolve) => { openGate = resolve; });
+    const later = withheldPatch('ghp_LATER', gate); // its body arrives only once released below
+    const earlier = await fastPatch('ghp_EARLIER'); // provably fully committed before the gate opens
+    assert.ok(earlier.ok, JSON.stringify(earlier));
+    openGate();
+    const laterResult = await later;
+    assert.ok(laterResult.ok, JSON.stringify(laterResult));
 
     // Independent verification #1: decrypt users.json's OWN ciphertext directly
     // off disk — no HTTP round-trip, no route logic involved in the check.
     const onDisk = JSON.parse(fs.readFileSync(inst.env.PW_USERS_PATH, 'utf8'));
     const aliceRecord = onDisk.users.find((u) => u.username === 'alice');
     const usersJsonToken = decryptToken(inst.secretKey, aliceRecord.ghToken);
-    assert.equal(usersJsonToken, 'ghp_B', 'users.json must hold the NEWER commit');
+    assert.equal(usersJsonToken, 'ghp_LATER', 'users.json must hold the commit that was provably later, not whichever the test happened to issue first');
 
     // Independent verification #2: read the derived git credential file
     // directly — no mutating "check" (a resync PATCH) that could itself
     // paper over a divergence between the two.
     const fileToken = readGhTokenFromCredFile(proj);
-    assert.equal(fileToken, 'ghp_B', 'the derived credential file must match — not whichever effect happened to run last in real time');
+    assert.equal(fileToken, 'ghp_LATER', 'the derived credential file must match — not whichever effect happened to run last in real time');
   });
 });
 
@@ -418,11 +457,19 @@ async function withServerKeepDir(inst, port, fn) {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 150));
     if (child.exitCode === null) child.kill('SIGKILL');
+    // See test/deploy-route.test.mjs's identical cleanup for why: PW_ISOLATED
+    // auto-derives a tmux socket keyed to this server's own pid, and nothing
+    // else ever cleans that server up.
+    await new Promise((resolve) => {
+      const tk = spawn('tmux', ['-L', `pwprev-${child.pid}`, 'kill-server']);
+      tk.on('exit', resolve);
+      tk.on('error', resolve);
+    });
   }
 }
 
 test('REGRESSION: a real per-user stamp left over from when the feature was ON reads stale once the feature is toggled OFF', { timeout: 30000 }, async () => {
-  const port = 3920;
+  const port = 3937; // NOT 3920: that port is used by test/user-lifecycle-locking.test.mjs, and the two files run concurrently under default (parallel) test concurrency
   const sock = 'pw-toggle-' + crypto.randomBytes(4).toString('hex');
   const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true', PW_TMUX_SOCKET: sock });
   const proj = seedProject(inst, 'demo');

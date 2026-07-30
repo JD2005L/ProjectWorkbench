@@ -91,6 +91,17 @@ async function withServer(inst, port, fn) {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 150));
     if (child.exitCode === null) child.kill('SIGKILL');
+    // PW_ISOLATED auto-derives a tmux socket ('pwprev-' + this server's own
+    // pid) the instant a test exercises a tmux-touching route; nothing else
+    // ever cleaned that server up, so it leaked indefinitely across every
+    // run (hundreds of accumulated tmux servers found across prior rounds —
+    // a real contributor to "fork failed: No space left on device" under
+    // load). Harmless no-op for a test that never touches tmux at all.
+    await new Promise((resolve) => {
+      const tk = spawn('tmux', ['-L', `pwprev-${child.pid}`, 'kill-server']);
+      tk.on('exit', resolve);
+      tk.on('error', resolve);
+    });
     fs.rmSync(inst.dir, { recursive: true, force: true });
   }
 }

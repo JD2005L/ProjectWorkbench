@@ -86,9 +86,18 @@ async function waitUp(inst) {
 }
 
 async function killAll(procs) {
+  const pids = procs.map((p) => p.pid);
   for (const p of procs) { try { p.kill('SIGTERM'); } catch { /* already gone */ } }
   await new Promise((r) => setTimeout(r, 200));
   for (const p of procs) { if (p.exitCode === null) { try { p.kill('SIGKILL'); } catch { /* fine */ } } }
+  // See test/projects-lock.test.mjs's identical cleanup for why: PW_ISOLATED
+  // auto-derives a tmux socket keyed to each server's own pid, and nothing
+  // else ever cleans those servers up.
+  await Promise.all(pids.map((pid) => new Promise((resolve) => {
+    const tk = spawn('tmux', ['-L', `pwprev-${pid}`, 'kill-server']);
+    tk.on('exit', resolve);
+    tk.on('error', resolve);
+  })));
 }
 
 function readSessionsRaw(sessionsPath) {

@@ -720,3 +720,215 @@ different projects concurrently, 6 each — old lock lost 5 of 12; fixed lock pr
 - `bash -n scripts/project-terminal-start` and `node --check` on every modified `.js` file: clean.
 - `app/VERSION` bumped `1.26.0730.0151` → `1.26.0730.0257`; `test/release-version.test.mjs` confirms
   the bump satisfies the forward-motion + deployable-content-requires-a-bump guard.
+
+## Round 6: reboot/orchestrator credential bypass, a structural lock flaw, an orphaned-session
+## race, and test-suite flakiness — six items (A-F) at reviewed HEAD f1add50
+
+The largest round of this remediation. Two reviewer-supplied exact reproduction scripts
+(`/tmp/pr20_lock_quarantine_race.mjs`, `/tmp/pr20_same_user_delete_race.mjs`) both reproduced
+immediately against `f1add50` before any fix — confirmed first, per the standing discipline of this
+whole engagement. Mid-round, explicit user steering corrected an over-permissive assumption I had
+carried into the new orchestrator/restore code (see item B).
+
+### Item C — the lifecycle lock's stale-reclaim design was structurally unsound (fixed first; D depends on it)
+
+The reviewer's probe called the round-4 lock's internal `tryReclaim()` directly against a genuinely
+ACTIVE holder B. `tryReclaim()` unconditionally `rename()`s the lock path away as its first step —
+that vacates the path, even when the lock turns out to be perfectly live — and during that vacancy a
+third party's fresh acquisition (D) can slip into the empty path and run concurrently with the
+still-active B. Confirmed directly: `overlap:true`, reproducibly. This is not a bug in the staleness
+*judgment* (round 4 fixed that class); it is structural — ANY "quarantine by rename, decide after"
+design has this hole, because the moment the path is vacated, anything can fill it.
+
+**Fix: abandon path-based quarantine/staleness entirely for a real kernel `flock(2)` lock.** No PID
+liveness, no start-time/PID-reuse guard, no stale-timeout guess — none of that is needed, because
+there is no userspace staleness judgment left to get wrong. Mechanism (Node has no `flock(2)` binding
+without a native addon, which is disallowed): open the lock file ourselves (`O_NOFOLLOW`, refusing a
+symlink; reject anything that is not a plain regular file), then spawn the external `flock(1)` binary
+(util-linux, present on every target host) with that already-open file descriptor INHERITED — never a
+path. `flock(1)` given a bare fd number (no command to run) calls `flock(2)` on it and exits
+immediately; the lock is then held by whichever open file description that fd refers to — OUR fd, not
+the short-lived child's — for as long as we keep it open. Closing it (or the whole process dying, for
+ANY reason including SIGKILL) is what releases the lock; the kernel guarantees this, we do not
+implement it. `flock(1)` never sees a path in this design, so it cannot be tricked by a symlink either.
+Verified empirically before writing the real implementation: opened an fd, spawned `flock -x -w N 3`
+against it, confirmed a genuinely independent second fd conflicts (blocked) while the first is held,
+confirmed closing the first fd releases it immediately, and confirmed SIGKILLing the holder process
+releases the lock instantly with zero cleanup code — a real kernel-backed crash-release guarantee.
+
+RED→GREEN: `test/lifecycle-lock.test.mjs` rewritten (the old `_internal` reclaim-testing API no longer
+exists — there is no more reclaim step to attack). New tests: the reviewer's overlap probe adapted to
+the public API (200 iterations, zero tolerance); 16 real processes racing, high iteration; SIGKILLing a
+real holder process and confirming immediate recovery; a lock that never releases correctly times out;
+a symlinked lock path is refused; a non-regular-file lock path (a directory) is refused; a lock file
+with arbitrary garbage content still works (content is never trusted/parsed — the kernel's lock state
+is the only identity that matters); no stray bookkeeping files are ever created. The reviewer's exact
+probe script can no longer run at all (`_internal.tryReclaim` doesn't exist) — the strongest possible
+outcome: the vulnerable code path isn't safer, it's gone.
+
+### Item D — same-user login-vs-delete left orphaned sessions (needed C's lock, correctly)
+
+Reviewer probe: DELETE returns 200 while 24 concurrent logins for the SAME victim account succeed;
+`sessions.json` retained victim sessions afterward. `authenticate()` read users.json OUTSIDE any lock
+DELETE respected, so a login racing a concurrent delete of the same account could authenticate against
+a user record about to be removed, and create a session AFTER DELETE's session-purge step had already
+run against an already-vacated victim.
+
+Fixed by holding the cross-process users lifecycle lock across the ENTIRE login flow — authenticate,
+the best-effort `lastLoginAt` update, AND session creation — nesting session creation inside it exactly
+like DELETE already nests its own session purge (users lock outer, sessions lock inner: one consistent
+global order, matching round 5's existing invariant, never the reverse, never held across the other).
+Whichever critical section runs first is now authoritative for the other: DELETE first ⇒ a subsequent
+login's fresh users.json read (from inside the SAME lock) correctly 401s and creates no session; login
+first ⇒ it fully completes (session included) before DELETE can even start, so DELETE's own fresh
+sessions.json read sees and purges that session too. Either ordering: no orphan, no revived session.
+
+RED→GREEN: new `test/same-user-delete-login-race.test.mjs` (the reviewer's probe ported into a
+permanent 6-round regression test, two real dashboard processes) plus a re-run of the reviewer's exact
+original script — both clean, `victimSessions:0` every round.
+
+### Item A — scripts/pw-tmux-restore bypassed per-user credentials entirely on reboot
+
+The boot-time session restorer recreated every project session/window with one FIXED shared
+`ENVBASH` string — no owner resolution, no fingerprint, regardless of `PW_PER_USER_CLAUDE` or a
+project's `primaryUser` — then resumed Claude conversations under that shared identity. A reboot
+silently downgraded every restored project back to the shared login.
+
+Fixed by resolving each restored session's project (matching tmux session names back to the main
+registry, since a session name alone doesn't carry a project id) and routing through
+`project-terminal-credentials.mjs` — the SAME fail-closed helper `project-terminal-start` uses — before
+creating each NEW session, then stamping + read-verifying `@pw_cred_key` exactly like that script
+(round 5 hardening ported here too: no `-q`, distinguish "invalid option" from any other tmux failure,
+verify every stamp by reading it back). A resolution or stamp-verification failure means the session is
+simply never created (or, for a stamp failure after creation, left running but given no further
+windows/resume this run) — never silently shared. Sessions this run does NOT create (already existing
+at boot) are left completely alone, unchanged from before.
+
+**Also added: explicit `PW_TMUX_SOCKET` support** (this script had none at all before — every `tmux`
+call was bare). This mattered concretely, not just for testability: mid-round, my own prior tmux server
+(the harness this whole session runs inside of, on socket `pvibot-agents`) was killed by a
+restore/test interaction — a bare `tmux` invocation, run from a shell where `$TMUX` was already set,
+silently targets whatever socket `$TMUX` points at instead of a real isolated one. Fixed by adding a
+`tmux()` wrapper function (shadowing the bare command for the rest of the script, mirroring
+`project-terminal-start`'s `tmux_sock_args` convention) so every call is explicit.
+
+RED→GREEN: new `test/pw-tmux-restore.test.mjs` — attributed user (real `CLAUDE_CONFIG_DIR` + real
+fingerprint stamped), disabled mode (stamped exactly `"off"`), missing owner (dangling primaryUser),
+missing project mapping, a corrupt users.json, an injected tmux control-plane failure while stamping a
+fresh session (same shim technique as round 5), and — directly proving the fix for what actually broke
+my own environment mid-round — a restore run that plants an "unrelated" tmux server AND sets `$TMUX`
+to point at it, confirming the unrelated server survives completely untouched; plus a dedicated test
+against the REAL default tmux socket (byte-identical session list before/after an isolated run).
+
+### Item B — the orchestrator's tmux session/lane-window creators had no fingerprint check at all
+
+`OrchestratorSessionManager._ensureSession()` created a project's shared tmux session (~line 249,
+before this fix) and `_createLane()` created its lane window (~line 388) with zero credential
+resolution — the reviewer's own probe observed `newWindow()` reached with no preceding stamp read.
+
+New `app/orchestrator/lane-credentials.js` resolves a THIRD entrypoint (alongside
+`app/server.js`'s `credentialContext()` and `app/project-terminal-credentials.mjs`) — cross-referencing
+the orchestrator's OWN project config (which has no notion of `primaryUser` at all) against the main
+dashboard's `projects.json` by name, since the lane's tmux session name is deliberately the same one
+the main registry computes ("the project's tmux session is shared with human windows," by the
+module's own design). `OrchestratorSessionManager` gained a `credentials` constructor dependency
+(defaulting to a cheap resolver that costs nothing when `PW_PER_USER_CLAUDE` is unset, so every
+existing test that doesn't care about this continues to pass byte-for-byte) and, in `_ensureSession`,
+resolves + verifies/stamps `@pw_cred_key` on the SESSION unconditionally before any window (fresh
+session) or before touching an EXISTING session's lane at all (existing session) — reusing
+`sessionCredentialState` from round 5 rather than re-deriving the same policy a fourth time.
+
+**Mid-round correction (explicit user steering, applied retroactively to work already in progress):**
+my first pass treated "feature on, but this specific project has no `primaryUser`" as a second
+legitimate shared/off case — correct and unchanged for the two EXISTING human-facing entrypoints
+(`server.js`, `project-terminal-start`, both untouched this round), but WRONG for the orchestrator and
+restore, which are unattended surfaces with no human present to notice a misattribution. Fixed in both
+`lane-credentials.js` and `pw-tmux-restore`'s `resolve_session_credentials`: "off" is legitimate ONLY
+when `PW_PER_USER_CLAUDE` is disabled outright; enabled-but-no-`primaryUser` now fails closed
+identically to a missing user, a broken credential, or a broken helper — never resolves to shared/off.
+This is a deliberate, narrow DIVERGENCE from the two established entrypoints' documented contract
+(`app/project-owner.js`'s own doc comment), not a change to them.
+
+A genuine bug surfaced and was fixed while building this: the new `getSessionCredKey`/
+`setSessionCredKey` initially used `=session` (exact-match target syntax, correct for
+`has-session`/`list-windows` name lookups elsewhere in this file) for `show-options`/`set-option` too
+— confirmed directly against a real tmux server that this specific combination reports "no such
+session" even though the session plainly exists. Fixed by using a bare session name for these two
+subcommands specifically (matching `app/server.js`'s own already-proven `readSessionCredKey`), and
+confirmed no prefix-matching ambiguity risk (`pw_Demo` vs `pw_DemoExtra`) either way.
+
+RED→GREEN: `test/orch-lane-credentials.test.mjs` (the resolver in isolation: disabled, no-primaryUser
+now-fails-closed, valid owner, missing project mapping, missing user, unreadable registry,
+materialization failure) and `test/orch-session-credentials.test.mjs` (production-shaped, real tmux
+server, injected `credentials` resolver: fresh session stamped before any window; off stamped exactly
+`"off"`; the reviewer's exact scenario — an owner rotating between two `ensureSession()` calls for the
+same project — caught BEFORE `newWindow()` ever runs, with the lane window byte-identical and the OLD
+fingerprint still the one stamped; an unreadable existing stamp fails closed; a resolution failure
+never falls back to shared). All 5 confirmed RED against the pre-fix `session.js` before GREEN.
+
+### Item E — the default-concurrent full suite was flaky, for two independent reasons
+
+**1. A test that predicted network scheduling instead of proving it.** The "two racing token updates"
+test fired A then B "back-to-back, same tick" and simply assumed issue order predicts commit order for
+two genuinely concurrent HTTP requests — nothing enforces that, and under load B can reach the
+server's handler first, failing the hardcoded "must be ghp_B" assertion for a reason that has nothing
+to do with the lock (which was working correctly the whole time). Fixed with a REAL barrier instead of
+a timing assumption: the "later" request's body is sent via a `ReadableStream` that withholds its bytes
+until the "earlier" request's response has been fully received — `express.json()` cannot invoke the
+route handler before a request's body is complete, so the withheld request's commit is provably unable
+to start until the other one's has entirely finished. Verified against a minimal `http.createServer()`
+probe first: the deliberately-withheld request's handler always runs strictly after the other's,
+regardless of source-code order.
+
+**2. A massive, accumulated tmux-server leak — the actual bigger problem.** `PW_ISOLATED=1` makes
+`app/server.js` auto-derive a tmux socket (`'pwprev-' + its own pid`) the instant any route touches
+tmux, but no test harness ever cleaned that server up — only the dashboard subprocess itself was
+killed. Found via direct investigation of a real "fork failed: No space left on device" failure:
+roughly 750 leaked tmux server processes had accumulated across every round of this entire remediation
+(confirmed via `ps`, matching hundreds of stale `pwprev-*`/`pw-lifelock-*` socket files already noticed
+in round 4's evidence as "harmless" — they were not harmless, they were leaking live server processes,
+not just empty socket files). PTY usage was at 1027/4096 before cleanup, 11/4096 after. Cleaned up
+directly (verified zero impact on the two real, live tmux servers on this host — `pvibot-agents`, this
+session's own harness, and `default`, which carries real production project terminals) and fixed at
+the source: every `withServer`/`killAll` helper across 9 test files (`deploy-route`, `cockpit-drawer`,
+`orch-smoke`, `rail-active`, `smoke`, `user-lifecycle-locking`, `user-lifecycle` ×2, `projects-lock`,
+`sessions-lock`) now also kills `pwprev-<the server's own pid>` in its cleanup — a harmless no-op for a
+test that never touches tmux, essential for the ones that do. Also fixed one genuine port collision
+(`3920` hardcoded in both `user-lifecycle.test.mjs` and `user-lifecycle-locking.test.mjs`, which run
+concurrently under default test-file parallelism).
+
+Verified: the default-concurrent full suite passed 5 times in a row after both fixes (was previously
+observed at 563/564 then 562/564), plus one sequential run, all 584/584 with zero tmux-process growth
+across any of them.
+
+### Item F — audit + final verification
+
+Preserved and unaffected by every change in this round (confirmed via the full suite, not just
+inspection): the root→admin O_NOFOLLOW credential-writer helper and its symlink/lstat guards; the
+documented shared-admin-UID non-confidentiality limitation (still explicitly not claimed otherwise
+anywhere); CSRF (`isTrustedLocal`/Origin-Referer matching, untouched); the deploy-password/reauth flow
+(untouched); `install.sh` and the release-version guard (untouched, VERSION bump verified against it).
+`app/server.js`'s ONLY change this round is the login route (item D) — confirmed via `git diff --stat`
+before committing, isolated and minimal.
+
+### Verification evidence
+
+- Both reviewer probe scripts re-run at the end, clean: `/tmp/pr20_same_user_delete_race.mjs` (6
+  rounds, `victimSessions:0` every time, exit 0); `/tmp/pr20_lock_quarantine_race.mjs` cannot run at all
+  against the new lock (the internal it calls no longer exists — the strongest possible outcome).
+- Full default-concurrent suite (`cd app && npm test`): **584/584 pass**, 5 consecutive clean runs.
+- Full sequential suite (`node --test --test-concurrency=1 ../test/*.test.mjs`): **584/584 pass**.
+- Two-real-server stress re-run 3× after all fixes: `sessions-lock` + `projects-lock` (9 tests total),
+  0 failures across all 3 rounds.
+- Production-shaped root-to-admin probe (host mode, real tmux, real per-user credentials): login,
+  recycle, status, new window, and DELETE (exercising item D's users-lock-held-across-login-and-delete
+  path) all exercised over real HTTP against a real root process. Credential tree confirmed admin-owned
+  throughout; correctly pruned after the DELETE. `users.json`/`sessions.json` root-owned as expected;
+  the three lock files (`.pw-lifecycle.lock`, `.pw-sessions.lock`, `.pw-projects.lock`) confirmed
+  present-but-idle (a persistent unlocked inode is the CORRECT, expected state for the new flock-based
+  design — not debris). No secret leakage in the server log. Production instance (a different,
+  already-running process on port 3000) and both real tmux servers on this host (`pvibot-agents`,
+  `default`) confirmed untouched before, during, and after every probe and every test run this round.
+- `bash -n scripts/pw-tmux-restore` and `node --check` on every modified/new `.js` file: clean.
+- `app/VERSION` bumped `1.26.0730.0257` → `1.26.0730.0442`; `test/release-version.test.mjs` confirms
+  the bump satisfies the forward-motion + deployable-content-requires-a-bump guard.
