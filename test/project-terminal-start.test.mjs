@@ -426,6 +426,30 @@ for (const [label, malformed] of [
   ['shared:false with a configDir but no fingerprint', '{"ok":true,"shared":false,"configDir":"/tmp/x"}'],
   ['shared is a string, not a boolean', '{"ok":true,"shared":"false"}'],
   ['ok is missing entirely', '{"shared":true}'],
+  // A `jq -r '.field // empty'` extraction silently STRINGIFIES any JSON scalar (a boolean becomes
+  // "true"/"false", a number becomes its decimal digits) — a bare non-empty-string check cannot
+  // tell a hijacked boolean/number apart from a real path or fingerprint. Each of these is exactly
+  // the reviewer's reproduced bypass: predicates that only checked "is this non-empty" accepted all
+  // of them.
+  ['a boolean configDir instead of a string', '{"ok":true,"shared":false,"configDir":true,"fingerprint":"aaaaaaaaaaaaaaaa","envFile":""}'],
+  ['a numeric configDir instead of a string', '{"ok":true,"shared":false,"configDir":42,"fingerprint":"aaaaaaaaaaaaaaaa","envFile":""}'],
+  ['a numeric fingerprint instead of a string', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":12345,"envFile":""}'],
+  ['an object fingerprint instead of a string', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":{"a":1},"envFile":""}'],
+  ['an array fingerprint instead of a string', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":["a"],"envFile":""}'],
+  // "off" is app/user-credentials.js's CREDENTIALS_OFF sentinel — shared:false already asserts a
+  // real per-user owner, so a fingerprint that collides with the shared/disabled sentinel must be
+  // refused explicitly: later stamp comparisons treat "off" as meaning the shared/disabled case
+  // REGARDLESS of what shared:false just asserted, which would silently launder an owned session
+  // into looking exactly like the shared one for every later fingerprint check.
+  ['the reserved "off" sentinel used as an owned fingerprint', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":"off","envFile":""}'],
+  ['a fingerprint of the wrong length (not the real 16 hex characters)', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":"abc123","envFile":""}'],
+  ['a fingerprint with non-hex characters', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":"ZZZZZZZZZZZZZZZZ","envFile":""}'],
+  // app/project-terminal-credentials.mjs's own contract (app/user-credentials.js's
+  // ensureUserCredentials()) always includes envFile as a string for shared:false — possibly empty
+  // (no GitHub token), but never absent and never any other type.
+  ['a non-string (numeric) envFile', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":"aaaaaaaaaaaaaaaa","envFile":12345}'],
+  ['a non-string (boolean) envFile', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":"aaaaaaaaaaaaaaaa","envFile":false}'],
+  ['envFile entirely missing (the real helper always includes it for shared:false)', '{"ok":true,"shared":false,"configDir":"/tmp/x","fingerprint":"aaaaaaaaaaaaaaaa"}'],
 ]) {
   test(`SECURITY REGRESSION: a zero-exit credential helper response with ${label} is refused, never treated as shared/off`, { timeout: 15000 }, async () => {
     const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
@@ -447,6 +471,22 @@ test('a genuinely well-formed shared:true response is still accepted normally', 
     const result = await runScript(ctx);
     assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
     assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]));
+  } finally { await teardown(ctx); }
+});
+
+test('a genuinely well-formed shared:false response (real string types, valid fingerprint) is still accepted normally', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  ctx.env.PW_APP_DIR = makeFakeCredentialHelper(
+    ctx.dir,
+    `{"ok":true,"shared":false,"configDir":"${ctx.dir}/fake-claude-config","fingerprint":"1234567890abcdef","envFile":""}`,
+  );
+  try {
+    const result = await runScript(ctx);
+    assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
+    const session = 'pw_' + ctx.name;
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]));
+    const env = await paneEnviron(ctx.sock, session);
+    assert.equal(env.CLAUDE_CONFIG_DIR, `${ctx.dir}/fake-claude-config`);
   } finally { await teardown(ctx); }
 });
 

@@ -105,11 +105,37 @@ if [[ "$cred_shape" == "shared" ]]; then
   cred_env_file=""
   cred_key="off"   # matches app/user-credentials.js's CREDENTIALS_OFF sentinel
 else
-  cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir // empty')
-  cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile // empty')
-  cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint // empty')
-  if [[ -z "$cred_config_dir" || -z "$cred_key" ]]; then
-    echo "[project-terminal-start] credential helper reported a per-user owner for '$name' but its response is missing configDir/fingerprint: $cred_json" >&2
+  # `jq -r '.field // empty'` silently STRINGIFIES any JSON scalar (a boolean becomes "true"/
+  # "false", a number becomes its decimal digits) — a bare non-empty-string check on the RESULT
+  # cannot tell a hijacked boolean/number apart from a real path or fingerprint. Check the actual
+  # JSON types first, before any extraction: app/project-terminal-credentials.mjs's own contract for
+  # shared:false is exactly configDir (string) and fingerprint (string), plus envFile — ALWAYS a
+  # string too (possibly empty, when the owner has no GitHub token; never absent, never any other
+  # type — see app/user-credentials.js's ensureUserCredentials()).
+  cred_types_ok=$(printf '%s' "$cred_json" | jq -r '
+    ((.configDir | type) == "string")
+    and ((.fingerprint | type) == "string")
+    and ((.envFile | type) == "string")
+  ' 2>/dev/null || echo false)
+  if [[ "$cred_types_ok" != "true" ]]; then
+    echo "[project-terminal-start] credential helper reported a per-user owner for '$name' but configDir/fingerprint/envFile are not the expected types: $cred_json" >&2
+    exit 1
+  fi
+  cred_config_dir=$(printf '%s' "$cred_json" | jq -r '.configDir')
+  cred_env_file=$(printf '%s' "$cred_json" | jq -r '.envFile')
+  cred_key=$(printf '%s' "$cred_json" | jq -r '.fingerprint')
+  if [[ -z "$cred_config_dir" ]]; then
+    echo "[project-terminal-start] credential helper reported a per-user owner for '$name' but configDir is empty: $cred_json" >&2
+    exit 1
+  fi
+  # A real fingerprint is exactly the 16-character lowercase hex digest
+  # app/user-credentials.js's credentialFingerprint() produces. Checked separately from that format,
+  # a fingerprint can never legitimately equal "off" (app/user-credentials.js's CREDENTIALS_OFF
+  # sentinel) here: shared:false already asserts a real per-user owner, and letting "off" through
+  # would make every LATER fingerprint comparison treat this owned session as though it were the
+  # shared/disabled case.
+  if [[ ! "$cred_key" =~ ^[0-9a-f]{16}$ ]] || [[ "$cred_key" == "off" ]]; then
+    echo "[project-terminal-start] credential helper reported a per-user owner for '$name' but its fingerprint is not a valid credential fingerprint: $cred_json" >&2
     exit 1
   fi
 fi

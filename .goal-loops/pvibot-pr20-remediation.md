@@ -1234,3 +1234,53 @@ scripts confirms this explicitly, guarding against an overly strict rewrite).
 - `app/VERSION` bumped `1.26.0730.1732` → `1.26.0730.1800`; guard test passes.
 - All three fix areas independently confirmed via `git stash` revert-and-retest, tree restored
   byte-identical each time.
+
+## Round: independent exact-head review of 1a13330 — typed schema validation gap
+
+Independent exact-head review of the previous commit is BLOCKED. Blocker: both scripts' schema
+validation (from the immediately prior round) only checked `.ok`/`.shared` and non-emptiness of
+`configDir`/`fingerprint` via `jq -r '.field // empty'` — a filter that silently STRINGIFIES any JSON
+scalar. Reviewer reproduced: a boolean `configDir` and a numeric `fingerprint` both pass the
+non-empty check (`jq -r` on `true` produces the string `"true"`; on `12345` produces `"12345"`).
+Additional named gaps: object/array fingerprints, the reserved `"off"` sentinel used as an owned
+(shared:false) fingerprint — colliding with `CREDENTIALS_OFF` and making a later stamp comparison
+treat an owned session as the shared/disabled case — and non-string `envFile`.
+
+Reproduced empirically before any fix: `echo '{"ok":true,"shared":false,"configDir":true,
+"fingerprint":12345,...}' | jq -r '.configDir // empty'` → `"true"`; `.fingerprint // empty` →
+`"12345"`; a `fingerprint:"off"` response → `"off"` extracted verbatim, all three passing the old
+non-empty-only check.
+
+RED first: 11 new adversarial tests added to BOTH `test/project-terminal-start.test.mjs` and
+`test/pw-tmux-restore.test.mjs` (boolean/numeric configDir, numeric/object/array fingerprint, the
+reserved "off" sentinel as an owned fingerprint, wrong-length fingerprint, non-hex fingerprint,
+non-string/missing envFile) plus one new positive test per script proving a genuinely well-formed
+`shared:false` response (real string types, valid 16-hex-char fingerprint) is still accepted normally.
+Confirmed RED against exact HEAD `1a13330` — all 22 new tests (11 per script) failed before either
+script changed.
+
+Fix: both scripts now validate JSON TYPES via `jq`'s own `type` introspection BEFORE any `-r`
+extraction — `configDir`, `fingerprint`, and `envFile` must each be `type == "string"` — closing the
+stringification bypass at its root rather than pattern-matching the already-stringified result.
+Separately, `configDir` must be non-empty, and `fingerprint` must match `^[0-9a-f]{16}$` (the exact
+16-character lowercase hex digest `app/user-credentials.js`'s `credentialFingerprint()` produces) AND
+must not equal the literal string `"off"` — the two checks are independent (the regex alone already
+excludes "off" by length, but the explicit check documents and hardens the intent against a future
+format change decoupled from length-16). `envFile`'s value may legitimately be empty (no GitHub
+token) but must always be present and a string, matching `project-terminal-credentials.mjs`'s real
+contract exactly (it's always included, via `ensureUserCredentials()`'s
+`envFile: ghToken ? envFile : ''`, never omitted, never any other type).
+
+### Verification evidence
+
+- `project-terminal-start.test.mjs`: 34/34 (11 new). `pw-tmux-restore.test.mjs`: 27/27 (11 new).
+- Focused suite (all orch-* + both scripts): 383/383.
+- Full canonical suite, `npm test` (default-concurrent): 646/646, clean (no flakiness this round).
+- Full canonical suite, serial (`--test-concurrency=1`): 646/646.
+- `bash -n` clean on both scripts; `node --check` clean on both test files.
+- Confirmed via `git stash` revert-and-retest for both scripts together: all 22 new tests failed
+  against the reverted code, tree restored byte-identical (`git diff --stat` matched exactly).
+- `app/VERSION` **not** bumped this round: the diff touches only `scripts/*` and `test/*`, neither
+  classified as deployable by `test/release-version.test.mjs`'s own `isDeployable()` (which covers
+  only `app/*` and `install.sh`) — confirmed by running that guard directly against the diff, which
+  passes cleanly with `app/VERSION` unchanged. Per policy, no bump is required or appropriate here.
