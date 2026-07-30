@@ -1378,3 +1378,83 @@ survives in the resulting spawn env.
 Committed as merge commit `9709a4faad07356ad0d1de5186aebea8c50019ab`
 (parents: `4a1384276ac3843fefe7755e6ceee7a6c7270812` PR20, `be034e4c0b40c36f430dee7a1e8f42fa0abe3f1e`
 PR19/origin-main). Not pushed, not merged upstream, not deployed.
+
+## Round: GitHub CI portability — two REAL-spawn credential runner tests hardcoded 'admin'
+
+Independent exact-head review of `165b44c` was BLOCKED only on GitHub CI. Authenticated failed-log
+review of canonical run `30575848178` was conclusive: 2 failures, both in
+`test/orch-runner.test.mjs`, both because GitHub's runner has no Unix account `admin`. The test at
+~line 561 (`SECURITY REGRESSION — a forbidden key smuggled via credentialTokens never reaches a REAL
+spawned process...`) expected `(absent)|/srv/pw-users/alice/.claude` but got `"the configured
+unprivileged account 'admin' does not exist on this host"`. The test at ~line 630 (`REGRESSION — the
+resolved credential env reaches a REAL spawned process...`) failed the same way. Local CT2115 passed
+only because `admin` happens to exist there (the real account this sandbox runs as).
+
+Both tests drive a REAL child process through the default `ClaudeCodeBackend`, which privilege-drops
+through a REAL `PrivilegeDropper` resolving `PW_ORCHESTRATOR_TMUX_USER` against the actual passwd
+database via `getent`. Neither test overrode `PW_ORCHESTRATOR_TMUX_USER` in its `loadOrchestratorConfig()`
+call, so both fell through to the production default (`'admin'`, set in `app/orchestrator/config.js`).
+A third, adjacent test in the same file — the `INTEGRATION — CLAUDE_CONFIG_DIR survives the REAL
+PrivilegeDropper.dropEnv() pass` test added in the previous (merge-integration) round — already handles
+this correctly by pinning `PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username`, which is why it wasn't
+one of the 2 CI failures.
+
+### RED reproduction
+
+Reproduced empirically in a genuine GitHub-Actions-shaped sandbox before any fix, rather than trusting
+the CI log alone. Built via nested unprivileged Linux user namespaces (no host root, no CT2115 changes):
+
+- Outer: `unshare --user --map-root-user --mount` — an unprivileged user namespace mapping this
+  process to uid 0 *inside the namespace only*, which grants the process-creator CAP_SYS_ADMIN within
+  that namespace's own mount table (real DAC permissions outside the namespace are unaffected — this
+  cannot touch host files it doesn't already own). Used solely to gain the capability to bind-mount a
+  substitute `/etc/passwd` (with the `admin` line removed) over the real path for the lifetime of the
+  namespace.
+- First attempt (rejected): staying at namespace-uid 0 to run the tests directly hit a *different*,
+  unrelated `privilege.js` refusal — `ROOT_NAMES`/superuser-uid checks correctly refuse to privilege-drop
+  to an account resolving to uid 0, under any name — which would have produced 3 failures (the
+  INTEGRATION test failing too) instead of the reported 2. This confirmed the naive repro was
+  over-broad and not faithful to GitHub's actual runner (which runs as an ordinary non-root user).
+- Corrected: nested a nonprivileged `unshare --user --map-user=1001 --map-group=1001` (no `--mount`,
+  reusing the parent's already-modified mount namespace) to drop out of root entirely and run as a
+  synthetic uid 1001 named `runner` — present in the substitute passwd file, absent the `admin` entry,
+  and not in `ROOT_NAMES` — closely mirroring a real GitHub Actions runner identity (non-root, a real
+  resolvable account, just not `admin`).
+- Verified before running the suite: `getent passwd admin` → exit 2 (not found) inside the sandbox;
+  `getent passwd runner` → resolves; `os.userInfo().username` → `'runner'`.
+- Ran `node --test ../test/orch-runner.test.mjs` inside this sandbox against exact HEAD `165b44c`:
+  **2 failures**, both at the exact reported locations, with **byte-identical error text** to the
+  authenticated CI log (`"the configured unprivileged account 'admin' does not exist on this host"`).
+  The INTEGRATION test passed, confirming the repro's fidelity to the real 2-failure CI report.
+
+### Fix
+
+Added `PW_ORCHESTRATOR_TMUX_USER: os.userInfo().username` to both failing tests' `loadOrchestratorConfig()`
+calls — the identical pattern the INTEGRATION test already used, naming the account this test process is
+actually running as (which by construction always exists) instead of relying on the production default.
+`app/orchestrator/config.js`'s default (`'admin'`) is untouched, so real deployments still privilege-drop
+to the configured production account exactly as before — this is a test-fixture-only change.
+
+### Verification evidence
+
+- GREEN confirmed in the same GitHub-shaped sandbox: `orch-runner.test.mjs` 38/38 pass, 0 fail.
+- GREEN confirmed locally on CT2115 (where `admin` genuinely exists): 38/38 pass — non-regression check.
+- Focused runner+privilege suite (`orch-runner.test.mjs` + `orch-privilege*.test.mjs`): 125/128 pass,
+  3 skipped (identity-required), 0 fail.
+- Focused orch/credential suite (all `orch-*.test.mjs` + `lane-credentials*`/`user-credentials*`/
+  `session-credentials*`): 528/531 pass, 3 skipped, 0 fail.
+- Full canonical suite, `npm test` (default-concurrent): 816/819 pass, 3 skipped, 0 fail — run twice,
+  identical both times.
+- Full canonical suite, serial (`--test-concurrency=1`): 816/819 pass, 3 skipped, 0 fail — matches both
+  concurrent runs exactly. (First serial attempt was killed and discarded after appearing stuck; root
+  cause was a standalone `project-terminal-start.test.mjs` run started concurrently against the same
+  checkout for unrelated diagnostic purposes, contending over the same real per-process resources —
+  not a defect in the suite. Re-run alone, uninterrupted, completed cleanly in ~258s.)
+- `bash -n` clean; `node --check` clean on the changed file; `git diff --check` clean; no stray conflict
+  markers repo-wide.
+- `test/release-version.test.mjs`: 4/4 pass. `app/VERSION` **not** bumped — this diff touches only
+  `test/orch-runner.test.mjs`, which `isDeployable()` does not classify as deployable content (only
+  `app/*` and `install.sh` require a bump). Confirmed by running the guard directly against the
+  committed diff.
+
+Committed as `fade767fb40f53c5d8ee99f429b4d2d44ad04f24`. Not pushed, not merged upstream, not deployed.
