@@ -420,3 +420,121 @@ true, a planted symlink at a DIFFERENT user's path reported false, through `GET 
   none of the atomic-write/lifecycle-lock changes are gated by it (they apply unconditionally, as a general
   durability/correctness improvement, transparent to a GOA deployment that never touches per-user
   credentials at all).
+
+## Round 4: a real lost-update bug in the lifecycle lock itself, found by final combined integration
+
+Final combined integration testing (PR20 HEAD `3b0021e`, the merge of round 3 with PR19's
+`3ac9212` installer fix from `origin/main`) exposed a genuine, reproducible correctness failure:
+`test/lifecycle-lock.test.mjs`'s two-real-process race test returned 79 instead of 80 increments
+under `node --test --test-concurrency=1`. The lock this whole remediation depends on for AC3/AC4's
+serialization guarantee had a lost-update bug of its own. This section documents the root cause,
+the fix, and the evidence that it's actually closed — not just less likely.
+
+### Root cause (empirically confirmed, not just reasoned about)
+
+v1's release and stale-reclaim paths both ended in a **blind, path-based unlink**
+(`fsp.rm(lockPath, { force: true })`) with no check that the file currently at that path was still
+the instance being acted on. That's a textbook ABA/TOCTOU: the staleness *decision* (read the path,
+judge dead-or-old) and the unlink *action* were two separate steps with an unbounded gap between
+them.
+
+Reproduced directly (not just inferred) by instrumenting a copy of the module with per-event,
+high-resolution logging and racing two real `node` processes against the same lock file. The
+captured trace (`/tmp/pw-lock-debug/fail-debug-2.log` during this session; not preserved in the
+repo) shows the exact sequence:
+
+1. Process **A** releases its lock (unlinks the path), then immediately starts its next loop
+   iteration's acquisition.
+2. Process **B**, still mid-retry from an earlier `EEXIST`, hits the brief gap where the path is
+   momentarily absent — its `readLockInfo` returns `null` and its age-based fallback
+   (`lockFileAgeMs`) also observes `ENOENT`, which the v1 code treated as `Infinity` age ⇒
+   `stale = true`.
+3. Between B's staleness *decision* and its `fsp.rm(lockPath)` *action*, A's `open()` + `writeFile()`
+   for its NEW (successor) lock lands — a fully valid, live lock.
+4. B's delayed `rm()` executes anyway (it's unconditional and path-based) and deletes A's brand-new
+   successor lock. Both A and B now believe they hold the lock. A's critical section and B's
+   critical section run concurrently — the exact mechanism that loses an update.
+
+A 15-run local reproduction loop hit this on run 3 with a WORSE loss than the user's original
+report (`73 !== 80`, i.e. 7 lost increments, not 1), confirming this was a fairly easily triggered
+systemic flaw, not a rare one-off tied to the specific "combined stack" CI environment.
+
+### Fix: an ownership-token, claim-then-verify protocol (`app/lifecycle-lock.js` v2)
+
+Kept fully in userspace — no native deps, no shelling out to `flock(1)` — because the redesign
+below closes the race without it:
+
+1. **Atomic publication.** Every acquisition writes its full record — `{pid, startTicks, token,
+   acquiredAt}` — to a private temp file first, then makes it visible at the lock path with a
+   single `link()` call (exclusive, atomic, fails `EEXIST` if already locked). A lock file is
+   therefore **never observable half-written**: any reader sees either nothing or a complete,
+   parseable record. This directly closes the "empty/ambiguous file during acquisition" trigger
+   that step 2 of the root cause above depended on.
+2. **Unguessable owner identity per acquisition**, not just per process: `crypto.randomBytes(16)` token
+   generated fresh every single call to `withLifecycleLock()`, so even the SAME process's own 40
+   sequential re-acquisitions of the same lock (exactly what the race test's worker loop does) are
+   distinguishable instances, not just distinguishable processes.
+3. **PID + start-time identity**, not bare PID liveness. `getStartTicks(pid)` reads
+   `/proc/<pid>/stat` field 22 (ticks since boot; comm-field parsing matches the existing
+   `scripts/pw-tmux-save` convention) so a dead PID recycled by an unrelated live process is
+   correctly still treated as dead, closing the PID-reuse gap round 3's own self-review had already
+   flagged as a residual, undocumented risk.
+4. **Removal is claim-then-verify, never a blind unlink.** Both a holder's own release
+   (`releaseOwned`) and a waiter's stale-lock reclaim (`tryReclaim`) start by calling
+   `claimExclusive()`, which does `rename(lockPath, privateClaimPath)`. `rename()` on a shared
+   source path is atomic — of any number of concurrent renamers, exactly one succeeds and the rest
+   get `ENOENT` — so exactly one actor ever ends up holding the file that WAS at the path,
+   decoupled from whatever gets published there next. Only then is the claimed content inspected:
+   `releaseOwned` deletes it only if its token matches the exact instance being released;
+   `tryReclaim` re-decides staleness fresh on the exact claimed content (never on an earlier,
+   separately-read snapshot). Anything that doesn't check out is restored via `restoreIfFree()`
+   (itself an atomic, exclusive `link()`), which can never clobber a fresh successor a legitimate
+   new holder published in the meantime.
+
+`app/server.js`'s `withUsersLock`/route usage of `withLifecycleLock()` is unchanged — the function
+signature is identical; only the internal protocol and on-disk record format changed. The on-disk
+format is a purely internal implementation detail (confirmed via grep: nothing outside
+`lifecycle-lock.js` itself reads or writes the lock file), so changing it from the v1 plaintext
+`"pid\ntimestamp\n"` to v2's JSON record required no migration.
+
+### RED → GREEN
+
+`test/lifecycle-lock.test.mjs` grew from 6 to 13 tests (net +7), rewritten against the new
+protocol/format so RED was "does not satisfy the v2 contract at all" (the new tests reference an
+`_internal` test-only export the v1 file didn't have) rather than a narrower single-assertion
+failure — appropriate for a full protocol redesign, not an incremental patch. New tests: two real
+processes racing at high iteration (150 each, up from 40, `150*2=300` expected), three real
+processes racing (100 each, `300` expected), a start-time-mismatch (simulated PID-reuse) reclaim
+test, a real crash-recovery test (a child process acquires and `process.exit()`s mid-critical-
+section, never reaching the release), two `_internal`-driven deterministic tests that directly
+reconstruct the exact race found above (a stale instance is claimed away and discarded while a
+fresh successor is published at the same path in between — the successor must survive untouched;
+`tryReclaim()` and `releaseOwned()` each get a direct exact-ownership assertion), an 8-contender
+concurrent-stale-breaker race (asserts `maxConcurrent === 1`), and every test now asserts no stray
+`.tmp-*`/`.claim-*` bookkeeping files survive. All 13 pass on the v2 implementation; running against
+the reverted v1 file fails immediately with a missing-export `SyntaxError` (confirmed RED before
+implementing v2).
+
+### Verification evidence
+
+- `test/lifecycle-lock.test.mjs` alone, sequential (`node --test --test-concurrency=1`), run
+  **93 times in a row: 0 failures** (33 runs interactively, then 60 more in a single unattended
+  loop) — this is the exact reproduction harness and flag the originally-reported failure used.
+- Additional standalone adversarial stress (outside the test file, real OS processes, no test
+  framework overhead): 5-process/300-iteration and 8-process/150-iteration races (3 rounds each),
+  a 16-process/60-iteration thundering-herd race, and 5 rounds of an 6-process race where one
+  worker deliberately hard-crashes (`process.exit()`) mid-critical-section at iteration 30 to force
+  the stale-reclaim path under live contention — every round's counter matched the exact expected
+  total, zero stray lock-directory debris in any round.
+- A dedicated real-process liveness test: a holder is `SIGSTOP`'d mid-hold (genuinely alive, merely
+  frozen — not a crash); a concurrent waiter correctly times out rather than reclaiming; `SIGCONT`
+  lets the original holder finish and release normally.
+- Downstream consumers unaffected: `test/user-lifecycle-locking.test.mjs` (24 tests, includes the
+  round-3 rename/delete/reconcile lifecycle-lock-dependent tests) and
+  `test/project-terminal-start.test.mjs` (10 tests) both still fully green against v2.
+- Full sequential suite (`cd app && npm test`, i.e. `node --test --test-concurrency=1
+  ../test/*.test.mjs`): **552/552 pass**, 0 failures (545 baseline per the round-4 report + 7 net
+  new lifecycle-lock tests this round added).
+- `app/VERSION` bumped `1.26.0730.0018` → `1.26.0730.0151` (only `app/lifecycle-lock.js` and
+  `test/lifecycle-lock.test.mjs` changed this round; `test/release-version.test.mjs` confirms the
+  bump satisfies the forward-motion + deployable-content-requires-a-bump guard from PR19).
