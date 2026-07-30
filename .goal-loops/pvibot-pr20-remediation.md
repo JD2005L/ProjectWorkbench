@@ -1284,3 +1284,97 @@ contract exactly (it's always included, via `ensureUserCredentials()`'s
   classified as deployable by `test/release-version.test.mjs`'s own `isDeployable()` (which covers
   only `app/*` and `install.sh`) — confirmed by running that guard directly against the diff, which
   passes cleanly with `app/VERSION` unchanged. Per policy, no bump is required or appropriate here.
+
+## Round: integration merge with origin/main — PR19 (host-mode privilege drop) x PR20
+
+PR19 ("run the coding CLI as the unprivileged account in host mode") squash-merged into
+`origin/main` at `be034e4c0b40c36f430dee7a1e8f42fa0abe3f1e`. A disposable trial merge of this
+branch's exact head (`4a1384276ac3843fefe7755e6ceee7a6c7270812`) onto that new main found two real
+content conflicts: `app/VERSION` and `app/orchestrator/runner/claude.js`. Instructed to
+integrate/rebase onto exact origin/main now, preserving BOTH PR19's fail-fast/sticky
+unconfirmed-kill semantics (including the immediate `_refuseIfProbeUnconfirmed()` guard between
+`fingerprint()` and `probeAuth()`) and all PR20 per-user credential env/attribution semantics.
+
+Ran `git merge origin/main --no-commit --no-ff`, reproducing exactly the two conflicts the
+disposable trial found — no others.
+
+`app/orchestrator/runner/claude.js` was the substantive conflict. PR19 independently added
+`CLAUDE_CONFIG_DIR` to the shared `FORBIDDEN_ENV` constant — correctly, for every other reader: a
+`settings.json` anywhere the CLI would look can carry its own `env.ANTHROPIC_API_KEY` or
+`apiKeyHelper`. But PR20's entire per-user attribution mechanism depends on setting
+`CLAUDE_CONFIG_DIR` via the narrow `ALLOWED_CREDENTIAL_TOKEN_KEYS` allowlist in `phaseEnv()`. Naive
+resolution (just excluding the allowlisted key from `phaseEnv()`'s own re-strip) would have been
+insufficient: tracing `this.exec = this.privilege.wrap(exec)` into `privilege.js` showed
+`PrivilegeDropper.dropEnv()` independently strips its **own** copy of `forbiddenEnv` a second time,
+on whatever env `phaseEnv()` already produced — a second, independent stripping layer that would
+still delete `CLAUDE_CONFIG_DIR` even after the first fix.
+
+Resolved with a two-layer exclusion:
+- `phaseEnv()`'s own re-strip pass skips keys in `ALLOWED_CREDENTIAL_TOKEN_KEYS` (defense-in-depth,
+  first layer, unchanged in spirit from the pre-merge code).
+- A new `PRIVILEGE_DROP_FORBIDDEN_ENV = FORBIDDEN_ENV.filter(key => !ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key))`
+  constant is passed to `privilegeDropperFor()` at the constructor call site instead of raw
+  `FORBIDDEN_ENV`, so the second, independent `dropEnv()` layer never sees `CLAUDE_CONFIG_DIR` as
+  forbidden in the first place. Every other consumer of the raw `FORBIDDEN_ENV` constant (including
+  `phaseEnv()`'s initial delete-pass) is untouched, so `CLAUDE_CONFIG_DIR` is still treated as
+  forbidden everywhere except the two places that legitimately need to set it.
+
+`verifyConfiguration()` was merged to keep PR19's immediate-guard placement literally intact
+(`_refuseIfProbeUnconfirmed()` called right after `fingerprint()`, before `probeAuth()` runs at
+all) while threading PR20's `credentialTokens` through both the fingerprint step and the
+`probeAuth(credentialTokens)` call, with a second `_refuseIfProbeUnconfirmed()` after the probe —
+unchanged from PR19's own two-call structure, just with tokens threaded through.
+
+`runPhase()` merged with **zero** conflicts — PR20's `api_billed`/`apiKeySource` check and PR19's
+`lastMeaningfulLine`/`terminationConfirmed` catch-block enhancements sit in disjoint sub-regions.
+
+`app/VERSION` conflict resolved to `1.26.0730.1906` (later than both parent tips:
+`1.26.0730.1800` mine, `1.26.0730.1654` theirs).
+
+`session.js`, `engine.js`, `index.js`, and `server.js` auto-merged with no conflict markers at all.
+Each was manually reviewed in full (not just trusted) to confirm the auto-merge is semantically
+correct: `session.js`'s `TmuxAdapter` signature change and `verifySession()`'s new
+`terminationConfirmed` parameter coexist correctly with my `resolveCredentials()` drift-check and
+`_createLane()`/`laneLaunchCommand()` credential-token wiring; `engine.js`'s new
+`_guardTermination()` calls and `privilege_drop_failed` failure-kind mapping coexist correctly with
+my `credentialTokens: cred.tokens` threading and `api_billed` failure-kind mapping, with my
+credential resolution happening before each backend call and PR19's termination guard checking the
+result after; `index.js`'s new `commandDropper`/`droppedExec` boot-time wiring and `server.js`'s
+log-message-only change have no functional overlap with PR20 at all.
+
+Added one new regression test to `test/orch-runner.test.mjs`, even though the fix is already
+non-vacuously exercised by existing tests (confirmed via `config.js` defaults: `deployMode: 'host'`
+and `tmuxUser: 'admin'` both default such that this sandbox's real account already drives
+`plan.mode === 'no_drop'`, which still calls `dropEnv()` for real) — added explicitly and by name
+because the two-layer bug this integration fixed was subtle enough to deserve a test that documents
+the property directly for future maintainers: *"runner: INTEGRATION — CLAUDE_CONFIG_DIR survives the
+REAL PrivilegeDropper.dropEnv() pass, not just phaseEnv()'s own stripping"*. It constructs a real
+`PrivilegeDropper` (not a fake `privilege` object), asserts `plan.mode !== 'passthrough'` so the test
+can't pass vacuously via container mode, then calls the actual `backend.privilege.invocation(...)`
+path `ClaudeCodeBackend`'s own `wrap()` uses for the coding CLI and asserts `CLAUDE_CONFIG_DIR`
+survives in the resulting spawn env.
+
+### Verification evidence
+
+- Repo-wide sweep for stray `<<<<<<<`/`=======`/`>>>>>>>` conflict markers: none found (git-grep
+  across all tracked files).
+- `bash -n` clean on all shell scripts; `node --check` clean on all 25 changed/added `.js`/`.mjs`
+  files (`app/orchestrator/*`, `app/server.js`, `scripts/pw-orch-clear-fence.mjs`, all touched/new
+  `test/orch-*.test.mjs` files).
+- `git diff --check`: clean, both cached and unstaged, before commit.
+- Focused orch-*/credential suite (`orch-*.test.mjs` + `lane-credentials*`/`user-credentials*`/
+  `session-credentials*`): 528/531 pass, 3 skipped (identity-required), 0 fail — including the new
+  INTEGRATION test (30/30 tests in `orch-runner.test.mjs` pass).
+- Full canonical suite, `npm test` (default-concurrent): 816/819 pass, 3 skipped, 0 fail — run
+  twice (once before commit, once after), byte-identical totals both times.
+- Full canonical suite, serial (`--test-concurrency=1`): 816/819 pass, 3 skipped, 0 fail — matches
+  both concurrent runs exactly.
+- `test/release-version.test.mjs` run explicitly both before and after the commit: 4/4 pass both
+  times. (Its real deployable-content-vs-bump check compares merge-base against **committed** HEAD,
+  so the pre-commit pass only validated the guard's own unit tests; the post-commit pass is the one
+  that actually validated `1.26.0730.1906` against the merge diff.)
+- `git status`: clean working tree after commit, no conflict state remaining.
+
+Committed as merge commit `9709a4faad07356ad0d1de5186aebea8c50019ab`
+(parents: `4a1384276ac3843fefe7755e6ceee7a6c7270812` PR20, `be034e4c0b40c36f430dee7a1e8f42fa0abe3f1e`
+PR19/origin-main). Not pushed, not merged upstream, not deployed.
