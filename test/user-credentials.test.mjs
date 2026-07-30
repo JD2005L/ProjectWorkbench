@@ -405,6 +405,22 @@ test('session drift is reported only when it is actionable', () => {
   assert.equal(sessionCredentialState({ perUserEnabled: true, desiredKey: 'abc', stampedKey: '' }).reason, 'unstamped');
 });
 
+test('REGRESSION: disabled/shared mode always desires "off" — a session stamped with a REAL per-user fingerprint left over from when the feature was on is stale, not silently fine', () => {
+  const off = CREDENTIALS_OFF;
+  // The bug: perUserEnabled:false used to short-circuit to stale:false
+  // unconditionally, ignoring the stamp entirely. A project that had a real
+  // per-user owner while the feature was on, then had it toggled off, left a
+  // session stamped with that real fingerprint — that stamp is exactly as
+  // stale as any other mismatch and must require a recycle, not be silently
+  // treated as current.
+  assert.equal(sessionCredentialState({ perUserEnabled: false, desiredKey: 'irrelevant-while-disabled', stampedKey: 'a1b2c3d4e5f6a7b8' }).stale, true);
+  assert.equal(sessionCredentialState({ perUserEnabled: false, desiredKey: 'irrelevant-while-disabled', stampedKey: 'a1b2c3d4e5f6a7b8' }).reason, 'changed');
+  // A session already stamped 'off' (or never stamped) while disabled is
+  // genuinely current — nothing changed underneath it.
+  assert.equal(sessionCredentialState({ perUserEnabled: false, desiredKey: 'irrelevant-while-disabled', stampedKey: off }).stale, false);
+  assert.equal(sessionCredentialState({ perUserEnabled: false, desiredKey: 'irrelevant-while-disabled', stampedKey: '' }).stale, false);
+});
+
 // ---------------------------------------------------------------------------
 // Adversarial review round 2, item 8: the Claude sign-in STATUS check
 // (server.js's userClaudeSignedIn, feeding GET /api/users' claudeSignedIn

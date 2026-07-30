@@ -253,6 +253,87 @@ test('REGRESSION (item 6, unified existing-session policy): an EXISTING session 
   } finally { await teardown(ctx); }
 });
 
+// Item 3 (round 5): a tmux show-options/set-option failure that is NOT a
+// genuinely-unset option must be distinguishable from "nothing stamped" and
+// must make the script fail closed. This shim passes every invocation
+// straight through to the real tmux, EXCEPT show-options/set-option against
+// a specific session while a marker file exists — that one call fails with a
+// distinctive, non-"invalid option" error.
+function makeTmuxShim(dir) {
+  const shimDir = fs.mkdtempSync(path.join(dir, 'tmux-shim-'));
+  const markerPath = path.join(dir, 'tmux-fail.marker');
+  fs.writeFileSync(path.join(shimDir, 'tmux'), `#!/usr/bin/env bash
+target=""
+prev=""
+subcmd=""
+for arg in "$@"; do
+  if [[ "$prev" == "-t" ]]; then target="$arg"; fi
+  if [[ "$arg" == "show-options" || "$arg" == "set-option" ]]; then subcmd="$arg"; fi
+  prev="$arg"
+done
+if [[ -n "$subcmd" ]] \\
+   && [[ -n "\${PW_TEST_TMUX_FAIL_SESSION:-}" && "$target" == "$PW_TEST_TMUX_FAIL_SESSION" ]] \\
+   && [[ -n "\${PW_TEST_TMUX_FAIL_MARKER:-}" && -f "$PW_TEST_TMUX_FAIL_MARKER" ]]; then
+  echo "injected test failure: simulated tmux control-plane error" >&2
+  exit 1
+fi
+exec "$PW_TEST_REAL_TMUX" "$@"
+`, { mode: 0o755 });
+  return { shimDir, markerPath };
+}
+
+test('REGRESSION: a tmux control-plane failure stamping a FRESH session fails closed, does not hand off to ttyd', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+  const { shimDir, markerPath } = makeTmuxShim(ctx.dir);
+  const session = 'pw_' + ctx.name;
+  fs.writeFileSync(markerPath, '1'); // armed before the very first set-option (fresh-session stamp)
+  ctx.env.PATH = `${shimDir}:${ctx.env.PATH}`;
+  ctx.env.PW_TEST_REAL_TMUX = await execFileAsync('bash', ['-c', 'command -v tmux']).then((r) => r.stdout.trim());
+  ctx.env.PW_TEST_TMUX_FAIL_SESSION = session;
+  ctx.env.PW_TEST_TMUX_FAIL_MARKER = markerPath;
+  try {
+    const result = await runScript(ctx);
+    assert.notEqual(result.code, 0, 'must not exit 0 (nor reach the ttyd exec) when the fresh stamp cannot be verified');
+    assert.equal(result.timedOut, false);
+    assert.match(result.stderr, /verify|stamp|injected test failure/i);
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION: a tmux control-plane failure reading an EXISTING session\'s fingerprint fails closed, never treated as unstamped', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_x') }] }));
+  const session = 'pw_' + ctx.name;
+  try {
+    const first = await runScript(ctx);
+    assert.ok(first.timedOut || first.code === 0, JSON.stringify(first));
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'sanity: the session must exist, stamped with a REAL fingerprint, before the injected failure');
+
+    // Disable the feature (desired becomes "off") AND inject a read failure
+    // at the same time — the exact combination that let the old `|| true`/
+    // `-q` script silently coerce "can't read it" into "nothing stamped, and
+    // nothing to worry about since we're off now", reusing a session that
+    // actually still carries a REAL per-user fingerprint underneath.
+    ctx.env.PW_PER_USER_CLAUDE = '';
+    const { shimDir, markerPath } = makeTmuxShim(ctx.dir);
+    fs.writeFileSync(markerPath, '1');
+    ctx.env.PATH = `${shimDir}:${ctx.env.PATH}`;
+    ctx.env.PW_TEST_REAL_TMUX = await execFileAsync('bash', ['-c', 'command -v tmux']).then((r) => r.stdout.trim());
+    ctx.env.PW_TEST_TMUX_FAIL_SESSION = session;
+    ctx.env.PW_TEST_TMUX_FAIL_MARKER = markerPath;
+
+    const second = await runScript(ctx);
+    assert.notEqual(second.code, 0, 'an unverifiable existing fingerprint must refuse to attach, not silently proceed even though desired is now "off"');
+    assert.equal(second.timedOut, false);
+    assert.match(second.stderr, /unverifiable|verify|injected test failure/i);
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'the existing session itself must be left running, untouched');
+  } finally { await teardown(ctx); }
+});
+
 test('SECURITY: no secret ever appears in the script\'s own stdout/stderr', { timeout: 15000 }, async () => {
   const secretKey = crypto.randomBytes(32).toString('hex');
   const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });

@@ -518,6 +518,172 @@ test('REGRESSION: ensureProjectTmuxSession (PVIKPBot base session) refuses to re
   }
 });
 
+// Item 3 (round 5): a tmux show-options/set-option failure that is NOT a
+// genuinely-unset option (a control-plane hiccup, a corrupt server, an
+// unexpected error) must be distinguishable from "nothing stamped" and must
+// make every caller fail closed — never silently coerced into "unstamped,
+// proceed". This shim passes every real tmux invocation straight through to
+// the real binary, EXCEPT show-options/set-option against a specific session
+// while a marker file exists — that one invocation fails with a distinctive,
+// non-"invalid option" error, simulating exactly that kind of failure. The
+// marker is a plain file the test creates/removes at will so a single running
+// server can be made to hit the failure on demand, without restarting it.
+function makeTmuxShim(dir) {
+  const shimDir = fs.mkdtempSync(path.join(dir, 'tmux-shim-'));
+  const markerPath = path.join(dir, 'tmux-fail.marker');
+  // The real invocation is `tmux -u -L <sock> show-options -t <sess> ...` (or
+  // `sudo -u <owner> tmux ...` in host mode) — the subcommand is NOT $1, it
+  // comes after tmux's own global flags. Scan every arg instead of assuming a
+  // position.
+  fs.writeFileSync(path.join(shimDir, 'tmux'), `#!/usr/bin/env bash
+target=""
+prev=""
+subcmd=""
+for arg in "$@"; do
+  if [[ "$prev" == "-t" ]]; then target="$arg"; fi
+  if [[ "$arg" == "show-options" || "$arg" == "set-option" ]]; then subcmd="$arg"; fi
+  prev="$arg"
+done
+if [[ -n "$subcmd" ]] \\
+   && [[ -n "\${PW_TEST_TMUX_FAIL_SESSION:-}" && "$target" == "$PW_TEST_TMUX_FAIL_SESSION" ]] \\
+   && [[ -n "\${PW_TEST_TMUX_FAIL_MARKER:-}" && -f "$PW_TEST_TMUX_FAIL_MARKER" ]]; then
+  echo "injected test failure: simulated tmux control-plane error" >&2
+  exit 1
+fi
+exec "$PW_TEST_REAL_TMUX" "$@"
+`, { mode: 0o755 });
+  return { shimDir, markerPath };
+}
+
+test('REGRESSION: a tmux control-plane failure reading the stamped fingerprint fails closed, never silently treated as unstamped', { timeout: 20000 }, async () => {
+  const port = 3935;
+  const tmuxSock = 'pw-lifelock-' + crypto.randomBytes(4).toString('hex');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-tmux-shim-parent-'));
+  const { shimDir, markerPath } = makeTmuxShim(dir);
+  const realTmux = (await import('node:child_process')).execSync('command -v tmux').toString().trim();
+  const inst = makeInstance(port, {
+    PW_PER_USER_CLAUDE: 'true', PW_DEPLOY_MODE: 'container', PW_INTERNAL_HANDOFF_TOKEN: 'test-token', PW_TMUX_SOCKET: tmuxSock,
+    PATH: `${shimDir}:${process.env.PATH}`,
+    PW_TEST_REAL_TMUX: realTmux,
+    PW_TEST_TMUX_FAIL_SESSION: 'pw_demo',
+    PW_TEST_TMUX_FAIL_MARKER: markerPath,
+  });
+  const proj = seedProject(inst, 'demo');
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7841, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  try {
+    await withServer(inst, port, async (base) => {
+      const handoff = (prompt) => fetch(`${base}/api/internal/pvikpbot/handoff`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-token' },
+        body: JSON.stringify({ project: 'demo', prompt }),
+      }).then((r) => r.json());
+
+      // First call: shim inert (no marker yet) — behaves exactly like real
+      // tmux, session gets created and properly stamped.
+      handoff('hello').catch(() => {});
+      await new Promise((r) => setTimeout(r, 3000));
+      assert.ok(await tmuxOk(tmuxSock, 'demo'), 'sanity: the base session must have been created through the shim');
+
+      // Arm the injected failure: the NEXT show-options against pw_demo fails
+      // with a control-plane error, not "invalid option".
+      fs.writeFileSync(markerPath, '1');
+
+      const start = Date.now();
+      const result = await handoff('hello again');
+      const elapsed = Date.now() - start;
+      assert.equal(result.ok, false, 'an unverifiable fingerprint read must refuse to reattach, not silently proceed');
+      assert.match(result.error || '', /verif|credential|stale/i);
+      assert.ok(elapsed < 5000, `must fail fast, not after the ~30s claude-prompt wait: ${elapsed}ms`);
+    });
+  } finally {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    await execFileAsync(realTmux, ['-L', tmuxSock, 'kill-server']).catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('REGRESSION: a tmux control-plane failure while stamping a FRESH session fails closed (create must not silently claim success)', { timeout: 20000 }, async () => {
+  const port = 3936;
+  const tmuxSock = 'pw-lifelock-' + crypto.randomBytes(4).toString('hex');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-tmux-shim-parent-'));
+  const { shimDir, markerPath } = makeTmuxShim(dir);
+  const realTmux = (await import('node:child_process')).execSync('command -v tmux').toString().trim();
+  // Arm the marker BEFORE the server ever starts — the very first
+  // show-options/set-option against pw_demo (the read-back verification
+  // inside stampSessionCredKey, during FRESH session creation) fails.
+  fs.writeFileSync(markerPath, '1');
+  const inst = makeInstance(port, {
+    PW_PER_USER_CLAUDE: 'true', PW_DEPLOY_MODE: 'container', PW_INTERNAL_HANDOFF_TOKEN: 'test-token', PW_TMUX_SOCKET: tmuxSock,
+    PATH: `${shimDir}:${process.env.PATH}`,
+    PW_TEST_REAL_TMUX: realTmux,
+    PW_TEST_TMUX_FAIL_SESSION: 'pw_demo',
+    PW_TEST_TMUX_FAIL_MARKER: markerPath,
+  });
+  const proj = seedProject(inst, 'demo');
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7842, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  try {
+    await withServer(inst, port, async (base) => {
+      const result = await fetch(`${base}/api/internal/pvikpbot/handoff`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer test-token' },
+        body: JSON.stringify({ project: 'demo', prompt: 'hello' }),
+      }).then((r) => r.json());
+      assert.equal(result.ok, false, 'a fresh session whose stamp cannot be verified must not be handed off as successfully created');
+      assert.match(result.error || '', /verif|credential|stale|injected test failure/i);
+    });
+  } finally {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    await execFileAsync(realTmux, ['-L', tmuxSock, 'kill-server']).catch(() => {});
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Item 2 (round 5): newTmuxWindow() / POST /api/term/:project/windows must
+// verify the LIVE session's stamped fingerprint before adding a window to
+// it — not just resolve today's credentials — or a stale/mismatched session
+// silently gets a new pane under a DIFFERENT identity than the rest of the
+// session (mixed-attribution panes).
+test('REGRESSION: POST /api/term/:project/windows refuses to add a window to a session whose stamped fingerprint no longer matches', { timeout: 30000 }, async () => {
+  const port = 3934;
+  const tmuxSock = 'pw-lifelock-' + crypto.randomBytes(4).toString('hex');
+  const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true', PW_DEPLOY_MODE: 'container', PW_TMUX_SOCKET: tmuxSock });
+  const proj = seedProject(inst, 'demo');
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7840, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+  try {
+    await withServer(inst, port, async (base) => {
+      const started = await fetch(`${base}/api/term/demo/recycle`, { method: 'POST' });
+      assert.equal((await started.json()).ok, true, 'sanity: session starts cleanly');
+      const before = await (await fetch(`${base}/api/term/demo/windows`)).json();
+
+      // Directly corrupt the session's stamp to a fingerprint that does not
+      // match today's owner — simulating drift the dashboard itself did not
+      // cause (an out-of-band restamp, or a resolution change this specific
+      // check must catch independent of credentialContext()).
+      await execFileAsync('tmux', ['-L', tmuxSock, 'set-option', '-t', 'pw_demo', '@pw_cred_key', 'deadbeefdeadbeef']);
+
+      const res = await fetch(`${base}/api/term/demo/windows`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'extra' }),
+      });
+      const body = await res.json();
+      assert.equal(body.ok, false, 'must refuse to add a window to a session stamped with a mismatched fingerprint');
+      assert.match(body.error || '', /stale|fingerprint/i);
+
+      const after = await (await fetch(`${base}/api/term/demo/windows`)).json();
+      assert.equal(after.windows.length, before.windows.length, 'no window may have been created despite the refusal');
+    });
+  } finally {
+    await execFileAsync('tmux', ['-L', tmuxSock, 'kill-server']).catch(() => {});
+  }
+});
+
 async function tmuxOk(tmuxSock, projectName) {
   const { execFile } = await import('node:child_process');
   const { promisify } = await import('node:util');

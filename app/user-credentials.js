@@ -135,13 +135,19 @@ export const CREDENTIALS_OFF = 'off';
 // and reconciled deliberately, because recreating a session destroys whatever is
 // running in it.
 export function sessionCredentialState({ perUserEnabled = false, desiredKey = CREDENTIALS_OFF, stampedKey = '' } = {}) {
-  if (!perUserEnabled) return { stale: false, reason: 'disabled' };
-  if (stampedKey && stampedKey === desiredKey) return { stale: false, reason: 'current' };
+  // While disabled, the desired state is unconditionally the shared/off
+  // login — enforced here, not merely assumed of callers, so a caller that
+  // passes a stale/wrong desiredKey while disabled still gets the right
+  // answer. A session stamped with a REAL per-user fingerprint left over
+  // from when the feature was on is exactly as stale as any other mismatch;
+  // it must not be reported "fine" just because the feature is off now.
+  const effectiveDesired = perUserEnabled ? desiredKey : CREDENTIALS_OFF;
+  if (stampedKey && stampedKey === effectiveDesired) return { stale: false, reason: 'current' };
   if (!stampedKey) {
     // No stamp: the session predates stamping or was made by an older build.
     // With per-user credentials in play we cannot claim it is current, but with
     // nothing to be stale about there is no point alarming anyone.
-    return desiredKey === CREDENTIALS_OFF ? { stale: false, reason: 'current' } : { stale: true, reason: 'unstamped' };
+    return effectiveDesired === CREDENTIALS_OFF ? { stale: false, reason: 'current' } : { stale: true, reason: 'unstamped' };
   }
   return { stale: true, reason: 'changed' };
 }

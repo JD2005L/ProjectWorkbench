@@ -98,8 +98,61 @@ else
   tab_env="$base_tab_env bash --noprofile --norc"
 fi
 
+# Reads the session's stamped credential fingerprint, distinguishing a
+# genuinely-unset option (tmux's own "invalid option" error, surfaced by NOT
+# passing -q — which instead makes tmux swallow every kind of failure into
+# the same empty-stdout/exit-0 result) from any other tmux failure (session
+# vanished, socket error, corrupt server). Mirrors app/server.js's
+# readSessionCredKey exactly. Sets cred_key_read_ok (1/0) and cred_key_read;
+# callers must fail closed on cred_key_read_ok=0, never coerce it into
+# "unstamped" — that ambiguity is exactly the gap this closes.
+read_cred_key() {
+  local sess="$1" errfile rc
+  errfile=$(mktemp)
+  cred_key_read=$(tmux "${tmux_sock_args[@]}" show-options -t "$sess" -v @pw_cred_key 2>"$errfile")
+  rc=$?
+  cred_key_read_err=$(cat "$errfile")
+  rm -f "$errfile"
+  if [[ $rc -eq 0 ]]; then
+    cred_key_read_ok=1
+    return 0
+  fi
+  if [[ "$cred_key_read_err" == *"invalid option"* ]]; then
+    cred_key_read_ok=1
+    cred_key_read=""
+    return 0
+  fi
+  cred_key_read_ok=0
+  cred_key_read=""
+  return 1
+}
+# Stamps the fingerprint AND reads it back to confirm the write actually
+# landed — a set-option that exits nonzero, or one a control-plane hiccup
+# silently drops, must not be trusted without checking. Mirrors
+# app/server.js's stampSessionCredKey.
+stamp_cred_key() {
+  local sess="$1" key="$2" errfile rc seterr
+  errfile=$(mktemp)
+  tmux "${tmux_sock_args[@]}" set-option -t "$sess" @pw_cred_key "$key" 2>"$errfile"
+  rc=$?
+  seterr=$(cat "$errfile"); rm -f "$errfile"
+  if [[ $rc -ne 0 ]]; then
+    echo "[project-terminal-start] failed to stamp credential fingerprint on session '$sess': $seterr" >&2
+    return 1
+  fi
+  if ! read_cred_key "$sess" || [[ "$cred_key_read" != "$key" ]]; then
+    echo "[project-terminal-start] could not verify credential fingerprint stamp on session '$sess' (wrote '$key', read back '${cred_key_read}', ok=${cred_key_read_ok:-0})" >&2
+    return 1
+  fi
+  return 0
+}
+
 if [[ "$already_exists" -eq 1 ]]; then
-  stamped_key=$(tmux "${tmux_sock_args[@]}" show-options -t "$session" -qv @pw_cred_key 2>/dev/null || true)
+  if ! read_cred_key "$session"; then
+    echo "[project-terminal-start] project '$name' has an unverifiable credential fingerprint ($cred_key_read_err) — refusing to attach a possibly-mismatched identity. Recycle required: POST /api/term/$name/recycle" >&2
+    exit 1
+  fi
+  stamped_key="$cred_key_read"
   if [[ -n "$stamped_key" ]]; then
     if [[ "$stamped_key" != "$cred_key" ]]; then
       echo "[project-terminal-start] project '$name' has a stale credential fingerprint (session stamped '$stamped_key', current owner resolves to '$cred_key') — refusing to attach a possibly-mismatched identity. Recycle required: POST /api/term/$name/recycle" >&2
@@ -112,15 +165,24 @@ if [[ "$already_exists" -eq 1 ]]; then
     # Legitimately never stamped AND currently shared/no-owner: nothing to be
     # stale about — adopt the stamp now (upgrade hygiene), same as
     # app/server.js's ensureTmuxSession.
-    tmux "${tmux_sock_args[@]}" set-option -t "$session" @pw_cred_key "$cred_key" 2>/dev/null || true
+    if ! stamp_cred_key "$session" "$cred_key"; then
+      echo "[project-terminal-start] project '$name': refusing to attach — could not verify the credential fingerprint stamp" >&2
+      exit 1
+    fi
   fi
 else
   tmux "${tmux_sock_args[@]}" -u new-session -d -s "$session" -c "$real_path" "$tab_env"
   # Stamp the same non-secret fingerprint app/server.js stamps on sessions it
   # creates (@pw_cred_key), so GET /api/projects/status's staleness check
   # (credentialsStale) treats a session started here identically to one
-  # started via the dashboard — see app/user-credentials.js.
-  tmux "${tmux_sock_args[@]}" set-option -t "$session" @pw_cred_key "$cred_key" 2>/dev/null || true
+  # started via the dashboard — see app/user-credentials.js. A session whose
+  # stamp cannot be verified must not be handed off as though creation
+  # succeeded (the session itself is left running, same never-kill policy as
+  # everywhere else in this script — just not attached to/exec'd into ttyd).
+  if ! stamp_cred_key "$session" "$cred_key"; then
+    echo "[project-terminal-start] project '$name': refusing to hand off a freshly created session — could not verify the credential fingerprint stamp" >&2
+    exit 1
+  fi
   tmux "${tmux_sock_args[@]}" send-keys -t "$session" "printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' '$real_path' '$claude_path' '$session'" C-m
   # Auto-spawn tab templates flagged autoStart. The cmd is typed into the
   # new window via send-keys so the shell stays alive after it exits.

@@ -395,6 +395,64 @@ test('REGRESSION: a rename stales the tmux credential fingerprint of a project t
   });
 });
 
+// Like withServer, but leaves inst.dir on disk — needed when a second server
+// process must restart against the SAME registry/users/workspace files (a
+// real tmux session persists independently of the dashboard process, exactly
+// like a real feature-flag toggle followed by a dashboard restart would).
+async function withServerKeepDir(inst, port, fn) {
+  const logs = [];
+  const child = spawn(process.execPath, [serverJs], { cwd: appDir, env: inst.env, stdio: ['ignore', 'pipe', 'pipe'] });
+  child.stdout.on('data', (d) => logs.push(String(d)));
+  child.stderr.on('data', (d) => logs.push(String(d)));
+  const base = `http://127.0.0.1:${port}`;
+  try {
+    let up = false;
+    for (let i = 0; i < 80 && !up; i++) {
+      if (child.exitCode !== null) break;
+      try { up = (await fetch(base + '/healthz')).status === 200; } catch {}
+      if (!up) await new Promise((r) => setTimeout(r, 125));
+    }
+    assert.ok(up, `server did not come up on :${port}\n--- logs ---\n${logs.join('')}`);
+    await fn(base);
+  } finally {
+    child.kill('SIGTERM');
+    await new Promise((r) => setTimeout(r, 150));
+    if (child.exitCode === null) child.kill('SIGKILL');
+  }
+}
+
+test('REGRESSION: a real per-user stamp left over from when the feature was ON reads stale once the feature is toggled OFF', { timeout: 30000 }, async () => {
+  const port = 3920;
+  const sock = 'pw-toggle-' + crypto.randomBytes(4).toString('hex');
+  const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true', PW_TMUX_SOCKET: sock });
+  const proj = seedProject(inst, 'demo');
+  writeProjects(inst, [{ name: 'demo', path: proj, port: 7820, primaryUser: 'alice' }]);
+  writeUsers(inst, [{ id: 'u-alice', username: 'alice', role: 'developer', projects: '*' }]);
+  try {
+    await withServerKeepDir(inst, port, async (base) => {
+      const started = await fetch(`${base}/api/term/demo/recycle`, { method: 'POST' });
+      assert.equal((await started.json()).ok, true, 'sanity: the session must start cleanly with the feature on');
+    });
+
+    // Restart the SAME dashboard instance — same registry/users/workspace,
+    // same tmux socket, so the session (and its real per-user stamp) is
+    // exactly the one a live dashboard would find after an operator flips
+    // PW_PER_USER_CLAUDE off and restarts.
+    const instOff = { ...inst, env: { ...inst.env, PW_PER_USER_CLAUDE: '' } };
+    await withServerKeepDir(instOff, port, async (base) => {
+      const status = await (await fetch(`${base}/api/projects/status`)).json();
+      const demo = status.projects.find((p) => p.name === 'demo');
+      assert.equal(demo.credentialsStale, true, 'a real per-user fingerprint left over from when the feature was on must be reported stale now, not silently fine');
+    });
+  } finally {
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+    await execFileAsync('tmux', ['-L', sock, 'kill-server']).catch(() => {});
+    fs.rmSync(inst.dir, { recursive: true, force: true });
+  }
+});
+
 test('drift/restart: recycling a stale session after a rename reconciles it to the new fingerprint', { timeout: 30000 }, async () => {
   const port = 3906;
   const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true' });

@@ -538,3 +538,185 @@ implementing v2).
 - `app/VERSION` bumped `1.26.0730.0018` → `1.26.0730.0151` (only `app/lifecycle-lock.js` and
   `test/lifecycle-lock.test.mjs` changed this round; `test/release-version.test.mjs` confirms the
   bump satisfies the forward-motion + deployable-content-requires-a-bump guard from PR19).
+
+## Round 5: four more blockers at reviewed HEAD 47fad43, plus an audit finding
+
+A further independent review, still against the branch (now at `47fad43`, round 4's lock fix),
+found four more concrete gaps in the per-user-credential fingerprint/session machinery, and asked
+for an audit of other process-local caches/locks for item 4's defect class. All four items plus one
+audit-discovered issue are fixed below, each with its own RED→GREEN regression test.
+
+### Item 1 — disabled/shared mode did not desire "off"
+
+`sessionCredentialState()` (`app/user-credentials.js`) short-circuited `perUserEnabled:false` straight
+to `{stale:false}`, ignoring the stamped key entirely. A project that had a real per-user owner while
+the feature was on, then had it toggled off, left a session stamped with that real fingerprint — the
+old code called that "fine" instead of "stale, recycle required". `credentialsStale()` (the
+`/api/projects/status` poll, `app/server.js`) had the exact same bug independently, via its own
+`if(!PER_USER_CLAUDE) return false` early return that bypassed `sessionCredentialState` altogether.
+
+Fixed by making `sessionCredentialState` enforce `effectiveDesired = perUserEnabled ? desiredKey :
+CREDENTIALS_OFF` itself (not merely assumed of callers), and removing `credentialsStale`'s redundant
+early return so it still reads the session's stamp (skipping only the owner-resolution cost, since
+desired is unconditionally 'off' regardless of project when disabled). `ensureTmuxSession` /
+`ensureProjectTmuxSession` needed no separate change — they already passed a correctly-resolved
+`cred.key` (already 'off' when disabled via `credentialContext`'s early `off` return) into
+`sessionCredentialState`; the bug was entirely inside that one function plus `credentialsStale`'s
+copy of it. `scripts/project-terminal-start`'s bash policy already computed this correctly
+independently (compares `stamped_key` against `cred_key` unconditionally, no disabled-mode
+short-circuit) — confirmed by a new test that starts a session while enabled, restarts the same
+dashboard instance (same registry/users/workspace, same tmux socket) with the feature toggled off,
+and checks `/api/projects/status` reports it stale.
+
+RED→GREEN: `test/user-credentials.test.mjs` (+1 unit test), `test/user-lifecycle.test.mjs` (+1
+route-level test using a new `withServerKeepDir` helper for the restart-same-instance shape).
+
+### Item 2 — newTmuxWindow() never verified the live session's fingerprint
+
+`newTmuxWindow()` (used by `POST /api/term/:project/windows`) resolved *today's* credentials via
+`credentialContext()` but never checked whether the *existing* session's stamped `@pw_cred_key`
+still matched before adding a window to it — unlike `ensureTmuxSession`/`ensureProjectTmuxSession`,
+which both already had this check for their own attach paths. A session whose owner rotated a token,
+was renamed, or was reassigned could silently get a new window running under a *different* identity
+than the rest of the session (mixed-attribution panes).
+
+Fixed by adding the identical read-stamp/`sessionCredentialState`/fail-closed-on-stale check to
+`newTmuxWindow()` itself (one point of enforcement covering every caller, including
+`ensurePvikpbotClaude`'s two call sites), plus the same legacy-unstamped-adopt-now step the other two
+functions already had.
+
+RED→GREEN: `test/user-lifecycle-locking.test.mjs` (+1: a session stamped with a mismatched
+fingerprint via raw tmux `set-option` must refuse `POST .../windows`, and no window may be created).
+
+### Item 3 — tmux fingerprint I/O failures were indistinguishable from "unstamped"
+
+`readSessionCredKey` used `show-options -qv` — tmux's `-q` flag makes it swallow *every* failure
+(genuinely-unset option, session vanished, socket/control-plane error, corrupt server) into the same
+empty-stdout/exit-0 result. `stampSessionCredKey` used `set-option ... || true`, discarding failures
+outright with no read-back verification. `scripts/project-terminal-start` had the identical shape in
+bash (`-qv ... 2>/dev/null || true` / `set-option ... || true`). The practical failure mode: a
+transient tmux error while reading a fingerprint got coerced to "" (empty) exactly like a legitimately
+never-stamped session — and if desired happened to be `off` at that moment (item 1's scenario, or
+simply no owner), the ambiguous "can't tell" result got silently treated as "nothing to worry about",
+letting an attach/window-create/hand-off proceed without ever having actually verified the identity.
+
+Fixed on both sides: `readSessionCredKey`/`read_cred_key` drop `-q`, capture stderr, and treat *only*
+tmux's own `invalid option` error as a genuine "nothing stamped" signal — anything else returns
+`{ok:false, error}` (JS) / sets `cred_key_read_ok=0` (bash), which every caller (`credentialsStale`,
+`ensureTmuxSession`, `ensureProjectTmuxSession`, `newTmuxWindow`, and the script's existing-session and
+fresh-creation paths) now treats as fail-closed, never as "unstamped". `stampSessionCredKey`/
+`stamp_cred_key` no longer swallow the `set-option` failure and additionally read the value back to
+confirm it landed, throwing/exiting nonzero on any mismatch — so a fresh session whose stamp cannot be
+verified is never handed off as though creation succeeded (the tmux session itself is still left
+running, same never-kill policy as everywhere else in this feature — just not attached to or exec'd
+into ttyd).
+
+RED→GREEN: both `test/user-lifecycle-locking.test.mjs` and `test/project-terminal-start.test.mjs`
+gained a small tmux shim (a `tmux` shell script on `PATH` ahead of the real binary, forwarding
+everything except `show-options`/`set-option` against one marked session while a marker file exists)
+and two tests each — one injecting the failure during fresh-session stamping, one during an
+existing-session read (this one specifically combined with the feature toggled off mid-scenario, the
+exact combination that let the old ambiguity slip through; without that combination the old code
+happened to fail closed anyway, for the wrong reason, and would not have been a meaningful regression
+test).
+
+### Item 4 — sessions.json's lock was in-process only (the headline finding)
+
+`app/server.js`'s `sessionsCache`/`sessionsLock` were a bare module-level variable and an in-process
+promise chain — `app/lifecycle-lock.js`'s round-3/4 cross-process lock was never applied to
+sessions.json at all, unlike users.json (`withUsersLock`, since round 3). Two real dashboard processes
+(a rolling restart overlap, two instances) each kept their *own* `sessionsCache`: whichever process's
+whole-file write landed last silently discarded every session the *other* process had created or
+revoked in the meantime. Reproduced directly: two real server processes racing 16 concurrent logins
+(8 per process) left exactly 8 of 16 sessions on disk — each process's cache overwrote the other's
+entirely.
+
+Fixed by giving sessions.json the exact same shape as users.json: `loadSessions`/`saveSessions` are
+now fully stateless (no cache, always fresh from disk), and `withSessionsLock(mutate)` wraps them in
+`withLifecycleLock(SESSIONS_LOCK_PATH, ...)` — a *different* lock file than users.json's, cross-process
+via the same hardened round-4 protocol. `createSession`/`revokeSession`/`purgeExpiredSessions` and the
+DELETE-user route's inline session purge were all updated to the new `mutate(sessions) -> return false
+to skip save` calling convention (mirroring `withUsersLock`'s). `lookupSession` stays an unlocked plain
+read, exactly like reads of `loadUsers()` elsewhere in this file — safe because both users.json and
+sessions.json are only ever written via atomic rename, so a concurrent read never sees a torn file.
+
+**Lock ordering.** DELETE `/api/users/:username` already held the cross-process *users* lock
+(`LIFECYCLE_LOCK_PATH`) for its entire operation and, nested inside that same critical section,
+acquires the *sessions* lock to purge the deleted user's sessions — users-lock outer, sessions-lock
+inner. Login previously created the session *before* the best-effort `lastLoginAt` users-lock update —
+not actually nested (the two acquisitions never overlapped), so no live deadlock existed, but two
+locks used in inconsistent temporal order by different routes is exactly the kind of thing that stops
+being safe by luck instead of by construction the moment either side's shape changes. Reordered login
+to do the users-lock update *before* creating the session, so the whole codebase now has one
+consistent global order (users lock always at or before sessions lock, never the reverse, never held
+across it) — verified, not merely argued, by a DELETE-vs-concurrent-login test below completing
+without ever hanging.
+
+RED→GREEN: new `test/sessions-lock.test.mjs` (4 tests, each spawning two REAL separate dashboard
+processes sharing one sessions.json/users.json): concurrent login (16 across 2 processes, exact
+count preserved — this is the direct reproduction of the reported bug); concurrent logout mixed with
+concurrent fresh logins (revoke exactly the intended sessions, no resurrection, no collateral loss on
+the untouched half); a naturally-expired session reaped via `lookupSession`'s auth-triggered revoke on
+one process while the other concurrently creates fresh sessions; DELETE purging a deleted user's
+sessions racing 16 concurrent logins for a *different* user spread across both processes (needed
+widening from an initial 6-login version, which didn't reproduce reliably against the old code — the
+delete route only performs one write cycle, so collision odds scale with how many write cycles race
+it, not just with concurrency existing at all).
+
+### Audit — other process-local whole-file locks for the same defect
+
+Swept `app/server.js` and every other `app/*.js` for the `let ... = Promise.resolve()` in-process-lock
+shape and for stray module-level caches. Found one more live instance: `projectsLock`, guarding
+`projects.json` across 6 call sites (`/manage/add`, `/manage/update`, `/manage/delete`,
+`/api/projects/reorder`, `reconcileRenameCredentials`, and DELETE-user's project-reference cleanup) —
+same defect class as sessions.json, minus the stale-cache flavor (`loadProjects`/`saveProjects` were
+already cache-free; only the *lock* was in-process-only). Confirmed a lock-ordering audit first:
+nothing calls `withUsersLock`/`withLifecycleLock` from inside any `withProjectsLock` callback (checked
+`cloneWorkspace`, `applyRouting`, `startProject`, `stopProject`, `removeWorkspace`,
+`syncProjectCredentials` directly), so upgrading it introduces no new nesting direction and no
+deadlock risk. Fixed identically: `withProjectsLock(fn)` now wraps `fn` in
+`withLifecycleLock(PROJECTS_LOCK_PATH, fn)` — a third distinct lock file, same protocol — with **no
+call-site changes at all**, since every caller already did its own load/mutate/save inside the
+callback.
+
+Other candidates checked and ruled out as out of scope: `terminalOwnerCache` (memoizes a read-only
+passwd-lookup fact that is identical across all processes and never written by the dashboard — no
+mutation race is even possible); `orchestrator`/`app/orchestrator/*` (a separate, independently
+reviewed subsystem with its own lane-lock and journal/git-backed store design, not part of the
+user/session/project/credential lifecycle this PR concerns); `app/user-store.js`'s `tail` chain
+(confirmed via grep genuinely unimported by `app/server.js` — dead code kept only for its own
+standalone unit tests since round 3, no live multi-process exposure).
+
+RED→GREEN: new `test/projects-lock.test.mjs` (1 test: two real dashboard processes creating 12
+different projects concurrently, 6 each — old lock lost 5 of 12; fixed lock preserves all 12).
+
+### Verification evidence
+
+- Full sequential suite (`cd app && node --test --test-concurrency=1 ../test/*.test.mjs`): **564/564
+  pass**, 0 failures (552 round-4 baseline + 12 net new tests this round: 2 item-1, 1 item-2, 4
+  item-3, 4 item-4, 1 audit).
+- Full default (parallel) suite (`cd app && npm test`): **564/564 pass**, 0 failures, no shared-host
+  noise this run.
+- `test/sessions-lock.test.mjs` and `test/projects-lock.test.mjs` re-run 5x each after the fix: 0
+  failures across 25 total runs; the pre-fix versions were confirmed to fail via `git stash` on
+  `app/server.js`/`scripts/project-terminal-start` before each fix, then pass again after `stash pop`
+  — genuine RED→GREEN, not just a plausible-looking green.
+- Production-shaped root-to-admin probe: dashboard spawned as uid 0 in HOST mode (the container-mode
+  variant used earlier in this round for convenience was re-run in host mode after it revealed *why*
+  it matters — container mode with no `PW_TERMINAL_UID` legitimately runs credential materialization
+  in-process as root, per `terminal-owner.js`'s documented "container, no PW_TERMINAL_UID: pane is
+  root, no handover" case, which is correct behavior for that configuration but not what a
+  root-dashboard/admin-pane probe is meant to exercise). In host mode: login, recycle (real tmux
+  session + real per-user credential materialization), `/api/projects/status`, a new window, and
+  `GET /api/users` all exercised over real HTTP against the real root process. Credential tree
+  (`pw-users/alice/**`) confirmed admin-owned throughout, including the newly-created `claude/` dir,
+  `.claude.json`, and `session-env.sh` (never root) — the core invariant this whole feature exists to
+  enforce, unaffected by any round-5 change. `users.json`/`sessions.json` root-owned (expected — root
+  owning its own files), `sessions.json` content well-formed and correct. No stray `.pw-*.lock` /
+  `.tmp-*` / `.claim-*` files left behind while idle. No secret (`ghp_probe_token_MUST_NOT_LEAK`)
+  appeared anywhere in the server's stdout/stderr log. Production instance (`/opt/project-workbench/
+  app/server.js`, a different, already-running process on port 3000) confirmed untouched throughout;
+  probe torn down (server killed, tmux socket killed, scratch dir removed) afterward.
+- `bash -n scripts/project-terminal-start` and `node --check` on every modified `.js` file: clean.
+- `app/VERSION` bumped `1.26.0730.0151` → `1.26.0730.0257`; `test/release-version.test.mjs` confirms
+  the bump satisfies the forward-motion + deployable-content-requires-a-bump guard.

@@ -292,15 +292,19 @@ async function credentialContext(project){
  }
 }
 
-// Serialize every projects.json read-modify-write transaction. Concurrent POSTs
-// from two browser tabs would otherwise both loadProjects() against the same
-// pre-edit snapshot, mutate independently, then last-write-wins on saveProjects.
-let projectsLock = Promise.resolve();
+// Serialize every projects.json read-modify-write transaction, cross-process
+// (app/lifecycle-lock.js) — not just in-process. Concurrent POSTs from two
+// browser tabs against ONE dashboard process were already covered by a bare
+// in-process promise chain, but that gave no protection at all across TWO
+// real dashboard processes (a rolling restart overlap, two instances): each
+// would loadProjects() its own snapshot, mutate independently, and
+// last-write-wins on saveProjects — the exact same defect class closed for
+// users.json (round 3) and sessions.json (round 5, item 4). Every call site
+// already does its own load/mutate/save inside the callback, so only the
+// serialization mechanism changes here, not the call signature.
+const PROJECTS_LOCK_PATH = process.env.PW_PROJECTS_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-projects.lock');
 async function withProjectsLock(fn){
- const prev = projectsLock;
- let release;
- projectsLock = new Promise(r => { release = r; });
- try { await prev; return await fn(); } finally { release(); }
+ return withLifecycleLock(PROJECTS_LOCK_PATH, fn);
 }
 
 // ============================================================================
@@ -467,40 +471,47 @@ async function authenticate(rawUsername, password){
  return (await verifyPassword(password, u.passwordHash)) ? u : null;
 }
 
-let sessionsCache = null;
-let sessionsLock = Promise.resolve();
-async function withSessionsLock(fn){
- const prev = sessionsLock;
- let release;
- sessionsLock = new Promise(r => { release = r; });
- try { await prev; return await fn(); } finally { release(); }
-}
+// Cross-process serialized, exactly like users.json's withUsersLock: no
+// process-local cache (a process-local cache is precisely what made the
+// original in-process-only sessionsLock lose sessions across processes — two
+// dashboard processes each kept their OWN sessionsCache, and whichever one's
+// whole-file write landed last silently discarded every session the OTHER
+// process had created or revoked in the meantime). Every mutation reloads
+// the current on-disk sessions under the SAME cross-process lifecycle lock
+// app/lifecycle-lock.js already provides for users.json, so two real
+// processes racing create/revoke/purge can never lose or resurrect a session.
+const SESSIONS_LOCK_PATH = process.env.PW_SESSIONS_LOCK_PATH || path.join(path.dirname(sessionsPath), '.pw-sessions.lock');
 async function loadSessions(){
- if(sessionsCache) return sessionsCache;
- try { const raw = await fs.readFile(sessionsPath,'utf8'); const data = JSON.parse(raw); sessionsCache = Array.isArray(data?.sessions) ? data.sessions : []; }
- catch { sessionsCache = []; }
- return sessionsCache;
+ try { const raw = await fs.readFile(sessionsPath,'utf8'); const data = JSON.parse(raw); return Array.isArray(data?.sessions) ? data.sessions : []; }
+ catch(e){ if(e.code === 'ENOENT') return []; throw e; }
 }
-async function saveSessions(){
- if(!sessionsCache) return;
+async function saveSessions(sessions){
  await fs.mkdir(path.dirname(sessionsPath),{recursive:true});
- await writeFileAtomic(sessionsPath, JSON.stringify({ sessions: sessionsCache }, null, 2)+'\n', { mode: 0o600 });
+ await writeFileAtomic(sessionsPath, JSON.stringify({ sessions }, null, 2)+'\n', { mode: 0o600 });
 }
-async function createSession(userId){
- return withSessionsLock(async () => {
+async function withSessionsLock(mutate){
+ return withLifecycleLock(SESSIONS_LOCK_PATH, async () => {
   const sessions = await loadSessions();
-  const id = crypto.randomBytes(32).toString('base64url');
-  const now = new Date();
-  sessions.push({ id, userId, createdAt: now.toISOString(), expiresAt: new Date(now.getTime()+SESSION_TTL_MS).toISOString() });
-  await saveSessions();
-  return id;
+  const outcome = await mutate(sessions);
+  if(outcome === false) return { changed:false, result: outcome };
+  await saveSessions(sessions);
+  return { changed:true, result: outcome };
  });
 }
+async function createSession(userId){
+ const { result: id } = await withSessionsLock((sessions) => {
+  const newId = crypto.randomBytes(32).toString('base64url');
+  const now = new Date();
+  sessions.push({ id: newId, userId, createdAt: now.toISOString(), expiresAt: new Date(now.getTime()+SESSION_TTL_MS).toISOString() });
+  return newId;
+ });
+ return id;
+}
 async function revokeSession(id){
- return withSessionsLock(async () => {
-  const sessions = await loadSessions();
+ await withSessionsLock((sessions) => {
   const i = sessions.findIndex(s => s.id === id);
-  if(i >= 0){ sessions.splice(i,1); await saveSessions(); }
+  if(i < 0) return false;
+  sessions.splice(i,1);
  });
 }
 async function lookupSession(id){
@@ -512,11 +523,13 @@ async function lookupSession(id){
  return s;
 }
 async function purgeExpiredSessions(){
- return withSessionsLock(async () => {
-  const sessions = await loadSessions();
+ await withSessionsLock((sessions) => {
   const now = new Date();
+  const before = sessions.length;
   const kept = sessions.filter(s => new Date(s.expiresAt) >= now);
-  if(kept.length !== sessions.length){ sessionsCache = kept; await saveSessions(); }
+  if(kept.length === before) return false;
+  sessions.length = 0;
+  sessions.push(...kept);
  });
 }
 
@@ -923,16 +936,43 @@ const agentLoginDropArgv = agentLoginDrop(TERMINAL_PRIV);
 // reconcile it deliberately (POST /api/term/:project/recycle) rather than
 // silently killing a session that may be holding running work.
 const CRED_KEY_OPTION = '@pw_cred_key';
+// Reads the session's stamped credential fingerprint. Deliberately omits `-q`
+// (which makes tmux swallow ALL errors — a genuinely-unset option, a session
+// that no longer exists, and a control-plane hiccup all collapse to the same
+// empty-stdout/exit-0 result, indistinguishable from each other): without it,
+// a truly-unset option fails with tmux's own "invalid option" error, which is
+// the ONLY case this treats as a real, positive "nothing stamped" signal.
+// Anything else — the session vanished, a socket error, a corrupt server —
+// comes back `ok:false`, and callers must fail closed on that, never coerce
+// it into "unstamped" (that ambiguity is exactly what let a stale identity
+// through before this fix).
 async function readSessionCredKey(sess){
- try { const { stdout } = await tmux(['show-options','-t',sess,'-qv',CRED_KEY_OPTION]); return String(stdout || '').trim(); }
- catch { return ''; }
+ try {
+  const { stdout } = await tmux(['show-options','-t',sess,'-v',CRED_KEY_OPTION]);
+  return { ok:true, key: String(stdout || '').trim() };
+ } catch(e){
+  const stderr = String(e?.stderr || e?.message || '');
+  if(/invalid option/i.test(stderr)) return { ok:true, key:'' };
+  return { ok:false, error: stderr.trim() || String(e) };
+ }
 }
+// Stamps the fingerprint AND reads it back to confirm the write actually
+// landed — a `set-option` that exits nonzero, or one that "succeeds" but a
+// control-plane hiccup silently drops, must not be trusted without checking.
 async function stampSessionCredKey(sess,key){
- await tmux(['set-option','-t',sess,CRED_KEY_OPTION,key]).catch(()=>{});
+ await tmux(['set-option','-t',sess,CRED_KEY_OPTION,key]);
+ const verify = await readSessionCredKey(sess);
+ if(!verify.ok || verify.key !== key){
+  throw new Error(`could not verify the credential fingerprint stamp on session "${sess}" (wrote ${JSON.stringify(key)}, read back ${verify.ok ? JSON.stringify(verify.key) : `unreadable: ${verify.error}`})`);
+ }
 }
 // Is this project's live session running on credentials other than the ones it
-// would get today? Costs nothing (and touches no tmux) while the feature is off.
-// This is a READ-ONLY status poll across every project, not a launch path, so a
+// would get today? Still checks the session's stamp even while the feature is
+// off — a real per-user fingerprint left over from when it was on is exactly
+// as stale as any other mismatch (see the round-4 fix to sessionCredentialState
+// in app/user-credentials.js) — but skips resolving a project owner (and its
+// loadUsers/decrypt cost) in that case, since the desired state is unconditionally
+// 'off' regardless of the project. This is a READ-ONLY status poll across every project, not a launch path, so a
 // broken project's credential owner (e.g. a dangling primaryUser) must not
 // throw and 500 the whole /api/projects/status response for every other
 // project too. But it must also never silently report "not stale" when it
@@ -940,18 +980,27 @@ async function stampSessionCredKey(sess,key){
 // mode into the status poll instead of removing it. So an unresolvable owner
 // is reported stale (visible, actionable) rather than swallowed either way.
 async function credentialsStale(p){
- if(!PER_USER_CLAUDE) return false;
  const sess = tmuxSession(p.name);
  try { await tmux(['has-session','-t',sess]); } catch { return false; }
- const [desired, stampedKey] = await Promise.all([
-  desiredCredentialKey(p).then(key => ({ ok:true, key })).catch(e => ({ ok:false, e })),
-  readSessionCredKey(sess),
- ]);
+ const stamped = await readSessionCredKey(sess);
+ if(!stamped.ok){
+  console.warn(`[per-user-claude] ${p?.name || '?'}: cannot read the session's credential fingerprint — reporting stale: ${stamped.error}`);
+  return true;
+ }
+ if(!PER_USER_CLAUDE){
+  // Desired is unconditionally 'off' while disabled — no need to resolve a
+  // project owner (and pay loadUsers/decrypt cost) just to learn that. A
+  // real per-user fingerprint left stamped from when the feature was on is
+  // still reported stale here, via sessionCredentialState's own enforcement
+  // of "disabled always desires off" — see app/user-credentials.js.
+  return sessionCredentialState({ perUserEnabled: false, desiredKey: CREDENTIALS_OFF, stampedKey: stamped.key }).stale;
+ }
+ const desired = await desiredCredentialKey(p).then(key => ({ ok:true, key })).catch(e => ({ ok:false, e }));
  if(!desired.ok){
   console.warn(`[per-user-claude] ${p?.name || '?'}: cannot determine desired credential state — reporting stale: ${desired.e?.message || desired.e}`);
   return true;
  }
- return sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: desired.key, stampedKey }).stale;
+ return sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: desired.key, stampedKey: stamped.key }).stale;
 }
 // Unified existing-session policy (both for this function and for
 // scripts/project-terminal-start, which applies the identical rule in bash):
@@ -981,8 +1030,11 @@ async function ensureTmuxSession(p){
  // for either case — see the policy note above.
  const cred = await credentialContext(p);
  if(exists){
-  const stampedKey = await readSessionCredKey(sess);
-  const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey });
+  const stamped = await readSessionCredKey(sess);
+  if(!stamped.ok){
+   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credential fingerprint could not be verified (${stamped.error}). Refusing to attach under an unverifiable identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+  }
+  const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
   if(state.stale){
    throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to attach a possibly-mismatched identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
   }
@@ -990,7 +1042,7 @@ async function ensureTmuxSession(p){
   // stamp on a legacy-unstamped session now that we've confirmed there is
   // nothing to be stale about (sessionCredentialState already only reports
   // stale:false-unstamped for the legitimate off case).
-  if(!stampedKey) await stampSessionCredKey(sess, cred.key);
+  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
   return;
  }
  const cwd = p.path || workspacePath(p.name);
@@ -1020,12 +1072,15 @@ async function ensureProjectTmuxSession(p){
  try { await tmux(['has-session','-t',sess]); } catch { exists = false; }
  const cred = await credentialContext(p);
  if(exists){
-  const stampedKey = await readSessionCredKey(sess);
-  const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey });
+  const stamped = await readSessionCredKey(sess);
+  if(!stamped.ok){
+   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credential fingerprint could not be verified (${stamped.error}). Refusing to attach under an unverifiable identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+  }
+  const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
   if(state.stale){
    throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to attach a possibly-mismatched identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
   }
-  if(!stampedKey) await stampSessionCredKey(sess, cred.key);
+  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
   return;
  }
  const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]).join(' ') + ' bash ' + cred.shellArgs.join(' ');
@@ -1097,12 +1152,26 @@ async function injectPvikpbotPrompt(p,prompt){
 }
 async function newTmuxWindow(p,name='new task',cmd=''){
  const safeName = String(name || 'new task').replace(/[\r\n\t]/g,' ').trim().slice(0,80) || 'new task';
+ const sess = tmuxSession(p.name);
  // A new window gets today's credentials, which may differ from the ones the
  // session was created with; that is why drift is reported per session and
- // reconciled by recreating it, rather than left to accumulate silently.
+ // reconciled by recreating it, rather than left to accumulate silently. The
+ // LIVE session's stamped fingerprint must match exactly before adding to
+ // it — otherwise a new window lands under a different identity than the
+ // rest of the session (mixed-attribution panes), which is never allowed
+ // implicitly; POST /api/term/:project/recycle is the deliberate fix.
  const cred = await credentialContext(p);
+ const stamped = await readSessionCredKey(sess);
+ if(!stamped.ok){
+  throw new Error(`[per-user-claude] project "${p.name}"'s existing session credential fingerprint could not be verified (${stamped.error}). Refusing to create a window under an unverifiable identity.`);
+ }
+ const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
+ if(state.stale){
+  throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to create a mixed-attribution window — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+ }
+ if(!stamped.key) await stampSessionCredKey(sess, cred.key);
  const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
- await tmux(['new-window','-t',tmuxSession(p.name),'-c',p.path,'-n',safeName,...winEnv,'bash',...cred.shellArgs]);
+ await tmux(['new-window','-t',sess,'-c',p.path,'-n',safeName,...winEnv,'bash',...cred.shellArgs]);
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
   await new Promise(r=>setTimeout(r,80));
@@ -2623,11 +2692,19 @@ app.post(BASE + '/api/auth/login', async (req,res) => {
   try { u = await authenticate(username, password); }
   catch(e){ await audit('login_fail', { reason:'ldap-bind', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
   if(!u){ await audit('login_fail', { reason:'invalid', username }, req); return res.status(401).json({ ok:false, error:'Invalid username or password' }); }
-  const sid = await createSession(u.id);
-  setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
   // Record lastLoginAt opportunistically (best-effort; the store re-reads so this
   // cannot revert a change made while the directory bind above was in flight).
+  // Deliberately BEFORE createSession(): the users lock and the sessions lock
+  // are two separate cross-process locks (app/lifecycle-lock.js), and
+  // DELETE /api/users/:username holds the users lock for its ENTIRE
+  // operation while nesting a sessions-lock acquisition inside it (to purge
+  // the deleted user's sessions). One consistent global order — users lock
+  // always before sessions lock, never the reverse, never held across the
+  // other — rules out a login-vs-delete lock-ordering deadlock by
+  // construction rather than by coincidence.
   try { await withUsersLock((users)=>{ const rec = users.find(x => x.id === u.id); if(!rec) return false; rec.lastLoginAt = new Date().toISOString(); }); } catch {}
+  const sid = await createSession(u.id);
+  setSessionCookie(req, res, sid, Math.floor(SESSION_TTL_MS / 1000));
   req.user = u;
   await audit('login_ok', { username }, req);
   res.json({ ok:true, user: { username:u.username, role:u.role, projects:u.projects } });
@@ -3010,10 +3087,12 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
      for(const p of fresh){ if(namesToClear.has(p.primaryUser)){ delete p.primaryUser; changed = true; } }
      if(changed) await saveProjects(fresh);
     });
-    await withSessionsLock(async () => {
-     const sessions = await loadSessions();
+    await withSessionsLock((sessions) => {
+     const before = sessions.length;
      const kept = sessions.filter(s => s.userId !== victim.id);
-     if(kept.length !== sessions.length){ sessionsCache = kept; await saveSessions(); }
+     if(kept.length === before) return false;
+     sessions.length = 0;
+     sessions.push(...kept);
     });
    } catch(e){
     return { failure: { status:500, error:
