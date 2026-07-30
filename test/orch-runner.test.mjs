@@ -376,6 +376,63 @@ test('runner: a successful phase returns structured facts, not the agent’s pro
   assert.match(result.summary, /Implemented the change/);
 });
 
+// ---------------------------------------------------------------------------
+// SECURITY: runPhase() must refuse an API-billed session exactly like
+// verifyConfiguration() already does — a real phase, not just the one-time
+// verification probe, is what actually spends money and does the work.
+//
+// CLAUDE_CONFIG_DIR (see phaseEnv()'s allowlist above) points at the SAME
+// per-user config directory a human's own interactive terminal uses (per
+// app/orchestrator/lane-credentials.js's own docs: "used by TWO independent
+// entrypoints"). A settings.json placed there with its own `env.
+// ANTHROPIC_API_KEY` is honored by the real CLI regardless of what
+// phaseEnv() stripped from the process environment — verified empirically
+// against the real installed claude binary. verifyConfiguration() already
+// refuses this via attestation.js's claimsSubscription check (init.
+// apiKeySource !== 'none'); nothing made runPhase() apply the identical
+// rule, so a phase could silently bill to that key with ok:true.
+// ---------------------------------------------------------------------------
+
+test('runner: SECURITY — a phase reporting non-subscription apiKeySource is refused, never ok:true', async () => {
+  const billed = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5',
+    apiKeySource: 'ANTHROPIC_API_KEY', session_id: 's1', permissionMode: 'acceptEdits',
+  });
+  const { backend } = backendWith({ stdout: `${billed}\n${RESULT_LINE}\n` });
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(result.ok, false, 'a phase that actually ran under API-key billing must never report ok:true, whatever the CLI itself reported about the task');
+  assert.equal(result.failure_kind, 'api_billed');
+});
+
+test('runner: SECURITY — a phase whose init event omits apiKeySource entirely is refused too — absence is not consent', async () => {
+  // Mirrors attestation.js's own claimsSubscription logic exactly: apiKeySource missing/non-string
+  // resolves to null, and null !== 'none', so it is refused — the real CLI has always reported this
+  // field (see the file-level comment on INIT_LINE), so its absence is itself suspicious.
+  const noField = JSON.stringify({
+    type: 'system', subtype: 'init', model: 'claude-sonnet-5', session_id: 's1', permissionMode: 'acceptEdits',
+  });
+  const { backend } = backendWith({ stdout: `${noField}\n${RESULT_LINE}\n` });
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(result.ok, false);
+  assert.equal(result.failure_kind, 'api_billed');
+});
+
+test('runner: a phase reporting the subscription (apiKeySource: "none") is unaffected by the new check', async () => {
+  const { backend } = backendWith({ stdout: `${INIT_LINE}\n${RESULT_LINE}\n` });
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+  });
+  assert.equal(result.ok, true);
+  assert.notEqual(result.failure_kind, 'api_billed');
+});
+
 test('runner: a max-turn exit is a failure, never a success', async () => {
   const { backend } = backendWith({
     stdout: `${INIT_LINE}\n${JSON.stringify({
@@ -446,6 +503,85 @@ test('runner: no credentialTokens means the spawned process env is byte-unchange
   // The base environment (process.env, minus the forbidden API-billing keys) must be otherwise
   // untouched — the same object shape phaseEnv() always produced.
   assert.equal(phase.options.env.PATH, process.env.PATH);
+});
+
+// ---------------------------------------------------------------------------
+// SECURITY: credentialTokens must never be able to reintroduce a forbidden
+// (API-billing) environment key.
+//
+// phaseEnv() strips FORBIDDEN_ENV from process.env FIRST, then applies
+// credentialTokens — a caller-supplied array of KEY=VALUE strings threaded
+// all the way from app/orchestrator/lane-credentials.js's resolver through
+// engine.js and session.js. Applying tokens AFTER the strip with no check on
+// what they name means any token naming a forbidden key (a bug in a future
+// resolver, or a malicious project registry entry) silently reintroduces it
+// — undoing this exact function's own stated contract ("every API-billing
+// escape hatch removed").
+// ---------------------------------------------------------------------------
+
+test('runner: SECURITY — credentialTokens can never reintroduce a forbidden API-billing key', () => {
+  const { backend } = backendWith({});
+  for (const forbidden of [
+    'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL', 'ANTHROPIC_CUSTOM_HEADERS',
+    'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'AWS_BEARER_TOKEN_BEDROCK',
+  ]) {
+    const env = backend.phaseEnv([`${forbidden}=reintroduced`, 'CLAUDE_CONFIG_DIR=/safe']);
+    assert.equal(forbidden in env, false, `${forbidden} must never be reintroducible via credentialTokens`);
+    // The legitimate token alongside it must still apply — this is not a blanket rejection of the
+    // whole token list, only of the specific forbidden key.
+    assert.equal(env.CLAUDE_CONFIG_DIR, '/safe');
+  }
+});
+
+test('runner: SECURITY — only the resolver-owned CLAUDE_CONFIG_DIR key may be set via credentialTokens, not an arbitrary key', () => {
+  const { backend } = backendWith({});
+  const env = backend.phaseEnv(['SOME_UNEXPECTED_KEY=value', 'CLAUDE_CONFIG_DIR=/safe', 'PATH=/hijacked']);
+  assert.equal('SOME_UNEXPECTED_KEY' in env, false, 'a key resolveLaneCredentials() never produces must be dropped, not trusted');
+  assert.equal(env.CLAUDE_CONFIG_DIR, '/safe');
+  assert.notEqual(env.PATH, '/hijacked', 'PATH is not a resolver-owned key and must not be overridable via credentialTokens');
+});
+
+test('runner: an empty or malformed credential token is dropped, never applied as an empty override', () => {
+  const { backend } = backendWith({});
+  // No '=' at all: already skipped by the pre-existing eq === -1 guard.
+  // An empty value ("KEY="): must not silently null out a real config dir.
+  // An empty key ("=value"): nonsensical, must not reach the allowlist.
+  const env = backend.phaseEnv(['CLAUDE_CONFIG_DIR=', '=orphan-value', 'not-a-token-at-all']);
+  assert.equal('CLAUDE_CONFIG_DIR' in env, false, 'an empty value must not be applied as an empty CLAUDE_CONFIG_DIR override');
+  assert.equal('' in env, false);
+});
+
+test('runner: SECURITY REGRESSION — a forbidden key smuggled via credentialTokens never reaches a REAL spawned process, while the legitimate key still does', async () => {
+  const { execFile } = await import('node:child_process');
+  const { promisify } = await import('node:util');
+  const execFileAsync = promisify(execFile);
+
+  const config = loadOrchestratorConfig({
+    PW_ORCHESTRATOR_ENABLED: 'true', PW_ORCHESTRATOR_INSTANCE_ID: 'wb-1',
+    PW_ORCHESTRATOR_CLAUDE_BIN: '/usr/local/bin/claude',
+  });
+  const exec = async (file, args, options) => {
+    if (args[0] === '--version') return { stdout: '2.1.220 (Claude Code)', stderr: '' };
+    if (args[0] === '--help') return { stdout: REAL_HELP, stderr: '' };
+    if (args[0] === 'auth') return { stdout: JSON.stringify({ loggedIn: true, authMethod: 'claude.ai', apiProvider: 'firstParty' }), stderr: '' };
+    // A REAL child process — proves a forbidden key smuggled through credentialTokens really is
+    // absent from a live process's environment, not just from a JS object this test constructed.
+    const real = await execFileAsync('env', [], { env: options.env });
+    const lines = real.stdout.split('\n');
+    const apiKey = lines.find((l) => l.startsWith('ANTHROPIC_API_KEY=')) ?? '(absent)';
+    const configDir = lines.find((l) => l.startsWith('CLAUDE_CONFIG_DIR='))?.slice('CLAUDE_CONFIG_DIR='.length) ?? '';
+    return { stdout: `${INIT_LINE}\n${JSON.stringify({ ...JSON.parse(RESULT_LINE), result: `${apiKey}|${configDir}` })}\n`, stderr: '' };
+  };
+  const backend = new ClaudeCodeBackend({ config, exec, clock: () => new Date('2026-07-27T12:00:00.000Z') });
+  backend.fingerprint = async () => FINGERPRINT;
+
+  const result = await backend.runPhase({
+    prompt: 'implement it', model: 'sonnet', effort: 'high', maxTurns: 10,
+    phaseClass: PhaseClass.IMPLEMENTATION, cwd: '/srv/workspaces/Demo',
+    credentialTokens: ['ANTHROPIC_API_KEY=reintroduced', 'CLAUDE_CONFIG_DIR=/srv/pw-users/alice/.claude'],
+  });
+  assert.equal(result.summary, '(absent)|/srv/pw-users/alice/.claude',
+    'a REAL spawned process must never see the smuggled ANTHROPIC_API_KEY, while the legitimate CLAUDE_CONFIG_DIR must still reach it');
 });
 
 test('runner: REGRESSION — the resolved credential env reaches a REAL spawned process, not just a JS options object', async () => {

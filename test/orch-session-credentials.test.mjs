@@ -303,3 +303,63 @@ tmuxTest('a reboot-restored plain shell IS accepted as-is (re-marked, never kill
       'disabled mode must re-mark the restored shell in place — unchanged from before per-user credential application existed');
   });
 });
+
+// ---------------------------------------------------------------------------
+// SECURITY: credential drift between ensureSession() (which decides what is
+// STAMPED and what the pane is LAUNCHED with) and every later resolution —
+// verifySession()'s probe, and engine.js's per-phase resolveCredentials()
+// call (see app/orchestrator/engine.js's _runPhase()/_runReview()).
+//
+// Each of these resolves the project's credential context FRESH,
+// independently, on every call — by design, so a genuinely stale session is
+// always caught. But nothing compared a FRESH resolution against what the
+// lane was actually stamped/launched with: if the underlying state changes
+// mid-job (a token rotated, primaryUser reassigned, the feature toggled)
+// between ensureSession() and a later call, that later call would silently
+// resolve to the NEW identity and apply IT to a real spawned process or
+// verification probe — while the pane itself (and the stamp) still say the
+// OLD one. A job's automated work and its own attributed pane would then be
+// running under two different identities at once.
+// ---------------------------------------------------------------------------
+
+tmuxTest('SECURITY REGRESSION: a credential resolution AFTER ensureSession() must fail closed when the underlying identity has drifted, never silently apply the newly-resolved one', async () => {
+  const configDirA = '/tmp/pw-orch-drift-A-' + process.pid;
+  const configDirB = '/tmp/pw-orch-drift-B-' + process.pid;
+  let active = 'A';
+  const credentials = async () => (active === 'A'
+    ? { key: 'a000000000000000', tokens: [`CLAUDE_CONFIG_DIR=${configDirA}`], shellArgs: ['--noprofile', '--norc'] }
+    : { key: 'b111111111111111', tokens: [`CLAUDE_CONFIG_DIR=${configDirB}`], shellArgs: ['--noprofile', '--norc'] });
+
+  await withLane({ credentials }, async ({ manager, project, token }) => {
+    // ensureSession() resolves and stamps identity A — the lane's pane is launched under A.
+    await ensure(manager, project, token);
+
+    // The underlying credential state changes mid-job — a token rotated, the owner was
+    // reassigned, whatever the cause. Nothing about the ALREADY-STAMPED, already-launched pane
+    // changes; only what a FRESH resolution would now produce does.
+    active = 'B';
+
+    // engine.js's _runPhase()/_runReview() call this exact method before spawning a phase. It must
+    // never silently hand back identity B's tokens for a job whose lane is stamped for A — that
+    // would spawn a REAL Claude process under a DIFFERENT identity than the one this job's pane
+    // (and its own fingerprint stamp) claims to be running under.
+    await assert.rejects(
+      manager.resolveCredentials(project.project_id),
+      /drift|changed|stale|mismatch/i,
+      'a credential resolution that disagrees with what the lane is currently stamped/launched under must fail closed, not silently hand back the new identity',
+    );
+  });
+});
+
+tmuxTest('a credential resolution that has NOT drifted (repeated identical resolution) still succeeds normally', async () => {
+  const configDir = '/tmp/pw-orch-nodrift-' + process.pid;
+  const credentials = async () => ({
+    key: 'c222222222222222', tokens: [`CLAUDE_CONFIG_DIR=${configDir}`], shellArgs: ['--noprofile', '--norc'],
+  });
+  await withLane({ credentials }, async ({ manager, project, token }) => {
+    await ensure(manager, project, token);
+    // Same identity resolves again — the common case (nothing changed) must not be treated as drift.
+    const cred = await manager.resolveCredentials(project.project_id);
+    assert.deepEqual(cred.tokens, [`CLAUDE_CONFIG_DIR=${configDir}`]);
+  });
+});

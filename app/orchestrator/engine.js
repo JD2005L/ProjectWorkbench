@@ -871,6 +871,10 @@ export class OrchestrationEngine {
         malformed_output: JobStatus.BLOCKED_VERIFICATION,
         // A max-turn exit is a failure. It is emphatically not a success with a caveat.
         max_turns: JobStatus.BLOCKED_VERIFICATION,
+        // Same status verifyConfiguration()'s own API-billing refusal reaches (via effective: null
+        // -> !verification.effective, above) — a phase that ran under API-key billing is a
+        // configuration problem, not a transient one.
+        api_billed: JobStatus.BLOCKED_CONFIGURATION,
       }[result.failure_kind] ?? JobStatus.BLOCKED_PROJECT_STATE;
 
       await this._blockWith(jobId, target, `the ${phaseClass} phase did not complete (${result.failure_kind})`);

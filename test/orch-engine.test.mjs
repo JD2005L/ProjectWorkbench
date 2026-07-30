@@ -394,6 +394,21 @@ gitTest('engine: a max-turn exit is a failure, never a success', async () => {
   }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
 });
 
+gitTest('engine: SECURITY — a phase that ran under API-key billing blocks the job with blocked_configuration, never completes', async () => {
+  await withEngine(async ({ engine, repo, backend }) => {
+    backend.phaseResults = [{
+      ok: false, failure_kind: 'api_billed', session_id: 's1',
+      summary: 'the coding CLI ran under API-key billing, not the subscription — refusing to treat this as a valid phase',
+      questions: [], turns_used: 0, max_turns_reached: false,
+    }];
+    const handle = await submit(engine);
+    await engine.drain();
+    const job = repo.getJob(handle.workbench_job_id);
+    assert.equal(job.status, JobStatus.BLOCKED_CONFIGURATION,
+      'the SAME status verifyConfiguration()\'s own API-billing refusal reaches — a phase that ran under API-key billing is a configuration problem, never a silent success');
+  }, { backendOptions: { effective: { model_alias: 'sonnet', effort: 'high' } } });
+});
+
 gitTest('engine: backend failures reach distinct safe states, preserving work', async () => {
   const cases = [
     ['authExpired', JobStatus.BLOCKED_AUTHENTICATION],

@@ -60,6 +60,18 @@ const FORBIDDEN_ENV = [
 ];
 
 /**
+ * The ONLY environment key a resolved credential token is permitted to set — see phaseEnv().
+ * app/orchestrator/lane-credentials.js's resolveLaneCredentials() never produces anything else
+ * (`tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir]`, always exactly this one key when non-empty).
+ * `credentialTokens` is caller-supplied data threaded through several layers (engine.js, session.js)
+ * before it reaches here; trusting an arbitrary key from it — rather than checking it against what
+ * the resolver actually owns — is how a bug (or a malicious project registry entry) upstream could
+ * reintroduce a forbidden API-billing key or override an unrelated variable like PATH. Keep this in
+ * lockstep with resolveLaneCredentials() if it is ever extended to produce another key.
+ */
+const ALLOWED_CREDENTIAL_TOKEN_KEYS = new Set(['CLAUDE_CONFIG_DIR']);
+
+/**
  * Classify a process failure into a distinct kind, so each can reach its own safe state.
  *
  * Lumping these together is how "the job failed" comes to mean nothing: an expired subscription, a
@@ -150,6 +162,14 @@ export class ClaudeCodeBackend {
    * identity than what the pane is attributed as). `credentialTokens`
    * omitted or empty (disabled mode, or the legitimate no-primaryUser case)
    * leaves the environment byte-identical to before this parameter existed.
+   *
+   * SECURITY: only ALLOWED_CREDENTIAL_TOKEN_KEYS may be set this way, and
+   * FORBIDDEN_ENV is stripped again AFTER applying tokens (not just before)
+   * — a token naming an unexpected or forbidden key is dropped outright,
+   * never trusted. Without both of these, a token like
+   * `ANTHROPIC_API_KEY=...` reaching this function (a resolver bug, or a
+   * malicious project registry entry) would silently reintroduce exactly
+   * the escape hatch this function's own contract says it removes.
    */
   phaseEnv(credentialTokens = []) {
     const env = { ...process.env };
@@ -157,8 +177,16 @@ export class ClaudeCodeBackend {
     for (const token of credentialTokens) {
       const eq = token.indexOf('=');
       if (eq === -1) continue;
-      env[token.slice(0, eq)] = token.slice(eq + 1);
+      const key = token.slice(0, eq);
+      const value = token.slice(eq + 1);
+      if (!ALLOWED_CREDENTIAL_TOKEN_KEYS.has(key)) continue;
+      if (!value) continue;
+      env[key] = value;
     }
+    // Defense in depth: even if ALLOWED_CREDENTIAL_TOKEN_KEYS were ever misconfigured to include a
+    // forbidden key, this function's contract — no API-billing escape hatch, ever — must hold
+    // unconditionally.
+    for (const key of FORBIDDEN_ENV) delete env[key];
     return env;
   }
 
@@ -431,6 +459,35 @@ export class ClaudeCodeBackend {
     }
 
     const { sawJson, init, result, rateLimit } = this.parseStream(stdout);
+
+    // The SAME "no API-billing escape hatch, ever" rule verifyConfiguration() enforces once per
+    // job (see app/orchestrator/attestation.js's claimsSubscription check) must hold for every REAL
+    // phase too — a one-time verification probe spends no money and does no work; a phase does
+    // both. CLAUDE_CONFIG_DIR (phaseEnv()'s one allowed credential token) points at the SAME
+    // per-user config directory verifyConfiguration() already checked, but nothing about phaseEnv()
+    // stops a settings.json placed THERE from carrying its own `env.ANTHROPIC_API_KEY` — the real
+    // CLI honors that regardless of what phaseEnv() stripped from the process environment.
+    // init.apiKeySource is the CLI's own authoritative report of what it actually authenticated
+    // with. Mirrors attestation.js's exact fail-closed treatment: a non-string/missing value is
+    // never read as "none" — absence is not consent, the same reasoning that field's own producing
+    // comment (on INIT_LINE, in the test suite) documents for why it is never omitted legitimately.
+    if (init) {
+      const apiKeySource = typeof init.apiKeySource === 'string' ? init.apiKeySource : null;
+      if (apiKeySource !== 'none') {
+        return {
+          ok: false,
+          failure_kind: 'api_billed',
+          retry_after_seconds: null,
+          session_id: init.session_id ?? null,
+          model: init.model ?? null,
+          permission_mode: init.permissionMode ?? permissionMode,
+          summary: 'the coding CLI ran under API-key billing, not the subscription — refusing to treat this as a valid phase',
+          turns_used: 0,
+          max_turns_reached: false,
+        };
+      }
+    }
+
     if (!sawJson || !result) {
       return {
         ok: false,

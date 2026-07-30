@@ -1068,3 +1068,96 @@ consistency with the other three fixture files rather than re-touching a passing
 - `app/VERSION` bumped `1.26.0730.1600` → `1.26.0730.1643`; guard test passes.
 - Working tree confirmed clean (no stray stashes, no untracked debris) after both revert-and-retest
   passes (mine and the independent reviewer's).
+
+## Round: credible security blocker — FORBIDDEN_ENV bypass, credential drift, apiKeySource
+
+An independent PR20 review timed out before a final verdict but produced a credible, empirically
+confirmed security blocker plus an explicit adversarial request. Fixed all three, strict RED→GREEN.
+
+### Issue 1 — phaseEnv() let credentialTokens reintroduce a forbidden API-billing key
+
+`app/orchestrator/runner/claude.js`'s `phaseEnv()` stripped `FORBIDDEN_ENV` from `process.env`
+FIRST, then blindly applied caller-supplied `credentialTokens` AFTER with no check on what key each
+token named. Empirically confirmed at HEAD: `phaseEnv(["ANTHROPIC_API_KEY=reintroduced",
+"CLAUDE_CONFIG_DIR=/safe"])` returned an env with `ANTHROPIC_API_KEY` present — reintroducing
+exactly the escape hatch this function's own docstring claims to remove.
+
+RED first: 4 new tests in `test/orch-runner.test.mjs` proving every `FORBIDDEN_ENV` key can be
+smuggled through, that an arbitrary non-resolver-owned key (e.g. `PATH`) is trusted, and that empty/
+malformed tokens are silently applied. One is a REAL spawned-process regression (nested
+`execFileAsync('env', ...)`), not just a JS object assertion.
+
+Fix: added `ALLOWED_CREDENTIAL_TOKEN_KEYS = new Set(['CLAUDE_CONFIG_DIR'])` — the exact and only key
+`resolveLaneCredentials()` ever produces. `phaseEnv()` now only applies a token if its key is in
+that set AND its value is non-empty, and re-strips `FORBIDDEN_ENV` again AFTER applying tokens as
+defense in depth (so even a future misconfiguration of the allowlist can't reintroduce a forbidden
+key). Verified the exact original repro now returns `undefined`/`"/safe"` respectively.
+
+### Issue 2 — credential drift between ensureSession(), verifySession(), and per-phase resolution
+
+Adversarially requested: could a lane be stamped/verified for identity A, then have a later phase
+resolve fresh and silently run under a freshly-resolved identity B if the underlying credential
+state changed mid-job (token rotation, primaryUser reassignment)? Confirmed real: `session.js`'s
+`resolveCredentials(projectId)` was a blind passthrough to the resolver with no cross-check against
+what was actually stamped.
+
+RED first: two new tests in `test/orch-session-credentials.test.mjs` force the injected resolver to
+switch identities between `ensureSession()` and a subsequent `resolveCredentials()` call against a
+real tmux server — confirmed the drifted call silently succeeded and returned identity B before any
+fix.
+
+Fix: `resolveCredentials()` now, when the fresh resolution asserts a real per-user identity
+(`cred.tokens.length > 0`), reads the CURRENT tmux-stamped `@pw_cred_key` for the project's lane
+session and throws (fail-closed) on any mismatch. Disabled/off resolutions (`tokens.length === 0`)
+skip the check entirely and return immediately — required after the naive "always check" version
+broke a legitimate `tmux: null` test harness (`test/orch-provenance.test.mjs`'s attestation-plumbing
+test) that has no tmux backing at all; disabled mode has no real identity to drift from anyway.
+`verifySession()` now calls `this.resolveCredentials()` instead of the raw unretained resolver, so
+the SAME drift protection covers the verification probe too.
+
+### Issue 3 (self-surfaced during adversarial verification) — runPhase() never checked apiKeySource
+
+The independent adversarial subagent commissioned to verify issues 1-2, while forming a judgment on
+whether the one allowed key (`CLAUDE_CONFIG_DIR`) could itself cause harm, empirically confirmed
+against the real installed `claude` 2.1.220 binary that a `settings.json` inside a
+`CLAUDE_CONFIG_DIR` with its own `env.ANTHROPIC_API_KEY` is honored regardless of what `phaseEnv()`
+stripped from the process environment. `verifyConfiguration()` already refuses this via
+`attestation.js`'s `claimsSubscription` check on `init.apiKeySource` — but only once per job.
+`runPhase()` — the ACTUAL per-phase execution path, called for every discovery/implementation/
+revision/review — parses the identical init event and never checked this at all. Since this
+specific reachability (CLAUDE_CONFIG_DIR wired into runPhase's env at all) was introduced by an
+earlier round in this same remediation, closed it in the same commit rather than leaving it as a
+flagged follow-up.
+
+RED first: 3 new tests in `test/orch-runner.test.mjs` (non-'none' apiKeySource refused; MISSING
+apiKeySource also refused, mirroring attestation.js's exact "absence is not consent" fail-closed
+treatment; the legitimate subscription case unaffected) plus 1 engine-level test in
+`test/orch-engine.test.mjs` proving a job blocks with `blocked_configuration` (the SAME status
+`verifyConfiguration()`'s own API-billing refusal reaches) rather than completing.
+
+Fix: `runPhase()` now checks `init.apiKeySource` immediately after `parseStream()`, before
+evaluating success/failure, using the identical `typeof` + non-'none' fail-closed logic
+`attestation.js` already uses. Returns `failure_kind: 'api_billed'` on any non-subscription (or
+missing) report. `engine.js`'s `_runPhase()` failure-kind map gained `api_billed: BLOCKED_CONFIGURATION`;
+`_runReview()` needed no change since it already treats any non-ok result as `INCONCLUSIVE` →
+`BLOCKED_REVIEW`, independent of failure_kind.
+
+### Verification evidence
+
+- All three issues confirmed RED before their fix (issues 1+2 verified together via one combined
+  `git stash` revert-and-retest: 5 tests failed exactly as expected; issue 3 verified via a second,
+  separate revert-and-retest: 7 tests failed — the new apiKeySource tests plus the previously-fixed
+  credentialTokens tests, since both live in the same file). Both stashes restored byte-identical
+  (`git diff --stat` matched the pre-stash baseline exactly each time).
+- A separate independent adversarial subagent re-verified issues 1+2 from scratch: reproduced the
+  original exploit against the fixed code (all 7 `FORBIDDEN_ENV` keys, not just the one in the
+  report), tried allowlist-bypass techniques (case tricks, `__proto__`/`constructor` keys, multiple
+  `=` signs — none worked), traced every `resolveCredentials()` caller, re-read
+  `lane-credentials.js`'s current content to confirm the `tokens.length > 0` gate has no bypass
+  path, and independently repeated the revert-and-retest. It surfaced issue 3 unprompted while
+  forming a judgment on the allowlist's own safety, which was then fixed in this same round.
+- Full `orch-*` suite: **319/319**.
+- Full canonical suite, `npm test` (default-concurrent): **605/605**.
+- Full canonical suite, serial (`--test-concurrency=1`): **605/605**.
+- `node --check` clean on all 6 touched files.
+- `app/VERSION` bumped `1.26.0730.1643` → `1.26.0730.1732`; guard test passes.

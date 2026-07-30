@@ -315,14 +315,35 @@ export class OrchestratorSessionManager {
   /**
    * Resolves the per-project credential context — the SAME resolution `ensureSession()` uses to
    * decide the fingerprint it stamps on the lane's tmux pane. Exposed so a caller that spawns a
-   * coding-CLI process directly (the engine's `_runPhase`/`_runReview`, which run headlessly and do
-   * not go through the tmux pane at all) applies EXACTLY what the lane is attributed as, rather than
-   * resolving its own possibly-drifted answer. Throws (fail-closed) on any resolution or
-   * materialization failure, exactly like `ensureSession()` — an automated phase must never run
-   * under a silently-substituted identity any more than the pane it is nominally attached to.
+   * coding-CLI process directly (the engine's `_runPhase`/`_runReview`, and this class's own
+   * `verifySession()`, none of which go through the tmux pane) applies EXACTLY what the lane is
+   * attributed as, rather than resolving its own possibly-drifted answer.
+   *
+   * SECURITY: resolving fresh on every call (by design — a genuinely stale session must always be
+   * caught) means the underlying identity CAN change between `ensureSession()` and a later call in
+   * the same job — a token rotated, `primaryUser` reassigned, the feature toggled. Without a
+   * cross-check, a later call would silently hand back the NEW identity while the lane's pane (and
+   * its own fingerprint stamp) still reflect the OLD one — a real spawned process running under a
+   * different identity than the pane it is nominally attached to. So — ONLY when this resolution
+   * asserts a real per-user identity (`cred.tokens.length > 0`; disabled mode asserts nothing, so
+   * there is nothing to drift to except itself) — this compares the freshly resolved fingerprint
+   * against what is CURRENTLY stamped on the project's lane session and throws (fail-closed) on any
+   * mismatch, exactly as it throws on a resolution/materialization failure. A disabled-to-enabled
+   * transition is still caught: it is the newly-resolved (enabled) side of the comparison that
+   * triggers the check, not the stamped (disabled) side.
    */
   async resolveCredentials(projectId) {
-    return this.credentials(projectId);
+    const cred = await this.credentials(projectId);
+    if (cred.tokens.length === 0) return cred;
+    const lane = this.laneFor({ project_id: projectId }, {});
+    const stamped = await this.tmux.getSessionCredKey(lane.tmuxSession);
+    if (!stamped.ok) {
+      throw new Error(`project "${projectId}"'s lane session credential fingerprint could not be verified (${stamped.error}) — refusing to run under a possibly-mismatched identity`);
+    }
+    if (stamped.key !== cred.key) {
+      throw new Error(`project "${projectId}"'s credential context has changed since its lane session was last verified (stamped "${stamped.key}", now resolves to "${cred.key}") — refusing to run under a possibly-mismatched identity`);
+    }
+    return cred;
   }
 
   /**
@@ -601,14 +622,16 @@ export class OrchestratorSessionManager {
       throw notFound('no such orchestrator session on this instance');
     }
 
-    // Resolved fresh — the SAME resolution ensureSession() uses to decide the fingerprint stamped
-    // on the lane — and applied to the verification probe itself: checking sign-in status and
-    // effective model/effort under a DIFFERENT identity than the one that will actually run the
-    // job would make "verified" attest to nothing. A resolution failure is reported exactly like a
-    // backend-query failure (below): unverifiable, never silently probed under the shared login.
+    // Resolved fresh via resolveCredentials() — the SAME resolution ensureSession() uses to decide
+    // the fingerprint stamped on the lane, cross-checked against that exact stamp — and applied to
+    // the verification probe itself: checking sign-in status and effective model/effort under a
+    // DIFFERENT identity than the one that will actually run the job would make "verified" attest
+    // to nothing. A resolution failure OR a drifted identity (the stamp no longer matches a fresh
+    // resolution) is reported exactly like a backend-query failure (below): unverifiable, never
+    // silently probed under a substituted login.
     let cred;
     try {
-      cred = await this.credentials(project.project_id);
+      cred = await this.resolveCredentials(project.project_id);
     } catch (e) {
       return this._verificationResponse(record, null, `cannot resolve the current credential context: ${e?.message || e}`, null);
     }
