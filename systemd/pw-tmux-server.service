@@ -1,0 +1,75 @@
+[Unit]
+Description=Project Workbench: persistent tmux server owning all project terminal sessions
+Documentation=https://github.com/JD2005L/ProjectWorkbench
+# WHY THIS UNIT EXISTS
+#
+# In host mode the shared tmux server used to have no unit of its own.
+# project-terminal-start runs `tmux new-session` inline, so whichever
+# project-terminal@<project>.service happened to start first ended up parenting
+# the server — putting EVERY project's pw_* panes (and their Claude agents) into
+# one arbitrary per-project ttyd unit's cgroup.
+#
+# That made all terminals share fate with one unrelated ttyd. On 2026-08-03 a
+# single OOM-killed pane failed that unit and, under KillMode=control-group,
+# systemd tore down the whole cgroup — killing the tmux server and every
+# project's sessions, mid-uptime, with no reboot to trigger pw-tmux-persist.
+#
+# This unit takes ownership: it holds the server in its OWN cgroup, so a ttyd
+# restart, crash or OOM can no longer reach it. The per-project terminals become
+# pure clients (they order themselves After= this unit).
+#
+# The container-mode deployment has always had this via the `pw-tmux` sidecar
+# (systemd/pw-tmux.service); this is the host-mode equivalent, sharing the same
+# scripts/pw-tmux-keepalive.sh entry point.
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+Group=admin
+Environment=HOME=/home/admin
+# tmux mangles literal tabs in -F format output to underscores under a non-UTF-8
+# locale, and systemd runs units with a minimal environment. pw-tmux-save parses
+# those formats, so the locale must be pinned here too.
+Environment=LANG=C.UTF-8
+Environment=LC_ALL=C.UTF-8
+# Use the per-user DEFAULT tmux socket rather than the sidecar's TMUX_TMPDIR
+# bind mount — that is the socket project-terminal-start and server.js attach to.
+Environment=PW_TMUX_HOST_MODE=1
+ExecStart=/usr/local/bin/pw-tmux-keepalive
+
+# Self-heal. pw-tmux-persist.service only restores at BOOT, so before this unit
+# existed a mid-uptime server death was never replayed — the sessions were simply
+# gone until someone noticed. Replaying here means the server coming back for ANY
+# reason (crash, OOM of the keepalive, manual restart) rebuilds the sessions from
+# the last manifest and resumes their Claude conversations.
+#
+# Safe to run on every start: pw-tmux-restore is idempotent (it skips sessions
+# that already exist and Claude conversations already live) and always exits 0,
+# so the duplicate run at boot — once here, once from pw-tmux-persist — is a
+# no-op. Leading `-` so a restore failure can never fail the server unit.
+ExecStartPost=-/usr/local/bin/pw-tmux-restore
+TimeoutStartSec=180
+
+Restart=always
+RestartSec=5
+
+# The whole point of the unit is that this cgroup outlives everything else, so an
+# OOM-killed pane must NOT fail it — that is precisely the chain that wiped every
+# session on 2026-08-03. Without this, systemd's default (OOMPolicy=stop) would
+# reintroduce the bug one level up.
+OOMPolicy=continue
+
+# Every project's panes and long-running Claude agents accumulate in this cgroup,
+# so make it visible to `systemctl status` / `systemd-cgtop`. install.sh drops in
+# a MemoryHigh sized from this machine's actual MemTotal (see
+# pw-tmux-server.service.d/memory.conf) — a soft limit that throttles and reclaims
+# under pressure instead of letting the host-wide OOM killer pick a victim. It is
+# deliberately NOT set here: a hardcoded value would be wrong on a smaller box,
+# and a percentage is wrong under LXC, where `%` resolves against the PHYSICAL
+# host's RAM, not the container's limit.
+MemoryAccounting=yes
+
+[Install]
+WantedBy=multi-user.target
