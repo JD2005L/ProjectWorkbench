@@ -2,6 +2,12 @@
 Description=ttyd terminal for project %i
 After=network-online.target
 Wants=network-online.target
+# Attach to the shared tmux server that pw-tmux-server.service owns instead of
+# racing to create it here. Whichever terminal won that race used to parent the
+# server, putting every project's panes in one per-project ttyd unit's cgroup —
+# see pw-tmux-server.service for the incident that caused.
+After=pw-tmux-server.service
+Wants=pw-tmux-server.service
 # Let tmux sessions be restored before this terminal attaches, so
 # `tmux new-session -A` reattaches to the restored session instead of creating
 # an empty one. Wants= (not Requires=) so a restore failure never blocks the

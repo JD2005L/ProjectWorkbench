@@ -2,6 +2,10 @@
 Description=ttyd setup/auth terminal for Project Workbench Setup Wizard
 After=network-online.target
 Wants=network-online.target
+# Shares the default tmux socket with project-terminal@, so it must also attach
+# to the server pw-tmux-server.service owns rather than racing to create it.
+After=pw-tmux-server.service
+Wants=pw-tmux-server.service
 [Service]
 Type=simple
 User=admin
