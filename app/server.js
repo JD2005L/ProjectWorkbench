@@ -13,7 +13,8 @@ import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn, credentialExecutionPlan } from './user-credentials.js';
+import { applyWorkspaceGitCredentialJob, inventoryWorkspaceGitCredentials, assertSerialized } from './workspace-git-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
 import { loadUsersFile } from './users-file.js';
@@ -144,26 +145,60 @@ async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8'
 async function saveProjects(projects){ await writeFileAtomic(registryPath, JSON.stringify(projects, null, 2)+'\n', { mode: 0o644 }); }
 
 // Configure per-workspace git credentials based on the project's primaryUser token.
-async function syncProjectCredentials(project, users){
- if(!project?.path) return;
- const gitDir = path.join(project.path, '.git');
- try { await fs.access(gitDir); } catch { return; } // no .git dir yet
+//
+// This process is root in both deploy modes, and <workspace>/.git is owned by the
+// account the panes run as — so NONE of this work happens here. The credential
+// line and the `git config --local` mutations are handed to
+// app/credential-writer.mjs running AS that account, exactly like the per-user
+// credential tree. See app/workspace-git-credentials.js for the full note; the
+// short version is that a pane user could otherwise plant a symlink at the
+// credential path and have root write through it.
+//
+// Serialization: every caller is already inside withProjectsLock() or
+// withLifecycleLock(), which is what serializes rotation and removal against
+// project/user lifecycle changes. `serialized: true` records that contract —
+// this function must not take a lock itself, because withLifecycleLock() is
+// flock-based and not re-entrant, so acquiring here would deadlock its own
+// callers.
+async function syncProjectCredentials(project, users, { serialized = false } = {}){
+ if(!project?.path) return { applied:false, reason:'no-path' };
+ assertSerialized(serialized);
  const user = users && project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
- const credFile = path.join(gitDir, '.pw-credentials');
- if(user?.ghToken){
-  const token = decrypt(user.ghToken);
-  await fs.writeFile(credFile, `https://${token}:x-oauth-basic@github.com\n`, { mode: 0o600 });
-  // Use ONLY our project-local store: clear any prior local entries, then add an
-  // empty reset (drops inherited global/system helpers for this repo so the token
-  // is never dispatched to — and duplicated into — a global store) followed by our
-  // per-project store. Two --add (not --replace-all, which would drop the reset).
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', '']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', `store --file=${credFile}`]).catch(()=>{});
- } else {
-  // Remove credential file and unset the helper
-  await fs.unlink(credFile).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+ // Decrypted only here, passed only on the helper's stdin, never logged and
+ // never returned. An empty credential means revoke.
+ const credential = user?.ghToken ? `https://${decrypt(user.ghToken)}:x-oauth-basic@github.com\n` : '';
+ const job = { action:'git-credential', projectPath: project.path, credential };
+ const plan = credentialExecutionPlan({ owner: await terminalOwner(), currentUid: process.getuid?.() ?? null });
+ const result = plan.drop
+  ? await runCredentialJob(job, plan)
+  : await applyWorkspaceGitCredentialJob({ fsp: fs, execFile: execFileAsync, projectPath: project.path, credential });
+ if(result?.remediated){
+  console.warn(`[workspace-git-credentials] ${project.name || project.path}: replaced an unsafe credential artifact (${result.remediatedReason})`);
+ }
+ return result;
+}
+
+// Report unsafe pre-existing credential artifacts so an operator can see what
+// needs remediating without waiting for each project's next token write. Read
+// through the same dropped helper: this process must not lstat a pane-controlled
+// path either. Purely informational — never fails a caller.
+async function inventoryWorkspaceCredentials(projects){
+ try {
+  const names = (projects || await loadProjects()).map(p => p?.name).filter(Boolean);
+  const job = { action:'git-credential-inventory', workspaceRoot: workspaceRoot, names };
+  const plan = credentialExecutionPlan({ owner: await terminalOwner(), currentUid: process.getuid?.() ?? null });
+  const result = plan.drop
+   ? await runCredentialJob(job, plan)
+   : await inventoryWorkspaceGitCredentials({ fsp: fs, workspaceRoot, names });
+  if(result?.unsafeCount){
+   for(const a of result.artifacts.filter(x => x.unsafe)){
+    console.warn(`[workspace-git-credentials] ${a.project}: unsafe credential artifact (type=${a.type} uid=${a.uid} mode=${a.mode.toString(8)}) — will be replaced on the next credential write`);
+   }
+  }
+  return result;
+ } catch(e){
+  console.warn(`[workspace-git-credentials] could not inventory credential artifacts: ${e?.message || e}`);
+  return { artifacts: [], unsafeCount: 0 };
  }
 }
 
@@ -2183,7 +2218,7 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
   const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
   let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
   await cloneWorkspace(p, cloneToken); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
-  if(p.primaryUser){ await syncProjectCredentials(p, users); }
+  if(p.primaryUser){ await syncProjectCredentials(p, users, { serialized:true }); }
  });
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
  if(wantsJson(req)) return res.json({ok:true,name});
@@ -2247,7 +2282,7 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
  const users = await loadUsers();
  await saveProjects(projects); await applyRouting(projects); await startProject(p);
- await syncProjectCredentials(p, users);
+ await syncProjectCredentials(p, users, { serialized:true });
  });
  await audit('project_update', { oldName, newName, port }, req);
  if(wantsJson(req)) return res.json({ok:true,name:newName});
@@ -2898,7 +2933,7 @@ async function reconcileRenameCredentials({ userId, fromUsername, toUsername }){
   if(changed) await saveProjects(projects);
  });
  const projects = await loadProjects();
- for(const p of projects){ if(p.primaryUser === toUsername) await syncProjectCredentials(p, currentUsers); }
+ for(const p of projects){ if(p.primaryUser === toUsername) await syncProjectCredentials(p, currentUsers, { serialized:true }); }
  await pruneUserCredentialTrees(currentUsers);
 }
 
@@ -2993,7 +3028,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
       }
      } else {
       const projects = await loadProjects();
-      for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p, users); }
+      for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p, users, { serialized:true }); }
      }
     } catch(e){
      throw new Error(`user "${u.username}" was updated in users.json, but syncing dependent project/credential state failed: ${e?.message || e}. users.json reflects the change${opId ? ' and a pending reconciliation marker was recorded' : ''}; retry this request${opId ? `, or POST ${BASE}/api/users/${encodeURIComponent(u.username)}/reconcile,` : ''} once the underlying issue is resolved.`);
@@ -3098,7 +3133,7 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
     // safe to repeat on a retry.
     const projectsBeforeCleanup = await loadProjects();
     for(const p of projectsBeforeCleanup){
-     if(namesToClear.has(p.primaryUser)) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers);
+     if(namesToClear.has(p.primaryUser)) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers, { serialized:true });
     }
     await pruneUserCredentialTrees(remainingUsers);
 
@@ -3427,6 +3462,15 @@ const srv = app.listen(PORT,'127.0.0.1',()=>{
   pruneUserCredentialTrees()
    .then(r => { if(r.removed?.length) console.log(`[per-user-claude] pruned ${r.removed.length} orphaned credential tree(s)`); })
    .catch(e => console.warn(`[per-user-claude] boot credential prune failed: ${e?.message || e}`));
+ }
+ // Surface unsafe pre-existing workspace credential artifacts at boot. Not gated
+ // on PER_USER_CLAUDE: syncProjectCredentials runs off a project's primaryUser and
+ // ghToken, independently of that flag, so these artifacts exist on instances that
+ // never enabled the per-user feature.
+ if(!ISOLATED){
+  inventoryWorkspaceCredentials()
+   .then(r => { if(r.unsafeCount) console.warn(`[workspace-git-credentials] ${r.unsafeCount} unsafe credential artifact(s) found; each is replaced by its owner on the next credential write`); })
+   .catch(()=>{});
  }
  if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
  if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
