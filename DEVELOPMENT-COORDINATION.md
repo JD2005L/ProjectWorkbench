@@ -1520,3 +1520,87 @@ entries authored by automation and to entries authored by an agent — including
 - Candidate A: **not yet started**; it begins from the `main` that results from merging this round.
 - The `PW GOA development coordination` automation: **paused**.
 - This round changes documentation only.
+
+---
+
+## Hermes-James — Round 8 — adversarial-verification findings for Candidates A and B
+
+**Base:** exact canonical `main` `7783ee2c1141ec893cbaca2005eaaa5a238b865c` (Round 7 merged).
+Documentation only; no product code, unit, runtime, service, or deployment is changed by this entry.
+Drafted while Round 7 was still open and carried forward unchanged in substance after it merged.
+
+**Provenance and scope.** The superseded combined candidate (PR #27, head `e39a468`, closed and
+reference-only) was put through independent adversarial verification whose brief was to **refute**
+its claims — including by reverting pieces of each fix in throwaway copies and confirming the
+corresponding test then actually fails. It refuted three claims and confirmed the rest.
+
+**Read these as properties of a proposed repair, not as new defects in canonical `main`.** `main`
+has neither the environment contract nor those checks; its `pw-tmux-restore` still behaves exactly
+as GOA's Round 3 A/B reproduction recorded. What follows is *how that shape of repair fell short*, so
+Candidate B does not rebuild the same gap and Candidate A does not inherit the weak assertion.
+
+### For Candidate B (GOA lane) — two ways the GOA-1 repair still exits 0 having restored nothing
+
+**B-1. The configuration check was gated on the library being found, with no fallback.** The
+candidate wrapped its registry and app-dir requirement in `if [[ -n "${PW_ENV_LIB:-}" ]]`, while the
+state-dir check kept a non-library fallback. Reproduced by placing `pw-tmux-restore` where neither a
+sibling `pw-env.sh` nor an installed copy resolves, with a valid manifest present and the registry
+absent:
+
+```
+rc=0   restored: nothing   stderr: empty   (only a line in persist.log)
+```
+
+That is precisely the failure GOA-1 exists to close, reachable on any partial deployment that copies
+`app/` and `scripts/` without running the installer — a documented habit on this fleet. **The
+configuration refusal must not depend on an optional helper being present.** Either the entry point
+refuses when its contract library is unreachable, or every required check carries the same fallback
+the state-dir check has. Add a regression that runs the script with the library deliberately absent.
+
+**B-2. An unreadable manifest exits 0.** With a valid state dir and `manifest.tsv` at mode `000`,
+the read fails and the script exits 0 having restored nothing; the unit reports success. A manifest
+that exists but cannot be read is misconfiguration, not an empty manifest, and must be a distinct
+nonzero configuration failure like the others. Note this interacts with the Final Implementation
+Notes Disposition item 2: `pw-tmux-persist.service` is the observing path, so the nonzero result has
+to reach *it*.
+
+**B-3, smaller but in the same class.** `pw-tmux-save` never sources the contract, although the
+library's own header claims it does — so the manual invocation the migration steps recommend runs on
+compiled-in defaults. And `PW_SECRET_KEY_PATH` carries duplicated defaults across `app/server.js`,
+`app/project-terminal-credentials.mjs` and `app/orchestrator/lane-credentials.js`: the exact
+multi-entry-point path class the contract exists to end. That variable is already accepted into the
+schema by the Final Implementation Notes Disposition; this is independent corroboration of why.
+
+### For Candidate A (PVI2 lane) — the ownership assertion must be able to fail
+
+The credential-boundary routing itself was **confirmed**, with real evidence rather than inference:
+run as root against an account-owned repository, the pre-repair in-process path produced `uid=0`
+artifacts, and the routed path produced `uid=1000`, mode `600`. Three independent reverts were each
+caught by the candidate's tests.
+
+But the ownership regression named the *current* user as the expected owner and asserted
+`st.uid === os.userInfo().uid`. Run as root, that suite still passes — because it then asserts
+root-wrote-it-as-root. **An assertion that passes identically for the correct and the defective
+outcome is not evidence.** Candidate A must assert ownership against the *workspace owner resolved
+independently of the process running the test*, and must include a case where the test process and
+the expected owner genuinely differ; where that cannot be arranged, it is reported as **not run**,
+never as pass. This is the evidence PVI2 owns under the Final Implementation Notes Disposition, so
+it cannot be discharged by a test that cannot fail.
+
+### Also confirmed, and carried forward
+
+- Deploy-mode resolution: no raw `PW_DEPLOY_MODE` parse remains in app code; existing plain host
+  installs boot unchanged, verified by real TCP connection rather than absence-of-exit; only an
+  unrecognised value or unset-with-container-evidence refuses. Non-vacuous under revert.
+- The contract does reach the container sidecar via `--env-file`, and identity resolution is
+  genuinely contract-driven: with `env -i` and the per-user flag supplied only by the file, a project
+  with no `primaryUser` refuses and restores nothing.
+
+### Status
+
+- These findings bind no candidate to the superseded implementation; they record what its
+  verification proved and disproved.
+- **B-1 and B-2 are acceptance requirements for Candidate B**, with regressions.
+- **The Candidate A ownership-evidence requirement is binding on the PVI2 lane.**
+- No disposition, scope, gate, sequence, lane assignment, or authorization boundary is changed by
+  this entry.
