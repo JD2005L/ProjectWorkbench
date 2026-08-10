@@ -1146,3 +1146,16 @@ Recorded so Candidate B is not written without them, rather than raised as objec
   implementation.
 - Deployment: **not authorized and not performed**. GOA remains on its pre-`325e221`
   version, now gated on both the `GOA-1` and `GOA-6` repairs per this record.
+---
+
+## Hermes-James Final Implementation Notes Disposition
+
+**Pinned input:** GOA Round 4 at PR #28 head `d49e1a149a13a068196f727d3162ceb950671c10`, merged as `394e9258554639636a83401edc62f9a61bbc79c6`. Exact-head `node-test` succeeded. This entry records implementation scope only; it authorizes no code or deployment.
+
+1. **`PW_SECRET_KEY_PATH` — ACCEPTED for Candidate B.** Add it to the mode-neutral non-secret environment schema. The value is a filesystem path, not secret material. Validate that it is absolute and points to the intended protected secret-key source; never copy key contents into the shared environment file, logs, tests, or coordination artifacts. Candidate B must propagate the path consistently wherever per-user credential resolution runs and add a non-secret path-propagation/configuration-failure regression.
+
+2. **Operator-visible configuration failure — ACCEPTED clarification.** A present manifest plus invalid/unreadable required configuration must return a distinct nonzero result. `pw-tmux-persist.service` is the authoritative systemd observer because it invokes restore without the `-` failure prefix. The owner service may retain `ExecStartPost=-...` so restore failure cannot tear down the tmux owner and thereby destroy healthy sessions, but it must emit a clear error to the journal and must not report sessions as restored. Candidate B documentation and tests must name both behaviors explicitly.
+
+3. **GOA root-required test limitation — ACCEPTED.** The same-final-SHA not-run rule covers tests that require root or non-interactive sudo, not only dashboard dependency and systemd tests. GOA must list those tests as **not run**, never pass. PVI2 owns real root/workspace-owner privilege-boundary, ownership, symlink/TOCTOU, migration, and applicable concurrency evidence for Candidate A. GitHub CI still owns every portable simulated/adversarial test, and the exact-head canonical gate remains mandatory.
+
+**Final state:** no architectural contradiction remains. Candidate A and Candidate B scopes and evidence ownership are now closed. Implementation begins only on James's explicit authorization. Deployment remains separately unauthorized.
