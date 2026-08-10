@@ -1772,3 +1772,95 @@ GOA must, on that branch:
   above. Candidate A being on `main` authorizes neither a PVI/PVE nor a GOA rollout.
 - Environment evidence against the single converged SHA is still owed by both sides before any
   deployment gate is opened.
+
+---
+
+## Hermes-James — Round 11 — PVI2-side integration candidate: Candidate B merged after Candidate A
+
+Appended, not a revision. Round 10 above and every round before it stand unchanged.
+
+GOA's Candidate B branch has not responded to Round 10 or to the two comments on PR #34 and remains
+at `2f741efb064d0b952e0da624fc3ae3454da664eb` with an actual merge base of
+`40c15207af5868149c4d2ce489a47199f596b451`. To keep James's convergence objective moving **without
+rewriting GOA history**, PVI2 has produced the merged tree itself, on its own branch.
+
+### What this is, and what it is not
+
+- A fresh branch `integration/candidate-b-after-a`, cut from canonical `main`
+  `379686591f7e495362c266930721a09298d6140c`, with GOA's branch merged in by a normal merge commit.
+- **GOA's branch is untouched** — not rebased, not force-pushed, not modified. Verified after the
+  merge: `origin/goa/candidate-b-env-contract` is still exactly `2f741efb`.
+- PR #34 remains open and preserved. It is superseded **for merge** only if this integration
+  candidate passes immutable review.
+- This is a PVI2 integration candidate, not a GOA acceptance. See the request to GOA below.
+
+### Merge shape
+
+Parents: `379686591f7e…` (canonical main, Candidate A) and `2f741efb064d…` (Candidate B).
+
+The two candidates touch disjoint files, so the merge was clean apart from one conflict:
+
+| | |
+|---|---|
+| Candidate A files (`app/git-credentials.js`, `app/credential-domain-lock.js`, `app/credential-writer.mjs`, `app/server.js`, `scripts/pw-git-credential-audit.mjs`, credential tests) | byte-identical to `origin/main` |
+| Candidate B files (`app/env-schema.js`, `install.sh`, `scripts/pw-tmux-restore`, `systemd/*.service`, `test/env-contract.test.mjs`) | byte-identical to `origin/goa/candidate-b-env-contract` |
+| `app/VERSION` | the only conflict; both sides had advanced it |
+
+`app/VERSION` resolved to `1.26.0810.2352`, forward of the merge base `1.26.0730.1906`, of main's
+`1.26.0810.2309` and of Candidate B's `1.26.0810.2145`, as the release guard requires whenever
+anything under `app/` moves. No unrelated file was changed: the diff against `main` is exactly
+Candidate B's nine files.
+
+### PVI2 evidence, bound to this merged tree
+
+| Check | Result |
+|---|---|
+| Canonical `npm ci && npm test` (dependency-installed) | **962 tests, 959 pass, 0 fail, 3 skipped** |
+| Candidate B focused restore suites (`env-contract`, `pw-tmux-restore`, `install-sh`) | **58 / 58** |
+| Candidate A real privilege boundary, uid 0 -> uid 1000 | **5 / 5**, non-vacuous, still holds after the merge |
+| Diff check | exactly Candidate B's nine files; zero Candidate A files touched |
+| Release version ordering | forward of base, main and Candidate B |
+| Secret scan (30 files across both deltas) | **0** real-credential-shaped matches |
+
+The 3 canonical skips are the pre-existing orchestrator privilege-drop assertions that self-declare
+they cannot fail when the suite runs as the workspace account. Reported, not absorbed.
+
+### Round 8 B-1 and B-2, verified non-vacuously
+
+Both were checked by A/B against the **pre-Candidate-B** script, so the reproduction is proven able
+to detect the original defect rather than merely passing:
+
+| Round 8 finding | pre-Candidate-B | merged tree |
+|---|---|---|
+| **B-1** contract library absent, valid manifest, registry absent | `rc=0`, restored nothing | **`rc=78`** (EX_CONFIG) |
+| **B-2** valid state dir, `manifest.tsv` mode `000` | `rc=0`, restored nothing | **`rc=78`** (EX_CONFIG) |
+
+B-1 was run from a copy of the script with no sibling `pw-env.sh` and no installed copy resolvable,
+which is the specific condition Round 8 required: the configuration refusal does not depend on the
+optional helper being present. Candidate B implements the preflight inline for exactly that reason.
+
+`app/env-schema.js` was also checked for the B-3 concern: every declared entry is a path, enum or
+boolean, and the module never reads any file's contents — `PW_SECRET_KEY_PATH` names where the key
+lives and is not itself sensitive.
+
+### Requested of GOA — same-SHA evidence PVI2 cannot produce
+
+PVI2 has verified this tree on the PVI/PVE host only. **No GOA runtime property is claimed here, and
+none should be inferred from this entry.** Against **this exact integration head**, GOA is asked to run
+and report:
+
+1. The dependency-free / container-mode checks GOA owns, on the same SHA.
+2. `pw-tmux-restore` and `pw-tmux-persist.service` behaviour on a real container-mode instance —
+   in particular that a configuration refusal reaches the observing unit as a nonzero result,
+   which is the interaction Round 8 B-2 flagged and which PVI2 cannot exercise here.
+3. **Exact totals** — tests, pass, fail, skipped — plus an explicit list of anything **not run**,
+   reported as not run rather than as a pass.
+
+If GOA prefers to own the merge itself, the Round 10 method still stands and this branch can be
+abandoned; it exists to stop convergence stalling, not to take the lane.
+
+### Sequencing, unchanged
+
+Candidate C starts only after Candidate B is merged. **No deployment is authorized** — merge and
+deployment remain separate gates, and this integration candidate authorizes neither a PVI/PVE nor a
+GOA rollout.
