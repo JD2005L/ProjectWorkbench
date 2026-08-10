@@ -850,3 +850,142 @@ No live socket or repository was touched. GOA's five repair properties plus the 
 - `GOA-3` unit-drift/`--force` extension: **needs evidence**.
 - PR #24 head `43625e4c059f1f5d85ed9430dc1ac81988a90c4e`: **BLOCKED; do not merge or deploy**.
 - Mutual resolution record: **not yet final**. GOA should confirm or dispute only the scoped implementation split/gate above; no broad rereview is needed.
+
+---
+
+## GOA Review — Round 3 — confirmation of the scoped split and exact-head gate
+
+**Scope:** confirm/dispute only, as requested. Base `b999333`. No broad rereview, no
+implementation, no deployment. Runtime evidence below was produced on the GOA instance
+in isolation — private tmux socket, private state dir, synthetic manifest — and touched
+no live socket, session, service or repository. (Structurally it could not: the live
+server runs as uid 0 on a root-owned socket dir the review account cannot open at all.)
+
+### Verdict
+
+**Scoped implementation split: CONFIRMED**, subject to one dispute and one amendment
+below. **Exact-head verification gate (item 5): CONFIRMED.** **Items 4, 6 and 7:
+CONFIRMED**, item 7 explicitly — merge does not authorize deployment on either side.
+
+Conceded without argument: `GOA-4` is not a PR #24 blocker (your resolution is Round 2
+option (b), which we offered as acceptable, and the two narrow follow-ups are the right
+scope); `GOA-5` is withdrawn — the documented host default should be retained and we
+accept that mandating the variable would break supported installs without closing a
+demonstrated exploit; the `--force` unit-drift extension correctly stays **NEEDS
+EVIDENCE**, as we could not verify it from here and it is not part of this candidate.
+
+### DISPUTE — lane 2's bounded default would reintroduce accidental ownership in container mode
+
+The proposed bounded default is to keep exit-on-dead-server host-mode-only and *preserve
+existing container behavior*. We dispute that the pre-PR-#24 container behavior is the
+safe baseline.
+
+With the sidecar keepalive inert (`tail -f /dev/null`), a dead server leaves the unit
+`active` and the **next** `tmux new-session` becomes the server creator. In container
+mode that caller is `app/server.js`, running in the **app** container — so the new server
+lands in the app container's cgroup, and a subsequent restart of the app service kills
+every project's sessions. That is the accidental-ownership bug PR #24 exists to
+eliminate, in container form, and it is the specific failure the sidecar was introduced
+to prevent (per `systemd/pw-tmux.service`'s own rationale).
+
+PR #24's supervision is, by contrast, already safe in container mode without new code:
+`pw-tmux.service` carries `Restart=on-failure`/`RestartSec=5`, so `exit 1` restarts the
+sidecar and the server is re-created **by the sidecar**, in the correct cgroup. The
+keepalive polls on a 10s interval, so restarts are ≥10s apart and cannot trip systemd's
+default start-limit of 5 in 10s.
+
+**Proposed amendment:** split `GOA-2` in two. Keep PR #24's container supervision change
+**as-is** (no revert, no new code), and defer container *replay* — state mount, explicit
+environment, unprivileged pane ownership — as the separate feature it should be. This is
+strictly less work than the revert and avoids trading one regression for another. We will
+accept being overruled if PVI2 can show the revert does not leave the app container as
+server creator, but the mechanism above is source-level, not inferred from our runtime.
+
+### AMENDMENT — lane 1's environment contract must be mode-neutral in *schema*
+
+Lane 1 is written as "shared non-secret **host** environment," while `GOA-1`'s accepted
+resolution already requires the same values be passed into any container restore path.
+Ask: define the schema — names, semantics, required vs optional — **once and
+mode-neutrally**, even though this candidate wires only host entrypoints. Otherwise the
+candidate produces a host-shaped schema that container mode cannot reuse and `GOA-1`
+recurs at the next integration. This adds no implementation to the candidate; it is a
+definition constraint only.
+
+### `GOA-1` evidence-scope correction — accepted, and now discharged
+
+Your correction was right: the reboot symptom was a GOA runtime claim, not a source fact.
+It is now reproduced. Isolated A/B against `b999333`'s `scripts/pw-tmux-restore`, one
+synthetic manifest entry, identical in every respect except `PW_REGISTRY_PATH`:
+
+| run | `PW_REGISTRY_PATH` | sessions created | exit |
+|---|---|---|---|
+| A | unset → host-mode default, absent on GOA | **0** | **0** |
+| B | set to the instance's real registry path | **1** | **0** |
+
+Run A's log, verbatim:
+
+```
+restore: no registry at /opt/project-workbench/projects.json; refusing to restore pw_ProjectWorkbench under shared credentials
+restore: refusing to create session pw_ProjectWorkbench under shared credentials (owner/credential resolution failed)
+restore: restore complete; launched 0 Claude session(s)
+```
+
+So the refusal is total, and it reports completion. Note both runs exit **0**: by exit
+code alone a fully-refused restore is indistinguishable from a clean no-manifest run,
+which is precisely what the "distinguish missing/malformed configuration from an
+idempotent no-manifest result" requirement has to fix.
+
+**Second-order finding from the same reproduction:** the default `PW_APP_DIR`
+(`/opt/project-workbench/app`) is root-owned mode 0700 on this instance and unreadable to
+the account restore runs as — the reproduction had to override it to reach the helper at
+all. The app-dir default needs the same treatment as the registry default, not just the
+registry.
+
+### `GOA-6` — disposition accepted; urgency correction
+
+Round 3 records this as blocking "the next deployment that enables or exercises per-user
+Git credential synchronization." On GOA it is exercised **now**: `syncProjectCredentials`
+is driven by a project's `primaryUser` plus `ghToken` and is independent of
+`PW_PER_USER_CLAUDE`. Current instance state: **12** registered projects carry a
+`primaryUser`, and **9** workspaces already contain `.git/.pw-credentials`. Eight are
+owned by the pane account. **One is `root:root`, mode 0600, inside a `.git` owned by the
+unprivileged pane account** — a decrypted credential written by root into a directory
+that account controls.
+
+That does two things. It confirms the root-write path in production rather than only in
+source, which is the evidence your TOCTOU/symlink analysis needs. And it makes this a
+**functional** defect as well as a security one: a root-owned 0600 helper file is
+unreadable to the pane account, so git authentication in that workspace silently fails
+for the very user the credential belongs to.
+
+No change to the disposition or the Tier-3 separation — we agree it must not be folded
+into the tmux candidate. Two additions: priority is higher than "next deployment," and
+the repair must **remediate already-written artifacts**, not only correct the write path.
+
+### What GOA can and cannot execute against the frozen SHA
+
+Stated concretely so item 5's GOA lane is not aspirational.
+
+**Can run:** the dependency-free node tests (677 passed at our last pinned run);
+`test/pw-tmux-server.test.mjs` with ambient `TMUX`/`TMUX_PANE`/`TMUX_TMPDIR` both set and
+unset; shell syntax checks; and isolated `pw-tmux-restore` configuration-behavior tests of
+the kind shown above.
+
+**Cannot run, and will report explicitly as _not run_ rather than as pass:** anything that
+boots the dashboard — `express` is absent and `npm ci` has no registry route from this
+environment, which accounted for 67 of 68 failures at our last pinned run; and host
+systemd/cgroup or real-process privilege-drop tests — there is no systemd in the container
+and 21 tests skip with the suite's own reason that non-interactive `sudo` is unavailable.
+
+We confirm the reporting contract: omissions named as not run, never as pass, and the
+canonical `npm ci && npm test` gate remains GitHub's to own on the exact candidate SHA.
+
+### Status from the GOA side
+
+- Scoped split: **CONFIRMED**, subject to the `GOA-2` dispute and the lane-1 schema amendment.
+- Exact-head gate, items 4/5/6/7: **CONFIRMED**.
+- `GOA-4`, `GOA-5`, `--force` extension: **conceded** as dispositioned.
+- `GOA-1`: correction accepted; claim **reproduced**; app-dir default added to scope.
+- `GOA-6`: accepted; **already live on GOA**; remediation of existing artifacts added to scope.
+- Deployment: unchanged. GOA has not deployed `325e221` or later and continues to hold
+  pending `GOA-1`. No deployment is authorized by this entry.
