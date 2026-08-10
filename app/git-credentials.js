@@ -479,9 +479,14 @@ export async function discardStaged({ deps, pin, stagedName }) {
 // Take a CONTENT-BLIND snapshot of the existing artifact by hard-linking it to a
 // second name. link(2) does not follow symlinks and copies no bytes, so the
 // prior credential can be restored exactly without this process ever reading it.
-export async function snapshotArtifact({ deps, pin }) {
+export async function snapshotArtifact({ deps, pin, expectedUid }) {
   const seen = await inspectArtifact({ deps, pin });
   if (!seen.present || seen.type !== 'regular') return null;
+  // Only a credential WE own can be snapshotted, and only that one should be.
+  // `link(2)` against a root-owned 0600 file fails EPERM under
+  // fs.protected_hardlinks, and a credential written by the old root path is
+  // precisely the thing that must not be preserved or reused.
+  if (expectedUid !== null && expectedUid !== undefined && seen.uid !== Number(expectedUid)) return null;
   const snapshotName = `${CREDENTIAL_BASENAME}.rollback-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
   await deps.link(pinnedPath(pin, CREDENTIAL_BASENAME), pinnedPath(pin, snapshotName));
   return { snapshotName, mode: seen.mode, uid: seen.uid };
@@ -753,14 +758,24 @@ export function expectedHelperValues(credFileAbs) {
 // byte-for-byte without this process ever having read it. If the restore itself
 // fails the snapshot link is deliberately LEFT in place — it is the only
 // remaining copy, and an operator can recover from it.
-async function rollbackApply({ deps, pin, snapshot, captured, published, hadArtifact }) {
+async function rollbackApply({ deps, pin, runGit, snapshot, captured, published, hadArtifact, expectedUid }) {
   if (published) {
     if (snapshot) {
       try { await restoreSnapshot({ deps, pin, snapshot }); } catch { /* keep the link as the last copy */ }
-    } else if (!hadArtifact) {
-      // We created it; there was nothing here before, so removing it restores
-      // the prior state exactly.
-      await deps.unlink(pinnedPath(pin, CREDENTIAL_BASENAME)).catch(() => {});
+      try { await restoreGitConfig({ deps, pin, captured }); } catch { /* the original error is what matters */ }
+      return;
+    }
+    // Either there was nothing here before, or what was here was a credential we
+    // did not own and could not snapshot (the historical root-written artifact).
+    // Removing what we published restores the prior state in the first case and
+    // reaches an explicit SAFE state in the second: no usable credential, and no
+    // helper pointing at one. It cannot expose the old value — we never read it —
+    // and the next authoritative sync completes deterministically from the
+    // current credential state.
+    await deps.unlink(pinnedPath(pin, CREDENTIAL_BASENAME)).catch(() => {});
+    if (hadArtifact) {
+      try { await clearLocalCredentialHelper({ deps, pin, runGit, expectedUid }); } catch { /* best effort */ }
+      return;
     }
   } else if (snapshot) {
     await discardSnapshot({ deps, pin, snapshot });
@@ -779,7 +794,7 @@ async function applyCredential({ deps, runGit, pin, plan, token, expectedUid }) 
     );
   }
 
-  const snapshot = await snapshotArtifact({ deps, pin });
+  const snapshot = await snapshotArtifact({ deps, pin, expectedUid });
   const captured = await captureGitConfig({ deps, pin });
   let staged = null;
   let published = false;
@@ -807,7 +822,7 @@ async function applyCredential({ deps, runGit, pin, plan, token, expectedUid }) 
       helperCount: helpers.length,
     };
   } catch (e) {
-    await rollbackApply({ deps, pin, snapshot, captured, published, hadArtifact: before.present });
+    await rollbackApply({ deps, pin, runGit, snapshot, captured, published, hadArtifact: before.present, expectedUid });
     if (staged) await discardStaged({ deps, pin, stagedName: staged.stagedName });
     throw e;
   }
@@ -826,7 +841,7 @@ async function revokeCredential({ deps, runGit, pin, plan, expectedUid }) {
     );
   }
 
-  const snapshot = await snapshotArtifact({ deps, pin });
+  const snapshot = await snapshotArtifact({ deps, pin, expectedUid });
   const captured = await captureGitConfig({ deps, pin });
   let cleared = false;
   try {
@@ -1005,7 +1020,10 @@ async function inspectOneProject({ deps, runGit, workspaceRoot, registeredPaths,
       if (wrongOwner) reasons.push(`owned by uid ${artifact.uid}, expected the workspace owner uid ${expectedUid}`);
       if (wrongMode) reasons.push(`mode ${artifact.mode.toString(8)}, expected 600`);
       if (!helperOk) reasons.push('the local credential.helper pair does not match');
-      return { ...base, status: 'needs-repair', detail: reasons.join('; '), eligible: true };
+      // An artifact owned by somebody else cannot be converted in place without
+      // reading a secret we must not read. It needs the authoritative current
+      // credential re-applied over it instead.
+      return { ...base, status: 'needs-repair', detail: reasons.join('; '), eligible: true, resyncRequired: wrongOwner };
     }
     return { ...base, status: 'ok', detail: 'owner-owned 0600 credential with a matching helper pair', eligible: false };
   } catch (e) {
@@ -1038,53 +1056,26 @@ export async function inventoryGitCredentials({ deps, runGit, workspaceRoot, pro
   return inEachProject({ deps, runGit, workspaceRoot, projects, expectedUid }, (row) => row);
 }
 
-// Bring ONE already-existing artifact up to the contract, touching nothing else.
+// Tighten an artifact WE ALREADY OWN. Content-blind in the strict sense: the
+// mode is changed through a descriptor and not one byte is ever read.
 //
-// CONTENT-BLIND: when we already own the file, only its mode is changed, through
-// a descriptor — not one byte is read. When it is owned by somebody else (the
-// historical root-written artifact, which we cannot chmod) the bytes are MOVED
-// into a file we own and never parsed, logged, or returned.
-async function repairArtifact({ deps, pin, expectedUid, artifact }) {
-  if (artifact.uid === Number(expectedUid)) {
-    const fh = await deps.open(pinnedPath(pin, CREDENTIAL_BASENAME), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-    try {
-      await fh.chmod(CREDENTIAL_MODE);
-      await fh.sync();
-    } finally {
-      await fh.close().catch(() => {});
-    }
-    return 'chmod';
-  }
-
-  const stagedName = `${CREDENTIAL_BASENAME}.staged-${process.pid}-${crypto.randomBytes(6).toString('hex')}`;
-  const src = await deps.open(pinnedPath(pin, CREDENTIAL_BASENAME), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
-  let bytes;
+// There is deliberately no path here for an artifact owned by somebody else. The
+// historical root-written credential is 0600 and root-owned, so the workspace
+// owner can neither read it (EACCES) nor even hard-link it (EPERM, under
+// fs.protected_hardlinks) — and converting it by copying would mean reading a
+// secret this process has no business seeing. Such an artifact is reported as
+// requiring an AUTHORITATIVE RESYNC, which the operator command performs by
+// rewriting the pair from the current credential state and discarding the old
+// value unread. See scripts/pw-git-credential-audit.mjs.
+async function repairOwnedArtifactMode({ deps, pin }) {
+  const fh = await deps.open(pinnedPath(pin, CREDENTIAL_BASENAME), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
   try {
-    const st = await src.stat();
-    if (!st.isFile()) throw new Error(`git credential boundary: ${pin.gitDirAbs}/${CREDENTIAL_BASENAME} stopped being a regular file during remediation`);
-    bytes = await src.readFile();
+    await fh.chmod(CREDENTIAL_MODE);
+    await fh.sync();
   } finally {
-    await src.close().catch(() => {});
+    await fh.close().catch(() => {});
   }
-
-  const dst = await deps.open(
-    pinnedPath(pin, stagedName),
-    fsConstants.O_WRONLY | fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_NOFOLLOW,
-    CREDENTIAL_MODE,
-  );
-  try {
-    await dst.writeFile(bytes);
-    await dst.chmod(CREDENTIAL_MODE);
-    await dst.sync();
-  } catch (e) {
-    await dst.close().catch(() => {});
-    await deps.unlink(pinnedPath(pin, stagedName)).catch(() => {});
-    throw e;
-  }
-  await dst.close();
-  await deps.rename(pinnedPath(pin, stagedName), pinnedPath(pin, CREDENTIAL_BASENAME));
-  await syncPin(pin);
-  return 'replaced';
+  return 'chmod';
 }
 
 export async function remediateGitCredentials({ deps, runGit, workspaceRoot, projects, expectedUid, apply = false }) {
@@ -1101,7 +1092,17 @@ export async function remediateGitCredentials({ deps, runGit, workspaceRoot, pro
         // It changed under us between the inventory and the repair. Refuse.
         return { ...row, action: 'refused', detail: `the credential path is now a ${artifact.type}` };
       }
-      const how = await repairArtifact({ deps, pin, expectedUid, artifact });
+      if (artifact.uid !== Number(expectedUid)) {
+        // Reported, never guessed at: the caller holds the authoritative
+        // credential state and must rewrite the pair from it.
+        return {
+          ...row,
+          action: 'resync-required',
+          resyncRequired: true,
+          detail: `owned by uid ${artifact.uid}; it cannot be converted without reading it, so the current credential must be re-applied over it`,
+        };
+      }
+      const how = await repairOwnedArtifactMode({ deps, pin });
       await applyLocalCredentialHelper({ deps, pin, runGit, credFileAbs: plan.credFileAbs, expectedUid });
       const verified = await verifyArtifact({ deps, pin, expectedUid });
       return { ...row, action: 'repaired', how, artifact: verified };

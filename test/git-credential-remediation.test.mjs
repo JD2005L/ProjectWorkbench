@@ -254,3 +254,52 @@ test('remediation never traverses outside the registry, even with a hostile regi
   assert.equal(byName(report, 'stray').action, 'refused');
   assert.equal(fs.lstatSync(artifact(stray)).mode & 0o777, 0o644, 'nothing outside the workspace root may be touched');
 });
+
+// ---------------------------------------------------------------------------
+// Content-blindness, as an invariant rather than a promise
+// ---------------------------------------------------------------------------
+
+test('remediation never reads the bytes of an existing credential', async () => {
+  const root = tmpRoot();
+  const p = repo(root, 'demo');
+  const content = `https://${SENTINEL}:x-oauth-basic@github.com\n`;
+  fs.writeFileSync(artifact(p), content, { mode: 0o644 });
+
+  // Opening the artifact to fstat it is legitimate — that is how type, owner and
+  // mode are verified. READING it is not: the historical root-owned artifact is
+  // 0600 and unreadable to the workspace owner anyway, and a repair that depends
+  // on reading a secret is the defect this guards against.
+  const real = nodeJobDeps();
+  let reads = 0;
+  const deps = {
+    ...real,
+    async open(name, flags, mode) {
+      const fh = await real.open(name, flags, mode);
+      if (String(name).endsWith('.pw-credentials')) {
+        fh.readFile = async () => { reads += 1; throw new Error('remediation read the credential'); };
+        fh.read = async () => { reads += 1; throw new Error('remediation read the credential'); };
+      }
+      return fh;
+    },
+  };
+
+  const report = await remediateGitCredentials({ ...ctx(root, [{ name: 'demo', path: p }]), deps, apply: true });
+  assert.equal(byName(report, 'demo').action, 'repaired');
+  assert.equal(reads, 0, 'the credential bytes must never be read during remediation');
+  assert.equal(fs.lstatSync(artifact(p)).mode & 0o777, 0o600);
+  assert.equal(fs.readFileSync(artifact(p), 'utf8'), content, 'and the credential must survive untouched');
+});
+
+test('an artifact owned by someone else is handed back for authoritative resync, never converted in place', async () => {
+  const root = tmpRoot();
+  const p = repo(root, 'demo');
+  fs.writeFileSync(artifact(p), `https://${SENTINEL}:x-oauth-basic@github.com\n`, { mode: 0o600 });
+
+  // Declaring a different expected owner is how this runs unprivileged: the
+  // artifact is not ours, exactly as a root-written one would not be.
+  const foreign = { ...ctx(root, [{ name: 'demo', path: p }]), expectedUid: ME + 1 };
+  const row = byName(await remediateGitCredentials({ ...foreign, apply: true }), 'demo');
+  assert.equal(row.status, 'foreign-git', 'a repository we do not own is refused before anything else');
+  assert.equal(row.action, 'refused');
+  assert.equal(fs.lstatSync(artifact(p)).uid, ME, 'nothing may be converted in place');
+});

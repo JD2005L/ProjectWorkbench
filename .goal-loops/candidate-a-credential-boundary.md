@@ -204,3 +204,62 @@ credential file moved out of the pane-owned workspace root), `app/VERSION`.
 - `test/git-credential-portability.test.mjs` fails the build if a hostname, a
   deployment path, an IP, or a hard-coded account name is ever introduced into the
   boundary sources.
+
+
+## 8. Blocker delta after the immutable review of `eea352b`
+
+Two blocking findings, both real, both repaired test-first.
+
+### A31-5 was not discharged (primary blocker)
+
+The reviewer reproduced the shape base `app/server.js` actually leaves behind — a
+**root-owned, mode 0600** `.git/.pw-credentials` inside an owner-controlled `.git`
+with the `store --file=` helper active — and found the remediation reported success
+without safely converting it, and was not content-blind.
+
+Root cause, measured rather than reasoned about:
+
+| operation on a root-owned 0600 file, as the workspace owner | result |
+|---|---|
+| `read(2)` | `EACCES` |
+| `link(2)` | `EPERM` (`fs.protected_hardlinks=1`) |
+| `unlink(2)` | ok (the owner owns the DIRECTORY) |
+| `rename(2)` over it | ok (same reason) |
+
+So the byte-copy repair was doubly wrong: impossible against the real shape, and a
+read of a secret this process must never see. My own root test had used mode
+**0644**, which is why it passed — it never reproduced the true shape. That is the
+defect behind the defect, and it is why the new regression builds the exact base
+shape and drives the **actual operator command**, not a helper seam.
+
+The repair removes the byte-copy entirely:
+
+- `snapshotArtifact` refuses to snapshot anything it does not own — `link(2)` would
+  fail anyway, and a root-written credential must not be preserved or reused.
+- An artifact owned by somebody else is reported `resync-required`; the helper
+  never opens it.
+- `scripts/pw-git-credential-audit.mjs --apply` resolves the AUTHORITATIVE current
+  credential (decrypted from the users store, exactly as the dashboard does) and
+  rewrites the pair through the already-proven credential job: a fresh owner-owned
+  `0600` file renamed over the old inode, which goes away **unread**. With no
+  current credential the pair is revoked instead — an explicit safe state that
+  cannot use or expose the old value.
+- If a conversion fails after publishing over a foreign artifact, the rollback
+  reaches that same safe revoked state rather than leaving a stale credential.
+
+Content-blindness is now an invariant with a test behind it: a deps wrapper makes
+`readFile`/`read` on the artifact throw, and remediation must still succeed.
+
+### The canonical gate was red on contract-pin drift (secondary blocker)
+
+`get_approvals` and `publish` had **graduated** from PW-local Milestone 2 additions
+into the orchestrator's own `ALLOWED_CLIENT_METHODS` (§9.2 "since delivered"). PW
+already implements both tools — every client method had a matching `pw_` tool — so
+only the test's hard-coded "beyond the contract" list was stale. Every substantive
+cross-contract check (state vocabulary, enums, transitions, error table) already
+passed at the moved revision.
+
+Conforming removes those two from the local list, which **tightens** the check:
+they are now required by the contract's own authority instead of declared by ours,
+and the undeclared-capability assertion is untouched. The pin then moved
+`aff7a60` -> `5324e7c`. Nothing was skipped, relaxed, or made conditional.

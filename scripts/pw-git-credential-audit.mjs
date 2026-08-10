@@ -36,6 +36,8 @@ import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
 
 import { makePasswdLookup, resolveTerminalOwner } from '../app/terminal-owner.js';
+import { makeSecretCrypto } from '../app/secret-crypto.js';
+import { loadUsersFile } from '../app/users-file.js';
 import { credentialDropArgv, credentialExecutionPlan, spawnCredentialJob } from '../app/user-credentials.js';
 import { makeCredentialLockDomain } from '../app/credential-domain-lock.js';
 
@@ -50,6 +52,30 @@ function usage() {
   --apply    repair the eligible subset, as the resolved workspace owner
   --json     emit the raw report instead of a table
 `);
+}
+
+// Rewrite one project's credential pair from the AUTHORITATIVE current state.
+//
+// This is how a root-owned artifact is dealt with. It is never read, never
+// copied, never compared: the current credential is written into a fresh
+// owner-owned file which is renamed over it (the owner may do that because it
+// owns the DIRECTORY), and the old inode simply goes away unread. With no
+// current credential the pair is revoked instead — an explicit safe state that
+// cannot use or expose the old value.
+async function resyncFromAuthoritativeState({ project, token, workspaceRoot, registeredPaths, expectedUid, argv }) {
+  return spawnCredentialJob({
+    spawn,
+    argv,
+    job: {
+      action: 'git-credential',
+      workspaceRoot,
+      projectPath: project.path,
+      registeredPaths,
+      token,
+      expectedUid,
+    },
+    timeoutMs: 120000,
+  });
 }
 
 const STATUS_NOTE = {
@@ -82,7 +108,7 @@ function renderTable(report) {
       `${STATUS_NOTE[r.status] || r.status}${mode}${r.detail ? ` — ${r.detail}` : ''}`,
     );
   }
-  const repaired = rows.filter((r) => r.action === 'repaired').length;
+  const repaired = rows.filter((r) => r.action === 'repaired' || r.action === 'resynced' || r.action === 'revoked').length;
   const repairable = rows.filter((r) => r.status === 'needs-repair').length;
   const refused = rows.filter((r) => r.action === 'refused' || r.status === 'error').length;
   lines.push('', `repairable: ${repairable}   repaired: ${repaired}   refused/unserviceable: ${refused}`);
@@ -161,8 +187,50 @@ async function main() {
   let report;
   try {
     // Repairs must not overlap a live rotation, revocation, or project mutation.
-    report = await domain.withLocks(['lifecycle', 'projects', 'credential'], () =>
-      spawnCredentialJob({ spawn, argv, job, timeoutMs: 120000 }));
+    report = await domain.withLocks(['lifecycle', 'projects', 'credential'], async () => {
+      const audited = await spawnCredentialJob({ spawn, argv, job, timeoutMs: 120000 });
+      if (!apply) return audited;
+
+      // Rows the owner-side helper deliberately refused to convert: an artifact
+      // owned by somebody else. Rewrite those from the authoritative credential
+      // state instead of touching the old bytes.
+      const needResync = audited.projects.filter((r) => r.resyncRequired);
+      if (!needResync.length) return audited;
+
+      const secretKeyPath = process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key';
+      const usersPath = process.env.PW_USERS_PATH || '/etc/project-workbench/users.json';
+      let decrypt;
+      let users = [];
+      try {
+        ({ decrypt } = makeSecretCrypto({ secretKeyPath }));
+        users = await loadUsersFile(usersPath);
+      } catch (e) {
+        process.stderr.write(`pw-git-credential-audit: cannot read the authoritative credential state (${e.message}); ` +
+          'refusing to guess — no artifact was converted\n');
+        return audited;
+      }
+
+      const byPath = new Map(projects.filter((p) => p?.path).map((p) => [p.path, p]));
+      const registeredPaths = job.projects.map((p) => p.path);
+      const resolved = new Map();
+      for (const row of needResync) {
+        const project = byPath.get(row.path);
+        const record = project?.primaryUser ? users.find((u) => u.username === project.primaryUser) : null;
+        let token = '';
+        try { token = record?.ghToken ? (decrypt(record.ghToken) || '') : ''; } catch { token = ''; }
+        try {
+          const result = await resyncFromAuthoritativeState({
+            project, token, workspaceRoot, registeredPaths, expectedUid, argv,
+          });
+          resolved.set(row.path, token
+            ? { ...row, action: 'resynced', detail: 'rewritten from the current credential; the old value was discarded unread', artifact: result.artifact }
+            : { ...row, action: 'revoked', detail: 'no current credential for this project; the unusable artifact and its helper were removed' });
+        } catch (e) {
+          resolved.set(row.path, { ...row, action: 'failed', detail: e.message });
+        }
+      }
+      return { ...audited, projects: audited.projects.map((r) => resolved.get(r.path) ?? r) };
+    });
   } catch (e) {
     process.stderr.write(`pw-git-credential-audit: ${e.message}\n`);
     process.exitCode = 1;
