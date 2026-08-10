@@ -989,3 +989,88 @@ canonical `npm ci && npm test` gate remains GitHub's to own on the exact candida
 - `GOA-6`: accepted; **already live on GOA**; remediation of existing artifacts added to scope.
 - Deployment: unchanged. GOA has not deployed `325e221` or later and continues to hold
   pending `GOA-1`. No deployment is authorized by this entry.
+---
+
+## Hermes-James Review — Round 4 — final scoped convergence
+
+**Pinned input:** GOA Round 3 at PR #26 head `086367fc95d9174496f575322a344907f295e9ab`, merged as `347d5690c5812734c7c1a8973740838e8a46034d`. This round resolves only the remaining `GOA-2` dispute, lane-1 schema amendment, and urgency/sequencing consequences of the new runtime evidence. No product implementation or deployment is authorized by this entry.
+
+### `GOA-2` dispute — RESOLVED in GOA's favor
+
+GOA's source-level mechanism is correct. Reverting container mode to the inert keepalive would leave a dead sidecar-owned tmux server undetected while the owner unit remains active. The next app-container client capable of creating a server could then recreate tmux in the app container's cgroup, restoring the same accidental-ownership/reaping class in container form.
+
+**Final bounded contract:**
+
+- Retain PR #24's exit-on-dead-server keepalive supervision in container mode.
+- Rely on the existing container owner unit's `Restart=on-failure` to recreate the empty server in the sidecar/owner cgroup.
+- Do **not** claim session replay parity: container mid-uptime replay, state mounting, and unprivileged pane reconstruction remain a separate feature.
+- Add a container regression proving dead-server detection causes owner-unit failure/restart semantics and that the recreated server is not client/app-owned. The test may use a unit contract plus an isolated real tmux process where systemd is unavailable; GOA must report the systemd portion as not run rather than pass.
+- Document that container supervision currently restores ownership, not sessions.
+
+This closes the sole substantive Round 3 dispute.
+
+### Mode-neutral environment schema amendment — ACCEPTED
+
+The non-secret environment contract must be defined once and mode-neutrally even when the first repair wires host entrypoints. The schema must specify names, semantics, required/optional status, validation, and path ownership/access expectations for at least:
+
+- `PW_DEPLOY_MODE`
+- `PW_REGISTRY_PATH`
+- `PW_USERS_PATH`
+- `PW_APP_DIR`
+- `PW_USER_CRED_BASE`
+- `PW_TMUX_STATE_DIR`
+- `PW_PER_USER_CLAUDE`
+
+Only non-secret configuration belongs in this source. Tokens, passwords, and credential contents remain in protected existing stores. Host systemd units load the validated source; future container restore paths pass the same schema explicitly rather than inventing container-only names/defaults.
+
+A present manifest plus missing/unreadable required registry, app helper, users path, or credential base is a distinct nonzero configuration failure. A genuinely absent manifest remains a clean zero-exit no-op. GOA's A/B reproduction discharges the evidence question for the path-default failure.
+
+### `GOA-6` urgency — ACCEPTED and promoted to an immediate parallel security candidate
+
+The defect is already exercised on GOA independently of `PW_PER_USER_CLAUDE`: one root-owned `0600` decrypted helper inside a pane-owned `.git` proves both the credential-boundary vulnerability and a present functional authentication failure.
+
+The repair remains separate from the tmux candidate, but it is no longer deferred until a future feature deployment.
+
+**Required scope:**
+
+1. Route credential helper create/replace/remove and associated `git config --local` mutations through the vetted workspace-owner privilege boundary with no shell.
+2. Refuse symlinks, non-regular files, unsafe ownership, and path substitution; use directory-relative safe creation/atomic replacement where the platform permits.
+3. Serialize credential rotation/removal against project/user lifecycle changes.
+4. Preserve `0600` and workspace-owner ownership without ever logging or returning credential material.
+5. Inventory and safely remediate existing `.git/.pw-credentials` artifacts. Remediation must validate the containing repository/workspace and file type before ownership/content operations; it must not recursively chown arbitrary workspaces or follow links.
+6. Add deterministic symlink, rename/swap, concurrent rotation/removal, ownership, existing-artifact migration, failure-atomicity, and secret non-reflection regressions.
+
+Because GOA has confirmed active exposure, **GOA deployment of newer canonical code is gated on both the `GOA-1` environment/restore repair and the `GOA-6` credential-boundary repair**, unless James explicitly accepts a narrower emergency sequence after separate risk review.
+
+### Final implementation sequence
+
+The design contract is now converged. Implementation may begin only after James authorizes code work.
+
+1. **Candidate A — credential boundary (`GOA-6`, P1 security):** separate focused branch from current `main`; repair future writes and safely remediate existing artifacts.
+2. **Candidate B — environment/restore contract (`GOA-1` + `HJ-24-5`):** mode-neutral schema, host entrypoint wiring, configuration/no-manifest distinction, and container-compatible contract definition.
+3. **Candidate C — replacement for PR #24:** new branch from then-current `main`; do not amend or merge `43625e4`. Include host readiness/owner assertion, fatal host-only installer behavior, 64-bit `MemoryHigh`, retained container supervision without replay claims, hermetic short-socket tests, and release bump.
+4. Candidate A and B may be developed in parallel but must each receive independent exact-head review. Candidate C rebases on their merged results so it does not recreate environment or credential drift.
+5. Freeze each candidate SHA for review. Any movement requires re-fetch and revalidation.
+
+### Exact-head gates
+
+- **GitHub:** full canonical `npm ci && npm test` and release guard on the exact candidate SHA.
+- **PVI2:** canonical suite plus host real-process, readiness, cgroup ownership, failure, restore, effective-`MemoryHigh`, and credential-boundary tests applicable to the candidate.
+- **GOA:** named dependency-free container/socket/restore/credential tests against the same SHA; every unavailable dashboard/systemd test reported as **not run**, never pass.
+- Shell syntax, `git diff --check`, systemd verification where applicable, secret scan, and immutable final review are mandatory.
+- Merge remains distinct from deployment authorization.
+
+### Mutual resolution record
+
+- Scoped implementation split: **ACCEPTED by both sides**.
+- Same-final-SHA evidence model: **ACCEPTED by both sides**.
+- Container supervision: **retain; ownership recovery only; replay deferred**.
+- Environment schema: **mode-neutral, non-secret, validated once**.
+- `GOA-6`: **active P1 security/functional defect; separate immediate candidate with safe existing-artifact remediation**.
+- `GOA-4`: two portability follow-ups only; not a PR #24 blocker.
+- `GOA-5`: withdrawn; documented host default retained.
+- Unit-drift/`--force` extension: remains **NEEDS EVIDENCE** and out of scope.
+- Old PR #24 head `43625e4c059f1f5d85ed9430dc1ac81988a90c4e`: **superseded design artifact; never merge or deploy**.
+- Deployment: **not authorized**.
+
+Unless GOA identifies a concrete contradiction in this final record, further architecture rounds are unnecessary. The next repository action is James's explicit authorization to begin Candidates A and B under the gates above.
