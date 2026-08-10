@@ -121,13 +121,24 @@ test('REGRESSION: a wrong-mode artifact is replaced, not chmod-ed in place', asy
   t.after(() => fsp.rm(ws, { recursive: true, force: true }));
   await writeCredentialStore({ projectPath: ws, token: TOKEN, expectUid: ME });
   await fsp.chmod(store(ws), 0o644);
-  const before = (await fsp.lstat(store(ws))).ino;
+
+  // Proving "replaced, not modified in place" by comparing inode NUMBERS is filesystem-dependent:
+  // after unlink+create the kernel is free to hand the same number straight back, which is exactly
+  // what the CI runner's filesystem does and this host's does not. Holding an open descriptor to
+  // the original file is deterministic everywhere — if it was replaced, the old inode has lost its
+  // only name and its link count is 0; if it was modified in place, the descriptor still refers to
+  // a live, named file.
+  const original = await fsp.open(store(ws), 'r');
+  t.after(() => original.close().catch(() => {}));
 
   const res = await remediateCredentialArtifact({ projectPath: ws, expectUid: ME, token: TOKEN });
   assert.equal(res.action, 'replaced');
+  assert.equal((await original.stat()).nlink, 0,
+    'the bad artifact must have been unlinked and a fresh file published, not repaired in place');
+
   const st = await fsp.lstat(store(ws));
   assert.equal(st.mode & 0o777, 0o600);
-  assert.notEqual(st.ino, before, 'replacement, so the repaired file cannot inherit anything from the bad one');
+  assert.equal(st.nlink, 1);
 });
 
 test('an unsafe artifact (symlink) is unlinked as a link, and its target is untouched', async (t) => {

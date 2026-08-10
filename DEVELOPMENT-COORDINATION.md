@@ -1659,7 +1659,7 @@ point we are trying to stop using it.
 
 ### Evidence at the frozen head
 
-Frozen head is recorded in the PR. Release identifier advanced to `1.26.0810.2049`.
+Frozen head is recorded in the PR. Release identifier advanced with the candidate.
 
 **Canonical gate, this host (PVI2):**
 
@@ -1693,6 +1693,15 @@ target (fifo), hard-linked target, path substitution after validation, `.git` ow
 account, interrupted publish leaving the working credential intact and no temp file behind,
 concurrent rotations converging on one intact store, removal racing rotations, migration of
 wrong-mode and foreign-owned artifacts, and secret non-reflection across every failure surface.
+
+**One assertion had to be rewritten after the first CI run**, and it is worth recording because it is
+a portability trap rather than a product defect. "Replaced, not modified in place" was first proved by
+comparing inode *numbers* before and after. That is filesystem-dependent: after `unlink` + create the
+kernel may hand the same number straight back, which the GitHub runner's filesystem does and this
+host's does not — so the candidate passed locally and failed in CI on identical code. It now holds an
+open descriptor to the original file and asserts its link count reaches 0, which is deterministic
+everywhere: a replaced inode has lost its only name, a chmod-ed one has not. Verified directly in
+both directions.
 
 Also: `bash -n` on changed scripts, `git diff --check`, and a scan confirming no credential material,
 private URL, or host inventory in any artifact.
