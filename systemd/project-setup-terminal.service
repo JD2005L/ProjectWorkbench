@@ -10,5 +10,10 @@ Environment=HOME=/home/admin
 ExecStart=/usr/local/bin/setup-terminal-start
 Restart=on-failure
 RestartSec=3
+# This unit shares the default tmux socket with project-terminal@, so it can
+# equally end up parenting the shared server. Same rationale as that unit:
+# never let an OOM-killed pane or a ttyd restart reap the server behind it.
+OOMPolicy=continue
+KillMode=process
 [Install]
 WantedBy=multi-user.target

@@ -16,5 +16,17 @@ Environment=HOME=/home/admin
 ExecStart=/usr/local/bin/project-terminal-start %i
 Restart=on-failure
 RestartSec=3
+# The shared tmux server has no unit of its own in host mode: whichever
+# project-terminal@ instance runs `tmux new-session` first ends up parenting it,
+# so EVERY project's pw_* panes live in that one instance's cgroup. Under the
+# systemd defaults (OOMPolicy=stop, KillMode=control-group) a single OOM-killed
+# pane failed the unit and took the whole cgroup — i.e. every project's sessions
+# — down with it, mid-uptime, with no reboot to trigger pw-tmux-restore.
+# (Observed 2026-08-03: `Failed with result 'oom-kill'`, 8.1G peak.)
+#   OOMPolicy=continue — an OOM-killed pane no longer fails the unit.
+#   KillMode=process   — stopping/restarting ttyd kills only ttyd, never the
+#                        tmux server or the panes behind it.
+OOMPolicy=continue
+KillMode=process
 [Install]
 WantedBy=multi-user.target
