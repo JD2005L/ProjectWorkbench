@@ -341,11 +341,14 @@ async function credentialContext(project){
 // already does its own load/mutate/save inside the callback, so only the
 // serialization mechanism changes here, not the call signature.
 const PROJECTS_LOCK_PATH = process.env.PW_PROJECTS_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-projects.lock');
-// Project mutations enter the SAME domain as credential work, from the top of
-// the canonical order, so a project rename/delete can never overlap a token
-// rotation on the repository it is moving. See app/credential-domain-lock.js.
+// projects.json transactions — and ONLY those. This section legitimately spans
+// long external work (clone, chown, routing, systemd), so it must never hold a
+// lock that anything latency-sensitive waits on. Credential work reaches the
+// same exclusion by taking this lock itself, from the top of the canonical
+// order, in its own short section: see syncProjectCredentials() and
+// app/credential-domain-lock.js.
 async function withProjectsLock(fn){
- return credentialDomain.withLocks(['lifecycle','projects'], fn);
+ return credentialDomain.withLocks(['projects'], fn);
 }
 
 // ============================================================================
@@ -2214,6 +2217,7 @@ app.get(BASE + '/manage', requireAdmin, async (req,res)=>{
 app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
  if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
+ let added = null;
  await withProjectsLock(async () => {
   const projects = await loadProjects();
   if(projects.some(p=>p.name===name)) throw new Error('A project named "'+name+'" already exists');
@@ -2231,8 +2235,12 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
   const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
   let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
   await cloneWorkspace(p, cloneToken); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
-  if(p.primaryUser){ await syncProjectCredentials(p); }
+  added = p;
  });
+ // Outside the projects lock on purpose: this is a SHORT ordered transition
+ // (lifecycle > projects > credential) and must not be reached while the clone
+ // above is still running, or every login waits behind the network.
+ if(added?.primaryUser){ await syncProjectCredentials(added); }
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
  if(wantsJson(req)) return res.json({ok:true,name});
  res.redirect(BASE + '/manage');
@@ -2246,6 +2254,7 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  const primaryUser = String(req.body.primaryUser || '').trim();
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
+ let updated = null;
  await withProjectsLock(async () => {
  const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project "'+oldName+'" not found');
  if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('A project named "'+newName+'" already exists');
@@ -2295,8 +2304,11 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
  const users = await loadUsers();
  await saveProjects(projects); await applyRouting(projects); await startProject(p);
- await syncProjectCredentials(p);
+ updated = p;
  });
+ // Same reason as /manage/add: the credential transition is short and ordered,
+ // and is taken after the long project work has released its lock.
+ if(updated){ await syncProjectCredentials(updated); }
  await audit('project_update', { oldName, newName, port }, req);
  if(wantsJson(req)) return res.json({ok:true,name:newName});
  res.redirect(BASE + '/manage');

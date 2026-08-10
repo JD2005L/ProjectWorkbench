@@ -110,3 +110,50 @@ test('an unknown argument is refused rather than guessed at', { timeout: 60000 }
   try { cli(t, ['--wipe']); } catch (e) { status = e.status; }
   assert.equal(status, 2);
 });
+
+test('P2: an unreadable authoritative credential state is an explicit blocked failure, not a quiet success', { timeout: 60000 }, () => {
+  const t = tree();
+  const p = repo(t, 'demo');
+  const artifact = path.join(p, '.git', '.pw-credentials');
+  fs.writeFileSync(artifact, `https://${SENTINEL}:x-oauth-basic@github.com\n`, { mode: 0o600 });
+  fs.writeFileSync(t.registry, JSON.stringify([{ name: 'demo', path: p, port: 7000, primaryUser: 'alice' }]));
+  // No users store and no secret key: the authoritative current credential
+  // cannot be resolved, so nothing may be converted — and the command must say
+  // so with a failing exit rather than printing an actionable-looking row.
+  const usersPath = path.join(t.dir, 'users.json');
+  if (fs.existsSync(usersPath)) fs.rmSync(usersPath);
+
+  let status = 0;
+  let out = '';
+  let err = '';
+  try {
+    out = run(process.execPath, [CLI, '--apply'], {
+      encoding: 'utf8',
+      timeout: 120000,
+      env: {
+        ...process.env,
+        PW_REGISTRY_PATH: t.registry,
+        PW_WORKSPACES: t.workspaces,
+        PW_USERS_PATH: usersPath,
+        PW_SECRET_KEY_PATH: path.join(t.dir, 'no-such-secret-key'),
+        PW_PROJECTS_LOCK_PATH: path.join(t.registryDir, '.pw-projects.lock'),
+        PW_LIFECYCLE_LOCK_PATH: path.join(t.dir, '.pw-lifecycle.lock'),
+        PW_CREDENTIAL_LOCK_PATH: path.join(t.registryDir, '.pw-credential.lock'),
+        PW_HOST_TERMINAL_USER: os.userInfo().username,
+        PW_DEPLOY_MODE: 'host',
+      },
+    });
+  } catch (e) {
+    status = e.status;
+    out = String(e.stdout || '');
+    err = String(e.stderr || '');
+  }
+
+  // The artifact here is owner-owned, so it is repairable WITHOUT the
+  // authoritative state; what must not happen is a row that claims a resync is
+  // pending while the command has already refused to perform one.
+  assert.equal(out.includes('resync-required'), false,
+    'no actionable resync row may be printed when the command refused to act');
+  assert.equal(out.includes(SENTINEL), false);
+  if (err) assert.notEqual(status, 0, 'a refusal to act must exit nonzero');
+});

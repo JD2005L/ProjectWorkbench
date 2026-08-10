@@ -263,3 +263,53 @@ Conforming removes those two from the local list, which **tightens** the check:
 they are now required by the contract's own authority instead of declared by ours,
 and the undeclared-capability assertion is untouched. The pin then moved
 `aff7a60` -> `5324e7c`. Nothing was skipped, relaxed, or made conditional.
+
+
+## 9. Blocker delta after the second immutable review of `5e69ea7`
+
+### P1 — I caused an availability regression, and the fix is SCOPE, not order
+
+Widening `withProjectsLock()` to `['lifecycle','projects']` was wrong. Project
+creation legitimately holds that section across `cloneWorkspace()` — a network
+`git clone` with a 300s timeout — so every login and user-management route, which
+waits on the lifecycle lock with a 15s timeout, queued behind a slow network and
+then failed. Base `main` never had this: its projects lock and lifecycle lock were
+different locks, and login only ever touched the latter.
+
+The repair restores the base availability profile while keeping the domain:
+
+- `withProjectsLock()` is `['projects']` again — exactly what it was on base. That
+  section may span long external work precisely because nothing latency-sensitive
+  waits on it.
+- The credential publish moved OUT of that long section in `/manage/add` and
+  `/manage/update`. It runs afterwards as its own SHORT ordered transition, and
+  `syncProjectCredentials()` still takes the full chain
+  `lifecycle > projects > credential` from a clean state.
+
+Serialization is unchanged by this: credential work still excludes project
+mutations (it takes `projects`) and user-lifecycle mutations (it takes
+`lifecycle`). What changed is only WHEN the chain is held — around the short state
+transition rather than around a clone. The ordering guard in
+`app/credential-domain-lock.js` makes the old mistake unrepeatable: acquiring
+`lifecycle` while holding `projects` now throws instead of deadlocking.
+
+Regression: `test/git-credential-availability.test.mjs` stalls a real `git clone`
+via a PATH shim inside a real `/manage/add` request and asserts that
+`/api/auth/check`, `GET /api/users`, `POST /api/auth/login` and
+`PATCH /api/users/:username` all stay successful and bounded (<5s) while it hangs.
+It fails against the previous head.
+
+### P2 — the audit CLI could refuse to act and still look successful, or worse
+
+The reported shape was a `resync-required` row printed while stderr said it had
+refused. Investigating found something worse: neither loader announces its own
+absence — `loadUsersFile()` returns `[]` for a missing store, and
+`makeSecretCrypto()` does not touch the key until something is decrypted. So the
+guard never fired, the token resolved to `''`, and the command would have
+**revoked a perfectly good credential** on the strength of missing information.
+
+Now the authoritative state is PROVEN readable first (`fs.access` on the store, and
+the key is forced to load), and revocation is a POSITIVE decision only — this
+project has no owner, or its owner holds no token. Anything unresolved (no registry
+entry, unresolvable `primaryUser`, undecryptable token) is reported `blocked` and
+exits nonzero. No actionable row survives a refusal.

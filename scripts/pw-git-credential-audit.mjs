@@ -202,12 +202,30 @@ async function main() {
       let decrypt;
       let users = [];
       try {
-        ({ decrypt } = makeSecretCrypto({ secretKeyPath }));
+        // PROVE the authoritative state is readable before converting anything.
+        // Neither loader announces its own absence: loadUsersFile() returns an
+        // empty list for a missing store, and makeSecretCrypto() does not touch
+        // the key until something is decrypted. Taken at face value, both would
+        // resolve to "this project has no credential" and REVOKE a perfectly
+        // good one. An absent store is missing information, not an answer.
+        await fs.access(usersPath);
+        const crypto_ = makeSecretCrypto({ secretKeyPath });
+        crypto_.encrypt('probe');
+        decrypt = crypto_.decrypt;
         users = await loadUsersFile(usersPath);
       } catch (e) {
+        // Refusing to act and still printing an actionable-looking row would be a
+        // false success: the operator would read "resync-required" as a plan, and
+        // the exit code as agreement. Mark the affected rows BLOCKED and fail.
         process.stderr.write(`pw-git-credential-audit: cannot read the authoritative credential state (${e.message}); ` +
           'refusing to guess — no artifact was converted\n');
-        return audited;
+        return {
+          ...audited,
+          blocked: true,
+          projects: audited.projects.map((r) => (r.resyncRequired
+            ? { ...r, action: 'blocked', resyncRequired: false, detail: 'the authoritative credential state could not be read, so nothing was converted' }
+            : r)),
+        };
       }
 
       const byPath = new Map(projects.filter((p) => p?.path).map((p) => [p.path, p]));
@@ -215,9 +233,22 @@ async function main() {
       const resolved = new Map();
       for (const row of needResync) {
         const project = byPath.get(row.path);
-        const record = project?.primaryUser ? users.find((u) => u.username === project.primaryUser) : null;
+        // Revocation must be a POSITIVE authoritative decision — this project has
+        // no owner, or its owner holds no token — never the residue of a lookup
+        // that failed. Anything unresolved is blocked and reported.
+        const blocked = (why) => resolved.set(row.path, {
+          ...row, action: 'blocked', resyncRequired: false, detail: why,
+        });
         let token = '';
-        try { token = record?.ghToken ? (decrypt(record.ghToken) || '') : ''; } catch { token = ''; }
+        if (!project) { blocked('the project is no longer in the registry'); continue; }
+        if (project.primaryUser) {
+          const record = users.find((u) => u.username === project.primaryUser);
+          if (!record) { blocked(`primaryUser "${project.primaryUser}" does not resolve to a user record`); continue; }
+          if (record.ghToken) {
+            try { token = decrypt(record.ghToken) || ''; } catch { token = ''; }
+            if (!token) { blocked(`the credential for "${project.primaryUser}" could not be decrypted`); continue; }
+          }
+        }
         try {
           const result = await resyncFromAuthoritativeState({
             project, token, workspaceRoot, registeredPaths, expectedUid, argv,
@@ -240,7 +271,10 @@ async function main() {
   process.stdout.write(asJson ? `${JSON.stringify(report, null, 2)}\n` : renderTable(report));
   // Anything the operator still has to deal with by hand is a nonzero exit, so
   // this is usable from a check.
-  if (report.projects.some((r) => r.status === 'error' || r.action === 'failed')) process.exitCode = 1;
+  if (report.blocked
+    || report.projects.some((r) => r.status === 'error' || r.action === 'failed' || r.action === 'blocked')) {
+    process.exitCode = 1;
+  }
 }
 
 await main();

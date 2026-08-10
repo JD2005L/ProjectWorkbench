@@ -290,3 +290,27 @@ test('REAL A31-5: a dry run reports the root-owned artifact and changes nothing'
     assert.equal(out.includes(OLD_ROOT_SENTINEL), false);
   } finally { cleanup(tree); }
 });
+
+test('REAL P2: a root-owned artifact plus unreadable authoritative state is reported blocked and exits nonzero', { timeout: 240000 }, async (t) => {
+  const cap = await rootCapability();
+  if (!cap.ok) { t.skip(`not run: ${cap.why} — PVI2 owns this evidence; reported as NOT RUN, never as a pass`); return; }
+  if (ME === 0) { t.skip('not run: already root, so no distinct unprivileged workspace owner can be resolved'); return; }
+
+  const tree = makeManagedTree({ withCurrentToken: true });
+  try {
+    // The authoritative state is destroyed AFTER the base shape is in place, so
+    // the row genuinely needs a resync that cannot be performed.
+    fs.rmSync(path.join(tree.dir, 'users.json'));
+    fs.rmSync(tree.secretKeyPath);
+
+    let status = 0;
+    let out = '';
+    try { out = runAudit(tree, ['--apply']); } catch (e) { status = e.status; out = String(e.stdout || ''); }
+
+    assert.notEqual(status, 0, 'refusing to act must be a failing exit, never a quiet success');
+    assert.equal(out.includes('resync-required'), false, 'no actionable resync row may be printed after refusing to act');
+    assert.match(out, /blocked/, 'the row must say plainly that nothing was converted');
+    assert.equal(fs.lstatSync(tree.artifact).uid, 0, 'and nothing may have been converted');
+    assert.equal(out.includes(OLD_ROOT_SENTINEL), false);
+  } finally { cleanup(tree); }
+});
