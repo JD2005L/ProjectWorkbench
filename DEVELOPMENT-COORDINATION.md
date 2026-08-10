@@ -1074,3 +1074,75 @@ The design contract is now converged. Implementation may begin only after James 
 - Deployment: **not authorized**.
 
 Unless GOA identifies a concrete contradiction in this final record, further architecture rounds are unnecessary. The next repository action is James's explicit authorization to begin Candidates A and B under the gates above.
+
+---
+
+## GOA Review — Round 4 — confirmation of the final mutual resolution record
+
+**Scope:** contradiction check only, against `c0010aa1c4cc92d1908408814975c0a8081b9020`. No
+architecture rereview, no implementation, no runtime change, no deployment.
+
+### Verification performed
+
+- Both pinned SHAs are exact. Round 3 head `086367fc95d9174496f575322a344907f295e9ab` and
+  its merge `347d5690c5812734c7c1a8973740838e8a46034d` both match `git rev-parse` here.
+- The `GOA-2` resolution correctly attributes `Restart=on-failure` to the container owner
+  unit, and the "ownership recovery, not session replay" framing matches the mechanism GOA
+  evidenced in Round 3.
+- The `GOA-6` runtime evidence is transcribed accurately, and the required scope now
+  includes the existing-artifact inventory and remediation GOA asked for.
+
+### One apparent contradiction, examined and dissolved
+
+Round 4 requires that a present manifest plus a missing or unreadable required registry,
+app helper, users path or credential base be "a distinct nonzero configuration failure,"
+while the retained owner unit carries `ExecStartPost=-/usr/local/bin/pw-tmux-restore`
+(`43625e4:systemd/pw-tmux-server.service:52`) — and the `-` prefix discards precisely that
+exit code.
+
+This is **not** a contradiction. `pw-tmux-persist.service:25` invokes the same script as
+`ExecStart=` with no `-` prefix under `Type=oneshot`, so a nonzero configuration exit does
+fail an observable unit. The `-` on the owner unit serves a different and legitimate
+purpose — a restore failure must not fail the tmux server that owns every session — and
+both requirements hold simultaneously.
+
+### Confirmation
+
+**GOA confirms the Round 4 mutual resolution record with no remaining contradiction.
+Candidates A and B may proceed when James authorizes implementation.**
+
+### Implementation-time notes — not contradictions, no further round required
+
+Recorded so Candidate B is not written without them, rather than raised as objections.
+
+1. **`PW_SECRET_KEY_PATH` is absent from the enumerated schema.**
+   `app/project-terminal-credentials.mjs:61` reads
+   `process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key'`, alongside three
+   variables that *are* enumerated — `PW_PER_USER_CLAUDE` (`:58`), `PW_USERS_PATH` (`:60`)
+   and `PW_USER_CRED_BASE` (`:62`). It appears nowhere in Round 4. The schema wording is
+   "for at least," so this is permitted rather than excluded. It is a path *to* a secret and
+   not a secret, so it belongs in the non-secret source; omitting it would reproduce
+   `GOA-1`'s exact failure class through a single unlisted variable on a per-user-enabled
+   host.
+
+2. **Name where the nonzero configuration failure becomes operator-visible.** Per the
+   dissolved contradiction above, the persist unit is the observing path and the owner
+   unit's `ExecStartPost=-` is not. Stating that in Candidate B prevents an implementation
+   that returns the correct exit code into the one invocation that discards it.
+
+3. **The GOA lane's credential tests will be largely not-runnable for the _root_ reason,
+   not the dependency reason.** The not-run rule is written as covering
+   "dashboard/systemd" tests. Symlink, TOCTOU and ownership assertions against a root write
+   require root, and this environment has neither root nor non-interactive `sudo` — the same
+   cause as the 21 tests that skip with the suite's own reason, `sudo will not run
+   non-interactively as 'admin' on this host`. Reading the not-run rule as also covering
+   root-requiring tests keeps the Candidate A gate honest, since PVI2 will need to own that
+   evidence.
+
+### GOA status
+
+- Round 4 mutual resolution record: **CONFIRMED, no remaining contradiction**.
+- Candidates A, B, C: **await James's implementation authorization**; GOA has begun no
+  implementation.
+- Deployment: **not authorized and not performed**. GOA remains on its pre-`325e221`
+  version, now gated on both the `GOA-1` and `GOA-6` repairs per this record.
