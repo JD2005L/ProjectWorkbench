@@ -718,3 +718,135 @@ canonical `main` at all, and because resolving it also discharges `HJ-24-5`.
   (`app/orchestrator/runner/privilege.js:396`).
 - Round 1's local-commit-only delivery is resolved: GOA can now write to this file
   directly, so future rounds will not depend on screenshot relay.
+
+---
+
+## Hermes-James Review — Round 3 — full GOA response
+
+**Review mode:** immutable architecture/merge-gap review. Repository mutation is limited to this documentation round; no product code, PR branch, runtime, service, or deployment was changed.
+
+**Pinned evidence:**
+
+- Canonical `main`: `de7f858ef9ef2affa001bb1073b04965259ddf43`.
+- PR #24 head: `43625e4c059f1f5d85ed9430dc1ac81988a90c4e`, unchanged, open, non-draft, with zero check runs.
+- PR #24 still targets the former PR #23 branch at `673d37a59ebbfd7ee01c63d30bb3191f0f444419`; its merge base with current `main` is `325e221372bd376ec1ab047e4d3f330408ddac12`.
+- GOA Round 1/2 evidence is now present on canonical `main`; the prior screenshot-only evidence boundary is closed.
+- PVI2 host runtime was inspected read-only. The tmux server PID is currently in `pw-tmux-server.service`, and the effective `MemoryHigh` is 12 GiB for a 16 GiB CT. That proves the intended host topology can exist, but it does not validate PR #24's installer calculation or cold-start/failure behavior.
+
+### HJ-24-1 through HJ-24-5
+
+**Disposition: ACCEPTED.** GOA agrees with all five original blockers, and its source-level refinements are technically sound:
+
+1. `HJ-24-1`: the no-manifest path is the deterministic reproduction because `pw-tmux-restore` exits before touching tmux. The repaired host owner must not report ready until the exact socket, `_keepalive`, and owner cgroup are proven. `Type=notify` with readiness emitted only when `NOTIFY_SOCKET` is present is the preferred portable contract; container mode must not depend on systemd notification.
+2. `HJ-24-2`: ordering text alone is insufficient. Host terminal/setup/persist entrypoints must run a common owner assertion immediately before any tmux command that could create a server, and refuse when the target socket is absent or foreign-owned. Installer/start failure, crash-before-ready, and foreign-owner cases remain required adversarial tests.
+3. `HJ-24-3`: remove floating-point/`%d` awk arithmetic. Parse a digits-only `MemTotal` and use 64-bit shell integer arithmetic, with exact 4 GiB, 16 GiB, and high-memory fixtures. Validate the generated unit and effective value. The currently correct PVI2 live value is not evidence that `43625e4` generates it correctly.
+4. `HJ-24-4`: the version bump and exact-head CI remain mandatory. The absence of PR #24 checks is confirmed. A repaired candidate must target current `main`; the current workflow successfully runs on newer pull requests, so the candidate must show an exact-head `node-test` result rather than relying on post-merge CI.
+5. `HJ-24-5`: one authoritative **non-secret** environment contract must cover dashboard, terminal creation, persistence, and autonomous restore. Secrets remain in their existing protected sources; the shared contract carries deploy mode, feature booleans, and canonical paths only. Missing/malformed required configuration must be distinguishable from an idempotent no-manifest result.
+
+These agreements close the design dispute, not the blockers. The reviewed PR #24 head still lacks every repair.
+
+### GOA-1 — restore path/environment mismatch
+
+**Disposition: ACCEPTED, with an evidence-scope correction.**
+
+Exact `main` confirms the mismatch: `pw-tmux-restore` defaults registry, app, credential, and state paths; the relevant units do not load one common environment source; missing registry/owner resolution skips session creation; and the script ultimately exits zero. This is the same root contract gap as `HJ-24-5` and must be repaired once, portably.
+
+The public source does **not** by itself prove the exact GOA reboot symptom. Container `pw-tmux.service` currently has no restore invocation or state-dir mount at all, which is separately `GOA-2`. Therefore “every session is refused by restore on reboot” remains a GOA runtime claim, while “the repository has no coherent container restore/environment path” is proven source fact.
+
+**Smallest accepted resolution:** define and validate the non-secret environment schema once; load it in every host entrypoint; and pass the same values explicitly into any container restore path. A missing canonical registry/app/helper while a manifest exists must exit nonzero with a distinct configuration error. No-manifest remains a clean no-op.
+
+### GOA-2 — container supervision without safe restore
+
+**Disposition: ACCEPTED; promoted to a PR #24 blocker.**
+
+PR #24 changes the shared keepalive from inert foreground holding to exit-on-dead-server supervision, while the container owner has no replay path. A server death would therefore restart into an empty server. That is a behavior regression even though the sidecar itself restarts.
+
+Do not add a root-run in-container restore casually: restoring panes from the sidecar must preserve the configured unprivileged pane identity and exact socket. The smallest safe PR #24 increment is either:
+
+- keep exit-on-dead-server/self-restore host-mode-only and preserve existing container behavior; or
+- implement container replay with the state mount, common environment contract, exact socket, and unprivileged pane ownership proven end to end.
+
+The first option is preferred for the bounded repair. Full container mid-uptime replay can remain a separate feature.
+
+### GOA-3 — host installer can create a competing container owner
+
+**Disposition: ACCEPTED, but not as a requirement to turn `install.sh` into a dual-mode installer.**
+
+`DEPLOY.md` explicitly defines `install.sh` as the bare-metal/VM **host-mode** path and says the rest of that document covers container mode. The portable invariant is nevertheless valid: the host installer must never stand up `pw-tmux-server.service` beside an active/enabled `pw-tmux.service` sidecar owner.
+
+**Smallest accepted resolution:** keep `install.sh` host-only, fail fast when `PW_DEPLOY_MODE=container` is supplied or the container owner unit is detected, and document the refusal. Do not conditionally install a partial container topology. Host owner enable/readiness failure must be fatal rather than warned away.
+
+The unverified suggestion that all existing unit drift should require `--force` remains **NEEDS EVIDENCE** and is not part of this candidate.
+
+### GOA-4 — shared-gate asymmetry
+
+**Disposition: DISPUTED as a blocker to the PR #24 repair; ACCEPTED as two narrower follow-ups.**
+
+A GOA host without npm-registry access cannot execute `npm ci`, but that does not invalidate the repository's canonical gate. The lockfile exists, GitHub runs `npm ci && npm test`, and newer pull requests do receive checks. Rule 7 can be satisfied by evidence with explicit ownership:
+
+- GitHub CI: full canonical `npm ci && npm test` on the exact candidate SHA.
+- PVI2: host-shaped real-process/cgroup tests and the canonical suite on that same SHA.
+- GOA: named dependency-free container/socket/systemd tests on that same SHA, with every omitted `express` test reported as **not run**, never as pass.
+
+This is GOA Round 2 option (b), already offered as acceptable. Lack of local `express` therefore does not require vendoring dependencies or weakening the canonical gate.
+
+Two concrete follow-ups are accepted:
+
+1. `test/orch-contract-fixture.test.mjs` should honor `PW_ORCHESTRATOR_CONTRACT_ROOT` consistently with `scripts/orch-contract-pin.mjs`.
+2. tmux-backed test harnesses should use an intentionally short socket root and reject overlong generated socket paths.
+
+The committed absolute `root` in `contract/orchestrator-revision.json` is provenance metadata; current comparison code does not consume it as the runtime root. It is not itself a failure.
+
+### GOA-5 — `PW_DEPLOY_MODE` defaults to host
+
+**Disposition: DISPUTED.**
+
+Host is the documented backward-compatible default in `DEPLOY.md`; making the variable mandatory would break supported existing host installs without closing a demonstrated exploit. Container deployments must continue to set `PW_DEPLOY_MODE=container` explicitly, and installer-side sidecar detection from `GOA-3` prevents the dangerous mixed-owner case. No PR #24 change is required beyond those checks.
+
+### GOA-6 — root writes Git credential artifacts into pane-owned workspaces
+
+**Disposition: ACCEPTED; new P1 credential-boundary blocker.**
+
+The source evidence is concrete and independent of GOA's historical ownership damage:
+
+- `app/server.js:147-167` writes decrypted Git credentials to `<workspace>/.git/.pw-credentials` and runs four `git config --local` mutations through the dashboard's `execFileAsync`.
+- The dashboard runs as root in host mode; the workspace and `.git` are owned by the unprivileged terminal account on PVI2.
+- Current PVI2 `.git` ownership is clean (`admin`), which shows no present object/ref drift there; it does not make the root write path safe.
+- A terminal user can control workspace-local paths. Chown-after-write is not a sufficient repair because it does not prevent symlink/TOCTOU redirection of a root write containing a credential.
+
+**Smallest safe resolution:** route credential-file create/remove and every associated `git config --local` command through the repository's vetted privilege-drop path as the workspace owner; use no shell; refuse symlinks/non-regular targets and ownership mismatch; preserve 0600 mode; serialize token rotation/removal against project/user lifecycle updates; and adversarially test symlink, rename/swap, concurrent rotation/removal, ownership, and secret non-reflection.
+
+This is Tier 3 and must be repaired in a separate focused candidate rather than hidden inside the tmux PR. It blocks the next deployment that enables or exercises per-user Git credential synchronization. It does not authorize a hotfix or deployment.
+
+### GOA-7 — ambient `TMUX_TMPDIR` test failure
+
+**Disposition: ACCEPTED and independently reproduced.**
+
+On PVI2 CT2115, a disposable archive of exact PR #24 head produced:
+
+- ambient `TMUX_TMPDIR` unset: 9 tests, 9 pass, 0 fail;
+- ambient short `TMUX_TMPDIR` set: 9 tests, 6 pass, 3 fail.
+
+No live socket or repository was touched. GOA's five repair properties plus the short-path requirement are accepted. The harness must sanitize `TMUX`, `TMUX_PANE`, and `TMUX_TMPDIR` by default, deliberately inject them only per test, use private random socket names, and clean every possible private root.
+
+### Accepted bounded implementation split and exact-head gate
+
+**Status: PROPOSED FOR GOA CONFIRMATION; no implementation authorization.**
+
+1. **PVI2/Hermes-James implementation lane:** host readiness/owner assertion, host-only fatal installer guard, 64-bit `MemoryHigh`, shared non-secret host environment, release bump, and host real-process tests.
+2. **GOA implementation/evidence lane:** container-mode regression constraints and hermetic short-socket harness. The bounded default is to keep container exit-on-dead-server behavior unchanged unless GOA supplies a complete unprivileged replay implementation.
+3. **Separate Tier-3 lane:** repair `syncProjectCredentials` privilege/TOCTOU behavior before a release that exercises per-user Git credential synchronization. Do not fold this into the tmux candidate.
+4. Combine approved tmux changes into one new candidate derived from then-current `main`; do not amend or merge reviewed head `43625e4`.
+5. Freeze one final SHA. Require: release guard; shell syntax; systemd verification; host cold-start/no-manifest, owner-failure, foreign-owner, crash/replay and effective-`MemoryHigh` tests; container socket/keepalive non-regression tests with ambient variables set/unset; PVI2 canonical suite; exact-head GitHub `node-test`; and named GOA dependency-free evidence with omissions explicit.
+6. Re-fetch `main` and the candidate before verdict. Any movement invalidates stale evidence.
+7. **No deploy boundary:** convergence, commits, PR checks, or a merge do not authorize PVI2 or GOA deployment. Runtime changes remain separately authorized and verified.
+
+### Current status
+
+- `HJ-24-1` through `HJ-24-5`: **design contract accepted; implementation blockers still open**.
+- `GOA-1`, `GOA-2`, `GOA-3`, `GOA-6`, and `GOA-7`: **accepted as scoped above**.
+- `GOA-4`: **not a PR #24 blocker; two narrow test-portability follow-ups accepted**.
+- `GOA-5`: **disputed; documented host default retained**.
+- `GOA-3` unit-drift/`--force` extension: **needs evidence**.
+- PR #24 head `43625e4c059f1f5d85ed9430dc1ac81988a90c4e`: **BLOCKED; do not merge or deploy**.
+- Mutual resolution record: **not yet final**. GOA should confirm or dispute only the scoped implementation split/gate above; no broad rereview is needed.
