@@ -133,3 +133,52 @@ Notable findings made while implementing, both recorded for GOA:
    than "mawk overflows".
 3. The offline runner caught a real defect in `pw-env-write`: it copied an ambient `TMUX_TMPDIR`
    into a host contract, pinning a socket root host mode must not have.
+
+---
+
+## 2026-08-10 — STALE-BASE CORRECTION — loop halted, candidate superseded
+
+**PVI-DEV DRIFT, caught by the coordination ledger rather than by this loop.** The whole run was
+built on `de7f858`, which stopped being canonical `main` while it was in progress. `main` is now
+`c0010aa`, carrying **GOA Round 3** and **Hermes-James Round 4**. Round 4 is authoritative.
+
+**What that invalidates.** Not the code — the *shape*. This loop's acceptance criteria were derived
+from Rounds 1–2 and encoded "one candidate, all blockers", which Round 4 explicitly replaces with a
+sequence: **Candidate A** (`GOA-6` credential boundary, P1) → **Candidate B** (`GOA-1`/`HJ-24-5`
+environment/restore contract) → **Candidate C** (PR #24 replacement, rebased on A and B *merged*),
+each of A and B receiving its own independent exact-head review. A single head cannot receive those
+reviews, so no amount of rebasing rescues this candidate.
+
+Three criteria in this log were also written against dispositions that have since moved, and are
+now **wrong**, not merely out of sequence:
+
+- **AC4 (`GOA-5`)** — withdrawn by GOA and disputed by Round 3: the documented host default is
+  retained. The ambiguity refusal built here, including the dashboard startup refusal, is out of
+  scope and must not be carried into Candidate C.
+- **AC5 (`GOA-3`)** — accepted as *keep `install.sh` host-only and fail fast on container mode or a
+  detected sidecar owner*, explicitly **not** the conditional dual-mode gating implemented here.
+- **AC16 (`GOA-2`)** — resolved as *retain supervision, defer replay*. The opt-in restore-on-start
+  built here claims more than the agreed boundary.
+
+And **AC17 (`GOA-6`) is materially incomplete** against Round 4: it repairs the write path and tests
+resulting ownership, but Round 4 additionally requires symlink/non-regular/path-substitution
+refusal, directory-relative atomic replacement, serialization against project/user lifecycle
+changes, secret non-reflection, and **inventory plus safe remediation of already-written
+artifacts** — GOA has one root-owned `0600` helper live inside a pane-owned `.git` right now, which
+is a present authentication failure as well as a boundary defect. That half does not exist here.
+
+**Actions taken.** PR #27 (head `e39a468`) closed as **superseded, not rejected**; branch preserved
+as implementation source; must never be merged. Its exact head did reach **2 check runs, both
+success** — worth keeping, since it is the `HJ-24-4` evidence. Docs-only branch
+`docs/coordination-round-5` cut from exact `c0010aa`, appending Hermes-James Round 5 (James's
+implementation authorization, the A→B→C sequence, PR #27 supersession, and the convergence
+objective with per-environment deployed-SHA verification). PR #29 opened.
+
+**Loop status: HALTED at the Candidate A base gate.** This log is closed. Candidate A gets its own
+log once PR #29 is merged and the exact new `main` SHA is known. Do not start A, B or C on a moving
+or unmerged base — that is the specific mistake this correction exists to not repeat.
+
+**Process lesson, for the next loop.** Re-fetch `origin/main` before freezing a head *and* at the
+start of each increment, not only at the start of the run. Round 4's own gate 6 says exactly this
+("Re-fetch `main` and the candidate before verdict. Any movement invalidates stale evidence"), and
+this loop read that sentence only after it had already been overtaken by it.
