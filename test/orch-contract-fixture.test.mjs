@@ -14,9 +14,13 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 import { buildFixture, serialiseFixture, FIXTURE_PATH } from '../scripts/orch-contract-fixture.mjs';
-import { compareToPin, orchestratorAvailable } from '../scripts/orch-contract-pin.mjs';
+import { compareToPin, orchestratorAvailable, ORCHESTRATOR_ROOT } from '../scripts/orch-contract-pin.mjs';
 
-const ORCHESTRATOR_ROOT = '/opt/project-workbench/workspaces/PVICodingOrchestrator';
+// GOA-4: this used to hardcode the sibling path, so — unlike scripts/orch-contract-pin.mjs, which
+// has always honoured PW_ORCHESTRATOR_CONTRACT_ROOT — it could not be redirected in a CI checkout or
+// on another instance. The cross-contract assertions therefore bound only on PVI2 and skipped
+// everywhere else, which is how the same command on the same SHA produced "2 failures" here and
+// "2 skips" there. Importing the resolved root means one override moves both.
 const VENV_PYTHON = path.join(ORCHESTRATOR_ROOT, '.venv', 'bin', 'python');
 const HAVE_ORCHESTRATOR = fs.existsSync(VENV_PYTHON) && fs.existsSync(path.join(ORCHESTRATOR_ROOT, 'src'));
 const crossTest = (name, fn) => test(name, {

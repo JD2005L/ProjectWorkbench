@@ -55,6 +55,50 @@ esac
 log "Project Workbench installer — target: $PW_INSTALL_DIR ($PW_REPO @ $PW_REF)"
 log "Reminder: this host should be LAN-internal only. Authenticated users get shell access."
 
+# --- Deploy-mode gate (GOA-3) -------------------------------------------------
+#
+# This installer is host-mode-only by construction: it installs the per-project systemd terminal
+# units and, now, the dedicated tmux owner. It has never installed systemd/pw-tmux.service, the
+# container-mode owner — that unit is instance-managed.
+#
+# Run unchanged against a container-mode host, it would stand up a SECOND tmux-server owner on the
+# per-user default socket while the real one lives on the sidecar's bind-mounted TMUX_TMPDIR: the
+# "second, invisible server" the keepalive's own comment warns about, reached from the other
+# direction. Combined with the fail-closed ownership behaviour below, an ungated run would also make
+# this installer unrunnable there.
+#
+# So the mode is resolved once, from an existing environment contract if there is one, and the
+# host-only pieces are gated on it. An ambiguous mode stops the install rather than guessing — same
+# rule as app/deploy-mode.js.
+PW_DEPLOY_MODE="${PW_DEPLOY_MODE:-}"
+if [ -z "$PW_DEPLOY_MODE" ] && [ -r "$CONF_DIR/pw.env" ]; then
+  PW_DEPLOY_MODE="$(sed -n 's/^[[:space:]]*PW_DEPLOY_MODE[[:space:]]*=[[:space:]]*["'"'"']\{0,1\}\([A-Za-z]*\).*/\1/p' "$CONF_DIR/pw.env" | head -1)"
+fi
+PW_DEPLOY_MODE="$(printf '%s' "$PW_DEPLOY_MODE" | tr '[:upper:]' '[:lower:]')"
+case "$PW_DEPLOY_MODE" in
+  host|container) : ;;
+  '')
+    PW_CONTAINER_EVIDENCE=""
+    [ -n "${container:-}" ] && PW_CONTAINER_EVIDENCE="container=${container}"
+    [ -e /run/.containerenv ] && PW_CONTAINER_EVIDENCE="${PW_CONTAINER_EVIDENCE:+$PW_CONTAINER_EVIDENCE; }/run/.containerenv"
+    [ -e /.dockerenv ] && PW_CONTAINER_EVIDENCE="${PW_CONTAINER_EVIDENCE:+$PW_CONTAINER_EVIDENCE; }/.dockerenv"
+    if [ -n "$PW_CONTAINER_EVIDENCE" ]; then
+      die "PW_DEPLOY_MODE is unset but this host looks containerised ($PW_CONTAINER_EVIDENCE).
+    This installer configures HOST mode: systemd terminal units and a dedicated tmux owner on the
+    per-user default socket. On a container-mode deployment that stands up a competing server owner.
+    Re-run with PW_DEPLOY_MODE=host to confirm, or see DEPLOY.md for container mode."
+    fi
+    PW_DEPLOY_MODE=host
+    ;;
+  *) die "PW_DEPLOY_MODE='$PW_DEPLOY_MODE' is not one of host|container." ;;
+esac
+export PW_DEPLOY_MODE
+log "Deploy mode: $PW_DEPLOY_MODE"
+if [ "$PW_DEPLOY_MODE" = "container" ]; then
+  warn "Container mode: skipping the host-mode tmux owner (pw-tmux-server.service) and its MemoryHigh drop-in."
+  warn "The container-mode owner is systemd/pw-tmux.service, which this installer does not manage. See DEPLOY.md."
+fi
+
 export DEBIAN_FRONTEND=noninteractive
 log "Installing apt packages…"
 apt-get update -qq
@@ -168,10 +212,42 @@ install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-keepalive.sh"   /usr/local/bin/pw-tmux-keepalive
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-assert-owner"   /usr/local/bin/pw-tmux-assert-owner
+install -m 0755 "$SRC_DIR/scripts/pw-mem-high"            /usr/local/bin/pw-mem-high
+# The shell half of the authoritative environment contract, sourced by the entry points above from
+# /usr/local/lib once installed (they fall back to the repo copy when run from a source tree).
+install -d -m 0755 /usr/local/lib
+install -m 0644 "$SRC_DIR/scripts/pw-env.sh"              /usr/local/lib/pw-env.sh
+
 
 # State dir for tmux-session persistence (manifest + captured scrollback).
 install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/tmux-persist
 install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/tmux-persist/content
+
+# --- The authoritative non-secret environment contract (GOA-1 / HJ-24-5) ------
+#
+# One file naming this instance's registry, app dir, users store, state dir, per-user flag and
+# deploy mode, loaded by the dashboard, both terminal units, the persistence units and the tmux
+# owner. Before it, each entry point resolved those from its own compiled-in defaults, so an
+# instance whose registry is not at the default path had a restore that refused every session and
+# still exited 0 — a reboot that restored nothing and reported success.
+#
+# Seeded only when absent, exactly like auth.conf: a re-run of the installer must never silently
+# revert an operator's tuning on a live instance. `--check` afterwards so a hand-edited file that no
+# longer resolves is reported at install time rather than at the next reboot.
+if [ ! -f "$CONF_DIR/pw.env" ]; then
+  log "Writing the environment contract ($CONF_DIR/pw.env)…"
+  PW_APP_DIR="$APP_DIR" PW_REGISTRY_PATH="$PW_INSTALL_DIR/projects.json" \
+  PW_CANONICAL_REGISTRY="$PW_INSTALL_DIR/projects.json" PW_USERS_PATH="$USERS_JSON" \
+  PW_SESSIONS_PATH="$SESSIONS_JSON" PW_WORKSPACES="$WORKSPACES_DIR" PW_AUDIT_LOG="$AUDIT_LOG" \
+    node "$SRC_DIR/scripts/pw-env-write" --mode "$PW_DEPLOY_MODE" --out "$CONF_DIR/pw.env" \
+    || warn "could not write $CONF_DIR/pw.env — entry points will fall back to their built-in defaults"
+else
+  log "Keeping the existing environment contract at $CONF_DIR/pw.env (operator edits survive updates)."
+fi
+node "$SRC_DIR/scripts/pw-env-write" --check --out "$CONF_DIR/pw.env" >/dev/null 2>&1 \
+  || warn "$CONF_DIR/pw.env does not currently validate — run: node $SRC_DIR/scripts/pw-env-write --check"
 
 if [ -f "$SRC_DIR/config/tmux.conf" ]; then
   install -o "$PW_USER" -g "$PW_USER" -m 0644 "$SRC_DIR/config/tmux.conf" "/home/$PW_USER/.tmux.conf"
@@ -184,6 +260,9 @@ install -m 0644 "$SRC_DIR/systemd/project-setup-terminal.service" /etc/systemd/s
 install -m 0644 "$SRC_DIR/systemd/project-preview@.service"       /etc/systemd/system/project-preview@.service
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.service"     /etc/systemd/system/claude-code-update.service
 install -m 0644 "$SRC_DIR/systemd/claude-code-update.timer"       /etc/systemd/system/claude-code-update.timer
+if [ "$PW_DEPLOY_MODE" = "host" ]; then
+  install -m 0644 "$SRC_DIR/systemd/pw-tmux-server.service"        /etc/systemd/system/pw-tmux-server.service
+fi
 install -m 0644 "$SRC_DIR/systemd/pw-tmux-persist.service"        /etc/systemd/system/pw-tmux-persist.service
 install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.service"           /etc/systemd/system/pw-tmux-save.service
 install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.timer"             /etc/systemd/system/pw-tmux-save.timer
@@ -194,7 +273,64 @@ install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.timer"             /etc/systemd/s
 install -d -m 0755 /etc/systemd/system/project-workbench.service.d
 [ -f /etc/systemd/system/project-workbench.service.d/auth.conf ] || \
   install -m 0644 "$SRC_DIR/systemd/project-workbench.service.d/auth.conf" /etc/systemd/system/project-workbench.service.d/auth.conf
+
+# Soft memory ceiling for the tmux-server cgroup, which holds every project's panes and their
+# long-running agents. Sized from THIS machine's real MemTotal rather than written into the unit,
+# because a hardcoded value would be wrong on a smaller box and a percentage is wrong under LXC —
+# systemd resolves `%` against the PHYSICAL host's RAM, not the container's limit (a 16G CT on a
+# 540G host would get a 352G "limit", i.e. none at all). MemoryHigh throttles and reclaims under
+# pressure rather than hard-killing, so a busy box degrades instead of losing sessions. Seeded only
+# when absent, so operator tuning survives an update.
+#
+# The arithmetic lives in scripts/pw-mem-high (and is tested there against representative sizes).
+# It used to be `awk '/^MemTotal:/ { printf "%d", $2*1024*0.75 }'`, which on the mawk that Debian
+# ships as /usr/bin/awk clamps to INT_MAX — a ~2 GiB ceiling on every machine above ~2.73 GiB,
+# below the 8.1 GiB peak of the incident this drop-in exists to protect against (HJ-24-3).
+if [ "$PW_DEPLOY_MODE" = "host" ]; then
+  install -d -m 0755 /etc/systemd/system/pw-tmux-server.service.d
+  if [ ! -f /etc/systemd/system/pw-tmux-server.service.d/memory.conf ]; then
+    pw_mem_high="$("$SRC_DIR/scripts/pw-mem-high" /proc/meminfo 75 2>/dev/null || true)"
+    if [ -n "${pw_mem_high:-}" ] && [ "$pw_mem_high" -gt 0 ] 2>/dev/null; then
+      printf '# Generated by install.sh from MemTotal; edit freely, updates will not overwrite it.\n[Service]\nMemoryHigh=%s\n' \
+        "$pw_mem_high" > /etc/systemd/system/pw-tmux-server.service.d/memory.conf
+      chmod 0644 /etc/systemd/system/pw-tmux-server.service.d/memory.conf
+      log "tmux-server MemoryHigh set to $pw_mem_high bytes (75% of MemTotal)."
+    else
+      warn "could not read MemTotal — leaving pw-tmux-server without a MemoryHigh drop-in"
+    fi
+  fi
+fi
 systemctl daemon-reload
+
+# The dedicated tmux owner (HJ-24-1/HJ-24-2). Enabled BEFORE pw-tmux-persist, which orders itself
+# After= this unit and replays the manifest into the server it owns.
+#
+# FAIL CLOSED. This used to warn and continue, which meant an install could report success while
+# leaving the old unsafe topology fully available: with no owner, the first project-terminal@ to run
+# `tmux new-session` parents the server into its own cgroup, and a later owner start merely ADOPTS
+# that server — it cannot move the server and its panes. Since project-terminal-start now refuses to
+# create a terminal without proven ownership, an installer that shrugged here would hand the
+# operator a box with no working terminals and no explanation.
+if [ "$PW_DEPLOY_MODE" = "host" ]; then
+  if ! systemctl enable --now pw-tmux-server.service >/dev/null 2>&1; then
+    systemctl status --no-pager --lines=20 pw-tmux-server.service >&2 || true
+    die "pw-tmux-server.service failed to start.
+    It owns the shared tmux server; without it, terminals would recreate the topology that killed
+    every project's sessions on 2026-08-03, so project-terminal-start now refuses to start one.
+    Fix the unit above and re-run this installer. To install deliberately without the owner, set
+    PW_TMUX_OWNER_REQUIRED=false in $CONF_DIR/pw.env first (see DEPLOY.md)."
+  fi
+  # An install that lands on a host whose server predates this unit adopts it rather than moving it:
+  # the sessions stay in whatever cgroup created them until the server is actually replaced. Say so
+  # rather than letting `systemctl is-active` imply the fix is in effect.
+  if ! /usr/local/bin/pw-tmux-assert-owner --quiet 2>/dev/null; then
+    warn "The running tmux server is not (yet) owned by pw-tmux-server.service."
+    warn "Its sessions remain in the cgroup that created them. To migrate when convenient:"
+    warn "  sudo -u $PW_USER /usr/local/bin/pw-tmux-save   # snapshot the sessions"
+    warn "  sudo -u $PW_USER tmux kill-server              # drop the old, wrongly-parented server"
+    warn "  sudo systemctl restart pw-tmux-server.service  # the owner replays the manifest on start"
+  fi
+fi
 
 # tmux-session persistence: restore-on-boot unit + periodic snapshot timer.
 # enable --now so the timer starts snapshotting immediately and the persist unit

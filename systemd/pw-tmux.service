@@ -14,8 +14,21 @@ ExecStartPre=-/usr/bin/podman rm -f pw-tmux
 # Same image + same mounts as the app container so shells/agents in the panes see
 # identical workspaces, agent homes, npm-global CLIs and CA trust. The extra
 # -v .../run/tmux mount is the shared tmux socket dir; TMUX_TMPDIR points at it.
+#
+# --env-file is container mode's half of the authoritative non-secret environment contract
+# (config/pw.env.example, app/pw-env.js) — the same values host mode gets through
+# `EnvironmentFile=`. It is REQUIRED: podman refuses to start without the file, which is the
+# intended behaviour, because a sidecar that silently ran on compiled-in defaults is exactly how
+# GOA-1 happened (a restore that could not find the registry, refusing every session and reporting
+# success). Create it once with `node scripts/pw-env-write --mode container` — the generator keeps
+# an existing file, so operator tuning survives. `-e TMUX_TMPDIR=` below still wins for the socket
+# root, since that path is a property of THIS unit's bind mount rather than of the instance.
+#
+# NOTE for container-mode operators: this unit is instance-managed — install.sh has never installed
+# it and, with the deploy-mode gate, never will. The copy here is the reference. See DEPLOY.md.
 ExecStart=/usr/bin/podman run --name pw-tmux \
   --network=host --pid=host --privileged \
+  --env-file=/etc/project-workbench/pw.env \
   -e TMUX_TMPDIR=/opt/project-workbench/run/tmux \
   -e NPM_CONFIG_PREFIX=/opt/npm-global \
   -e PATH=/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

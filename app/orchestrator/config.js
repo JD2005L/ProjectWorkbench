@@ -17,6 +17,7 @@ import path from 'path';
 import { PATTERNS } from './contract.js';
 import { parseModelAliases } from './attestation.js';
 import { validateDropUser } from './runner/privilege.js';
+import { requireDeployMode } from '../deploy-mode.js';
 
 /**
  * Parse the alias map, telling the operator when their configuration produced nothing.
@@ -146,7 +147,11 @@ export function loadOrchestratorConfig(env = process.env) {
   // as this account. Validated at load rather than at first launch: a malformed or superuser value
   // must stop the instance from booting, not surface as a failed job hours later. Container mode
   // has nothing to drop and is not constrained.
-  const deployMode = String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
+  // Shared resolver (app/deploy-mode.js). This config already throws on a malformed value rather
+  // than booting into a broken subsystem, and an unreadable deploy mode is exactly that class of
+  // problem: the host branch below validates a privilege-drop account that container mode has no
+  // use for, so guessing the mode picks the wrong validation as well as the wrong runtime (GOA-5).
+  const deployMode = requireDeployMode(env);
   const tmuxUser = str(env.PW_ORCHESTRATOR_TMUX_USER, 'admin');
   const sudoExecutable = str(env.PW_ORCHESTRATOR_SUDO_BIN, '');
   if (enabled && deployMode === 'host') {

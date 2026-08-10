@@ -27,6 +27,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// GOA-7: tmux environments come from test/tmux-env.mjs, which strips ambient TMUX, TMUX_PANE,
+// TMUX_TMPDIR and the PW_TMUX_* branch switches. Without that, this file's own client inherited an
+// ambient TMUX_TMPDIR while the script under test resolved a different socket root — a live server
+// the test could not see — and an ambient PW_TMUX_HOST_MODE (which a developer shell inside a PW
+// pane really does carry) silently changed which branch the script took. Cleanup goes through
+// killTestSock, which refuses any socket name without the harness prefix, so it can never reap a
+// real Project Workbench server.
+import { sanitizedTmuxEnv, sockName, killTestSock } from './tmux-env.mjs';
+
+
 const execFileAsync = promisify(execFile);
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = path.join(REPO, 'scripts', 'pw-tmux-restore');
@@ -34,17 +44,16 @@ const APP_DIR = path.join(REPO, 'app');
 const SEP = '\x1f';
 
 function tmuxSock() {
-  return 'pw20restoretest-' + crypto.randomBytes(4).toString('hex');
+  return sockName('restore');
 }
 async function tmux(sock, args) {
-  return execFileAsync('tmux', ['-L', sock, ...args]);
+  return execFileAsync('tmux', ['-L', sock, ...args], { env: sanitizedTmuxEnv() });
 }
 async function tmuxOk(sock, args) {
   try { await tmux(sock, args); return true; } catch { return false; }
 }
 async function killSock(sock) {
-  try { await tmux(sock, ['kill-server']); } catch { /* already gone */ }
-  try { await fsp.rm(`/tmp/tmux-${process.getuid()}/${sock}`, { force: true }); } catch { /* fine */ }
+  return killTestSock(execFileAsync, sock);
 }
 async function paneEnviron(sock, session) {
   const { stdout: pidOut } = await tmux(sock, ['list-panes', '-t', session, '-F', '#{pane_pid}']);
@@ -105,6 +114,10 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
     // pointing this at whichever account is actually running this test makes
     // that real path exercisable anywhere, never a fallback.
     PW_HOST_TERMINAL_USER: os.userInfo().username,
+    // Hermetic against the host's real environment contract: these tests must resolve the temp
+    // paths they set up, never /etc/project-workbench/pw.env. Individual tests point this at a
+    // real file when the file itself is what is under test.
+    PW_ENV_FILE: path.join(dir, 'no-such-pw.env'),
   };
   return { dir, name, projPath, port, sock, env, session, stateDir };
 }
@@ -436,4 +449,109 @@ test('REGRESSION: a properly isolated restore run leaves the REAL default tmux s
   }
   const after = await snapshotDefault();
   assert.equal(after, before, 'the real default tmux socket\'s session list must be byte-for-byte unchanged by an isolated restore run');
+});
+
+// --- GOA-1: misconfiguration must not masquerade as "nothing to restore" --------------------
+//
+// The live regression GOA is holding `main` on. `pw-tmux-restore` resolved REGISTRY_JSON, APP_DIR
+// and STATE_DIR from its own compiled-in defaults, and no persistence unit set any of them. On an
+// instance whose registry is not at the default path, resolve_session_credentials returned 1 for
+// EVERY session, the caller turned each into CREATED[$s]="skip", and the script still exit 0'd —
+// with `ExecStartPost=-` swallowing even that. A reboot refused to restore every session and
+// reported success. Fail-closed on IDENTITY is right and is unchanged; the bug was fail-closed on a
+// PATH being reported as an idempotent no-op.
+
+/** Run the script and report its exit code rather than throwing, so a refusal can be asserted. */
+async function runScriptRaw(ctx, extraEnv = {}) {
+  try {
+    const { stdout, stderr } = await execFileAsync(SCRIPT, [], { env: { ...ctx.env, ...extraEnv }, timeout: 15000 });
+    return { code: 0, stdout, stderr };
+  } catch (e) {
+    return { code: e.code ?? 1, stdout: e.stdout ?? '', stderr: e.stderr ?? String(e) };
+  }
+}
+
+test('REGRESSION: a manifest with an unreachable registry exits EX_CONFIG instead of "restoring nothing"', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  try {
+    const r = await runScriptRaw(ctx, { PW_REGISTRY_PATH: path.join(ctx.dir, 'moved-registry.json') });
+    assert.equal(r.code, 78, `a path mismatch must be a visible configuration failure, not exit 0\n${r.stdout}\n${r.stderr}`);
+    assert.match(r.stderr, /PW_REGISTRY_PATH/);
+    assert.match(r.stderr, /nothing to do/);
+    assert.equal(await tmuxOk(ctx.sock, ['has-session', '-t', ctx.session]), false,
+      'and it must still not restore anything under an unverified identity');
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION: a missing persistence state dir is a configuration failure, not an empty restore', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  try {
+    const r = await runScriptRaw(ctx, { PW_TMUX_STATE_DIR: path.join(ctx.dir, 'not-mounted') });
+    assert.equal(r.code, 78, `an unmounted state dir is exactly GOA's container case; it must not read as "no manifest"\n${r.stderr}`);
+    assert.match(r.stderr, /PW_TMUX_STATE_DIR/);
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION: a missing app dir (the fail-closed credential helper) exits EX_CONFIG', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  try {
+    const r = await runScriptRaw(ctx, { PW_APP_DIR: path.join(ctx.dir, 'no-app') });
+    assert.equal(r.code, 78, `without the helper every session would be refused; that is misconfiguration, not "nothing to restore"\n${r.stderr}`);
+    assert.match(r.stderr, /PW_APP_DIR/);
+  } finally { await teardown(ctx); }
+});
+
+test('a correctly configured instance with no manifest is still a legitimate exit 0', { timeout: 15000 }, async () => {
+  // The other half of the contract. "Nothing to restore" is a real state and must stay silent and
+  // successful, or every freshly installed host would report a failure at boot.
+  const ctx = await setup({ enabled: false });
+  try {
+    const r = await runScriptRaw(ctx);
+    assert.equal(r.code, 0, `no manifest must remain a successful no-op\n${r.stderr}`);
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION (HJ-24-5): the per-user flag is read from the environment contract, not assumed off', { timeout: 15000 }, async () => {
+  // The owner unit runs this script through ExecStartPost. Before the contract, that unit set only
+  // HOME/LANG/LC_ALL, so PW_PER_USER_CLAUDE was absent — which this script reads as the legitimate
+  // disabled/shared-credential mode. On a per-user-enabled install an owner restart could therefore
+  // restore and resume a session under SHARED credentials before any terminal-side drift check ran.
+  // Here the flag exists ONLY in the env file: if the file is not read, the session is created under
+  // the shared login and this test fails.
+  const ctx = await setup({ enabled: false, primaryUser: null });
+  const envFile = path.join(ctx.dir, 'pw.env');
+  await fsp.writeFile(envFile, `PW_DEPLOY_MODE=host\nPW_PER_USER_CLAUDE=true\nPW_TMUX_STATE_DIR=${ctx.stateDir}\n`);
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  const env = { ...ctx.env, PW_ENV_FILE: envFile };
+  delete env.PW_PER_USER_CLAUDE; // the whole point: it must come from the contract
+  try {
+    await execFileAsync(SCRIPT, [], { env, timeout: 15000 });
+    assert.equal(await tmuxOk(ctx.sock, ['has-session', '-t', ctx.session]), false,
+      'per-user credentials are ON in the contract and this project has no primaryUser — refusing is the only correct outcome');
+    const log = await fsp.readFile(ctx.env.PW_TMUX_LOG, 'utf8').catch(() => '');
+    assert.match(log, /no primaryUser configured/i,
+      'the refusal must be the per-user one, proving the flag was actually read from the env file');
+  } finally { await teardown(ctx); }
+});
+
+test('an explicit unit environment still wins over the contract file', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  const envFile = path.join(ctx.dir, 'pw.env');
+  await fsp.writeFile(envFile, `PW_REGISTRY_PATH=/definitely/not/here.json\nPW_TMUX_STATE_DIR=${ctx.stateDir}\n`);
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  try {
+    const r = await runScriptRaw(ctx, { PW_ENV_FILE: envFile });
+    assert.equal(r.code, 0, `systemd applies EnvironmentFile= before the script runs; an explicit value must not be overridden\n${r.stderr}`);
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', ctx.session]));
+  } finally { await teardown(ctx); }
 });

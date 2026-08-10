@@ -1,0 +1,111 @@
+#!/usr/bin/env node
+// Render the authoritative non-secret environment contract for THIS instance.
+//
+// One generator for both deployment models, so a host install and a container install describe
+// themselves in the same file, with the same keys, and can be diffed against each other:
+//
+//   host       install.sh runs this and the units load the result via EnvironmentFile=
+//   container  the operator runs it once and passes the result via podman --env-file
+//              (see DEPLOY.md — the app container AND the tmux sidecar both need it)
+//
+// Values come from the current environment where set, and from the documented per-mode defaults
+// otherwise. NOTHING SECRET is read or written: paths, the deploy mode, and feature flags only.
+//
+//   pw-env-write [--mode host|container] [--out PATH] [--force] [--print] [--check]
+//
+// Refuses to overwrite an existing file unless --force, because an operator's tuning of a live
+// instance must survive a re-run of the installer — the same rule install.sh already applies to
+// auth.conf and the MemoryHigh drop-in.
+import fs from 'node:fs';
+import path from 'node:path';
+
+import { PW_ENV_KEYS, PW_ENV_PATH, defaultPwEnv, serialisePwEnv, validatePwEnv, parseEnvFile } from '../app/pw-env.js';
+import { resolveDeployMode } from '../app/deploy-mode.js';
+
+function usage(code) {
+  process.stderr.write(
+    'usage: pw-env-write [--mode host|container] [--out PATH] [--force] [--print] [--check]\n'
+    + '  --mode   deployment model; default: resolved from PW_DEPLOY_MODE (refuses when ambiguous)\n'
+    + `  --out    destination; default: ${PW_ENV_PATH}\n`
+    + '  --force  overwrite an existing file (default: keep it, so operator edits survive)\n'
+    + '  --print  write the rendered file to stdout instead of to disk\n'
+    + '  --check  validate an existing file against the contract and exit non-zero on error\n',
+  );
+  process.exit(code);
+}
+
+const argv = process.argv.slice(2);
+const opts = { mode: '', out: PW_ENV_PATH, force: false, print: false, check: false };
+for (let i = 0; i < argv.length; i++) {
+  const arg = argv[i];
+  if (arg === '--mode') opts.mode = argv[++i] || '';
+  else if (arg === '--out') opts.out = argv[++i] || '';
+  else if (arg === '--force') opts.force = true;
+  else if (arg === '--print') opts.print = true;
+  else if (arg === '--check') opts.check = true;
+  else if (arg === '-h' || arg === '--help') usage(0);
+  else usage(2);
+}
+
+const EX_CONFIG = 78;
+
+function resolveMode() {
+  if (opts.mode) {
+    if (!['host', 'container'].includes(opts.mode)) {
+      process.stderr.write(`[pw-env-write] --mode ${JSON.stringify(opts.mode)} is not one of host|container\n`);
+      process.exit(EX_CONFIG);
+    }
+    return opts.mode;
+  }
+  const resolved = resolveDeployMode(process.env);
+  if (resolved.ambiguous) {
+    process.stderr.write(`[pw-env-write] ${resolved.reason}\n`);
+    process.exit(EX_CONFIG);
+  }
+  return resolved.mode;
+}
+
+if (opts.check) {
+  let text = '';
+  try {
+    text = fs.readFileSync(opts.out, 'utf8');
+  } catch (e) {
+    process.stderr.write(`[pw-env-write] cannot read ${opts.out}: ${e.message}\n`);
+    process.exit(EX_CONFIG);
+  }
+  const parsed = parseEnvFile(text);
+  const { errors, warnings } = validatePwEnv(parsed.values, {
+    exists: (p) => fs.existsSync(p),
+    isDir: (p) => { try { return fs.statSync(p).isDirectory(); } catch { return false; } },
+  });
+  for (const w of warnings) process.stderr.write(`[pw-env-write] warning: ${w}\n`);
+  const all = [...parsed.errors, ...errors];
+  for (const e of all) process.stderr.write(`[pw-env-write] ${opts.out}: ${e}\n`);
+  if (all.length) process.exit(EX_CONFIG);
+  process.stdout.write(`${opts.out}: ok (${Object.keys(parsed.values).length} values)\n`);
+  process.exit(0);
+}
+
+const mode = resolveMode();
+const values = defaultPwEnv(mode);
+for (const spec of PW_ENV_KEYS) {
+  const live = process.env[spec.key];
+  if (live !== undefined && live !== '') values[spec.key] = String(live);
+}
+values.PW_DEPLOY_MODE = mode;
+
+const rendered = serialisePwEnv(values, { mode });
+
+if (opts.print) {
+  process.stdout.write(rendered);
+  process.exit(0);
+}
+
+if (fs.existsSync(opts.out) && !opts.force) {
+  process.stdout.write(`${opts.out} already exists — keeping it (operator edits survive updates). Use --force to replace.\n`);
+  process.exit(0);
+}
+
+fs.mkdirSync(path.dirname(opts.out), { recursive: true });
+fs.writeFileSync(opts.out, rendered, { mode: 0o644 });
+process.stdout.write(`wrote ${opts.out} (${mode} mode)\n`);

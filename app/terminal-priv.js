@@ -13,9 +13,15 @@
 // gated to container mode. Unset PW_TERMINAL_UID (or host mode) => passthrough,
 // byte-identical to upstream.
 
+import { resolveDeployMode } from './deploy-mode.js';
+
 export function resolveTerminalPriv(env = {}) {
   const uid = String(env.PW_TERMINAL_UID || '');
-  const mode = String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
+  // Shared resolver (app/deploy-mode.js) so this cannot disagree with terminal-owner.js about the
+  // model. An ambiguous mode yields no mode, so the drop stays OFF here — the refusal itself is
+  // terminalOwnerPlan's and server.js's job, and a passthrough that never claims to have dropped is
+  // the safe reading of "we do not know what this deployment is".
+  const mode = resolveDeployMode(env).mode;
   if (!uid || mode !== 'container') {
     return { enabled: false, uid: '', gid: '', home: '', user: '', extraPath: '' };
   }

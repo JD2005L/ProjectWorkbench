@@ -6,6 +6,11 @@ Description=Project Workbench: restore tmux sessions on boot, snapshot on stop
 # After= this unit.
 After=network-online.target
 Wants=network-online.target
+# The server must exist before we replay sessions into it. pw-tmux-server.service owns it; without
+# this ordering the restore would start the server itself and it would land in THIS unit's cgroup
+# instead of the owner's.
+After=pw-tmux-server.service
+Wants=pw-tmux-server.service
 
 [Service]
 Type=oneshot
@@ -17,6 +22,12 @@ Group=admin
 Environment=HOME=/home/admin
 Environment=LANG=C.UTF-8
 Environment=LC_ALL=C.UTF-8
+# The authoritative non-secret environment contract (config/pw.env.example, app/pw-env.js).
+# One file, read by the dashboard, both terminal units, the persistence units and the tmux owner, so
+# no entrypoint can resolve a different registry/app dir/state dir/per-user flag than the others.
+# `-` because a host that has not yet run the new installer must still start: the CONSUMERS enforce
+# the contract (pw-tmux-restore exits EX_CONFIG on a misconfigured authoritative path), not systemd.
+EnvironmentFile=-/etc/project-workbench/pw.env
 ExecStart=/usr/local/bin/pw-tmux-restore
 ExecStop=/usr/local/bin/pw-tmux-save
 TimeoutStartSec=180

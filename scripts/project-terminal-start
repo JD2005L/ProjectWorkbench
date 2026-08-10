@@ -1,6 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
 name="$1"
+# The authoritative non-secret environment contract (app/pw-env.js), loaded before any
+# ${PW_*:-default} below so this script, the dashboard and pw-tmux-restore cannot disagree about
+# the registry, the app dir or the per-user flag. Already-set variables always win.
+PW_ENV_LIB="${PW_ENV_LIB:-}"
+if [[ -z "$PW_ENV_LIB" ]]; then
+  _pw_self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+  for _pw_cand in "$_pw_self_dir/pw-env.sh" /usr/local/lib/pw-env.sh; do
+    [[ -r "$_pw_cand" ]] && { PW_ENV_LIB="$_pw_cand"; break; }
+  done
+fi
+if [[ -n "$PW_ENV_LIB" ]]; then
+  # shellcheck source=scripts/pw-env.sh
+  . "$PW_ENV_LIB" || { echo "[project-terminal-start] cannot load the environment contract from $PW_ENV_LIB" >&2; exit 78; }
+  pw_env_load || exit 78
+fi
 # PW_REGISTRY_PATH override matches app/isolation.js's own env var (same
 # file, same name) so this script and the dashboard can never disagree about
 # which registry is authoritative; unset falls back to the canonical path.
@@ -18,6 +33,57 @@ primary_user=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .primaryUser // 
 # before this variable existed. Mirrors app/server.js's own PW_TMUX_SOCKET.
 tmux_sock_args=()
 [[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
+
+# HOST-MODE OWNERSHIP GATE (HJ-24-2). Refuse before touching tmux at all.
+#
+# The dedicated owner unit exists so every project's panes live in ONE cgroup that a ttyd restart,
+# crash or OOM cannot reach. Ordering alone does not deliver that: `Wants=` is a wish, an owner that
+# fails to start leaves the terminals free to create the server themselves, and a later owner retry
+# merely ADOPTS the already-running server — it cannot move the server and its panes into the owner
+# cgroup. So a terminal that cannot prove ownership must not create a session; it exits non-zero and
+# systemd's Restart=on-failure keeps it pending until the owner is healthy, which is a recoverable
+# state. Creating the server here is not: it silently rebuilds the exact topology that killed every
+# project's sessions on 2026-08-03.
+#
+# Container mode is exempt by construction — the sidecar owns the server and there is no host owner
+# unit — and an operator can opt out explicitly with PW_TMUX_OWNER_REQUIRED=false (documented in
+# DEPLOY.md) for a deployment that deliberately runs without the owner unit.
+pw_owner_required=$(printf '%s' "${PW_TMUX_OWNER_REQUIRED:-true}" | tr '[:upper:]' '[:lower:]')
+pw_mode="host"
+if [[ -n "${PW_ENV_LIB:-}" ]]; then
+  pw_mode=$(pw_env_deploy_mode) || exit 78
+fi
+if [[ "$pw_mode" == "host" && "$pw_owner_required" != "false" && "$pw_owner_required" != "0" ]]; then
+  pw_assert_bin="${PW_TMUX_ASSERT_OWNER_BIN:-}"
+  if [[ -z "$pw_assert_bin" ]]; then
+    for _pw_cand in "${_pw_self_dir:-}/pw-tmux-assert-owner" /usr/local/bin/pw-tmux-assert-owner; do
+      [[ -x "$_pw_cand" ]] && { pw_assert_bin="$_pw_cand"; break; }
+    done
+  fi
+  if [[ -n "$pw_assert_bin" ]]; then
+    pw_owner_rc=0
+    "$pw_assert_bin" --quiet || pw_owner_rc=$?
+    case "$pw_owner_rc" in
+      0) ;;
+      3)
+        echo "[project-terminal-start] refusing to start '$name': the dedicated tmux owner (pw-tmux-server.service) is not holding a server yet." >&2
+        echo "[project-terminal-start] Creating one here would parent every project's panes to THIS ttyd unit's cgroup — the 2026-08-03 topology. Start the owner: systemctl start pw-tmux-server.service" >&2
+        exit 1
+        ;;
+      4)
+        echo "[project-terminal-start] refusing to start '$name': the running tmux server is not owned by pw-tmux-server.service." >&2
+        echo "[project-terminal-start] Its sessions are in the wrong cgroup and one OOM-killed pane can still take them all down. Migrate: pw-tmux-save, then restart the owner (it replays the manifest)." >&2
+        echo "[project-terminal-start] See DEPLOY.md; PW_TMUX_OWNER_REQUIRED=false in /etc/project-workbench/pw.env deliberately opts out." >&2
+        exit 1
+        ;;
+      *)
+        echo "[project-terminal-start] refusing to start '$name': could not determine tmux server ownership (pw-tmux-assert-owner exited $pw_owner_rc)." >&2
+        exit 1
+        ;;
+    esac
+  fi
+fi
+
 # Same pattern for the ttyd binary itself: unset (the default, always true in
 # production) means the real, shipped /usr/bin/ttyd, byte-identical to before
 # this variable existed. Lets a test point this at a controlled stand-in

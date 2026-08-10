@@ -2,6 +2,16 @@
 Description=ttyd terminal for project %i
 After=network-online.target
 Wants=network-online.target
+# Attach to the shared tmux server that pw-tmux-server.service owns instead of racing to create it
+# here. Whichever terminal won that race used to parent the server, putting every project's panes in
+# one per-project ttyd unit's cgroup — see pw-tmux-server.service for the incident that caused.
+#
+# Wants= rather than Requires= on purpose: the fail-closed decision belongs to
+# scripts/pw-tmux-assert-owner, which project-terminal-start calls before creating anything. It can
+# tell "no owner yet" (exit 3) apart from "a foreign-owned server is already running" (exit 4) and
+# report each with the action that fixes it; Requires= would only couple restarts and could not.
+After=pw-tmux-server.service
+Wants=pw-tmux-server.service
 # Let tmux sessions be restored before this terminal attaches, so
 # `tmux new-session -A` reattaches to the restored session instead of creating
 # an empty one. Wants= (not Requires=) so a restore failure never blocks the
@@ -13,6 +23,12 @@ Type=simple
 User=admin
 Group=admin
 Environment=HOME=/home/admin
+# The authoritative non-secret environment contract (config/pw.env.example, app/pw-env.js).
+# One file, read by the dashboard, both terminal units, the persistence units and the tmux owner, so
+# no entrypoint can resolve a different registry/app dir/state dir/per-user flag than the others.
+# `-` because a host that has not yet run the new installer must still start: the CONSUMERS enforce
+# the contract (pw-tmux-restore exits EX_CONFIG on a misconfigured authoritative path), not systemd.
+EnvironmentFile=-/etc/project-workbench/pw.env
 ExecStart=/usr/local/bin/project-terminal-start %i
 Restart=on-failure
 RestartSec=3

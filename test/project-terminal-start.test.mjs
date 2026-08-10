@@ -23,28 +23,34 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+// GOA-7: tmux environments come from test/tmux-env.mjs, which strips ambient TMUX, TMUX_PANE,
+// TMUX_TMPDIR and the PW_TMUX_* branch switches. Without that, this file's own client inherited an
+// ambient TMUX_TMPDIR while the script under test resolved a different socket root — a live server
+// the test could not see — and an ambient PW_TMUX_HOST_MODE (which a developer shell inside a PW
+// pane really does carry) silently changed which branch the script took. Cleanup goes through
+// killTestSock, which refuses any socket name without the harness prefix, so it can never reap a
+// real Project Workbench server.
+import { sanitizedTmuxEnv, sockName, killTestSock } from './tmux-env.mjs';
+
+
 const execFileAsync = promisify(execFile);
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const SCRIPT = path.join(REPO, 'scripts', 'project-terminal-start');
 const APP_DIR = path.join(REPO, 'app');
 
 function tmuxSock() {
-  return 'pw20test-' + crypto.randomBytes(4).toString('hex');
+  return sockName('termstart');
 }
 
 async function tmux(sock, args) {
-  return execFileAsync('tmux', ['-L', sock, ...args]);
+  return execFileAsync('tmux', ['-L', sock, ...args], { env: sanitizedTmuxEnv() });
 }
 async function tmuxOk(sock, args) {
   try { await tmux(sock, args); return true; } catch { return false; }
 }
 
 async function killSock(sock) {
-  try { await tmux(sock, ['kill-server']); } catch { /* already gone */ }
-  // tmux's kill-server does not remove its own socket file on this system —
-  // without this, every run leaks an (empty, harmless, but accumulating)
-  // socket special file under /tmp/tmux-<uid>/.
-  try { await fsp.rm(`/tmp/tmux-${process.getuid()}/${sock}`, { force: true }); } catch { /* fine */ }
+  return killTestSock(execFileAsync, sock);
 }
 
 // tmux's own "session environment" (show-environment) is a separate tracked
@@ -117,6 +123,16 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
     // dedicated REGRESSION test below for the unresolvable case).
     PW_HOST_TERMINAL_USER: os.userInfo().username,
     PW_TTYD_BIN: makeFakeTtyd(dir),
+    // These tests exercise the CREDENTIAL contract on a deliberately private tmux socket, where by
+    // construction no pw-tmux-server.service owns anything. The host-mode ownership gate (HJ-24-2)
+    // would correctly refuse every one of them for that reason, which would say nothing about the
+    // behaviour under test. This is the documented opt-out; ownership itself — including that the
+    // gate refuses a missing owner and a foreign-owned server — is covered by
+    // test/pw-tmux-server.test.mjs against real processes.
+    PW_TMUX_OWNER_REQUIRED: 'false',
+    // Hermetic against the host's own contract file and against an ambient PW_TMUX_HOST_MODE, which
+    // a developer shell inside a PW pane inherits from the owner unit (see test/tmux-env.mjs).
+    PW_ENV_FILE: path.join(dir, 'no-such-pw.env'),
   };
   return { dir, name, projPath, sock, env };
 }

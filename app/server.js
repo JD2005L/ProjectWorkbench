@@ -22,6 +22,7 @@ import { withLifecycleLock } from './lifecycle-lock.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
+import { resolveDeployMode } from './deploy-mode.js';
 
 const app = express();
 const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
@@ -49,7 +50,18 @@ const extraNginxPath = process.env.PW_EXTRA_NGINX || '/etc/project-workbench/ext
 // PW_TLS_CERT/PW_TLS_KEY/PW_TLS_SERVER_NAME, see app/tls-config.js and
 // DEPLOY.md); resolveTlsConfig throws at startup when enabled but unusable.
 const TLS = resolveTlsConfig(process.env);
-const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
+// Deploy mode comes from the shared resolver (app/deploy-mode.js), and an ambiguous answer stops the
+// boot instead of silently selecting host semantics. Host and container are two mutually exclusive
+// terminal models — a container instance that fell through to host would try to launch every pane
+// via `sudo -u admin tmux` under systemd units it does not have. Refusing here is loud, immediate,
+// and tells the operator exactly which variable to set; the previous default made the same
+// misconfiguration surface hours later as terminals that never come up (GOA-5).
+const DEPLOY_MODE_RESOLVED = resolveDeployMode(process.env);
+if(DEPLOY_MODE_RESOLVED.ambiguous){
+ console.error(`[deploy-mode] refusing to start: ${DEPLOY_MODE_RESOLVED.reason}`);
+ process.exit(78); // EX_CONFIG
+}
+const DEPLOY_MODE = DEPLOY_MODE_RESOLVED.mode;
 const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
 const nginxTestCmd = process.env.PW_NGINX_TEST_CMD || '';
 const nginxReloadCmd = process.env.PW_NGINX_RELOAD_CMD || '';

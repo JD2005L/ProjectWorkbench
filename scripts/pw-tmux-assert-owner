@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Is the shared tmux server owned by the process that is supposed to own it?
+#
+# HJ-24-2 / GOA-3. The dedicated owner (pw-tmux-server.service in host mode, the pw-tmux sidecar in
+# container mode) exists so that every project's panes live in ONE cgroup that nothing else can
+# reap. That guarantee is worth exactly nothing if a terminal can quietly create the server itself
+# when the owner is missing — which is the 2026-08-03 topology, and which `Wants=` ordering alone
+# does not prevent: `Wants=` is a wish, and before the readiness fix the barrier released before the
+# server existed at all.
+#
+# So terminal creation asks this first, and refuses on anything but a clean answer.
+#
+#   exit 0  the server exists and the owner process created it
+#   exit 3  no server on the target socket        (nothing to attach to; do NOT create one)
+#   exit 4  a server exists but is FOREIGN-owned  (the legacy topology; sessions are in the wrong
+#                                                  cgroup and one OOM can still take them all)
+#   exit 78 the deploy mode is ambiguous          (see app/deploy-mode.js)
+#
+# HOW OWNERSHIP IS PROVEN, without root and without trusting unit text:
+#
+#   1. PROCESS. scripts/pw-tmux-keepalive.sh exports PW_TMUX_OWNER before creating the server, so
+#      the tmux daemon inherits it and /proc/<server-pid>/environ carries proof of which process
+#      created it. A server created by `tmux new-session` inside a ttyd unit has no such marker.
+#   2. CGROUP. /proc/<server-pid>/cgroup must name the expected owner unit. This is the property the
+#      incident was actually about — which cgroup dies when systemd tears one down.
+#
+# Both are read from a /proc root that can be redirected with PW_TMUX_PROC_ROOT, so the whole thing
+# is unit-testable against a faked /proc with no systemd and no privileges anywhere.
+set -uo pipefail
+
+PW_ENV_LIB="${PW_ENV_LIB:-}"
+if [[ -z "$PW_ENV_LIB" ]]; then
+	_pw_self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+	for _pw_cand in "$_pw_self_dir/pw-env.sh" /usr/local/lib/pw-env.sh; do
+		[[ -r "$_pw_cand" ]] && { PW_ENV_LIB="$_pw_cand"; break; }
+	done
+fi
+if [[ -n "$PW_ENV_LIB" ]]; then
+	# shellcheck source=scripts/pw-env.sh
+	. "$PW_ENV_LIB" || { printf '[pw-tmux-assert-owner] cannot load %s\n' "$PW_ENV_LIB" >&2; exit 78; }
+	pw_env_load || exit 78
+fi
+
+EXIT_NO_SERVER=3
+EXIT_FOREIGN=4
+EXIT_CONFIG=78
+
+PROC_ROOT="${PW_TMUX_PROC_ROOT:-/proc}"
+QUIET=0
+[[ "${1:-}" == "--quiet" ]] && QUIET=1
+
+say() { [[ "$QUIET" -eq 1 ]] || printf '[pw-tmux-assert-owner] %s\n' "$*" >&2; }
+
+if [[ -n "${PW_ENV_LIB:-}" ]]; then
+	MODE=$(pw_env_deploy_mode) || exit "$EXIT_CONFIG"
+else
+	MODE="${PW_DEPLOY_MODE:-host}"
+fi
+
+# What counts as the owner, per mode. Container mode's server is created by the sidecar running the
+# same keepalive, so the process marker is identical; its cgroup is the container's, not a systemd
+# unit's, so the cgroup expectation is deliberately empty there and the process marker carries it.
+case "$MODE" in
+	host)      EXPECT_CGROUP="${PW_TMUX_OWNER_CGROUP:-pw-tmux-server.service}" ;;
+	container) EXPECT_CGROUP="${PW_TMUX_OWNER_CGROUP:-}" ;;
+	*)         say "unknown deploy mode '$MODE'"; exit "$EXIT_CONFIG" ;;
+esac
+EXPECT_OWNER="${PW_TMUX_OWNER_EXPECT:-pw-tmux-server}"
+
+tmux_sock_args=()
+[[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
+
+# The server's own pid, from the server itself. `display-message -p '#{pid}'` fails when there is no
+# server, which is the "nothing to attach to" case rather than an error.
+server_pid=$(command tmux "${tmux_sock_args[@]}" display-message -p '#{pid}' 2>/dev/null)
+if [[ -z "${server_pid:-}" || ! "$server_pid" =~ ^[0-9]+$ ]]; then
+	say "no tmux server is running on the target socket"
+	exit "$EXIT_NO_SERVER"
+fi
+
+environ_file="$PROC_ROOT/$server_pid/environ"
+cgroup_file="$PROC_ROOT/$server_pid/cgroup"
+
+if [[ ! -r "$environ_file" ]]; then
+	# A server we cannot inspect cannot be proven ours. Refusing is the fail-closed reading: the
+	# alternative is to assume the good case for the one server whose provenance is unknown.
+	say "cannot read $environ_file — refusing to treat an uninspectable tmux server (pid $server_pid) as owned"
+	exit "$EXIT_FOREIGN"
+fi
+
+owner_marker=$(tr '\0' '\n' < "$environ_file" | sed -n 's/^PW_TMUX_OWNER=//p' | head -1)
+if [[ "$owner_marker" != "$EXPECT_OWNER" ]]; then
+	say "tmux server pid $server_pid was not created by the dedicated owner (PW_TMUX_OWNER='${owner_marker:-<unset>}', expected '$EXPECT_OWNER')."
+	say "That is the pre-2026-08-03 topology: the server is parented to whatever created it, so one OOM-killed pane can still take every project's sessions down."
+	exit "$EXIT_FOREIGN"
+fi
+
+if [[ -n "$EXPECT_CGROUP" ]]; then
+	if [[ ! -r "$cgroup_file" ]]; then
+		say "cannot read $cgroup_file — refusing to treat an uninspectable tmux server (pid $server_pid) as owned"
+		exit "$EXIT_FOREIGN"
+	fi
+	if ! grep -q -- "$EXPECT_CGROUP" "$cgroup_file"; then
+		say "tmux server pid $server_pid is not in the owner cgroup (expected '$EXPECT_CGROUP', got: $(tr '\n' ' ' < "$cgroup_file"))."
+		say "The sessions would share fate with whatever cgroup they ARE in — which is the incident this unit exists to prevent."
+		exit "$EXIT_FOREIGN"
+	fi
+fi
+
+say "tmux server pid $server_pid is owned by '$EXPECT_OWNER'${EXPECT_CGROUP:+ in $EXPECT_CGROUP}"
+exit 0

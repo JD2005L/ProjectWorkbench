@@ -22,6 +22,7 @@
 // non-root passwd entry produces an error, never a guess.
 
 import { resolveTerminalPriv } from './terminal-priv.js';
+import { resolveDeployMode } from './deploy-mode.js';
 
 // The account host-mode PW runs panes as. Exported so server.js's tmux() and the
 // ownership resolution below cannot drift apart — they must name the same user.
@@ -39,9 +40,10 @@ export function hostTerminalUser(env = {}) {
   return env.PW_HOST_TERMINAL_USER || HOST_TERMINAL_USER;
 }
 
-function deployMode(env = {}) {
-  return String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container' ? 'container' : 'host';
-}
+// Delegated to app/deploy-mode.js so this file, terminal-priv.js, the orchestrator config and
+// server.js cannot disagree about which model is running. An unreadable or ambiguous mode returns
+// no mode at all here — `terminalOwnerPlan` turns that into the existing `invalid` refusal rather
+// than resolving to host semantics a container instance would then run under (GOA-5).
 
 // Conservative POSIX account-name check. The name reaches `getent passwd <name>`
 // as an argv element (no shell), so this is defence in depth rather than the
@@ -78,7 +80,9 @@ export function parsePasswdEntry(line, expectName = '') {
 //   { kind: 'named', user }               host mode; the uid must come from passwd
 //   { kind: 'invalid', reason }           configured but unusable -> refuse
 export function terminalOwnerPlan(env = {}) {
-  if (deployMode(env) === 'container') {
+  const mode = resolveDeployMode(env);
+  if (mode.ambiguous) return { kind: 'invalid', reason: mode.reason };
+  if (mode.mode === 'container') {
     const priv = resolveTerminalPriv(env);
     if (!priv.enabled) return { kind: 'none', reason: 'container-root' };
     const uid = Number(priv.uid);

@@ -32,6 +32,32 @@ set -uo pipefail
 # any non-ASCII window names/keystrokes consistent with the ttyd terminals.
 export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
+# The authoritative non-secret environment contract (app/pw-env.js). Loaded FIRST, before any
+# ${PW_*:-default} below, so this entrypoint resolves the same registry, app dir, state dir and
+# per-user flag the dashboard and project-terminal-start do.
+#
+# GOA-1: without it, an instance whose registry is not at the compiled-in default had every session
+# refused by resolve_session_credentials — and this script still exited 0, so a reboot restored
+# nothing and reported success. HJ-24-5: the dedicated owner unit runs this script through
+# ExecStartPost and used to set only HOME/LANG/LC_ALL, so an absent PW_PER_USER_CLAUDE read as the
+# legitimate disabled/shared mode and an owner restart could resume a session under the SHARED
+# login on a per-user-enabled install.
+#
+# Already-set variables always win: systemd has applied EnvironmentFile= by now, and a test that
+# sets a path must resolve that path.
+PW_ENV_LIB="${PW_ENV_LIB:-}"
+if [[ -z "$PW_ENV_LIB" ]]; then
+	_pw_self_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
+	for _pw_cand in "$_pw_self_dir/pw-env.sh" /usr/local/lib/pw-env.sh; do
+		[[ -r "$_pw_cand" ]] && { PW_ENV_LIB="$_pw_cand"; break; }
+	done
+fi
+if [[ -n "$PW_ENV_LIB" ]]; then
+	# shellcheck source=scripts/pw-env.sh
+	. "$PW_ENV_LIB" || { printf '[pw-tmux-restore] cannot load the environment contract from %s\n' "$PW_ENV_LIB" >&2; exit 78; }
+	pw_env_load || exit 78
+fi
+
 STATE_DIR="${PW_TMUX_STATE_DIR:-/var/lib/project-workbench/tmux-persist}"
 CONTENT_DIR="$STATE_DIR/content"
 MANIFEST="$STATE_DIR/manifest.tsv"
@@ -47,6 +73,13 @@ SEP=$'\x1f'                                      # manifest field separator (mat
 REGISTRY_JSON="${PW_REGISTRY_PATH:-/opt/project-workbench/projects.json}"
 APP_DIR="${PW_APP_DIR:-/opt/project-workbench/app}"
 NODE_BIN=$(command -v node || echo /usr/bin/node)
+
+# Republish the EFFECTIVE values under their contract names, so the pw_env_require_* checks below
+# report the path this run actually used — which is the documented default when no contract file is
+# installed — instead of "is not set". Keeps a pre-contract host install reporting a real path.
+export PW_TMUX_STATE_DIR="$STATE_DIR"
+export PW_REGISTRY_PATH="$REGISTRY_JSON"
+export PW_APP_DIR="$APP_DIR"
 
 # Shared-login shell, used ONLY for the legitimate off/no-owner case (a
 # resolved cred_env_prefix of exactly this) — never as a fallback for a
@@ -66,7 +99,35 @@ tmux_sock_args=()
 [[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
 tmux() { command tmux "${tmux_sock_args[@]}" "$@"; }
 
+# MISCONFIGURATION IS NOT "NOTHING TO RESTORE" (GOA-1).
+#
+# The state dir is checked BEFORE the manifest, because an absent state dir and an absent manifest
+# are different facts with the same old symptom. A state dir that is not mounted (GOA's sidecar has
+# no /var/lib/project-workbench at all) produced "no manifest; nothing to restore" and exit 0 —
+# indistinguishable from a freshly installed host with nothing saved yet. One is a healthy no-op;
+# the other is an instance that will never restore anything and never say so.
+if [[ -n "${PW_ENV_LIB:-}" ]]; then
+	pw_env_require_dir PW_TMUX_STATE_DIR "tmux persistence state (manifest + captured scrollback)"
+elif [[ ! -d "$STATE_DIR" ]]; then
+	printf '[pw-tmux-restore] PW_TMUX_STATE_DIR=%s is not a directory. Refusing to continue as though there were nothing to do.\n' "$STATE_DIR" >&2
+	exit 78
+fi
+
+# A correctly configured instance with nothing saved is a real and successful state: silent, exit 0.
 [[ -f "$MANIFEST" ]] || { log "no manifest; nothing to restore"; exit 0; }
+
+# There IS work to do, so the paths that work depends on must actually resolve. Checked here rather
+# than per-session: a missing registry or app dir refuses every session identically, and reporting
+# that as N individual credential refusals buries the one fact the operator needs.
+if [[ -n "${PW_ENV_LIB:-}" ]]; then
+	pw_env_require_file PW_REGISTRY_PATH "the project registry every entry point must agree on"
+	pw_env_require_dir PW_APP_DIR "the dashboard app dir holding project-terminal-credentials.mjs"
+fi
+if [[ ! -f "$APP_DIR/project-terminal-credentials.mjs" ]]; then
+	printf '[pw-tmux-restore] %s/project-terminal-credentials.mjs is missing — the fail-closed credential helper cannot run.\n' "$APP_DIR" >&2
+	exit 78
+fi
+
 tmux start-server 2>/dev/null || true
 
 # Conversations already running right now (idempotency guard).

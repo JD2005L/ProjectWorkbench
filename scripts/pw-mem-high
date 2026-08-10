@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Print the MemoryHigh byte value for pw-tmux-server.service's cgroup: 75% of this machine's real
+# MemTotal, as a plain integer.
+#
+# WHY THIS IS A SCRIPT AND NOT A LINE IN install.sh (HJ-24-3)
+#
+# It used to be this, inline:
+#
+#     awk '/^MemTotal:/ { printf "%d", $2 * 1024 * 0.75 }' /proc/meminfo
+#
+# On Debian and Ubuntu `/usr/bin/awk` is **mawk** via alternatives, and mawk's `%d` conversion goes
+# through a 32-bit int. So `printf "%d"` returns INT_MAX — 2147483647, about 2 GiB — for EVERY
+# machine with MemTotal above ~2.73 GiB. Not a large-memory edge case: essentially every real
+# deployment. The generated drop-in would then impose a ~2 GiB soft ceiling on the one cgroup that
+# holds every project's panes and their agents — below the 8.1 GiB peak from the 2026-08-03
+# incident, i.e. it would throttle and reclaim precisely the workload it was added to protect. On a
+# gawk host the same code is correct, which is why it survived review.
+#
+# Bash arithmetic is 64-bit, exact, and has no awk-variant dependency at all. Multiplying before
+# dividing keeps it exact: `* 1024 * 3 / 4` never leaves integer space, so there is no float to
+# round and no precision to lose.
+#
+# Split out of install.sh so the calculation is directly executable against representative
+# /proc/meminfo fixtures — see test/pw-mem-high.test.mjs. An installer-only implementation can only
+# be tested by inspecting the installer's source, which is how the overflow shipped.
+#
+#   pw-mem-high [MEMINFO_PATH] [PERCENT]
+#
+# PERCENT defaults to 75 and is an integer. Exits non-zero, printing nothing, when MemTotal cannot
+# be read — the caller must not write a drop-in from a value it did not get.
+set -euo pipefail
+
+meminfo="${1:-/proc/meminfo}"
+percent="${2:-75}"
+
+if [[ ! -r "$meminfo" ]]; then
+	printf '[pw-mem-high] cannot read %s\n' "$meminfo" >&2
+	exit 1
+fi
+if [[ ! "$percent" =~ ^[0-9]+$ ]] || (( percent < 1 || percent > 100 )); then
+	printf '[pw-mem-high] percent must be an integer 1..100 (got %s)\n' "$percent" >&2
+	exit 2
+fi
+
+kb=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]\{1,\}\).*/\1/p' "$meminfo" | head -1)
+if [[ -z "${kb:-}" || ! "$kb" =~ ^[0-9]+$ || "$kb" -le 0 ]]; then
+	printf '[pw-mem-high] no usable MemTotal in %s\n' "$meminfo" >&2
+	exit 1
+fi
+
+printf '%d' $(( kb * 1024 * percent / 100 ))

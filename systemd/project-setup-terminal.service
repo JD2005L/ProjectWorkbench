@@ -2,11 +2,27 @@
 Description=ttyd setup/auth terminal for Project Workbench Setup Wizard
 After=network-online.target
 Wants=network-online.target
+# Shares the default tmux socket with project-terminal@, so it must also attach to the server
+# pw-tmux-server.service owns rather than racing to create it. With Type=notify on that unit this
+# ordering is a real barrier: it releases only once the server and _keepalive are proven live.
+#
+# NOTE: unlike project-terminal@, this unit is NOT gated by pw-tmux-assert-owner. The setup terminal
+# is the CLI sign-in path an operator needs when the instance is already unhealthy, and refusing it
+# would remove the tool used to repair the box. It is protected by ordering + readiness only, which
+# is stated here rather than left to be inferred.
+After=pw-tmux-server.service
+Wants=pw-tmux-server.service
 [Service]
 Type=simple
 User=admin
 Group=admin
 Environment=HOME=/home/admin
+# The authoritative non-secret environment contract (config/pw.env.example, app/pw-env.js).
+# One file, read by the dashboard, both terminal units, the persistence units and the tmux owner, so
+# no entrypoint can resolve a different registry/app dir/state dir/per-user flag than the others.
+# `-` because a host that has not yet run the new installer must still start: the CONSUMERS enforce
+# the contract (pw-tmux-restore exits EX_CONFIG on a misconfigured authoritative path), not systemd.
+EnvironmentFile=-/etc/project-workbench/pw.env
 ExecStart=/usr/local/bin/setup-terminal-start
 Restart=on-failure
 RestartSec=3
