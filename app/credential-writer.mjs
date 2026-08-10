@@ -22,6 +22,12 @@
 
 import fsp from 'node:fs/promises';
 import { applyCredentialJob, pruneUserCredentials, userSignedIn } from './user-credentials.js';
+import { runGitCredentialJob, remediateGitCredentials, nodeJobDeps, nodeRunGit } from './git-credentials.js';
+
+// Jobs that operate on the per-user credential TREE are addressed by `base`.
+// The git-credential job addresses a project REPOSITORY instead, so it carries
+// a workspace root and a project path and has no `base` at all.
+const TREE_ACTIONS = new Set(['ensure', 'prune', 'status']);
 
 async function readStdin() {
   const chunks = [];
@@ -42,13 +48,40 @@ async function main() {
     fail('credential helper: unreadable job');
     return;
   }
-  if (!job || typeof job !== 'object' || !job.base) {
+  if (!job || typeof job !== 'object') {
+    fail('credential helper: malformed job');
+    return;
+  }
+  const action = job.action || 'ensure';
+  if (TREE_ACTIONS.has(action) && !job.base) {
     fail('credential helper: malformed job');
     return;
   }
 
   try {
-    const result = job.action === 'prune'
+    const result = action === 'git-credential-audit'
+      // Always the remediation planner: with `apply` false it is a dry run that
+      // still reports the ACTION each row would get, which is what an operator
+      // has to see before authorising a change.
+      ? await remediateGitCredentials({
+        deps: nodeJobDeps(),
+        runGit: nodeRunGit(),
+        workspaceRoot: job.workspaceRoot,
+        projects: Array.isArray(job.projects) ? job.projects : [],
+        expectedUid: job.expectedUid,
+        apply: !!job.apply,
+      })
+      : action === 'git-credential'
+      ? await runGitCredentialJob({
+        deps: nodeJobDeps(),
+        runGit: nodeRunGit(),
+        workspaceRoot: job.workspaceRoot,
+        projectPath: job.projectPath,
+        registeredPaths: Array.isArray(job.registeredPaths) ? job.registeredPaths : [],
+        token: job.token || '',
+        expectedUid: job.expectedUid,
+      })
+      : job.action === 'prune'
       ? await pruneUserCredentials({ fsp, base: job.base, keep: Array.isArray(job.keep) ? job.keep : [] })
       : job.action === 'status'
       ? { signedIn: await userSignedIn({ fsp, base: job.base, username: job.username }) }
