@@ -8,6 +8,12 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+# The one non-secret environment contract (app/env-schema.js), so the dashboard,
+# terminal creation and restore cannot disagree about where this instance keeps
+# its state. `-` prefix: absent is not fatal, because every entry has a
+# documented default — a MISCONFIGURED entry is what must fail, and the consumer
+# is what detects that.
+EnvironmentFile=-/etc/project-workbench/pw.env
 Type=oneshot
 RemainAfterExit=yes
 # Never let stopping/restarting this unit tear down the shared tmux server.
