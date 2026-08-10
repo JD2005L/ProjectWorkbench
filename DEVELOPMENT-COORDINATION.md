@@ -1371,3 +1371,39 @@ deployment is recorded here separately from any merge:
 - PR #24 head `43625e4`: **superseded design artifact; never merge or deploy** (unchanged).
 - This round changes documentation only. Merging it is not itself the deployment trigger — the A/B/C
   gates are.
+---
+
+## Hermes-James — Round 6 — authoritative authorization correction
+
+**Authority:** James's exact instruction was: **“Authorize Candidates A and B under the finalized coordination contract.”**
+
+Round 5 over-read that sentence. The following Round 5 claims are **withdrawn and superseded immediately**:
+
+- that James authorized Candidate C;
+- that James authorized any eventual deployment;
+- that deployment may proceed without a further prompt;
+- that James established a new objective requiring every environment to deploy the same current `main` under this authorization.
+
+Those claims were never authorized by James. They must not be used as an implementation, merge, or operational decision source.
+
+### Authorization actually granted
+
+- **Candidate A implementation:** authorized under the finalized Tier-3 credential-boundary scope and exact-head gates.
+- **Candidate B implementation:** authorized under the finalized mode-neutral environment/restore scope and exact-head gates.
+- Candidate A and Candidate B may proceed in parallel on isolated branches derived from this corrected canonical `main`.
+- Each candidate must stop after commit, push, PR creation, exact-head CI/evidence, and independent immutable review. Merge requires the resulting READY verdict and the already-established repository lifecycle; no runtime deployment follows automatically.
+
+### Explicitly not authorized
+
+- **Candidate C:** remains planned only. Its implementation requires a later explicit authorization after Candidates A and B are resolved on canonical `main`.
+- **All deployments:** remain separately unauthorized for GOA, PVI2, PVI/PVE, and every other environment.
+- No merge, green check, candidate completion, or environment convergence statement removes the deployment authorization boundary.
+- No agent, supervisor, monitor, or coordination entry may infer a “no further prompt required” deployment path from James's Candidate A/B implementation authorization.
+
+### Candidate ownership for the authorized parallel work
+
+- **PVI2 ProjectWorkbench lane:** Candidate A (`GOA-6`) implementation and the real root/workspace-owner privilege-boundary evidence.
+- **GOA lane:** Candidate B (`GOA-1` + `HJ-24-5`) implementation, including the mode-neutral schema and GOA's container/path failure regressions. PVI2 and GitHub retain their previously assigned exact-SHA verification responsibilities.
+- Neither lane may edit the other's candidate branch. Cross-candidate integration waits until both independently reviewed candidates are resolved.
+
+This Round 6 authorization correction is the controlling record wherever Round 5 conflicts with it. All non-conflicting finalized scope, security, testing, evidence, and no-secret requirements remain in force.
