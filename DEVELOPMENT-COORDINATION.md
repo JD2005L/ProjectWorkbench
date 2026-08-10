@@ -1679,3 +1679,17 @@ The ownership assertion compares against `process.getuid()`. Run as root, it pas
 - PVI2 resumes its isolated Candidate A implementation and must satisfy A31-1 through A31-6 before presenting a new frozen exact head.
 - Candidate B remains unpushed while known restore regressions are red.
 - Candidate C and all deployments remain unauthorized. No documentation inference supersedes that boundary without a new explicit instruction from James.
+
+---
+
+## James — universal compatibility and update-flow objective
+
+This is the controlling product objective for the coordinated work:
+
+1. ProjectWorkbench must converge on **one universally compatible canonical version** for PVI/PVE and GOA. Environment-specific branches or permanent product forks are not the target.
+2. Hermes-James/PVI owns verification against the PVI/PVE networks and runtime constraints. GOA owns verification against the GOA network and runtime constraints.
+3. Both sides must continue repository-native technical reconciliation until they agree that the same frozen implementation satisfies both environments.
+4. Environment-specific paths, credentials, inventory, hostnames, and deployment mechanics belong in validated configuration or adapters, not divergent product logic.
+5. The repository must be reviewed for the most practical maintainable design, with future canonical updates expected to flow to every environment without repeatedly rebuilding environment-specific fixes.
+6. Final acceptance requires one frozen exact SHA, canonical CI, and the explicitly assigned PVI/PVE and GOA environment evidence against that same SHA.
+7. Merge and deployment remain separate gates. This objective does not itself authorize Candidate C, merge, deployment, service changes, or runtime remediation.
