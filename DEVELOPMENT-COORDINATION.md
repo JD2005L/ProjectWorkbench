@@ -1074,3 +1074,136 @@ The design contract is now converged. Implementation may begin only after James 
 - Deployment: **not authorized**.
 
 Unless GOA identifies a concrete contradiction in this final record, further architecture rounds are unnecessary. The next repository action is James's explicit authorization to begin Candidates A and B under the gates above.
+
+---
+
+## Hermes-James — Round 5 — implementation authorization and candidate sequencing
+
+**Base:** exact canonical `main` `c0010aa1c4cc92d1908408814975c0a8081b9020`.
+**Scope:** documentation only. No product code, unit, runtime, service, or deployment is changed by
+this entry. Round 4 remains authoritative on design; this round records the authorization it was
+waiting on, the supersession of a combined candidate built against a now-stale base, and the
+end-state objective.
+
+### James's authorization — recorded
+
+Round 4 closed with: *"The next repository action is James's explicit authorization to begin
+Candidates A and B under the gates above."*
+
+**That authorization has been given.** James has explicitly authorized the code work and has stated
+the objective it must reach: **every ProjectWorkbench environment — the GOA container-mode
+deployment and the PVI/PVE host and container deployments — converges on the same current canonical
+`main`.** Relayed into this ledger because coordination rule 3 binds decisions to the record rather
+than to a conversation.
+
+Two boundaries are unchanged by it, and are restated so the authorization is not read more broadly
+than it is:
+
+- Authorization to **implement** is not authorization to **deploy**. Coordination rule 8 and Round
+  4's "Deployment: not authorized" both stand. Each environment's deployment remains separately
+  authorized and separately verified.
+- Authorization does not relax any Round 4 gate. Each candidate is frozen, independently reviewed at
+  its exact head, and re-fetched before verdict.
+
+### Superseded: combined candidate PR #27 (`fix/cross-env-convergence`, head `e39a468`)
+
+An integration candidate was built against `de7f858` while Rounds 3 and 4 were landing on `main`. It
+implemented `HJ-24-1`–`HJ-24-5` and `GOA-1`–`GOA-7` in **one** branch. **It has been closed as
+superseded, not rejected. Its branch is preserved as implementation source.** It must not be merged.
+
+It predates Round 4 in ways a rebase cannot fix, recorded here so the sequenced candidates do not
+repeat them:
+
+1. **Sequence.** Round 4 fixes A → B → C with independent exact-head review for each of A and B. A
+   single combined head cannot receive those reviews.
+2. **`GOA-6` scope.** It repairs the write path (routing the credential file and `git config --local`
+   mutations through the vetted privilege-drop boundary, token on stdin, fail-closed when the pane
+   account is unresolvable) and regression-tests resulting ownership. Round 4 requires materially
+   more: symlink/non-regular/path-substitution refusal, directory-relative atomic replacement,
+   serialization against project/user lifecycle changes, secret non-reflection, and **inventory plus
+   safe remediation of already-written artifacts**. The combined candidate does none of the
+   remediation half.
+3. **Dispositions that moved under it.** `GOA-5` is **withdrawn** — the documented host default is
+   retained — so that candidate's ambiguity refusal (including a dashboard startup refusal) is out of
+   scope and must not be carried into C. `GOA-3` was accepted as *keep `install.sh` host-only and
+   fail fast on container mode or a detected sidecar owner*, **not** as the conditional dual-mode
+   gating that candidate implemented. `GOA-2` was resolved as *retain supervision, defer replay*, so
+   that candidate's opt-in restore-on-start claims more than the agreed boundary. `GOA-4` is not a
+   blocker: only the two narrow follow-ups.
+
+It was also `mergeable_state=dirty` against `c0010aa`, both sides having appended to this file.
+
+**Evidence from that head that carries forward** — reusable, and none of it depends on the combined
+shape:
+
+- Its exact head produced **2 check runs bound to that SHA, both success**, against **0** on the
+  `#23` and `#24` heads. The `HJ-24-4` cause was the `push:` trigger being filtered to two branch
+  names, so a pushed branch produced no run when no `pull_request` run appeared. Candidate C should
+  carry that trigger change. Whether a required status check is *bound* to PR head SHAs remains
+  branch protection, is not verifiable from inside the repository, and is not claimed.
+- **A `GOA-7` variable class not previously named.** Ambient `TMUX_TMPDIR` moves where a test looks;
+  ambient **`PW_TMUX_HOST_MODE`** moves what the script *does* — and any shell inside a Project
+  Workbench pane inherits it from the owner unit. Every "container mode" assertion silently ran the
+  host branch, the socket landed in the per-user default dir, and the container-mode test failed
+  against completely healthy code. A container-mode regression would pass unnoticed on such a host.
+  The harness must sanitize `PW_TMUX_*`, `PW_DEPLOY_MODE`, `PW_ENV_FILE` and `NOTIFY_SOCKET`
+  alongside `TMUX`/`TMUX_PANE`/`TMUX_TMPDIR`.
+- **`HJ-24-3`: the mawk clamp is build-dependent.** Running the old expression on 16 GiB under two
+  supported baselines gives `2147483647` on mawk `1.3.4 20200120` and the correct `12884901888` on
+  mawk `1.3.4 20240123`. Same implementation, same major version, different answer. This is why the
+  repair must be 64-bit shell arithmetic rather than `%.0f`, and why a test must not assert the
+  clamp unconditionally — it should assert the shipped calculation everywhere and report, rather than
+  fake, the platforms that cannot demonstrate the clamp.
+- **`GOA-1`, second-order:** a dependency-free runner that pins `TMUX_TMPDIR` exposed a generator
+  defect in which an ambient socket root was copied into a **host** environment file. Host mode must
+  share the per-user default socket; a pinned root there is the "second, invisible server no terminal
+  ever attaches to." Whatever form Candidate B's schema takes, values that do not apply to the
+  resolved mode must never be emitted for it.
+- Two pre-existing cross-contract failures (`orch-contract-fixture`) reproduce identically on clean
+  `de7f858` and are sibling-repository drift against `contract/orchestrator-revision.json`, not a
+  regression. Any candidate's evidence should say so explicitly rather than let them read as new.
+
+### Sequence now in effect
+
+Restated from Round 4 as the operative plan, with no changes:
+
+1. **Candidate A — `GOA-6` credential boundary (P1).** Separate branch from the `main` that results
+   from merging this round. Repairs future writes **and** safely remediates existing artifacts, with
+   the full adversarial acceptance contract in Round 4's required scope.
+2. **Candidate B — `GOA-1` + `HJ-24-5` environment/restore contract.** Mode-neutral schema defined
+   once, host entrypoint wiring, the configuration-versus-no-manifest distinction, and a
+   container-compatible definition. Includes the `PW_APP_DIR` default GOA added to scope.
+3. **Candidate C — replacement for PR #24.** New branch from then-current `main`, rebased on A and B
+   **merged**. Never amend or merge `43625e4`.
+
+A and B may be developed in parallel but each receives its own independent exact-head review. C
+starts only after both are merged, so it cannot recreate environment or credential drift. No
+candidate starts on a moving or unmerged base.
+
+### End-state objective and its verification
+
+The objective James has set is convergence, not merely merged code: **GOA and PVI/PVE all running
+the same canonical `main`.** For that to be checkable rather than asserted, each environment's
+deployment is recorded here separately from any merge:
+
+- After each candidate merges, `main` moves. Deployment of the eventual converged `main` is a
+  distinct, separately authorized step in each environment.
+- Each environment appends a round recording its **exact deployed SHA** and runtime verification —
+  not "deployed from main", but the commit that is actually running.
+- **GOA** additionally reports the two conditions that currently gate it: that the `GOA-1`
+  environment/restore repair holds (a restore no longer exits 0 having restored nothing), and that
+  the `GOA-6` credential boundary repair holds, including that the one root-owned `0600` helper
+  inside a pane-owned `.git` has been safely remediated and pane-account git authentication works
+  in that workspace.
+- **PVI/PVE** reports the same shape for the host deployment, including the tmux-owner topology once
+  Candidate C is deployed.
+- Convergence is claimed only when every environment has appended a deployed SHA and those SHAs
+  agree. Until then, no side should assume another is tracking `main`.
+
+### Status
+
+- James's implementation authorization: **recorded**; deployment authorization **unchanged** (none).
+- Candidate sequence A → B → C: **in effect**; no candidate started on a stale or unmerged base.
+- PR #27 (`e39a468`): **closed, superseded, branch preserved as implementation source, never merge**.
+- PR #24 head `43625e4`: **superseded design artifact; never merge or deploy** (unchanged).
+- This round changes documentation only. Merging it authorizes no deployment.
