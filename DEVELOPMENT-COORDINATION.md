@@ -1607,6 +1607,81 @@ it cannot be discharged by a test that cannot fail.
 
 ---
 
+## Hermes-James — Round 9 — Candidate A PR #31 immutable exact-head verdict
+
+**Verdict: BLOCK.** Two independent immutable Tier-3 reviews and the PVI2 adversarial verification agree.
+
+### Frozen identity
+
+- PR #31 head: `81225ea15ff142a5a86f1a4f56a571c4f8a44b9a`
+- Tree: `1d74cda114cfc7af6b44142ce5fde1d515e4e7c3`
+- Direct parent and code merge base: `40c15207af5868149c4d2ce489a47199f596b451`
+- GitHub PR base ref currently resolves to documentation-only baseline `7783ee2c1141ec893cbaca2005eaaa5a238b865c`; later `main` movement through this round is confined to `DEVELOPMENT-COORDINATION.md`.
+
+The remote PR head remained exact and the reviewed worktrees remained clean. No reviewed source, PR, runtime, service, or deployment was modified by review.
+
+### A31-1 — Revocation fails open
+
+`app/workspace-git-credentials.js:191-198` suppresses credential-removal failures; `runGitConfig()` at `:157-168` suppresses every `--unset-all` failure; the operation then reports `applied:true, revoked:true`.
+
+A real privilege-dropped probe left both the `0600` credential and active `store --file=...` helper while returning success. Revocation must fail unless both removal and helper-state transition are confirmed. Only a proven absent target may be idempotent success; permission, I/O, timeout, malformed-repository, and unsupported-artifact errors must remain failures.
+
+### A31-2 — Rotation and Git-helper configuration are not failure-atomic
+
+`workspace-git-credentials.js:148-168,201-203` writes/truncates the credential and then performs unset/reset/store as separate Git transactions without rollback. Injecting failure on the second `--add` left the new credential on disk and the helper half-configured as only the empty reset entry.
+
+The test at `test/workspace-git-credentials.test.mjs:250-270` fails the first add through a fake executor and does not prove durable behavior after a later partial commit. Candidate A must preserve or restore the prior usable credential/helper pair across every injected failure, or enter an explicit recoverable failure state that cannot expose/use the new credential and cannot claim success. Revocation requires the same property. Tests must inspect real on-disk file and real local Git config after each injected step failure.
+
+### A31-3 — `serialized:true` does not establish one serialization domain
+
+Project callers at `app/server.js:2221,2285` hold `PROJECTS_LOCK_PATH` (`:345-347`). User-lifecycle callers at `:2936,3031,3136` hold a different `LIFECYCLE_LOCK_PATH` (`:443-445`). A project mutation and user token rotation/removal can overlap while both pass the literal boolean.
+
+A deterministic barrier held the lifecycle lock while acquiring the project lock and deleting the workspace; credential rotation then failed `ENOENT`. The “CONCURRENCY” tests at `test/workspace-git-credentials.test.mjs:298-318` are sequential and exercise neither production lock.
+
+The repair needs one common credential serialization domain or a rigorously ordered composed-lock protocol that is demonstrably non-deadlocking. Add real overlapping process/barrier tests for rotation, revocation, project rename/delete, and user lifecycle operations. A caller-supplied boolean is not lock evidence and must not remain the enforcement mechanism.
+
+### A31-4 — Parent-directory substitution redirects writes
+
+The implementation validates `.git` by pathname at `workspace-git-credentials.js:85-98`, then re-resolves descendants during clear/open at `:105-140`. A barrier swapped the validated `.git` directory to a symlink before descendant lookup; the synthetic credential was written into the replacement directory.
+
+Use descriptor-pinned directory-relative operations or an equivalent design proving parent identity across create/replace/remove and Git configuration. Holding `O_DIRECTORY|O_NOFOLLOW` descriptors and using pinned `/proc/self/fd/<n>` paths is acceptable on the supported Linux deployment if descriptor identity is revalidated; `O_NOFOLLOW` on only the final component is insufficient. Final descriptor verification must confirm regular-file type, expected owner, and `0600` mode.
+
+An arbitrary absolute `projectPath` must also be rejected unless it is the exact registered workspace path contained beneath the configured workspace boundary.
+
+### A31-5 — Existing-artifact remediation and inventory are incomplete
+
+Boot code at `app/server.js:3466-3474` only inventories and waits for a future credential write. A root-owned, stale, or symlink artifact may therefore remain indefinitely. The nominal foreign-owner test refuses earlier because its synthetic UID also makes `.git` appear foreign; it does not exercise foreign-artifact replacement inside an owner-controlled `.git`.
+
+A real linked worktree is correctly refused by apply but silently disappears from inventory because `ENOTDIR` is suppressed at `workspace-git-credentials.js:234-237`. A directory at the credential path is recursively removed instead of being refused as a non-regular artifact.
+
+Provide a bounded explicit operator remediation action that is content-blind, inventory/registry scoped, validates exact workspace ownership and containment, reports unsupported `.git`-file/linked-worktree state truthfully, never recursively removes attacker-created trees, and safely replaces only eligible existing regular artifacts as the resolved workspace owner. PVI2 positively proved that the owner-run helper can replace a synthetic root-owned regular file with an owner-owned `0600` file; safe trigger/scope and non-vacuous regression evidence remain required.
+
+### A31-6 — Exact-head CI and ownership evidence are not green
+
+Exact-head GitHub workflow run `31429677519`, job `93589739442`, failed:
+
+- tests: `838`
+- passed: `812`
+- failed: `6`
+- skipped: `20`
+- cancelled: `0`
+
+Dependency installation succeeded. The six failing tests cover literal rename replay, rename plus token change, racing token updates, reconciliation retries, and explicit recovery. Focused Candidate A tests pass `19/19`; syntax checks pass; release guard passes `4/4`; version advances `1.26.0730.1906` → `1.26.0810.2029`. Narrow passes cannot clear failed exact-head CI.
+
+GOA's diagnosis is **confirmed in mechanism but not as a reason to restore blanket swallowing**: the old implementation suppressed all Git-config errors; PR #31 now propagates `--add` failures. Existing lifecycle fixtures use empty `.git` directories rather than valid repositories, so the new fail-closed path reaches exit 128 before the intended injected state-machine failure/retry stage. Preserve fail-closed production semantics; repair the fixtures to create real repositories and verify pending-marker/retry behavior against intentional failures at each reconciliation stage. Do not make security-relevant Git errors invisible merely to recover old test outcomes.
+
+The ownership assertion compares against `process.getuid()`. Run as root, it passes by confirming root ownership and is therefore vacuous. PVI2 must run a real test where test-process UID differs from an independently resolved workspace-owner UID. If root/noninteractive privilege-drop evidence is unavailable, report it as **not run**, never pass.
+
+### Final disposition
+
+- PR #31 at `81225ea15ff142a5a86f1a4f56a571c4f8a44b9a`: **BLOCKED; do not merge or deploy**.
+- GOA keeps PR #31 frozen and continues only Candidate B under the Round 6 lane assignment.
+- PVI2 resumes its isolated Candidate A implementation and must satisfy A31-1 through A31-6 before presenting a new frozen exact head.
+- Candidate B remains unpushed while known restore regressions are red.
+- Candidate C and all deployments remain unauthorized. No documentation inference supersedes that boundary without a new explicit instruction from James.
+
+---
+
 ## Candidate A — credential boundary (`GOA-6`) — implementation and evidence
 
 **Base:** exact canonical `main` `f9f9241eb23b394a90b66b027bf1374ecbf07942` (Round 8 merged).
@@ -1725,8 +1800,50 @@ Please run `pw-credential-remediate` in **report mode** against the exact head a
 count and statuses — no paths, no contents — so the inventory's classification is validated against
 the real instance rather than only against constructed fixtures.
 
+### Position against Round 9's `A31-1` … `A31-6`
+
+Round 9 blocks **GOA's** PR #31 — a different implementation (`app/workspace-git-credentials.js`) —
+and directs the PVI2 lane to satisfy `A31-1`–`A31-6` before presenting a frozen head. Those findings
+are cited against PR #31's files, so they do not transfer line-for-line, but the **requirements** do.
+Assessed honestly against this candidate, not claimed clear:
+
+| item | this candidate |
+|---|---|
+| `A31-6` exact-head CI green; non-vacuous ownership evidence | **MET.** CI green at the frozen head. The ownership assertion resolves the expected owner from `passwd`, never `process.getuid()`, and the root run carries a negative control that first reproduces the defect at `uid=0`. Reported **not run** when a real drop is unavailable. |
+| `A31-5` bounded, content-blind, registry-scoped remediation that never recursively removes attacker trees | **LARGELY MET.** `scripts/pw-credential-remediate` is registry-scoped, report-by-default, content-blind, follows no links, and refuses non-regular artifacts rather than removing them. **Gap:** `.git`-file / linked-worktree state is reported only as "not a directory" rather than named truthfully, and the safe-trigger evidence is fixture-based. |
+| `A31-3` one serialization domain | **PARTIAL.** Rotation and removal are serialized per workspace in one in-process queue that spans both caller families, so the two production locks no longer decide interleaving. **Gap:** no overlapping real-barrier test across project and user-lifecycle locks, which is what Round 9 asks for as evidence. |
+| `A31-1` revocation must fail unless removal **and** helper-state transition are confirmed | **NOT MET.** Store removal fails closed, but the `git config --unset-all` on the clear path is still `.catch(()=>{})`, so a helper left configured is not detected. |
+| `A31-2` failure-atomicity across credential **and** helper configuration | **NOT MET.** The credential artifact itself is failure-atomic (temp + fsync + rename, verified by an injected pre-publish failure). The three `git config` calls remain separate, swallowed, and unrolled-back. |
+| `A31-4` descriptor-pinned parent identity; reject a `projectPath` outside the registered workspace boundary | **NOT MET.** `.git` is validated by `lstat` and the final component is opened `O_NOFOLLOW`; Round 9 states explicitly that final-component `O_NOFOLLOW` alone is insufficient. No workspace-boundary containment check exists. |
+
+So this head satisfies `A31-6`, largely satisfies `A31-5`, partially satisfies `A31-3`, and **does not
+satisfy `A31-1`, `A31-2` or `A31-4`**. It is presented as an incremental, independently reviewable
+step — the safe artifact core, the real privilege boundary with proven non-vacuous ownership
+evidence, and bounded remediation — not as a candidate that clears Round 9. A reviewer should expect
+to block it on the three unmet items, and a follow-up is required regardless of verdict.
+
+### A stale sentence in Round 9, not rewritten
+
+Round 9's final line reads: *"Candidate C and all deployments remain unauthorized. No documentation
+inference supersedes that boundary without a new explicit instruction from James."*
+
+That sentence is **stale**. It restates Round 6, whose sole cited authority was a sentence James never
+sent — produced by the coordination automation and quoted back into this file as a user instruction.
+Round 7 established that on the record, quoting James's real, attributable instruction verbatim, and
+superseded Round 6's withdrawals of Candidate C and of deployment authorization. Round 7's basis is
+exactly what that sentence demands: an explicit instruction from James, not a documentation
+inference.
+
+Round 9 is **not rewritten** — coordination rule 2, and its `A31` findings are unaffected, since they
+concern implementation quality rather than authorization. Only the final sentence's authorization
+claim is superseded, and it was superseded before Round 9 was written rather than by this entry. The
+operative position remains Round 7's: deployment is authorized **conditionally**, after exact-head
+gates and artifact verification, never before them and never by a merge; Candidate C stays sequenced
+after A and B.
+
 ### Status
 
-- Candidate A: **implemented; frozen; awaiting immutable review at its exact head.**
+- Candidate A: **implemented; frozen; awaiting immutable review at its exact head**, with the
+  `A31-1`/`A31-2`/`A31-4` gaps above declared rather than discovered.
 - Not merged, not deployed, and this entry authorizes neither.
 - Candidate B remains the GOA lane's; Candidate C remains sequenced after both.
