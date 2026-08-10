@@ -1604,3 +1604,78 @@ it cannot be discharged by a test that cannot fail.
 - **The Candidate A ownership-evidence requirement is binding on the PVI2 lane.**
 - No disposition, scope, gate, sequence, lane assignment, or authorization boundary is changed by
   this entry.
+
+---
+
+## Hermes-James — Round 9 — Candidate A PR #31 immutable exact-head verdict
+
+**Verdict: BLOCK.** Two independent immutable Tier-3 reviews and the PVI2 adversarial verification agree.
+
+### Frozen identity
+
+- PR #31 head: `81225ea15ff142a5a86f1a4f56a571c4f8a44b9a`
+- Tree: `1d74cda114cfc7af6b44142ce5fde1d515e4e7c3`
+- Direct parent and code merge base: `40c15207af5868149c4d2ce489a47199f596b451`
+- GitHub PR base ref currently resolves to documentation-only baseline `7783ee2c1141ec893cbaca2005eaaa5a238b865c`; later `main` movement through this round is confined to `DEVELOPMENT-COORDINATION.md`.
+
+The remote PR head remained exact and the reviewed worktrees remained clean. No reviewed source, PR, runtime, service, or deployment was modified by review.
+
+### A31-1 — Revocation fails open
+
+`app/workspace-git-credentials.js:191-198` suppresses credential-removal failures; `runGitConfig()` at `:157-168` suppresses every `--unset-all` failure; the operation then reports `applied:true, revoked:true`.
+
+A real privilege-dropped probe left both the `0600` credential and active `store --file=...` helper while returning success. Revocation must fail unless both removal and helper-state transition are confirmed. Only a proven absent target may be idempotent success; permission, I/O, timeout, malformed-repository, and unsupported-artifact errors must remain failures.
+
+### A31-2 — Rotation and Git-helper configuration are not failure-atomic
+
+`workspace-git-credentials.js:148-168,201-203` writes/truncates the credential and then performs unset/reset/store as separate Git transactions without rollback. Injecting failure on the second `--add` left the new credential on disk and the helper half-configured as only the empty reset entry.
+
+The test at `test/workspace-git-credentials.test.mjs:250-270` fails the first add through a fake executor and does not prove durable behavior after a later partial commit. Candidate A must preserve or restore the prior usable credential/helper pair across every injected failure, or enter an explicit recoverable failure state that cannot expose/use the new credential and cannot claim success. Revocation requires the same property. Tests must inspect real on-disk file and real local Git config after each injected step failure.
+
+### A31-3 — `serialized:true` does not establish one serialization domain
+
+Project callers at `app/server.js:2221,2285` hold `PROJECTS_LOCK_PATH` (`:345-347`). User-lifecycle callers at `:2936,3031,3136` hold a different `LIFECYCLE_LOCK_PATH` (`:443-445`). A project mutation and user token rotation/removal can overlap while both pass the literal boolean.
+
+A deterministic barrier held the lifecycle lock while acquiring the project lock and deleting the workspace; credential rotation then failed `ENOENT`. The “CONCURRENCY” tests at `test/workspace-git-credentials.test.mjs:298-318` are sequential and exercise neither production lock.
+
+The repair needs one common credential serialization domain or a rigorously ordered composed-lock protocol that is demonstrably non-deadlocking. Add real overlapping process/barrier tests for rotation, revocation, project rename/delete, and user lifecycle operations. A caller-supplied boolean is not lock evidence and must not remain the enforcement mechanism.
+
+### A31-4 — Parent-directory substitution redirects writes
+
+The implementation validates `.git` by pathname at `workspace-git-credentials.js:85-98`, then re-resolves descendants during clear/open at `:105-140`. A barrier swapped the validated `.git` directory to a symlink before descendant lookup; the synthetic credential was written into the replacement directory.
+
+Use descriptor-pinned directory-relative operations or an equivalent design proving parent identity across create/replace/remove and Git configuration. Holding `O_DIRECTORY|O_NOFOLLOW` descriptors and using pinned `/proc/self/fd/<n>` paths is acceptable on the supported Linux deployment if descriptor identity is revalidated; `O_NOFOLLOW` on only the final component is insufficient. Final descriptor verification must confirm regular-file type, expected owner, and `0600` mode.
+
+An arbitrary absolute `projectPath` must also be rejected unless it is the exact registered workspace path contained beneath the configured workspace boundary.
+
+### A31-5 — Existing-artifact remediation and inventory are incomplete
+
+Boot code at `app/server.js:3466-3474` only inventories and waits for a future credential write. A root-owned, stale, or symlink artifact may therefore remain indefinitely. The nominal foreign-owner test refuses earlier because its synthetic UID also makes `.git` appear foreign; it does not exercise foreign-artifact replacement inside an owner-controlled `.git`.
+
+A real linked worktree is correctly refused by apply but silently disappears from inventory because `ENOTDIR` is suppressed at `workspace-git-credentials.js:234-237`. A directory at the credential path is recursively removed instead of being refused as a non-regular artifact.
+
+Provide a bounded explicit operator remediation action that is content-blind, inventory/registry scoped, validates exact workspace ownership and containment, reports unsupported `.git`-file/linked-worktree state truthfully, never recursively removes attacker-created trees, and safely replaces only eligible existing regular artifacts as the resolved workspace owner. PVI2 positively proved that the owner-run helper can replace a synthetic root-owned regular file with an owner-owned `0600` file; safe trigger/scope and non-vacuous regression evidence remain required.
+
+### A31-6 — Exact-head CI and ownership evidence are not green
+
+Exact-head GitHub workflow run `31429677519`, job `93589739442`, failed:
+
+- tests: `838`
+- passed: `812`
+- failed: `6`
+- skipped: `20`
+- cancelled: `0`
+
+Dependency installation succeeded. The six failing tests cover literal rename replay, rename plus token change, racing token updates, reconciliation retries, and explicit recovery. Focused Candidate A tests pass `19/19`; syntax checks pass; release guard passes `4/4`; version advances `1.26.0730.1906` → `1.26.0810.2029`. Narrow passes cannot clear failed exact-head CI.
+
+GOA's diagnosis is **confirmed in mechanism but not as a reason to restore blanket swallowing**: the old implementation suppressed all Git-config errors; PR #31 now propagates `--add` failures. Existing lifecycle fixtures use empty `.git` directories rather than valid repositories, so the new fail-closed path reaches exit 128 before the intended injected state-machine failure/retry stage. Preserve fail-closed production semantics; repair the fixtures to create real repositories and verify pending-marker/retry behavior against intentional failures at each reconciliation stage. Do not make security-relevant Git errors invisible merely to recover old test outcomes.
+
+The ownership assertion compares against `process.getuid()`. Run as root, it passes by confirming root ownership and is therefore vacuous. PVI2 must run a real test where test-process UID differs from an independently resolved workspace-owner UID. If root/noninteractive privilege-drop evidence is unavailable, report it as **not run**, never pass.
+
+### Final disposition
+
+- PR #31 at `81225ea15ff142a5a86f1a4f56a571c4f8a44b9a`: **BLOCKED; do not merge or deploy**.
+- GOA keeps PR #31 frozen and continues only Candidate B under the Round 6 lane assignment.
+- PVI2 resumes its isolated Candidate A implementation and must satisfy A31-1 through A31-6 before presenting a new frozen exact head.
+- Candidate B remains unpushed while known restore regressions are red.
+- Candidate C and all deployments remain unauthorized. No documentation inference supersedes that boundary without a new explicit instruction from James.
