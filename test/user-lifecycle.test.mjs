@@ -7,7 +7,7 @@
 // host. Ports 3890-3899 to stay clear of every other suite's fixed ports.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -90,7 +90,11 @@ function seedProject(inst, name, opts = {}) {
   const proj = path.join(inst.dir, 'workspaces', name);
   fs.mkdirSync(proj, { recursive: true });
   if (opts.git) {
-    fs.mkdirSync(path.join(proj, '.git'), { recursive: true });
+    // A REAL repository, not an empty `.git` directory. The credential
+    // boundary is fail-closed about the repositories it will service, so a
+    // fixture that is not a repository would exercise a refusal path instead of
+    // the reconciliation state machine these tests are about.
+    execFileSync('git', ['init', '-q', proj]);
   }
   return proj;
 }

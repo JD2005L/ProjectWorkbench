@@ -6,8 +6,8 @@
     "test failure with nothing in this repository having moved.",
     "Update deliberately, as part of conforming to the change: node scripts/orch-contract-pin.mjs --write"
   ],
-  "revision": "aff7a6053be620cc6e18b8c070010ba9ce924cad",
-  "pinned_at": "2026-07-28T01:24:39.963Z",
+  "revision": "5324e7cccf1a38b3808da598807157ad6aa12a80",
+  "pinned_at": "2026-08-10T22:25:25.556Z",
   "root": "/opt/project-workbench/workspaces/PVICodingOrchestrator",
   "files": {
     "src/pvi_orchestrator/contracts/policy.py": "55761eb33b37e464ff12018f2842b8aed06b4c07ed0635d71b3744fc89871c11",
@@ -15,12 +15,12 @@
     "src/pvi_orchestrator/contracts/states.py": "a8387ad0224540cf1c375730af3eef6a5a636a020d854a93e5da0f11a71c4c5b",
     "src/pvi_orchestrator/contracts/events.py": "62fe11bc2369f5f7d16939488b7d82918e9de878843cc64b6c64a9276961acd7",
     "src/pvi_orchestrator/contracts/evidence.py": "50ef5a81fc97f1c0173effa1878f143d9ffa55309274debffd033a39155cce54",
-    "src/pvi_orchestrator/contracts/interaction.py": "fd711651604034f87bd661a838b6b832042f81ed295061b1f2b15f378ab93a3d",
+    "src/pvi_orchestrator/contracts/interaction.py": "c969616ce0688399b2b9f7ffce76340abdecc6dd8c2c2c44a6ff024a188ffa57",
     "src/pvi_orchestrator/contracts/jobs.py": "ec4f957f7dec4cf18db56d04cf8e66d18f79e5fe7918afaf8027f544d2010391",
     "src/pvi_orchestrator/contracts/publication.py": "d8180e3d3898db734d0f71c0f7e73ec4d3a990f2bac227ab081ef0a293fd15b9",
     "src/pvi_orchestrator/contracts/workbench.py": "69833441d43b1769edf649d9612007a84d51809a25be6cfb6d499839031def59",
     "src/pvi_orchestrator/contracts/health.py": "ae0014459175ec5ef66e673c701ea4821437a61beaecbc387015829ae5795aba",
-    "src/pvi_orchestrator/workbench/protocol.py": "34292a3713c70d8b753932ffa519baee53b71f5df75eb7edb8867d49e49f4cca",
+    "src/pvi_orchestrator/workbench/protocol.py": "8d61a23847367b22a1af1bc04f71d6d7fe5491c127cb95a764c0e921228b5b68",
     "src/pvi_orchestrator/registry_admin.py": "dba607a2ca4773ba71119a898c05663ba96abae9155618f37901221c0ce78ba2",
     "src/pvi_orchestrator/registry_cli.py": "eb2553886f94669653e74c33af9d0528927efc23db628598a5b1954bd765acf0"
   }

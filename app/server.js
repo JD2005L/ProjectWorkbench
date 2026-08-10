@@ -13,12 +13,13 @@ import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { withLifecycleLock } from './lifecycle-lock.js';
+import { makeCredentialLockDomain } from './credential-domain-lock.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
@@ -143,28 +144,47 @@ app.use(attachUser);
 async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
 async function saveProjects(projects){ await writeFileAtomic(registryPath, JSON.stringify(projects, null, 2)+'\n', { mode: 0o644 }); }
 
-// Configure per-workspace git credentials based on the project's primaryUser token.
-async function syncProjectCredentials(project, users){
- if(!project?.path) return;
- const gitDir = path.join(project.path, '.git');
- try { await fs.access(gitDir); } catch { return; } // no .git dir yet
- const user = users && project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
- const credFile = path.join(gitDir, '.pw-credentials');
- if(user?.ghToken){
-  const token = decrypt(user.ghToken);
-  await fs.writeFile(credFile, `https://${token}:x-oauth-basic@github.com\n`, { mode: 0o600 });
-  // Use ONLY our project-local store: clear any prior local entries, then add an
-  // empty reset (drops inherited global/system helpers for this repo so the token
-  // is never dispatched to — and duplicated into — a global store) followed by our
-  // per-project store. Two --add (not --replace-all, which would drop the reset).
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', '']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', `store --file=${credFile}`]).catch(()=>{});
- } else {
-  // Remove credential file and unset the helper
-  await fs.unlink(credFile).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
- }
+// Configure a project's workspace-local git credentials.
+//
+// THE DASHBOARD DOES NOT TOUCH THE REPOSITORY. Everything below decides WHAT the
+// state should be; the state is then applied by app/credential-writer.mjs
+// running as the validated workspace owner, which pins the repository by
+// descriptor and makes the whole file+config transition all-or-nothing. See
+// app/git-credentials.js for why a root write into a pane-owned tree was a local
+// privilege escalation, and why a pathname is never used twice.
+//
+// The desired state is resolved from disk INSIDE the serialization domain, so a
+// caller holding a `users` snapshot taken before the lock can no longer write a
+// token that was rotated in the meantime. An empty token means REVOKE.
+//
+// Failures propagate. They are not swallowed: a credential that could not be
+// written, and a revocation that could not be confirmed, are exactly the states
+// an operator has to hear about.
+async function syncProjectCredentials(project){
+ if(!project?.path) return { applied:false, skipped:'no-path' };
+ return credentialDomain.withLocks(['lifecycle','projects','credential'], async () => {
+  const projects = await loadProjects();
+  // An absolute path is only ever eligible when it is the EXACT registered
+  // workspace path of a project, checked inside the helper against this list.
+  const registeredPaths = projects.map(p => p?.path).filter(Boolean);
+  const users = await loadUsers();
+  const owner = project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
+  const token = owner?.ghToken ? (decrypt(owner.ghToken) || '') : '';
+  const terminal = await terminalOwner();
+  const plan = credentialExecutionPlan({ owner: terminal, currentUid: process.getuid?.() ?? null });
+  // Resolved from passwd, INDEPENDENTLY of whoever this process happens to be:
+  // an ownership assertion against our own uid passes identically for the
+  // correct and the defective outcome, and is therefore not evidence.
+  const expectedUid = terminal ? Number(terminal.uid) : (process.getuid?.() ?? null);
+  return runGitCredentialHelperJob({
+   action: 'git-credential',
+   workspaceRoot,
+   projectPath: project.path,
+   registeredPaths,
+   token,
+   expectedUid,
+  }, plan);
+ });
 }
 
 // ── Per-user CLI credentials (opt-in via PW_PER_USER_CLAUDE) ────────────────
@@ -219,6 +239,19 @@ const CREDENTIAL_HELPER = path.join(path.dirname(new URL(import.meta.url).pathna
 function runCredentialJob(job, plan){
  const argv = credentialDropArgv({ owner: plan.owner, execPath: process.execPath, helperPath: CREDENTIAL_HELPER });
  return spawnCredentialJob({ spawn, argv, job });
+}
+// The git-credential job ALWAYS runs in a one-shot child process, even when no
+// privilege drop is needed (dashboard and panes share an account): it pins the
+// repository by chdir()ing into it, and chdir is process-global — the dashboard
+// must never move. The drop itself still goes through the same vetted
+// abstraction as every other credential job.
+function gitCredentialArgv(plan){
+ return plan.drop
+  ? credentialDropArgv({ owner: plan.owner, execPath: process.execPath, helperPath: CREDENTIAL_HELPER })
+  : [process.execPath, CREDENTIAL_HELPER];
+}
+function runGitCredentialHelperJob(job, plan){
+ return spawnCredentialJob({ spawn, argv: gitCredentialArgv(plan), job });
 }
 // Drop credential trees that no longer belong to a current user. Called after a
 // deletion and once at boot, so a tree orphaned while the service was down (or
@@ -308,8 +341,22 @@ async function credentialContext(project){
 // already does its own load/mutate/save inside the callback, so only the
 // serialization mechanism changes here, not the call signature.
 const PROJECTS_LOCK_PATH = process.env.PW_PROJECTS_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-projects.lock');
+// projects.json transactions — and ONLY those. This section legitimately spans
+// long external work (clone, chown, routing, systemd), so it must never hold a
+// lock that anything latency-sensitive waits on. Credential work reaches the
+// same exclusion by taking this lock itself, from the top of the canonical
+// order, in its own short section: see syncProjectCredentials() and
+// app/credential-domain-lock.js.
 async function withProjectsLock(fn){
- return withLifecycleLock(PROJECTS_LOCK_PATH, fn);
+ return credentialDomain.withLocks(['projects'], fn);
+}
+// Long, external, latency-unbounded workspace work — clone, chown, rm -rf,
+// routing, systemd. It serializes project mutations against each other exactly
+// as the projects lock used to, but nothing latency-sensitive waits on it, so a
+// 300s clone can no longer stall a token rotation or a login. The registry
+// transaction inside it stays SHORT and is what the credential path waits on.
+async function withWorkspaceLock(fn){
+ return credentialDomain.withLocks(['workspace'], fn);
 }
 
 // ============================================================================
@@ -406,8 +453,16 @@ async function saveUsers(users){
 // SAME lock across their project-reference and credential-tree effects, not
 // just the users.json write — see the route handlers below.
 const LIFECYCLE_LOCK_PATH = process.env.PW_LIFECYCLE_LOCK_PATH || path.join(path.dirname(usersPath), '.pw-lifecycle.lock');
+const CREDENTIAL_LOCK_PATH = process.env.PW_CREDENTIAL_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-credential.lock');
+const WORKSPACE_LOCK_PATH = process.env.PW_WORKSPACE_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-workspace.lock');
+// ONE serialization domain for user-lifecycle, project and credential work,
+// acquired in a single canonical order so the composition cannot deadlock and
+// an out-of-order acquisition is refused rather than hanging.
+const credentialDomain = makeCredentialLockDomain({
+ lockPaths: { lifecycle: LIFECYCLE_LOCK_PATH, workspace: WORKSPACE_LOCK_PATH, projects: PROJECTS_LOCK_PATH, credential: CREDENTIAL_LOCK_PATH },
+});
 async function withUsersLock(mutate){
- return withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+ return credentialDomain.withLocks(['lifecycle'], async () => {
   const users = await loadUsers();
   const outcome = await mutate(users);
   if(outcome === false) return { changed:false, result: outcome };
@@ -1406,11 +1461,16 @@ async function cloneWorkspace(p, token){
  if(token){
   // Authenticate the clone via a temporary credential store, so the token never
   // appears in argv, the remote URL, or any error output shown to the user.
-  const credFile = path.join(workspaceRoot, '.pw-clone-' + slug(p.name));
+  // NOT in workspaceRoot: that directory is owned by the pane account, so a
+  // symlink pre-planted at a predictable name would have had this root process
+  // write the decrypted token wherever the planter chose. mkdtemp gives an
+  // unguessable 0700 directory beside the registry, which only root can reach.
+  const credDir = await fs.mkdtemp(path.join(path.dirname(registryPath), '.pw-clone-'));
+  const credFile = path.join(credDir, 'credentials');
   try {
    await fs.writeFile(credFile, 'https://' + token + ':x-oauth-basic@github.com\n', { mode: 0o600 });
    await execFileAsync('git',['-c','credential.helper=','-c','credential.helper=store --file=' + credFile,'clone','--',p.repo,p.path],{timeout:300000});
-  } finally { await fs.rm(credFile,{force:true}).catch(()=>{}); }
+  } finally { await fs.rm(credDir,{recursive:true,force:true}).catch(()=>{}); }
  } else {
   await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
  }
@@ -2166,7 +2226,8 @@ app.get(BASE + '/manage', requireAdmin, async (req,res)=>{
 app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
  if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
- await withProjectsLock(async () => {
+ let added = null;
+ await withWorkspaceLock(async () => {
   const projects = await loadProjects();
   if(projects.some(p=>p.name===name)) throw new Error('A project named "'+name+'" already exists');
   const port = Number(req.body.port) || nextPort(projects);
@@ -2182,9 +2243,24 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
   if(!p.primaryUser && users.find(u=>u.username===req.user?.username)?.ghToken) p.primaryUser = req.user.username;
   const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
   let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
-  await cloneWorkspace(p, cloneToken); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
-  if(p.primaryUser){ await syncProjectCredentials(p, users); }
+  // The clone happens with NO registry lock held — it is network work with a
+  // 300s timeout, and a token rotation must not queue behind it.
+  await cloneWorkspace(p, cloneToken);
+  // Short registry transaction, re-validated against fresh state.
+  const published = await withProjectsLock(async () => {
+   const fresh = await loadProjects();
+   if(fresh.some(x=>x.name===name)) throw new Error('A project named "'+name+'" already exists');
+   if(allUsedPorts(fresh).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
+   fresh.push(p); await saveProjects(fresh);
+   return fresh;
+  });
+  await applyRouting(published); await startProject(p);
+  added = p;
  });
+ // Outside the projects lock on purpose: this is a SHORT ordered transition
+ // (lifecycle > projects > credential) and must not be reached while the clone
+ // above is still running, or every login waits behind the network.
+ if(added?.primaryUser){ await syncProjectCredentials(added); }
  await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
  if(wantsJson(req)) return res.json({ok:true,name});
  res.redirect(BASE + '/manage');
@@ -2198,7 +2274,8 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  const primaryUser = String(req.body.primaryUser || '').trim();
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
- await withProjectsLock(async () => {
+ let updated = null;
+ await withWorkspaceLock(async () => {
  const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project "'+oldName+'" not found');
  if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('A project named "'+newName+'" already exists');
  const others = projects.filter(x=>x.name!==oldName);
@@ -2245,10 +2322,14 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
- const users = await loadUsers();
- await saveProjects(projects); await applyRouting(projects); await startProject(p);
- await syncProjectCredentials(p, users);
+ // Short registry transaction only; the stop/rename/start around it are long.
+ await withProjectsLock(async () => { await saveProjects(projects); });
+ await applyRouting(projects); await startProject(p);
+ updated = p;
  });
+ // Same reason as /manage/add: the credential transition is short and ordered,
+ // and is taken after the long project work has released its lock.
+ if(updated){ await syncProjectCredentials(updated); }
  await audit('project_update', { oldName, newName, port }, req);
  if(wantsJson(req)) return res.json({ok:true,name:newName});
  res.redirect(BASE + '/manage');
@@ -2256,9 +2337,11 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
 
 app.post(BASE + '/manage/delete/:name', requireAdmin, async (req,res,next)=>{ try {
  if(req.body.confirm !== 'yes') throw new Error('Delete confirmation required'); const name = req.params.name;
- await withProjectsLock(async () => {
+ await withWorkspaceLock(async () => {
   const projects = await loadProjects(); const idx = projects.findIndex(p=>p.name===name); if(idx<0) throw new Error('Project not found'); const [p] = projects.splice(idx,1);
-  await stopProject(name); await removeWorkspace(p); await saveProjects(projects); await applyRouting(projects);
+  await stopProject(name); await removeWorkspace(p);
+  await withProjectsLock(async () => { await saveProjects(projects); });
+  await applyRouting(projects);
  });
  await audit('project_delete', { project: name }, req);
  if(wantsJson(req)) return res.json({ok:true});
@@ -2714,7 +2797,7 @@ app.post(BASE + '/api/auth/login', async (req,res) => {
   // first, it fully completes (session included) before DELETE can even
   // start, so DELETE's own fresh read of sessions.json sees and purges that
   // session too. Either ordering: no orphan, no revived session.
-  const outcome = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+  const outcome = await credentialDomain.withLocks(['lifecycle'], async () => {
    let u = null;
    try { u = await authenticate(username, password); }
    catch(e){ return { authError: 'ldap-bind' }; }
@@ -2848,7 +2931,7 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   if(passwordHash) rec.passwordHash = passwordHash;
   if(ghToken) rec.ghToken = encrypt(ghToken);
   if(deployPassword) rec.deployPassword = encrypt(deployPassword);
-  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+  const result = await credentialDomain.withLocks(['lifecycle'], async () => {
    const users = await loadUsers();
    if(users.some(u => u.username === username)) return { failure:{ status:409, error:`User "${username}" already exists` } };
    // A username still reserved by someone ELSE's unfinished rename (see
@@ -2898,7 +2981,7 @@ async function reconcileRenameCredentials({ userId, fromUsername, toUsername }){
   if(changed) await saveProjects(projects);
  });
  const projects = await loadProjects();
- for(const p of projects){ if(p.primaryUser === toUsername) await syncProjectCredentials(p, currentUsers); }
+ for(const p of projects){ if(p.primaryUser === toUsername) await syncProjectCredentials(p); }
  await pruneUserCredentialTrees(currentUsers);
 }
 
@@ -2920,7 +3003,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   // (the ABA this review round flagged) is now structurally impossible,
   // because nothing else — not another request in this process, not another
   // process — can be inside this same critical section at the same time.
-  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+  const result = await credentialDomain.withLocks(['lifecycle'], async () => {
    const users = await loadUsers();
    // Resolve by exact current username first; only falls back to an
    // unfinished rename's ORIGINAL name if there is no current match. This is
@@ -2993,7 +3076,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
       }
      } else {
       const projects = await loadProjects();
-      for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p, users); }
+      for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p); }
      }
     } catch(e){
      throw new Error(`user "${u.username}" was updated in users.json, but syncing dependent project/credential state failed: ${e?.message || e}. users.json reflects the change${opId ? ' and a pending reconciliation marker was recorded' : ''}; retry this request${opId ? `, or POST ${BASE}/api/users/${encodeURIComponent(u.username)}/reconcile,` : ''} once the underlying issue is resolved.`);
@@ -3014,7 +3097,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
 app.post(BASE + '/api/users/:username/reconcile', requireAdmin, async (req,res) => {
  try {
   const target = req.params.username;
-  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+  const result = await credentialDomain.withLocks(['lifecycle'], async () => {
    const users = await loadUsers();
    const u = resolveLifecycleTarget(users, target);
    if(!u) return { failure: { status:404, error:`User "${target}" not found` } };
@@ -3061,7 +3144,7 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   // victim's IMMUTABLE id throughout (never by username again, which a
   // concurrent rename or a recreate-under-the-vacated-name could otherwise
   // make point at the wrong account by the time phase 3 runs).
-  const result = await withLifecycleLock(LIFECYCLE_LOCK_PATH, async () => {
+  const result = await credentialDomain.withLocks(['lifecycle'], async () => {
    // Phase 1: validate against a current snapshot WITHOUT mutating anything.
    // The identity itself is only removed in phase 3, once every dependent
    // piece of state has actually been revoked — see the phase-2 comment.
@@ -3098,7 +3181,7 @@ app.delete(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
     // safe to repeat on a retry.
     const projectsBeforeCleanup = await loadProjects();
     for(const p of projectsBeforeCleanup){
-     if(namesToClear.has(p.primaryUser)) await syncProjectCredentials({ ...p, primaryUser: undefined }, remainingUsers);
+     if(namesToClear.has(p.primaryUser)) await syncProjectCredentials({ ...p, primaryUser: undefined });
     }
     await pruneUserCredentialTrees(remainingUsers);
 

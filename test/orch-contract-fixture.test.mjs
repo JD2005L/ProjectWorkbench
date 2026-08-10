@@ -208,7 +208,14 @@ print(json.dumps({
   assert.ok(fixture.mcp.tools.includes('pw_stream_events'));
 
   // Anything beyond the contract's own set must be one of the declared Milestone 2 additions.
-  const milestone2 = ['pw_get_questions', 'pw_get_approvals', 'pw_get_checks', 'pw_get_reviews', 'pw_publish'];
+  //
+  // `get_approvals` and `publish` have since GRADUATED into the orchestrator's own
+  // ALLOWED_CLIENT_METHODS (contract §9.2 "since delivered"), so they are no longer
+  // additions of ours — they are required of us. Removing them from this list does
+  // not relax anything: the loop above now demands `pw_get_approvals` and
+  // `pw_publish` on the CONTRACT's authority rather than on ours, which is
+  // strictly stronger, and this assertion still refuses any undeclared capability.
+  const milestone2 = ['pw_get_questions', 'pw_get_checks', 'pw_get_reviews'];
   const extra = fixture.mcp.tools.filter(
     (t) => !remote.methods.includes(t.replace(/^pw_/, '')) && t !== 'pw_stream_events',
   );

@@ -8,7 +8,7 @@
 // credential-prune failure / replay, and username-reuse credential isolation.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -72,7 +72,9 @@ function writeProjects(inst, projects) { fs.writeFileSync(inst.env.PW_REGISTRY_P
 function seedProject(inst, name, opts = {}) {
   const proj = path.join(inst.dir, 'workspaces', name);
   fs.mkdirSync(proj, { recursive: true });
-  if (opts.git) fs.mkdirSync(path.join(proj, '.git'), { recursive: true });
+  // A REAL repository, not an empty `.git` directory — see the note in
+  // test/user-lifecycle.test.mjs's seedProject.
+  if (opts.git) execFileSync('git', ['init', '-q', proj]);
   return proj;
 }
 function readGhTokenFromCredFile(projPath) {
