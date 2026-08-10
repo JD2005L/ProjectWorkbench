@@ -58,6 +58,7 @@ function makeInstance(port, extraEnv = {}) {
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
     PW_HOST_TERMINAL_USER: os.userInfo().username,
     PW_CREDENTIAL_LOCK_PATH: path.join(dir, 'registry', '.pw-credential.lock'),
+    PW_WORKSPACE_LOCK_PATH: path.join(dir, 'registry', '.pw-workspace.lock'),
     PW_PROJECTS_LOCK_PATH: path.join(dir, 'registry', '.pw-projects.lock'),
     PW_LIFECYCLE_LOCK_PATH: path.join(dir, 'users', '.pw-lifecycle.lock'),
     ...extraEnv,
@@ -260,6 +261,7 @@ import fs from 'node:fs';
 import { makeCredentialLockDomain } from '${appDir}/credential-domain-lock.js';
 const domain = makeCredentialLockDomain({ lockPaths: ${JSON.stringify({
       lifecycle: inst.env.PW_LIFECYCLE_LOCK_PATH,
+      workspace: inst.env.PW_WORKSPACE_LOCK_PATH,
       projects: inst.env.PW_PROJECTS_LOCK_PATH,
       credential: inst.env.PW_CREDENTIAL_LOCK_PATH,
     })}, timeoutMs: 20000 });

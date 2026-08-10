@@ -350,6 +350,14 @@ const PROJECTS_LOCK_PATH = process.env.PW_PROJECTS_LOCK_PATH || path.join(path.d
 async function withProjectsLock(fn){
  return credentialDomain.withLocks(['projects'], fn);
 }
+// Long, external, latency-unbounded workspace work — clone, chown, rm -rf,
+// routing, systemd. It serializes project mutations against each other exactly
+// as the projects lock used to, but nothing latency-sensitive waits on it, so a
+// 300s clone can no longer stall a token rotation or a login. The registry
+// transaction inside it stays SHORT and is what the credential path waits on.
+async function withWorkspaceLock(fn){
+ return credentialDomain.withLocks(['workspace'], fn);
+}
 
 // ============================================================================
 // Auth (Phase 1): users.json + cookie sessions + per-project grants.
@@ -446,11 +454,12 @@ async function saveUsers(users){
 // just the users.json write — see the route handlers below.
 const LIFECYCLE_LOCK_PATH = process.env.PW_LIFECYCLE_LOCK_PATH || path.join(path.dirname(usersPath), '.pw-lifecycle.lock');
 const CREDENTIAL_LOCK_PATH = process.env.PW_CREDENTIAL_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-credential.lock');
+const WORKSPACE_LOCK_PATH = process.env.PW_WORKSPACE_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-workspace.lock');
 // ONE serialization domain for user-lifecycle, project and credential work,
 // acquired in a single canonical order so the composition cannot deadlock and
 // an out-of-order acquisition is refused rather than hanging.
 const credentialDomain = makeCredentialLockDomain({
- lockPaths: { lifecycle: LIFECYCLE_LOCK_PATH, projects: PROJECTS_LOCK_PATH, credential: CREDENTIAL_LOCK_PATH },
+ lockPaths: { lifecycle: LIFECYCLE_LOCK_PATH, workspace: WORKSPACE_LOCK_PATH, projects: PROJECTS_LOCK_PATH, credential: CREDENTIAL_LOCK_PATH },
 });
 async function withUsersLock(mutate){
  return credentialDomain.withLocks(['lifecycle'], async () => {
@@ -2218,7 +2227,7 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
  const name = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim();
  if(!validName(name)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  let added = null;
- await withProjectsLock(async () => {
+ await withWorkspaceLock(async () => {
   const projects = await loadProjects();
   if(projects.some(p=>p.name===name)) throw new Error('A project named "'+name+'" already exists');
   const port = Number(req.body.port) || nextPort(projects);
@@ -2234,7 +2243,18 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
   if(!p.primaryUser && users.find(u=>u.username===req.user?.username)?.ghToken) p.primaryUser = req.user.username;
   const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
   let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
-  await cloneWorkspace(p, cloneToken); projects.push(p); await saveProjects(projects); await applyRouting(projects); await startProject(p);
+  // The clone happens with NO registry lock held — it is network work with a
+  // 300s timeout, and a token rotation must not queue behind it.
+  await cloneWorkspace(p, cloneToken);
+  // Short registry transaction, re-validated against fresh state.
+  const published = await withProjectsLock(async () => {
+   const fresh = await loadProjects();
+   if(fresh.some(x=>x.name===name)) throw new Error('A project named "'+name+'" already exists');
+   if(allUsedPorts(fresh).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
+   fresh.push(p); await saveProjects(fresh);
+   return fresh;
+  });
+  await applyRouting(published); await startProject(p);
   added = p;
  });
  // Outside the projects lock on purpose: this is a SHORT ordered transition
@@ -2255,7 +2275,7 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
  let updated = null;
- await withProjectsLock(async () => {
+ await withWorkspaceLock(async () => {
  const projects = await loadProjects(); const p = projects.find(x=>x.name===oldName); if(!p) throw new Error('Project "'+oldName+'" not found');
  if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('A project named "'+newName+'" already exists');
  const others = projects.filter(x=>x.name!==oldName);
@@ -2302,8 +2322,9 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
  if(tabs.length) p.tabs = tabs; else delete p.tabs;
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
- const users = await loadUsers();
- await saveProjects(projects); await applyRouting(projects); await startProject(p);
+ // Short registry transaction only; the stop/rename/start around it are long.
+ await withProjectsLock(async () => { await saveProjects(projects); });
+ await applyRouting(projects); await startProject(p);
  updated = p;
  });
  // Same reason as /manage/add: the credential transition is short and ordered,
@@ -2316,9 +2337,11 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
 
 app.post(BASE + '/manage/delete/:name', requireAdmin, async (req,res,next)=>{ try {
  if(req.body.confirm !== 'yes') throw new Error('Delete confirmation required'); const name = req.params.name;
- await withProjectsLock(async () => {
+ await withWorkspaceLock(async () => {
   const projects = await loadProjects(); const idx = projects.findIndex(p=>p.name===name); if(idx<0) throw new Error('Project not found'); const [p] = projects.splice(idx,1);
-  await stopProject(name); await removeWorkspace(p); await saveProjects(projects); await applyRouting(projects);
+  await stopProject(name); await removeWorkspace(p);
+  await withProjectsLock(async () => { await saveProjects(projects); });
+  await applyRouting(projects);
  });
  await audit('project_delete', { project: name }, req);
  if(wantsJson(req)) return res.json({ok:true});

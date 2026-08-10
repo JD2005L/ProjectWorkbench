@@ -313,3 +313,52 @@ the key is forced to load), and revocation is a POSITIVE decision only — this
 project has no owner, or its owner holds no token. Anything unresolved (no registry
 entry, unresolvable `primaryUser`, undecryptable token) is reported `blocked` and
 exits nonzero. No actionable row survives a refusal.
+
+
+## 10. Blocker delta after the third immutable review of `3c0749d`
+
+### The residual P1, and why my own barrier missed it
+
+`/manage/add` still held `.pw-projects.lock` across `cloneWorkspace()`. A token
+rotation takes `lifecycle` and then blocks on `projects` while syncing the owner's
+projects, so it waited ~15s and returned 500 — while `users.json` already carried
+the new token and the repository still had the old helper/credential.
+
+My shipped barrier could not catch it: it patched `{role:'admin'}` against an
+EMPTY registry, so `syncProjectCredentials()` never ran and nothing contended for
+the projects lock. That is the third time a probe of mine passed because it could
+not fail; the lesson is now encoded as a rule I apply to every barrier here —
+**a barrier must be shown to fail against the defective build before it is
+trusted.** This one is: mutating `withWorkspaceLock` back to `['projects']`
+reproduces the exact 500, and reverting it restores green.
+
+### The repair
+
+A fourth lock, `workspace`, ranked between `lifecycle` and `projects`:
+
+    lifecycle  >  workspace  >  projects  >  credential
+
+- `withWorkspaceLock()` covers the long, external, latency-unbounded work —
+  clone, chown, `rm -rf`, routing, systemd — and serializes project mutations
+  against each other exactly as the projects lock used to.
+- **No latency-sensitive request ever awaits it.** Rotation, revocation, user
+  delete and login take `lifecycle`/`projects`/`credential` and never `workspace`.
+  There is a direct test: a real second process holds `workspace` while a
+  credential transition must still complete in under 2s.
+- `withProjectsLock()` is now only ever a SHORT registry transaction. `/manage/add`
+  clones with no registry lock held, then publishes in a short re-validated
+  section; `/manage/update` and `/manage/delete` do their stop/rename/`rm -rf`
+  outside it and take it only to save.
+- Failure atomicity: the record is published only after the external work
+  succeeds, so a failed clone leaves no partial project — asserted directly.
+- The 15s lock timeout is unchanged.
+
+### The barrier is now non-vacuous by construction
+
+A pre-registered alice-owned project with a real repository, a gate-stalled clone
+of a second project, and then — all while it hangs — login, a role-only PATCH, a
+real `ghToken` rotation, a real revocation, and a user delete. Each must be
+bounded (<5s) and successful, the rotation's credential must actually be on disk
+at `0600`, the revocation must actually remove artifact and helper, and the
+registry must never contain the project whose clone failed. The clone shim
+announces its own stall with a marker file, so the test cannot pass without one.

@@ -168,6 +168,7 @@ async function main() {
   const domain = makeCredentialLockDomain({
     lockPaths: {
       lifecycle: process.env.PW_LIFECYCLE_LOCK_PATH || path.join(path.dirname(process.env.PW_USERS_PATH || '/etc/project-workbench/users.json'), '.pw-lifecycle.lock'),
+      workspace: process.env.PW_WORKSPACE_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-workspace.lock'),
       projects: process.env.PW_PROJECTS_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-projects.lock'),
       credential: process.env.PW_CREDENTIAL_LOCK_PATH || path.join(path.dirname(registryPath), '.pw-credential.lock'),
     },

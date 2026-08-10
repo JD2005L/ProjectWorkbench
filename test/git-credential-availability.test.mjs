@@ -24,16 +24,18 @@ import { fileURLToPath } from 'node:url';
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
 const SENTINEL = 'ghp_SYNTHETIC_AVAILABILITY_SENTINEL';
+const ROTATED = 'ghp_SYNTHETIC_AVAILABILITY_ROTATED';
 
 // A `git` that STALLS on clone and passes everything else through, so the server
 // is doing exactly the long external work it does in production.
-function makeStallingGitDir(dir, gateFile) {
+function makeStallingGitDir(dir, gateFile, stallMarker) {
   const binDir = path.join(dir, 'stall-bin');
   fs.mkdirSync(binDir, { recursive: true });
   const realGit = execFileSync('bash', ['-lc', 'command -v git'], { encoding: 'utf8' }).trim();
   fs.writeFileSync(path.join(binDir, 'git'), `#!/usr/bin/env bash
 for a in "$@"; do
   if [ "$a" = "clone" ]; then
+    touch ${JSON.stringify(stallMarker)}
     while [ ! -e ${JSON.stringify(gateFile)} ]; do sleep 0.05; done
     exit 1
   fi
@@ -54,8 +56,9 @@ function makeInstance(port, dir) {
   fs.mkdirSync(ttyd, { recursive: true });
   fs.writeFileSync(path.join(ttyd, 'ttyd'), '#!/usr/bin/env bash\nexec sleep infinity\n', { mode: 0o755 });
   const gateFile = path.join(dir, 'release-clone');
+  const stallMarker = path.join(dir, 'clone-started');
   const env = {
-    PATH: `${makeStallingGitDir(dir, gateFile)}:${ttyd}:${process.env.PATH}`,
+    PATH: `${makeStallingGitDir(dir, gateFile, stallMarker)}:${ttyd}:${process.env.PATH}`,
     HOME: process.env.HOME,
     LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port),
@@ -73,7 +76,7 @@ function makeInstance(port, dir) {
     PW_PROJECTS_LOCK_PATH: path.join(dir, 'registry', '.pw-projects.lock'),
     PW_LIFECYCLE_LOCK_PATH: path.join(dir, 'users', '.pw-lifecycle.lock'),
   };
-  return { dir, env, secretKey, gateFile, workspaces: env.PW_WORKSPACES };
+  return { dir, env, secretKey, gateFile, stallMarker, workspaces: env.PW_WORKSPACES };
 }
 
 function encryptToken(secretKeyHex, plaintext) {
@@ -106,6 +109,16 @@ async function withServer(inst, port, fn) {
   }
 }
 
+function helpersOf(gitDir) {
+  try {
+    return execFileSync('git', ['config', '--file', path.join(gitDir, 'config'), '--get-all', 'credential.helper'], { encoding: 'utf8' })
+      .split('\n').slice(0, -1);
+  } catch (e) {
+    if (e.status === 1) return [];
+    throw e;
+  }
+}
+
 async function timed(fn) {
   const started = Date.now();
   const value = await fn();
@@ -124,7 +137,15 @@ test('a stalled clone must not take down login or user management', { timeout: 1
   const port = 3971;
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pw-avail-')));
   const inst = makeInstance(port, dir);
-  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([]));
+  // A project that is ALREADY REGISTERED to alice, with a real repository, so a
+  // token rotation genuinely reaches syncProjectCredentials. An empty registry
+  // makes the rotation a no-op and the barrier vacuous.
+  const existing = path.join(inst.workspaces, 'existing');
+  fs.mkdirSync(existing, { recursive: true });
+  execFileSync('git', ['init', '-q', existing]);
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([
+    { name: 'existing', path: existing, port: 7940, primaryUser: 'alice' },
+  ]));
   fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({
     users: [{ id: 'u-a', username: 'alice', role: 'admin', projects: '*', ghToken: encryptToken(inst.secretKey, SENTINEL) }],
   }));
@@ -143,12 +164,15 @@ test('a stalled clone must not take down login or user management', { timeout: 1
 
     // Wait until the clone is genuinely stalled inside the request.
     const deadline = Date.now() + 20000;
+    // The shim itself announces that it has entered the clone and is blocking.
+    // Anything less direct risks the whole barrier passing without a stall.
     let stalled = false;
     while (Date.now() < deadline && !stalled) {
-      try { stalled = execFileSync('bash', ['-lc', `pgrep -af 'sleep 0.05' | grep -c . || true`], { encoding: 'utf8' }).trim() !== '0'; } catch { /* retry */ }
-      if (!stalled) await new Promise((r) => setTimeout(r, 100));
+      stalled = fs.existsSync(inst.stallMarker);
+      if (!stalled) await new Promise((r) => setTimeout(r, 50));
     }
     assert.ok(stalled, 'the clone never stalled, so this test would prove nothing');
+    assert.equal(fs.existsSync(inst.gateFile), false, 'the clone must still be blocked at this point');
 
     // THE ASSERTION: availability is unaffected while that long work is in flight.
     const during = await timed(() => fetch(`${base}/api/auth/check`));
@@ -169,15 +193,60 @@ test('a stalled clone must not take down login or user management', { timeout: 1
     assert.ok(login.value.status < 500, `login returned ${login.value.status} during a slow clone — it waited on a lock and gave up`);
     assert.ok(login.ms < 5000, `login took ${login.ms}ms during a slow clone`);
 
+    // THE COLLISION THAT MATTERS: a real TOKEN ROTATION for the owner of an
+    // already-registered project. This is the one that reaches
+    // syncProjectCredentials and therefore contends for the project lock the
+    // clone is holding. A role-only PATCH never gets there and cannot fail.
     const rotate = await timed(() => fetch(`${base}/api/users/alice`, {
       method: 'PATCH',
       headers: { 'content-type': 'application/json', Origin: new URL(base).host },
-      body: JSON.stringify({ role: 'admin' }),
+      body: JSON.stringify({ ghToken: ROTATED }),
     }));
-    assert.equal(rotate.value.status, 200, 'a user update must stay available during a slow clone');
-    assert.ok(rotate.ms < 5000, `PATCH /api/users took ${rotate.ms}ms during a slow clone`);
+    assert.equal(rotate.value.status, 200,
+      `token rotation returned ${rotate.value.status} during a slow clone — the credential path is waiting on a lock held across the clone`);
+    assert.ok(rotate.ms < 5000, `token rotation took ${rotate.ms}ms during a slow clone`);
+
+    // And it must really have happened, not merely returned 200.
+    const credFile = path.join(existing, '.git', '.pw-credentials');
+    assert.equal(fs.existsSync(credFile), true, 'the rotation must have written the credential');
+    assert.match(fs.readFileSync(credFile, 'utf8'), new RegExp(`https://${ROTATED}:x-oauth-basic@github\\.com`),
+      'the rotated credential must be the one on disk');
+    assert.equal(fs.lstatSync(credFile).mode & 0o777, 0o600);
+
+    // REVOKE, still during the stalled clone: it must also stay bounded, and it
+    // must actually take effect on disk.
+    const revoke = await timed(() => fetch(`${base}/api/users/alice`, {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json', Origin: new URL(base).host },
+      body: JSON.stringify({ ghToken: '' }),
+    }));
+    assert.equal(revoke.value.status, 200, `revocation returned ${revoke.value.status} during a slow clone`);
+    assert.ok(revoke.ms < 5000, `revocation took ${revoke.ms}ms during a slow clone`);
+    assert.equal(fs.existsSync(credFile), false, 'the revocation must have removed the credential');
+    assert.deepEqual(helpersOf(path.join(existing, '.git')), [], 'and unset the helper');
+
+    // USER DELETE, still during the stalled clone.
+    const del = await timed(() => fetch(`${base}/api/users/alice`, {
+      method: 'DELETE',
+      headers: { 'content-type': 'application/json', Origin: new URL(base).host },
+      body: JSON.stringify({ confirm: 'alice' }),
+    }));
+    assert.ok(del.value.status < 500, `user delete returned ${del.value.status} during a slow clone`);
+    assert.ok(del.ms < 5000, `user delete took ${del.ms}ms during a slow clone`);
+
+    // The registry must be coherent: whatever happened, no half state.
+    const registry = JSON.parse(fs.readFileSync(inst.env.PW_REGISTRY_PATH, 'utf8'));
+    assert.ok(Array.isArray(registry), 'the registry must remain valid JSON throughout');
+    assert.equal(registry.some((r) => r.name === 'slowclone'), false,
+      'a project whose clone never finished must not be published');
 
     fs.writeFileSync(inst.gateFile, 'go');
-    await adding;
+    const addResult = await adding;
+    assert.ok(addResult.status !== 200, 'the failed clone must not report success');
+
+    // Failure-atomic: the failed add left nothing behind in the registry.
+    const after = JSON.parse(fs.readFileSync(inst.env.PW_REGISTRY_PATH, 'utf8'));
+    assert.equal(after.some((r) => r.name === 'slowclone'), false,
+      'a failed clone must leave no usable partial project');
   });
 });

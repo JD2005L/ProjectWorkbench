@@ -16,7 +16,7 @@
 //
 // There is ONE canonical total order:
 //
-//     lifecycle  >  projects  >  credential
+//     lifecycle  >  workspace  >  projects  >  credential
 //
 // Every operation names the locks it needs and acquires them in that order.
 // Because every acquisition is a PREFIX-CONSISTENT walk of a single total order,
@@ -49,7 +49,12 @@ import { withLifecycleLock } from './lifecycle-lock.js';
 
 // Lowest rank is acquired first. Adding a lock means placing it in this list,
 // which is the whole specification of the ordering.
-export const LOCK_ORDER = ['lifecycle', 'projects', 'credential'];
+// `workspace` is the one that may legitimately be held for a long time: cloning,
+// chown, rm -rf, routing and systemd all happen under it, and nothing latency
+// sensitive waits on it. `projects` sits BELOW it so a registry transaction stays
+// short — that is the lock a credential rotation waits on, and it must never be
+// held across a network clone.
+export const LOCK_ORDER = ['lifecycle', 'workspace', 'projects', 'credential'];
 
 const RANK = new Map(LOCK_ORDER.map((name, i) => [name, i]));
 

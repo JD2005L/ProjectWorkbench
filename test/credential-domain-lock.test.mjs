@@ -25,6 +25,7 @@ function tmpDir() {
 function lockPathsIn(dir) {
   return {
     lifecycle: path.join(dir, '.lifecycle.lock'),
+    workspace: path.join(dir, '.workspace.lock'),
     projects: path.join(dir, '.projects.lock'),
     credential: path.join(dir, '.credential.lock'),
   };
@@ -70,8 +71,28 @@ await domain.withLocks(${JSON.stringify(names)}, async () => {
   return { child, logs, exited };
 }
 
-test('the canonical order is lifecycle > projects > credential', () => {
-  assert.deepEqual(LOCK_ORDER, ['lifecycle', 'projects', 'credential']);
+test('the canonical order is lifecycle > workspace > projects > credential', () => {
+  assert.deepEqual(LOCK_ORDER, ['lifecycle', 'workspace', 'projects', 'credential']);
+});
+
+test('latency-sensitive credential work never awaits the long-running workspace lock', async () => {
+  const dir = tmpDir();
+  const domain = domainIn(dir);
+  const holdFile = path.join(dir, 'held');
+  const releaseFile = path.join(dir, 'release');
+  // A real second process holds `workspace` — the lock that a clone, a chown or a
+  // systemd call sits under. Nothing on the credential path may wait for it.
+  const { logs, exited } = startHolder(dir, ['workspace'], { holdFile, releaseFile });
+  assert.equal(await until(() => fs.existsSync(holdFile)), true, `holder never took the lock: ${logs.join('')}`);
+
+  const started = Date.now();
+  const out = await domain.withLocks(['lifecycle', 'projects', 'credential'], async () => 'rotated');
+  const ms = Date.now() - started;
+  assert.equal(out, 'rotated');
+  assert.ok(ms < 2000, `a credential transition waited ${ms}ms on the workspace lock — it must never await it`);
+
+  fs.writeFileSync(releaseFile, 'go\n');
+  await exited;
 });
 
 test('acquiring in canonical order runs the body once, holding every named lock', async () => {
