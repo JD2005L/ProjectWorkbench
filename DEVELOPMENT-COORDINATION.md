@@ -1693,3 +1693,82 @@ This is the controlling product objective for the coordinated work:
 5. The repository must be reviewed for the most practical maintainable design, with future canonical updates expected to flow to every environment without repeatedly rebuilding environment-specific fixes.
 6. Final acceptance requires one frozen exact SHA, canonical CI, and the explicitly assigned PVI/PVE and GOA environment evidence against that same SHA.
 7. Merge and deployment remain separate gates. This objective does not itself authorize Candidate C, merge, deployment, service changes, or runtime remediation.
+
+---
+
+## Hermes-James — Round 10 — Candidate A merged; Candidate B rebase-free integration required
+
+**Verdict: Candidate A is READY and MERGED.** This entry is appended, not a revision of any prior
+round. Rounds 1–9 and the James objective above stand exactly as written, including the Round 9 BLOCK
+on PR #31 — that verdict was correct when issued and is not retracted by this one.
+
+### Candidate A — frozen identity and disposition
+
+- Reviewed exact head: `692e08a56d1c536cd7df6797bdeb77a64318a4e3` (PR #35)
+- Immutable review verdict: **READY**
+- Squash-merged to canonical `main` as `fc0c266f6cfcbb9c84af57528ade8ac3849901b9`
+- `main`'s `app/`, `scripts/` and `test/` are byte-identical to the reviewed head, so what was
+  reviewed is what landed.
+
+### READY evidence, bound to `692e08a5`
+
+| Gate | Result |
+|---|---|
+| Canonical `npm ci && npm test` (dependency-installed) | **936 tests, 933 pass, 0 fail, 3 skipped** |
+| Exact-head GitHub CI | **green** — 936 tests, 0 fail, 20 skipped |
+| PVI2 real privilege boundary | **non-vacuous**: driver uid **0**, workspace owner resolved independently from passwd as uid **1000**, asserted to differ; artifact lands owner-owned `0600` |
+| A31-1 … A31-6 | all discharged |
+| Clone/rotation availability barrier | green, and **proven able to fail** by mutation |
+| Audit CLI P2 | verified |
+
+The 3 canonical skips are pre-existing orchestrator privilege-drop assertions that self-declare they
+cannot fail when the suite runs as the workspace account. They are reported, not silently absorbed.
+
+Two points are worth recording because they cost three review rounds:
+
+1. **A barrier that cannot fail is not evidence.** Candidate A shipped three probes that passed
+   vacuously — a `0644` fixture that never reproduced the real root-owned `0600` shape, and a
+   role-only PATCH against an empty registry that never reached the credential path. Each was caught
+   by independent review, not by the lane. The accepted head proves its availability barrier by
+   mutating production back to the defective shape and showing the test fails.
+2. **Ordering is not sufficient; scope matters.** A correctly ordered lock domain still caused a P1
+   outage because a 300s `git clone` was inside it. The accepted design separates a long-running
+   `workspace` lock from the short `projects` registry transaction, so no latency-sensitive request
+   ever waits on external work. The 15s lock timeout was not raised.
+
+### Superseded heads — not deployable
+
+The following remain closed/superseded and must not be merged, deployed, cherry-picked, or used as a
+base. They are reference-only:
+
+- PR #31, head `81225ea15ff142a5a86f1a4f56a571c4f8a44b9a` — closed, Round 9 BLOCK
+- PR #33, head `2e2cd052d73e…` — closed
+- Prior PR #35 heads `eea352bf…`, `5e69ea7b…`, `3c0749d4…` — superseded by `692e08a5`
+
+Only `fc0c266f6cfcbb9c84af57528ade8ac3849901b9` carries the accepted Candidate A implementation.
+
+### Candidate B (GOA lane) — required integration method
+
+Candidate B's head `2f741efb064d0b952e0da624fc3ae3454da664eb`
+(`origin/goa/candidate-b-env-contract`) has an actual merge base of
+`40c15207af5868149c4d2ce489a47199f596b451`, confirmed by `git merge-base`. It therefore does **not**
+contain Candidate A, and its CI has never run against the merged tree.
+
+GOA must, on that branch:
+
+1. **Merge exact `fc0c266f6cfcbb9c84af57528ade8ac3849901b9` into the branch.** A real merge commit —
+   **no rebase, no force-push, no history rewrite.** The branch history is append-only.
+2. Resolve conflicts in favour of preserving Candidate A's merged behaviour; Candidate A's security
+   invariants are not renegotiable by conflict resolution.
+3. Rerun focused tests, the full dependency-installed canonical suite, and exact-head CI **after** the
+   merge.
+4. Present a **new exact head** for immutable review. Evidence bound to any pre-merge head, including
+   `2f741ef`, does not carry over.
+
+### Sequencing
+
+- **Candidate C starts only after Candidate B merges.** It remains unauthorized until then.
+- **No deployment occurs yet.** Merge and deployment remain separate gates, per the James objective
+  above. Candidate A being on `main` authorizes neither a PVI/PVE nor a GOA rollout.
+- Environment evidence against the single converged SHA is still owed by both sides before any
+  deployment gate is opened.
