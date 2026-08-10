@@ -323,3 +323,34 @@ test('install.sh ships the shell half and generates the contract without clobber
   assert.ok(!/pw-env-write[^\n]*--force/.test(sh),
     'a re-run of the installer must never overwrite an operator’s tuned contract');
 });
+
+test('REGRESSION: a key that does not apply to the mode is never written, whatever the ambient environment says', async (t) => {
+  // Found by the offline runner (scripts/pw-test-offline.mjs), which pins TMUX_TMPDIR to an isolated
+  // socket root. The generator copies live environment values, so `pw-env-write --mode host` run
+  // from ANY shell with TMUX_TMPDIR set — a tmux pane, a test harness, a container-oriented
+  // developer's terminal — wrote a socket root into a HOST contract. Host mode has to share the
+  // per-user default socket with project-terminal-start and app/server.js; a pinned root there is
+  // the "second, invisible server that no terminal ever attaches to" the keepalive warns about, and
+  // every session would look lost.
+  const dir = await tmp();
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  const out = path.join(dir, 'pw.env');
+
+  await execFileAsync('node', [ENV_WRITE, '--mode', 'host', '--out', out], {
+    env: { ...process.env, TMUX_TMPDIR: '/some/ambient/socket/root', PW_TMUX_OWNER_REQUIRED: 'true' },
+  });
+  const host = await fsp.readFile(out, 'utf8');
+  assert.ok(!/TMUX_TMPDIR/.test(host), 'a container-only key must not reach a host contract');
+  assert.match(host, /^PW_TMUX_OWNER_REQUIRED=true$/m, 'and a host-only key must still be written');
+
+  // The mirror image: a host-only key must not reach a container contract.
+  await execFileAsync('node', [ENV_WRITE, '--mode', 'container', '--out', out, '--force'], {
+    env: { ...process.env, TMUX_TMPDIR: '/opt/project-workbench/run/tmux', PW_TMUX_OWNER_REQUIRED: 'true' },
+  });
+  const container = await fsp.readFile(out, 'utf8');
+  assert.ok(!/PW_TMUX_OWNER_REQUIRED/.test(container), 'the host owner gate is meaningless in container mode');
+  assert.match(container, /^TMUX_TMPDIR=\/opt\/project-workbench\/run\/tmux$/m);
+
+  // And serialisation filters on the mode it is given, not on what happens to be in the object.
+  assert.ok(!/TMUX_TMPDIR/.test(serialisePwEnv({ ...defaultPwEnv('host'), TMUX_TMPDIR: '/x' }, { mode: 'host' })));
+});

@@ -148,15 +148,25 @@ export function serialisePwEnv(values, { mode = values.PW_DEPLOY_MODE || 'host',
     '# NOTHING SECRET BELONGS IN THIS FILE. Paths, the deploy mode, and feature flags only.',
     '',
   ];
+  const resolvedMode = String(mode || 'host').toLowerCase() === 'container' ? 'container' : 'host';
   for (const spec of PW_ENV_KEYS) {
     const value = values[spec.key];
     if (value === undefined || value === null || value === '') continue;
+    // A key that does not apply to THIS mode is never written, however it got into `values`.
+    //
+    // Found by the offline runner, which sets TMUX_TMPDIR to an isolated socket root: the generator
+    // copies live environment values, so running `pw-env-write --mode host` from any shell that has
+    // TMUX_TMPDIR set — a tmux pane, a test harness, a container-oriented developer's terminal —
+    // wrote a socket root into a HOST contract. Host mode must share the per-user default socket
+    // with project-terminal-start and server.js; pinning a different root there is exactly the
+    // "second, invisible server that no terminal ever attaches to" the keepalive warns about, and
+    // the sessions would look lost.
+    if (!spec.modes.includes(resolvedMode)) continue;
     const scope = spec.modes.length === 1 ? ` (${spec.modes[0]} mode only)` : '';
     out.push(`# ${spec.purpose}${scope}`);
     out.push(`${spec.key}=${value}`);
     out.push('');
   }
-  void mode;
   return out.join('\n');
 }
 
