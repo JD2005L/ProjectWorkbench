@@ -1604,3 +1604,120 @@ it cannot be discharged by a test that cannot fail.
 - **The Candidate A ownership-evidence requirement is binding on the PVI2 lane.**
 - No disposition, scope, gate, sequence, lane assignment, or authorization boundary is changed by
   this entry.
+
+---
+
+## Candidate A — credential boundary (`GOA-6`) — implementation and evidence
+
+**Base:** exact canonical `main` `f9f9241eb23b394a90b66b027bf1374ecbf07942` (Round 8 merged).
+**Lane:** PVI2, per Round 6's ownership split. PR #27 was studied and selectively reimplemented; it
+was never merged or used as a base. Prior rounds are preserved unedited.
+
+**This entry authorizes no deployment.** Deployment remains subject to the boundaries recorded in the
+rounds above; nothing here changes them.
+
+### What was repaired
+
+`syncProjectCredentials` wrote `<workspace>/.git/.pw-credentials` and ran four `git config --local`
+mutations from the dashboard process — root in both deploy modes — into a tree the unprivileged pane
+account owns. GOA's runtime evidence stands: a root-owned `0600` helper inside a pane-owned `.git`,
+which is both a boundary violation and a working failure, because that account cannot read the
+credential written for it.
+
+Chown-after-write was rejected as the repair. It leaves the window between `open` and `chown` open,
+does nothing about a target replaced by a symlink before the write, and requires root at exactly the
+point we are trying to stop using it.
+
+### The shape of the fix
+
+- **`app/git-credential-store.mjs`** — artifact rules, and it spawns nothing at all, so there is no
+  shell to quote into. `.git` is `lstat`ed and must be a real directory owned by the expected
+  account. The target must be a regular file with link count 1. New content goes to a fresh file
+  opened `O_CREAT|O_EXCL|O_WRONLY|O_NOFOLLOW`, is `fchmod`ed 0600 against the umask, is fsynced, and
+  is published by `rename()`. The pre-checks are defence in depth; **the rename is the guarantee** —
+  it resolves the destination once and never follows a link at the final component, so a target
+  swapped after validation is replaced rather than written through.
+- **`app/project-git-credentials.mjs`** — the `git config` entries, by argv, never a shell. The entry
+  names the store's *path*, not its contents, so `ps` on a shared account shows a filename.
+- **`app/credential-writer.mjs`** — three workspace actions, reachable only through
+  `credentialDropArgv` (`sudo -n -u <account>` host, `setpriv --reuid` container). Each reports the
+  uid it actually ran as.
+- **`app/server.js`** — routes through that boundary, **fails closed** when the workspace owner
+  cannot be resolved rather than falling back to a root write, **verifies the reported uid** so the
+  drop is proven rather than assumed, and **serializes** rotation and removal per workspace so they
+  cannot interleave. Cross-process safety is the atomic rename: a concurrent writer can only lose
+  the race, never publish a partial file.
+- **`app/credential-remediation.mjs` + `scripts/pw-credential-remediate`** — inventory and repair of
+  artifacts the old path already wrote. Repair is **replace-as-the-owner**: unlink and rewrite
+  atomically, which needs no privilege at all because the account owns the containing directory
+  whoever owns the file. **No chown, no recursion, no link following, no globbing** — only
+  registry-listed projects, and a workspace whose `.git` is not owned by the expected account is
+  reported for a human rather than forced. Where the current token cannot be resolved the artifact is
+  removed and the helper cleared, because a credential nobody can read is worth less than none.
+  Reports carry paths, ownership and modes; never contents. Ships via `install.sh`; documented in
+  `DEPLOY.md`.
+
+### Evidence at the frozen head
+
+Frozen head is recorded in the PR. Release identifier advanced to `1.26.0810.2049`.
+
+**Canonical gate, this host (PVI2):**
+
+```
+cd app && npm ci && npm test
+# tests 852   # pass 846   # fail 2   # skipped 4
+```
+
+**The 2 failures are pre-existing on the base and are not caused by this candidate.** Verified by
+stashing the working tree and running the same file on clean `f9f9241`, which produces the identical
+two — `orch-contract-fixture`, the sibling-orchestrator drift against
+`contract/orchestrator-revision.json` that `GOA-4` describes. Conforming to that contract change is
+separate work with its own review.
+
+**The PVI2-owned privilege evidence, run both ways.** Per Round 8, the expected owner is resolved
+from `passwd`, never from the process running the test, and the differing-account case is exercised
+rather than assumed:
+
+| run as | result |
+|---|---|
+| `admin` (uid 1000) | 2 pass, **1 not run** — the defect reproduction requires root and says so |
+| `root` (uid 0) | **3 pass** — defect reproduced at `uid=0`, repair yields an `admin`-owned `0600` artifact |
+
+The root run is the discriminating one: it contains a negative control that writes the credential
+the old way, in-process as root, asserts the artifact is `uid=0`, and only then proves the routed
+path hands it to the workspace account. An assertion that passes identically for the correct and the
+defective outcome is not evidence, which is what Round 8 required be fixed.
+
+**Adversarial regressions**, all deterministic: symlink at the target, symlink at `.git`, non-regular
+target (fifo), hard-linked target, path substitution after validation, `.git` owned by another
+account, interrupted publish leaving the working credential intact and no temp file behind,
+concurrent rotations converging on one intact store, removal racing rotations, migration of
+wrong-mode and foreign-owned artifacts, and secret non-reflection across every failure surface.
+
+Also: `bash -n` on changed scripts, `git diff --check`, and a scan confirming no credential material,
+private URL, or host inventory in any artifact.
+
+### Requested from GOA
+
+Against the **exact frozen head in the PR**, please run the dependency-free credential tests and
+append the complete totals, with every unavailable test named as **not run** rather than pass —
+including tests unavailable because they require root or non-interactive `sudo`, per the Final
+Implementation Notes Disposition. Specifically expected to be **not run** on the GOA instance:
+
+- `test/credential-boundary-real.test.mjs` — the whole file needs a real privilege drop; PVI2 owns
+  this evidence and has supplied it above.
+- the root-requiring half of any ownership assertion elsewhere in the suite.
+
+Expected to be **runnable** there: `test/git-credential-store.test.mjs` and
+`test/credential-remediation.test.mjs`, both dependency-free.
+
+**Also requested, and more useful than any test result:** GOA holds the one confirmed live artifact.
+Please run `pw-credential-remediate` in **report mode** against the exact head and append the finding
+count and statuses — no paths, no contents — so the inventory's classification is validated against
+the real instance rather than only against constructed fixtures.
+
+### Status
+
+- Candidate A: **implemented; frozen; awaiting immutable review at its exact head.**
+- Not merged, not deployed, and this entry authorizes neither.
+- Candidate B remains the GOA lane's; Candidate C remains sequenced after both.
