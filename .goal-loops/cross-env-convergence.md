@@ -108,3 +108,28 @@ head Hermes-James will review.
 Branch `fix/cross-env-convergence` created at `de7f858`. Assessment complete; criteria above.
 </content>
 </invoke>
+
+### 2026-08-10 — iterations 1–13 (complete)
+
+All increments landed. Commits: `617d49a` (contract, readiness, ownership gate, installer gate,
+MemoryHigh, deploy mode, offline target, hermetic harness), `98f3eca` (GOA-6 git credentials,
+GOA-2 documentation, VERSION + CI), `4258531` (pw-env mode filtering, found by the offline runner).
+
+Frozen head verification:
+- `cd app && npm ci && npm test` → 913 tests, 908 pass, **2 fail**, 3 skipped.
+  Both failures are the sibling-orchestrator contract drift, **verified pre-existing on `de7f858`**
+  by stashing the tree and re-running. Not a regression; recorded in the coordination round.
+- `npm run test:offline` → 760 tests, 755 pass, 2 fail (the same two), 3 skipped.
+- `PW_ORCHESTRATOR_CONTRACT_ROOT=/nonexistent npm run test:offline` → 760 tests, 752 pass,
+  **0 fail**, 8 skipped. This is the GOA-reproducible number.
+- `systemd-analyze verify systemd/pw-tmux-server.service` clean; `MemoryHigh=12884901888` on a
+  16 GiB host; `bash -n` on all changed scripts; `git diff --check` clean.
+
+Notable findings made while implementing, both recorded for GOA:
+1. Ambient `PW_TMUX_HOST_MODE` (inherited by any shell inside a PW pane) silently forced
+   container-mode tests down the host branch — the GOA-7 class, one variable wider than reported.
+2. PVI2's mawk 1.3.4 20240123 does **not** clamp the old MemoryHigh formula; GOA's 20200120 does.
+   Same implementation and major version, different answer — a stronger argument for dropping awk
+   than "mawk overflows".
+3. The offline runner caught a real defect in `pw-env-write`: it copied an ambient `TMUX_TMPDIR`
+   into a host contract, pinning a socket root host mode must not have.

@@ -718,3 +718,329 @@ canonical `main` at all, and because resolving it also discharges `HJ-24-5`.
   (`app/orchestrator/runner/privilege.js:396`).
 - Round 1's local-commit-only delivery is resolved: GOA can now write to this file
   directly, so future rounds will not depend on screenshot relay.
+
+---
+
+## Hermes-James / PVI2 — Round 3 — integration candidate
+
+**Base:** canonical `main` `de7f858ef9ef2affa001bb1073b04965259ddf43`.
+**Branch:** `fix/cross-env-convergence`. **Candidate head: `4258531` (exact SHA below).**
+
+PR #24's reviewed head `43625e4` was **not** built on, merged, or edited. Its intended
+dedicated-host-tmux-owner delta was reconciled onto current `main` by hand, together with the
+repairs for every open item. This satisfies Round 2's integration condition 1 (one candidate derived
+from current canonical `main`) and condition 5 (PR #24's reviewed head is untouched).
+
+### Disposition summary
+
+| ID | Disposition | Where it landed |
+|---|---|---|
+| `HJ-24-1` | **RESOLVED** | `Type=notify` owner unit + readiness proof in the keepalive; no-manifest cold-start regression |
+| `HJ-24-2` | **RESOLVED** | `scripts/pw-tmux-assert-owner` + fail-closed gate in `project-terminal-start`; installer no longer fails open |
+| `HJ-24-3` | **RESOLVED** | `scripts/pw-mem-high` (64-bit shell arithmetic) + executable tests + systemd validation |
+| `HJ-24-4` | **RESOLVED in-repo; one item is repo-admin and is NOT claimed** | `app/VERSION` advanced; workflow triggers broadened |
+| `HJ-24-5` | **RESOLVED** | folded into the `GOA-1` environment contract, as GOA proposed |
+| `GOA-1` | **AGREE — RESOLVED** | `/etc/project-workbench/pw.env`, generated, consumed by both modes; misconfiguration now exits non-zero |
+| `GOA-2` | **AGREE — partially delivered, limitation documented** | opt-in restore-on-start; `DEPLOY.md` states exactly what is and is not supported |
+| `GOA-3` | **AGREE — RESOLVED** | `install.sh` is deploy-mode gated; fail-closed behaviour is host-mode-only |
+| `GOA-4` | **AGREE — RESOLVED** | fixture honours `PW_ORCHESTRATOR_CONTRACT_ROOT`; `npm run test:offline` added; `npm ci` gate unchanged |
+| `GOA-5` | **AGREE — RESOLVED** | `app/deploy-mode.js`; explicit modes preserved, ambiguity fails safely |
+| `GOA-6` | **AGREE on the product instance — RESOLVED**; the workspace-ownership question is answered below | `syncProjectCredentials` routed through the privilege-dropped helper |
+| `GOA-7` | **AGREE — RESOLVED, and widened** | `test/tmux-env.mjs`; a variable class the report did not name is included |
+
+### HJ-24-1 — readiness
+
+`systemd/pw-tmux-server.service` is `Type=notify` with `NotifyAccess=all`, and
+`scripts/pw-tmux-keepalive.sh` signals `--ready` only after confirming the server **and** the
+`_keepalive` session on the intended socket. A start that cannot produce a server exits non-zero and
+never signals, so the unit start fails instead of sitting active with nothing behind it. Signalling
+is conditional on `NOTIFY_SOCKET` and can never become an exit path — GOA's stated constraint, and
+covered by a test that runs the sidecar path with no notifier at all.
+
+The regression uses the **no-manifest** path GOA identified: with a manifest present,
+`ExecStartPost=pw-tmux-restore` creates the server itself, in the owner's cgroup, and masks the bug.
+
+Ownership is asserted on the process and the cgroup, not on unit text:
+
+- The keepalive exports `PW_TMUX_OWNER` **before** creating the server, so the tmux daemon inherits
+  it and `/proc/<server-pid>/environ` carries proof of which process created it. A **negative
+  control** — letting a client create the server first — has no marker, so the assertion
+  demonstrably discriminates instead of being vacuously true.
+- A released client is then shown to attach to the owner's server: same pid before and after, marker
+  intact.
+- The server's cgroup is asserted equal to its **creator's**, which is the causal chain behind the
+  2026-08-03 incident.
+- The **cgroup branch** of the ownership check is exercised against a faked `/proc`
+  (`PW_TMUX_PROC_ROOT`), including a server placed in a `project-terminal@Demo.service` cgroup.
+  Stated plainly: every process in the test shares the runner's cgroup, so a real-process cgroup
+  comparison could not discriminate there; the faked root is what makes that branch testable — and
+  it needs no systemd, so GOA can run it too.
+
+### HJ-24-2 + GOA-3 — fail closed, host-mode only
+
+`scripts/pw-tmux-assert-owner` returns `0` owned, `3` no server, `4` foreign-owned, `78` ambiguous
+mode. `project-terminal-start` calls it before touching tmux and refuses on `3` and `4` with the
+action that fixes each. `Restart=on-failure` then keeps the unit pending, which is recoverable;
+creating the server there is not.
+
+`install.sh` resolves the deploy mode once and gates the owner unit, its `enable --now`, and the
+`MemoryHigh` drop-in on `host`. A failed owner start now **ends the install** instead of warning.
+Ambiguous mode stops the install. `PW_TMUX_OWNER_REQUIRED=false` is the documented opt-out.
+
+`project-setup-terminal.service` is deliberately **not** gated, and the unit says so: it is the CLI
+sign-in path an operator needs when the instance is already unhealthy, so refusing it would remove
+the tool used to repair the box. It is protected by ordering plus readiness only.
+
+On GOA-3's secondary, unverified concern (units overwritten unconditionally): **not addressed in
+this change.** We have no evidence of local unit drift on PVI2 and would rather not add a `--force`
+gate on a hypothesis. Raise it as its own item with a concrete instance if you see one.
+
+### HJ-24-3 — MemoryHigh, and a portability finding
+
+`scripts/pw-mem-high` replaces the awk expression with 64-bit shell arithmetic
+(`kb * 1024 * percent / 100`, multiplying before dividing so it never leaves integer space).
+
+Running the **old** formula under `mawk` on both baselines gives different answers:
+
+| build | `printf "%d", $2 * 1024 * 0.75` on 16 GiB |
+|---|---|
+| mawk 1.3.4 20200120 (GOA, Debian 12) | `2147483647` |
+| mawk 1.3.4 20240123 (PVI2) | `12884901888` |
+
+Same implementation, same major version, same expression. So the fix is not "avoid mawk", and it is
+certainly not "use `%.0f` and assume" — the value must not depend on which awk build a host ships.
+The test asserts the clamp where it can be observed and reports it where it cannot, rather than
+passing quietly on a host that cannot demonstrate it.
+
+Asserted byte values: 4 GiB → `3221225472`; 16 GiB → `12884901888`; the 7865348 kB GOA box →
+`6040587264` (matching your table); 512 GiB → `412316860416`.
+
+**Effective value on PVI2** (MemTotal 16777216 kB): `MemoryHigh=12884901888` (12 GiB).
+`systemd-analyze verify` accepts the generated unit; systemd 255. The only diagnostic emitted is the
+pre-existing `KillMode=none` deprecation notice on `pw-tmux-persist.service`, unchanged from `main`.
+
+### HJ-24-4 — release gate and CI
+
+`app/VERSION` → `1.26.0810.1941`; `test/release-version.test.mjs` passes at this head.
+
+The workflow was **not** the cause of the missing runs — `pull_request` and `fetch-depth: 0` were
+already there. What it lacked was a fallback: `push` was filtered to two branch names, so a pushed
+branch produced nothing when no `pull_request` run appeared. `push:` now has no branch filter, and
+`workflow_dispatch` is added, so a reviewed SHA gets a check run bound to itself.
+
+**Not claimed:** whether a required status check is *bound* to PR head SHAs is branch protection. It
+is not verifiable from inside the repository and no assertion here pretends otherwise. Until an
+administrator confirms it, "required CI is green" should be read as "a run exists for this exact SHA
+and it passed", which is checkable from the API.
+
+### GOA-1 + HJ-24-5 — the environment contract
+
+One non-secret file, `/etc/project-workbench/pw.env`, defined in `app/pw-env.js`, generated by
+`scripts/pw-env-write`, with a shell counterpart in `scripts/pw-env.sh`. Keys cover the mode, every
+path (`PW_APP_DIR`, `PW_REGISTRY_PATH`, `PW_CANONICAL_REGISTRY`, `PW_USERS_PATH`,
+`PW_SESSIONS_PATH`, `PW_WORKSPACES`, `PW_AUDIT_LOG`, `PW_TMUX_STATE_DIR`), and the per-user values
+(`PW_PER_USER_CLAUDE`, `PW_USER_CRED_BASE`), plus the per-mode values `PW_TMUX_OWNER_REQUIRED` and
+`TMUX_TMPDIR`.
+
+Consumed via `EnvironmentFile=` by the dashboard, both terminal units, `pw-tmux-persist`,
+`pw-tmux-save` and the owner; via podman `--env-file` by the sidecar. Already-set variables win,
+because systemd has applied `EnvironmentFile=` by the time a unit's script runs.
+
+**Misconfiguration is no longer "nothing to restore".** `pw-tmux-restore` exits `78` (`EX_CONFIG`)
+naming the variable and the path when the state dir, registry or app dir is missing or the wrong
+type. The state dir is checked **before** the manifest, because an unmounted state dir (your sidecar
+case) and an absent manifest previously produced the same silent exit 0. A correctly configured
+instance with nothing saved still exits 0 silently. Identity resolution is unchanged and still
+fail-closed.
+
+HJ-24-5 is covered by a regression in which `PW_PER_USER_CLAUDE=true` exists **only** in the env
+file: if the file is not read, the session is created under the shared login and the test fails.
+
+The generator seeds only when absent, so operator tuning survives an update; `--check` validates an
+existing file at install time.
+
+### GOA-2 — container parity: what is delivered, and what is not
+
+Delivered: the keepalive supports `PW_TMUX_RESTORE_ON_START=1`, replaying the manifest into the
+server it owns **before** readiness, with `PW_TMUX_RESTORE_BIN` overridable. A restore failure is
+logged and never stops supervision — holding the server open is the process's job.
+
+**Not delivered, and stated in `DEPLOY.md` rather than implied:** this needs the persistence state
+dir bind-mounted into the sidecar, which the image does not provide. Without the mount, a restart
+still returns to an empty server; with the flag but no mount, `pw-tmux-restore` now exits non-zero
+and says so instead of reporting success. Host mode's boot-time `pw-tmux-persist.service` and its
+`ExecStop` snapshot have **no container equivalent** here — periodic snapshots in container mode
+need a scheduler inside the sidecar or an external timer invoking `pw-tmux-save`. We are not
+claiming parity that does not exist.
+
+### GOA-4 — a gate both sides can run
+
+`test/orch-contract-fixture.test.mjs` now imports the resolved root from
+`scripts/orch-contract-pin.mjs`, so `PW_ORCHESTRATOR_CONTRACT_ROOT` moves both.
+
+`npm run test:offline` runs every test that needs no dependency. The subset is a property of the
+**commit**, not of the machine: it is computed identically whether or not `express` is installed
+(proved by classifying a synthetic tree with and without a populated `node_modules`), it pins a
+short isolated `TMUX_TMPDIR`, and it clears ambient `TMUX*`/`PW_TMUX_*`. Every exclusion is printed
+with its reason via `npm run test:offline:list`. `npm ci && npm test` remains the canonical gate,
+and CI runs both — the offline job deliberately performs no install step, which is what proves the
+target is genuinely dependency-free.
+
+The offline runner immediately earned itself: it caught a real defect in `pw-env-write`, which
+copied an ambient `TMUX_TMPDIR` into a **host** contract. That would pin a socket root host mode
+must not have — the "second, invisible server no terminal ever attaches to" — for any operator who
+happened to generate the file from a tmux-using shell. Fixed in `4258531` and regression-tested.
+
+### GOA-5 — deploy mode
+
+`app/deploy-mode.js` is the single resolver, used by `terminal-owner.js`, `terminal-priv.js`,
+`orchestrator/config.js` and `server.js`. Explicit `host`/`container` is always honoured and always
+beats evidence. Unset with no container evidence stays `host`, because that is what every existing
+`install.sh` deployment looks like. An unrecognised value, or an unset value with container evidence
+(`container=`, `PW_TERMINAL_UID`, `/run/.containerenv`, `/.dockerenv`), is ambiguous:
+`terminalOwnerPlan` returns its existing `invalid` refusal, the orchestrator config throws, and the
+dashboard exits `78` at startup naming the variable. `TMUX_TMPDIR` is deliberately **not** evidence
+— refusing to boot a working host box over an ambient variable is not failing safely.
+
+### GOA-6 — answering your questions, and the product fix
+
+**Do we observe root-owned objects/refs in host-mode workspaces?** Not as a standing condition on
+PVI2, and we have not reproduced your `.git/objects` ownership pattern here. **Do we gate root-run
+CLI sessions?** No. PW terminals run as the pane account, but nothing prevents an operator opening a
+root shell in a workspace, so we agree your local cause (prior root-run CLI sessions) is plausible
+and is operator process rather than product.
+
+The product instance is **agreed and fixed**. `syncProjectCredentials` ran `git -C <workspace>
+config --local` three times and wrote `<workspace>/.git/.pw-credentials` from the dashboard process,
+which is root in both deploy modes, into a tree the pane account owns. It is a privilege boundary as
+well as an ownership bug: Git config can name programs to execute (`core.pager`,
+`credential.helper`, `core.fsmonitor`). The work now runs through the **same** privilege-dropped
+helper the per-user credential tree uses (`app/credential-writer.mjs` via `credentialDropArgv` —
+`sudo -u <account>` in host mode, `setpriv --reuid` in container mode), with the token on stdin so
+it never reaches a command line. An unresolvable pane account fails closed rather than falling back
+to a root write.
+
+A real-process test asserts the resulting **ownership** of both `.git/config` and
+`.git/.pw-credentials`, skipping by name where non-interactive `sudo` is unavailable. Per your
+framing and ours: **no recursive chown of existing worktrees was added** — that would rewrite files
+the product never created — and a test pins the count of pre-existing recursive chowns so a fourth
+has to be argued for.
+
+### GOA-7 — all five properties, plus one you did not name
+
+Properties 1–5 are implemented in `test/tmux-env.mjs` and applied to every tmux-backed test file.
+Property 4's paired run is `test/tmux-hermetic.test.mjs`, which executes a small probe twice — once
+under an adversarial ambient environment, once cleared — and requires identical totals. It runs a
+dedicated probe rather than the full owner file so the parity evidence does not cost minutes for no
+extra signal. Your addition on short socket roots is implemented and asserted: the harness reports
+an over-long `sun_path` as itself instead of letting tmux say "File name too long".
+
+**The addition.** Ambient `TMUX_TMPDIR` moves where a test *looks*. Ambient **`PW_TMUX_HOST_MODE`**
+moves what the script *does* — and a developer shell inside a Project Workbench pane inherits it
+from the owner unit. We hit this while building the harness: every "container mode" assertion
+silently ran the host branch, the script unset `TMUX_TMPDIR`, the socket landed in the per-user
+default dir, and the container-mode test failed against a completely healthy script. A container-mode
+regression would sail straight through on such a host. The sanitizer therefore also strips
+`PW_TMUX_*`, `PW_DEPLOY_MODE`, `PW_ENV_FILE` and `NOTIFY_SOCKET`. Cleanup refuses any socket name
+without the harness prefix, so it can never reap a real Project Workbench server.
+
+### Verification on PVI2 (host-shaped), at the exact candidate head
+
+Toolchain: node `v22.23.2`, npm `10.9.8`, tmux `3.4`, mawk `1.3.4 20240123`, bash `5.2.21(1)`,
+jq `jq-1.7`, systemd `255`.
+
+```
+cd app && npm ci && npm test
+# tests 913   # pass 908   # fail 2   # skipped 3   # duration_ms 98176
+```
+
+**Both failures are pre-existing on canonical `main` and are not caused by this candidate.** Verified
+by stashing the working tree and running the same file on `de7f858`, which produces the identical two:
+
+```
+drift: the orchestrator contract has not moved since this repository was conformed to it
+cross-contract: the MCP tool set matches ALLOWED_CLIENT_METHODS plus the §9 additions
+```
+
+They are the PVI2-only asymmetry `GOA-4` describes: the sibling orchestrator working tree has moved
+past `contract/orchestrator-revision.json`'s pin. Conforming to that contract change is a separate
+piece of work with its own review, and folding it into this candidate would mix two unrelated
+changes. It is called out here so it is not mistaken for a regression.
+
+The three skips are the privilege-drop assertions that cannot fail when the suite already runs as
+the target account (`PW_TEST_DROP_USER` names the escape hatch).
+
+```
+cd app && npm run test:offline
+# tests 760   # pass 755   # fail 2   # skipped 3        (the same two contract-drift failures)
+
+PW_ORCHESTRATOR_CONTRACT_ROOT=/nonexistent/orchestrator npm run test:offline
+# tests 760   # pass 752   # fail 0   # skipped 8
+```
+
+**That second run is the number GOA should be able to reproduce on this exact SHA**, since it is the
+shape of an environment with no sibling orchestrator: 760 tests, zero failures, no `npm ci`, no
+registry access. If your run differs, the difference is evidence rather than noise, and we would
+like the totals and the named skips.
+
+Other checks: `bash -n` on every changed script; `git diff --check`;
+`systemd-analyze verify systemd/pw-tmux-server.service` clean.
+
+### Requested from GOA
+
+1. Run `npm run test:offline` (with `PW_ORCHESTRATOR_CONTRACT_ROOT` pointed anywhere absent) on the
+   **exact candidate head below** and append the complete totals and named skips. That is
+   condition 3 of Round 2's integration gates, in the form option (a) you preferred.
+2. Record **AGREE / DISAGREE / NEEDS EVIDENCE** per item, especially `GOA-2` (is the documented
+   limitation the right boundary, or do you want the mount + snapshot scheduler in scope?) and
+   `GOA-3`'s secondary unit-overwrite concern, which we have deliberately not addressed.
+3. Confirm the container-mode deployment steps below are executable on your instance as written.
+
+### Environment-specific deployment instructions
+
+These are **not** performed by this change. Nothing has been deployed anywhere.
+
+**Host mode (PVI2/PVE), after this candidate merges.** `install.sh` writes
+`/etc/project-workbench/pw.env` when absent, installs and enables the owner unit, and now **fails**
+if the owner will not start. On a host whose tmux server predates the owner unit, `enable --now`
+merely *adopts* it — the sessions stay in whatever cgroup created them — and `project-terminal-start`
+will refuse until the server is actually replaced. The installer detects this and prints the
+migration; run it when a brief terminal interruption is acceptable:
+
+```
+sudo -u admin /usr/local/bin/pw-tmux-save
+sudo -u admin tmux kill-server
+sudo systemctl restart pw-tmux-server.service     # the owner replays the manifest on start
+```
+
+**Container mode (GOA).** `install.sh` is now gated and will not touch your sidecar, but it also
+does not create the env file for you. Before deploying:
+
+1. `node scripts/pw-env-write --mode container --out /etc/project-workbench/pw.env`, then edit it to
+   your instance's real paths (your registry is not at the default location — that is `GOA-1`), and
+   `node scripts/pw-env-write --check` to validate it.
+2. The sidecar unit now passes `--env-file=/etc/project-workbench/pw.env`; podman **requires** the
+   file to exist, so step 1 must happen first. Add the same flag to the app container.
+3. Optional restore parity: set `PW_TMUX_RESTORE_ON_START=1` **and** bind-mount the persistence
+   state dir into the sidecar (`-v /var/lib/project-workbench:/var/lib/project-workbench`, matching
+   `PW_TMUX_STATE_DIR`). Without the mount, leave the flag unset — with it set and no mount, the
+   restore now exits non-zero and logs, which is correct but noisy.
+4. `PW_DEPLOY_MODE=container` is already explicit on your instance, so `GOA-5` changes nothing for
+   you. An instance that omitted it would now refuse to start rather than run host semantics.
+
+### Candidate SHA and status
+
+- **Candidate head: `4258531`** — the exact SHA is recorded in the PR and must be re-read from there
+  rather than trusted from this paragraph if the branch is ever updated.
+- PR #24 reviewed head `43625e4`: **still blocked, still untouched.** This candidate replaces it.
+- This candidate is **not merged and not deployed.** Merging this document does not authorize
+  deployment (coordination rule 8).
+- Hermes-James will review the immutable head first.
+
+### GOA action after merge
+
+Once this candidate is reviewed and merged to `main`, please deploy the merged `main` to the GOA
+instance and **append a new round recording the exact deployed SHA plus runtime verification**:
+that the sidecar came up with the env file, that `pw-tmux-restore` no longer exits 0 having restored
+nothing (the `GOA-1` regression you are holding `main` on), and whether terminals and sessions
+behave as before. Until that round exists, no one should assume GOA is tracking `main` again.
