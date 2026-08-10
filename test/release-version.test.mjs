@@ -225,3 +225,40 @@ test('release: a change to deployable release content carries a release bump wit
     `the release identifier must move forwards: ${previous} -> ${RELEASE_VERSION}`,
   );
 });
+
+// HJ-24-4 — the release gate only gates if a run actually exists for the reviewed SHA.
+//
+// The check-runs API reported ZERO runs for PR #23's head (673d37a) and PR #24's head (43625e4),
+// while every commit on `main` had one successful run: CI had only ever run post-merge, so neither
+// reviewed head was ever gated and this very guard never got the chance to fail PR #24 for shipping
+// `install.sh` on a stale `app/VERSION`.
+//
+// The workflow was not the cause — `pull_request` and `fetch-depth: 0` were already there — but it
+// had no fallback: `push` was limited to two branch names, so a pushed branch produced nothing.
+// These assertions pin the properties the repository CAN control. Whether a required status check
+// is BOUND to PR head SHAs is branch protection, which is not verifiable from in here and is
+// therefore documented rather than claimed.
+test('CI: a pushed commit on any branch produces a check run bound to its own SHA', () => {
+  const wf = fs.readFileSync(path.join(REPO, '.github', 'workflows', 'test.yml'), 'utf8');
+  const triggers = wf.slice(wf.indexOf('\non:'), wf.indexOf('\njobs:'));
+  assert.match(triggers, /^\s*push:\s*$/m,
+    'THE REGRESSION: `push:` filtered to named branches leaves a pushed feature branch with no run at all');
+  assert.match(triggers, /^\s*pull_request:/m);
+  assert.match(triggers, /^\s*workflow_dispatch:/m, 'a run must be requestable against a specific ref by hand');
+  assert.ok(!/^\s*branches:/m.test(triggers), 'no branch filter may narrow which commits get gated');
+});
+
+test('CI: the canonical gate keeps full history, so this guard cannot silently skip', () => {
+  const wf = fs.readFileSync(path.join(REPO, '.github', 'workflows', 'test.yml'), 'utf8');
+  // Comments stripped first: the workflow explains why fetch-depth matters, and a check that cannot
+  // tell the explanation from the setting would force the next person to delete the explanation.
+  const code = wf.split('\n').filter((l) => !l.trim().startsWith('#')).join('\n');
+  assert.equal((code.match(/fetch-depth: 0/g) || []).length, 2, 'every job needs the base branch, not a shallow clone');
+  assert.match(wf, /npm ci/, 'the canonical gate stays npm ci + npm test');
+  assert.match(wf, /npm test/);
+  // And the offline subset runs WITHOUT an install step, which is what proves it is dependency-free.
+  const offline = wf.slice(wf.indexOf('offline-subset:'));
+  assert.ok(!/npm ci|npm install/.test(offline),
+    'an offline job that installs dependencies proves nothing about running without them');
+  assert.match(offline, /npm run test:offline/);
+});

@@ -23,6 +23,7 @@ import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCu
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 import { resolveDeployMode } from './deploy-mode.js';
+import { applyProjectGitCredentials } from './project-git-credentials.mjs';
 
 const app = express();
 const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
@@ -156,27 +157,44 @@ async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8'
 async function saveProjects(projects){ await writeFileAtomic(registryPath, JSON.stringify(projects, null, 2)+'\n', { mode: 0o644 }); }
 
 // Configure per-workspace git credentials based on the project's primaryUser token.
+//
+// GOA-6: this used to do the work IN THIS PROCESS. The dashboard is root in both deploy modes, and
+// the workspace and its `.git` belong to the unprivileged pane account — so every run left a
+// root-owned `.git/config` and a root-owned 0600 `.git/.pw-credentials` inside a tree the pane owns.
+// The pane's own `git fetch` then failed with "cannot lock ref … Permission denied" / "failed to
+// write object", and git could not read the credential file that had just been written for it. It is
+// a privilege boundary as well as an ownership bug: `.git/config` can name programs to execute
+// (core.pager, credential.helper, core.fsmonitor), so a root write into an account-controlled
+// directory is a symlink away from being a local escalation.
+//
+// The work now runs THROUGH the same privilege-dropped helper the per-user credential tree already
+// uses (app/credential-writer.mjs via credentialDropArgv → `sudo -u <account>` in host mode,
+// `setpriv --reuid` in container mode), so the artifacts are created by the account that owns them.
+// The token travels in the job on stdin, never on a command line.
+//
+// When no handover is needed — container mode with no PW_TERMINAL_UID, where the dashboard and the
+// pane genuinely are the same account — the work is done in-process exactly as before, because
+// dropping to ourselves would add a failure mode and change nothing about ownership.
 async function syncProjectCredentials(project, users){
  if(!project?.path) return;
- const gitDir = path.join(project.path, '.git');
- try { await fs.access(gitDir); } catch { return; } // no .git dir yet
  const user = users && project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
- const credFile = path.join(gitDir, '.pw-credentials');
- if(user?.ghToken){
-  const token = decrypt(user.ghToken);
-  await fs.writeFile(credFile, `https://${token}:x-oauth-basic@github.com\n`, { mode: 0o600 });
-  // Use ONLY our project-local store: clear any prior local entries, then add an
-  // empty reset (drops inherited global/system helpers for this repo so the token
-  // is never dispatched to — and duplicated into — a global store) followed by our
-  // per-project store. Two --add (not --replace-all, which would drop the reset).
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', '']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', `store --file=${credFile}`]).catch(()=>{});
- } else {
-  // Remove credential file and unset the helper
-  await fs.unlink(credFile).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+ const token = user?.ghToken ? decrypt(user.ghToken) : '';
+
+ let owner = null;
+ try {
+  owner = await terminalOwner();
+ } catch(e){
+  // Fail closed: an unresolvable pane account means we cannot say who should own what we are about
+  // to write, and writing it as root is precisely the defect. Surfaced to the caller, which is
+  // already inside a route-level try/catch.
+  throw new Error(`[git-credentials] project "${project.name || '?'}": cannot resolve the terminal owner, refusing to write git credentials as root: ${e?.message || e}`);
  }
+
+ if(!owner){
+  await applyProjectGitCredentials({ fsp: fs, execFile: execFileAsync, projectPath: project.path, token });
+  return;
+ }
+ await runCredentialJob({ action: 'git-credentials', projectPath: project.path, ghToken: token }, { owner });
 }
 
 // ── Per-user CLI credentials (opt-in via PW_PER_USER_CLAUDE) ────────────────

@@ -1,10 +1,33 @@
 name: test
+
+# WHY THE TRIGGER LIST LOOKS LIKE THIS (HJ-24-4)
+#
+# Reviewed pull-request heads were reaching a green-looking review with NO check run at all. The
+# GitHub check-runs API reported 0 runs for both PR #23's head (673d37a) and PR #24's head
+# (43625e4), while every commit on `main` had exactly one successful run. So CI had only ever run
+# post-merge — and the one thing a reviewer needs, "this exact SHA was gated", was never true. The
+# release guard in test/release-version.test.mjs would have failed PR #24 on the spot.
+#
+# The workflow itself was not at fault: it already triggered on `pull_request` and already set
+# fetch-depth: 0. What it did NOT do was produce a run for a pushed BRANCH — `push` was limited to
+# two branch names — so when no pull_request run appeared, nothing else covered the SHA.
+#
+# `push:` with no branch filter fixes that from inside the repository: every pushed commit gets a
+# check run bound to its own SHA, whether or not a pull_request event fires. `workflow_dispatch`
+# allows a run to be requested against a specific ref by hand.
+#
+# WHAT THIS FILE CANNOT FIX, and is not claimed to: whether a required status check is BOUND to PR
+# head SHAs is a repository/branch-protection setting, and it is not verifiable from inside the
+# repository. Until an administrator confirms it, "required CI is green" has to mean "a run exists
+# for this exact SHA and it passed", which is checkable from the API.
 on:
   push:
-    branches: [ main, goa-deploy ]
   pull_request:
+  workflow_dispatch:
+
 jobs:
   node-test:
+    name: canonical gate (npm ci + npm test)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -23,3 +46,26 @@ jobs:
       - name: Run test suite
         working-directory: app
         run: npm test
+
+  offline-subset:
+    # The gate both environments can run (GOA-4). This job deliberately performs NO install step, so
+    # it proves the offline target really is dependency-free on a clean checkout — the property that
+    # lets an environment with no route to the npm registry produce numbers comparable to CI's on the
+    # same SHA. It does not replace the canonical gate above, which stays authoritative.
+    name: offline subset (dependency-free)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install tmux (the tmux-backed tests run real servers on isolated sockets)
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends tmux
+      - name: Show what the subset selected, and what it excluded and why
+        working-directory: app
+        run: npm run test:offline:list
+      - name: Run the dependency-free subset
+        working-directory: app
+        run: npm run test:offline
