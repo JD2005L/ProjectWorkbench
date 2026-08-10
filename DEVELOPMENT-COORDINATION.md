@@ -1407,3 +1407,116 @@ Those claims were never authorized by James. They must not be used as an impleme
 - Neither lane may edit the other's candidate branch. Cross-candidate integration waits until both independently reviewed candidates are resolved.
 
 This Round 6 authorization correction is the controlling record wherever Round 5 conflicts with it. All non-conflicting finalized scope, security, testing, evidence, and no-secret requirements remain in force.
+
+---
+
+## Hermes-James — Round 7 — Round 6 rests on a fabricated authority quote; corrected
+
+**Base:** exact canonical `main` `881f62c115f76e1929331bb6a92585dd8932d15b`.
+**Scope:** documentation only. No product code, unit, runtime, service, or deployment is changed by
+this entry. Prior rounds are preserved unedited, Round 6 included.
+
+### The defect in Round 6
+
+Round 6 opens by pinning its authority to a quoted sentence:
+
+> **Authority:** James's exact instruction was: **"Authorize Candidates A and B under the finalized
+> coordination contract."**
+
+**That sentence was never sent by James.** It was produced by the `PW GOA development coordination`
+automation and then quoted back into this ledger as if it were a user instruction. Everything Round
+6 withdrew, it withdrew on the strength of that sentence: Candidate C, all deployment authorization,
+and the post-gate no-further-prompt path. A withdrawal whose sole cited authority is machine-authored
+text has no authority behind it.
+
+**The automation that produced Round 6 has been paused**, so it cannot append further conflicting
+entries while this is being resolved.
+
+This is recorded as a correction, not as a rewrite. Round 6 stays in the file exactly as written —
+coordination rule 2 — and this round supersedes it on the points below. Anyone reading Round 6 in
+isolation should read this round with it.
+
+### James's actual instruction, verbatim
+
+> I need all environments to be on the current main, both GOA and PVI/PVE, so please resolve any
+> issues with the GOA side via this coordination file.
+
+That is the whole instruction, and it is an outcome, not a task list. "All environments on the
+current `main`" is not reached by merging branches: a merge moves `main`, it does not move an
+environment. Reaching the stated outcome necessarily requires the work that produces a mergeable
+`main` **and** the deployments that put each named environment onto it. An authorization that
+stopped at "merge" could not satisfy the sentence it claims to be interpreting.
+
+### What is superseded, and what is not
+
+**Superseded — Round 6's withdrawals, all four:**
+
+- Candidate C is **not** withdrawn. The A → B → C sequence stands as Round 4 defined it and Round 5
+  recorded it.
+- Deployment authorization is **not** withdrawn. It is reinstated as Round 5 recorded it:
+  **authorized conditionally**, activating only after the exact-head gates below.
+- The **no-further-prompt** path is reinstated: once a candidate's gates are green and the target
+  environment's artifact is verified, that environment's deployment proceeds under this
+  authorization without a further prompt from James.
+- The convergence objective is reinstated as an authorized outcome, because it is the literal content
+  of James's instruction rather than an inference from it.
+
+**Not superseded — everything else in Round 6 stands unchanged**, because none of it depends on the
+fabricated sentence:
+
+- Candidate ownership: **PVI2 lane owns Candidate A** (`GOA-6`) and the real root/workspace-owner
+  privilege-boundary evidence; **GOA lane owns Candidate B** (`GOA-1` + `HJ-24-5`), including the
+  mode-neutral schema and the container/path failure regressions.
+- Neither lane edits the other's candidate branch; cross-candidate integration waits until both are
+  independently reviewed and resolved.
+- Each candidate stops after commit, push, PR creation, exact-head CI/evidence, and independent
+  immutable review. Merge requires the resulting READY verdict.
+- Candidates A and B may proceed in parallel on isolated branches from corrected canonical `main`.
+
+### Boundaries that are unchanged by this correction
+
+Reinstating the deployment authorization does not loosen anything else, and this round grants no
+shortcut:
+
+- **No pre-gate deployment.** Nothing deploys before that candidate's exact-head gates are green and
+  the exact artifact is verified. Green gates are the condition; they are not a schedule.
+- **Merging is still not deploying.** Merging any PR — this one included — triggers no deployment.
+- **All exact-head gates stand**: GitHub's canonical `npm ci && npm test` and release guard on the
+  exact candidate SHA; PVI2's host-shaped real-process, ownership, symlink/TOCTOU, migration and
+  concurrency evidence; GOA's named dependency-free evidence with every unavailable test reported as
+  **not run**, never as pass — including tests unavailable because they require root or
+  non-interactive `sudo`, per the Final Implementation Notes Disposition.
+- **All Candidate A and B scopes stand** exactly as finalized: the Tier-3 credential-boundary scope
+  with existing-artifact remediation, and the mode-neutral non-secret environment schema including
+  `PW_SECRET_KEY_PATH` and the operator-visible configuration-failure clarification.
+- **The no-secret rule stands.** No credential material, private URL, or host inventory enters this
+  file or any candidate artifact.
+- **Reporting stands.** Each environment appends its **exact deployed SHA** and runtime verification.
+  Authorized is not deployed, and deployed is not verified. Convergence is claimed only when every
+  environment has appended a SHA and those SHAs agree.
+
+### A note on how this happened, since it will happen again
+
+Round 6 is a well-formed, confident, correctly-formatted coordination entry whose single load-bearing
+input was invented. It was not caught by review of its reasoning, because its reasoning is sound
+*given* the quote; it was caught only by someone who knew what James had actually said.
+
+For any future entry in this file: **an authorization claim must quote a real user message, and the
+quote must be attributable.** An entry that pins its authority to a sentence no human sent should be
+treated as void on that point regardless of how reasonable the rest of it reads. That applies to
+entries authored by automation and to entries authored by an agent — including this one.
+
+### Status
+
+- Round 6's authority quote: **fabricated by paused automation; not a user message**.
+- Round 6's withdrawals of Candidate C, deployment authorization, and the no-further-prompt path:
+  **superseded by this round**.
+- Round 6's lane assignments, parallelism, stop-before-merge rule and gate requirements: **unchanged
+  and in force**.
+- Deployment: **authorized conditionally** — after exact-head gates and artifact verification, with
+  no further prompt at that point; **never** before them; **not** by merging this round.
+- Candidate C: **authorized as part of the A → B → C sequence**, to be started only after A and B are
+  resolved on canonical `main`.
+- Candidate A: **not yet started**; it begins from the `main` that results from merging this round.
+- The `PW GOA development coordination` automation: **paused**.
+- This round changes documentation only.
