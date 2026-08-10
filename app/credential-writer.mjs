@@ -12,7 +12,16 @@
 //   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…}
 //         {"action":"prune","base":…,"keep":[…]}
 //         {"action":"status","base":…,"username":…}
+//         {"action":"git-credentials","projectPath":…,"ghToken":…,"expectUid":…}
+//         {"action":"git-credentials-inventory","projectPaths":[…],"expectUid":…}
+//         {"action":"git-credentials-remediate","projectPath":…,"ghToken":…,"expectUid":…,"dryRun":…}
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
+//
+// The three git-credentials actions are GOA-6 (Candidate A). The workspace and its `.git` belong to
+// the pane account, so the root dashboard writing `.git/.pw-credentials` and `.git/config` left
+// artifacts that account could neither read nor lock — and `.git/config` can name programs to
+// execute, which makes a root write there a privilege boundary rather than an ownership annoyance.
+// They take no `base`, so the malformed-job guard below admits them explicitly.
 //
 // The job travels on stdin specifically so the GitHub token never appears in
 // this process's command line, where `ps` would publish it to every other user
@@ -21,7 +30,16 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { applyCredentialJob, pruneUserCredentials, userSignedIn } from './user-credentials.js';
+import { applyProjectGitCredentials } from './project-git-credentials.mjs';
+import { inventoryCredentialArtifacts, remediateCredentialArtifact } from './credential-remediation.mjs';
+
+const execFileAsync = promisify(execFile);
+
+/** Actions that operate on a workspace rather than on the per-user credential tree. */
+const WORKSPACE_ACTIONS = new Set(['git-credentials', 'git-credentials-inventory', 'git-credentials-remediate']);
 
 async function readStdin() {
   const chunks = [];
@@ -42,12 +60,37 @@ async function main() {
     fail('credential helper: unreadable job');
     return;
   }
-  if (!job || typeof job !== 'object' || !job.base) {
+  if (!job || typeof job !== 'object' || (!job.base && !WORKSPACE_ACTIONS.has(job.action))) {
     fail('credential helper: malformed job');
     return;
   }
 
   try {
+    if (WORKSPACE_ACTIONS.has(job.action)) {
+      // Runs as the workspace owner: this process was started through credentialDropArgv. The uid
+      // is reported back so the caller can prove the drop actually happened rather than assume it.
+      const runningUid = process.getuid?.() ?? null;
+      let result;
+      if (job.action === 'git-credentials') {
+        if (!job.projectPath) { fail('credential helper: git-credentials job has no projectPath'); return; }
+        result = await applyProjectGitCredentials({
+          execFile: execFileAsync, projectPath: job.projectPath,
+          token: job.ghToken || '', expectUid: job.expectUid,
+        });
+      } else if (job.action === 'git-credentials-inventory') {
+        result = await inventoryCredentialArtifacts({
+          projectPaths: Array.isArray(job.projectPaths) ? job.projectPaths : [], expectUid: job.expectUid,
+        });
+      } else {
+        if (!job.projectPath) { fail('credential helper: git-credentials-remediate job has no projectPath'); return; }
+        result = await remediateCredentialArtifact({
+          projectPath: job.projectPath, expectUid: job.expectUid,
+          token: job.ghToken || '', dryRun: !!job.dryRun,
+        });
+      }
+      process.stdout.write(JSON.stringify({ ok: true, result: { ...result, runningUid } }));
+      return;
+    }
     const result = job.action === 'prune'
       ? await pruneUserCredentials({ fsp, base: job.base, keep: Array.isArray(job.keep) ? job.keep : [] })
       : job.action === 'status'

@@ -168,6 +168,11 @@ install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+# Finds and repairs credential artifacts the pre-Candidate-A root-write path left behind: a
+# root-owned .pw-credentials inside a pane-owned .git is unreadable by the account whose credential
+# it is, so git authentication silently fails there. Reports by default; --apply repairs by
+# replacing as the workspace owner, never by chowning. See DEPLOY.md.
+install -m 0755 "$SRC_DIR/scripts/pw-credential-remediate" /usr/local/bin/pw-credential-remediate
 
 # State dir for tmux-session persistence (manifest + captured scrollback).
 install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/tmux-persist

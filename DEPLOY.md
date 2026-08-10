@@ -68,6 +68,35 @@ previous config on failure before reloading.
 | `PW_TLS_SERVER_NAME` | — | this instance's hostname. Required with `PW_TLS_ENABLED`: it becomes `server_name` on both listeners and the target of the 80→443 redirect (`return 301 https://<name>$request_uri`), so the redirect never reflects the client-supplied `$host` |
 | `PW_TLS_DEFAULT_SERVER` | unset | `1` marks both the :80 and :443 blocks `default_server`. Only for hosts where PW is the sole site; never claimed implicitly |
 
+
+## Workspace Git credentials, and repairing artifacts written before this release
+
+A project with a `primaryUser` who has a GitHub token gets a per-workspace credential store at
+`<workspace>/.git/.pw-credentials`, plus `git config --local credential.helper` entries pointing at
+it. That work is done **as the workspace owner**, through the same privilege-dropped, shell-free
+helper the per-user credential tree uses — never by the dashboard process, which is root in both
+deploy modes while the workspace belongs to the unprivileged pane account.
+
+Writing it as root produced two problems at once: a decrypted credential placed inside a directory
+that account controls (and `.git/config` can name programs to execute), and a file the account
+cannot read — so git authentication silently failed for the very user the credential belonged to.
+
+**Artifacts written before this release are not repaired automatically.** Find and fix them with:
+
+```bash
+sudo /usr/local/bin/pw-credential-remediate            # report only; changes nothing
+sudo /usr/local/bin/pw-credential-remediate --apply    # repair
+```
+
+It examines only projects listed in the registry, never follows a symlink, never recurses, and
+**never chowns anything** — repair is unlink-and-rewrite performed as the workspace owner, which
+needs no privilege because that account owns the containing directory whoever owns the file. A
+workspace whose `.git` is not owned by the expected account is reported for a human rather than
+forced. Where the tool cannot resolve the project's current token it removes the artifact and clears
+the helper; the dashboard writes a correct one on that project's next credential sync.
+
+Reports carry paths, ownership and modes — never contents.
+
 ## Release version
 
 The canonical release identifier lives in `app/VERSION` and is shown in the shared footer on every primary UI, including the project cockpit. It must match `1.YY.MMDD.hhmm` (for example, `1.26.0721.2233`). Bump this file once for every release commit; because it is part of `app/`, both `install.sh` and container builds carry the same version to every environment.

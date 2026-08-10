@@ -22,6 +22,7 @@ import { withLifecycleLock } from './lifecycle-lock.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
+import { applyProjectGitCredentials } from './project-git-credentials.mjs';
 
 const app = express();
 const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
@@ -144,27 +145,76 @@ async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8'
 async function saveProjects(projects){ await writeFileAtomic(registryPath, JSON.stringify(projects, null, 2)+'\n', { mode: 0o644 }); }
 
 // Configure per-workspace git credentials based on the project's primaryUser token.
+//
+// GOA-6 (Candidate A). This used to do the work IN THIS PROCESS. The dashboard is root in both
+// deploy modes, and the workspace and its `.git` belong to the unprivileged pane account, so every
+// run left a root-owned `.git/config` and a root-owned 0600 `.git/.pw-credentials` inside a tree
+// that account owns. GOA confirmed the consequence live: the pane account cannot read the
+// credential written for it, so git authentication silently fails for the user it belongs to. It is
+// a privilege boundary as well as an ownership bug — Git config can name programs to execute
+// (core.pager, credential.helper, core.fsmonitor), so a root write into an account-controlled
+// directory is a symlink away from being a local escalation, and chown-after-write closes neither
+// the TOCTOU window nor the question of where the write landed.
+//
+// The work now runs THROUGH the same privilege-dropped, shell-free helper the per-user credential
+// tree already uses (app/credential-writer.mjs via credentialDropArgv → `sudo -n -u <account>` in
+// host mode, `setpriv --reuid` in container mode). The token travels in the job on stdin and never
+// reaches a command line; the git config entry names the store's PATH, not its contents.
+//
+// When no handover is needed — container mode with no PW_TERMINAL_UID, where the dashboard and the
+// pane genuinely are one account — the work is done in-process through the same safe module, because
+// dropping to ourselves would add a failure mode and change nothing about ownership.
+
+// Rotation and removal for one workspace are serialized here, so a token rotation and a revocation
+// arriving together cannot interleave into a half-applied state: the store write and the three
+// `git config` calls are one unit per workspace. Cross-process safety is separate and comes from the
+// artifact itself — publication is an atomic rename, so a concurrent writer elsewhere can only ever
+// lose the race, never produce a partial file. Callers that already hold the projects or lifecycle
+// lock serialize against each other through that lock as before; this queue covers the rest.
+const credentialQueues = new Map();
+function serializeCredentialWork(key, fn){
+ const prev = credentialQueues.get(key) || Promise.resolve();
+ const next = prev.catch(()=>{}).then(fn);
+ credentialQueues.set(key, next);
+ // Drop the entry once it is the tail, so the map cannot grow with every project touched.
+ next.catch(()=>{}).finally(()=>{ if(credentialQueues.get(key) === next) credentialQueues.delete(key); });
+ return next;
+}
+
 async function syncProjectCredentials(project, users){
  if(!project?.path) return;
  const gitDir = path.join(project.path, '.git');
- try { await fs.access(gitDir); } catch { return; } // no .git dir yet
+ try { await fs.access(gitDir); } catch { return; } // not cloned yet: nothing to configure or clear
  const user = users && project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
- const credFile = path.join(gitDir, '.pw-credentials');
- if(user?.ghToken){
-  const token = decrypt(user.ghToken);
-  await fs.writeFile(credFile, `https://${token}:x-oauth-basic@github.com\n`, { mode: 0o600 });
-  // Use ONLY our project-local store: clear any prior local entries, then add an
-  // empty reset (drops inherited global/system helpers for this repo so the token
-  // is never dispatched to — and duplicated into — a global store) followed by our
-  // per-project store. Two --add (not --replace-all, which would drop the reset).
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', '']).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--add', 'credential.helper', `store --file=${credFile}`]).catch(()=>{});
- } else {
-  // Remove credential file and unset the helper
-  await fs.unlink(credFile).catch(()=>{});
-  await execFileAsync('git', ['-C', project.path, 'config', '--local', '--unset-all', 'credential.helper']).catch(()=>{});
+ const token = user?.ghToken ? decrypt(user.ghToken) : '';
+
+ let owner;
+ try {
+  owner = await terminalOwner();
+ } catch(e){
+  // Fail closed. An unresolvable pane account means we cannot say who should own what we are about
+  // to write, and writing it as root is precisely the defect. Route handlers already wrap this.
+  throw new Error(`[git-credentials] project "${project?.name || '?'}": cannot resolve the workspace owner, refusing to write git credentials as root: ${e?.message || e}`);
  }
+
+ return serializeCredentialWork(project.path, async () => {
+  if(!owner){
+   return applyProjectGitCredentials({ execFile: execFileAsync, projectPath: project.path, token, expectUid: process.getuid?.() ?? undefined });
+  }
+  const result = await runCredentialJob(
+   { action: 'git-credentials', projectPath: project.path, ghToken: token, expectUid: owner.uid },
+   { owner },
+  );
+  // Proof rather than assumption: the helper reports the uid it actually ran as. If the drop did
+  // not happen we would be back to a root write, which is the whole defect.
+  if(result?.runningUid !== undefined && result.runningUid !== null && result.runningUid !== owner.uid){
+   throw new Error(`[git-credentials] project "${project.name}": credential helper ran as uid ${result.runningUid}, expected the workspace owner ${owner.uid}`);
+  }
+  if(result?.displacedForeign){
+   console.warn(`[git-credentials] project "${project.name}": replaced a credential artifact that was not owned by the workspace account`);
+  }
+  return result;
+ });
 }
 
 // ── Per-user CLI credentials (opt-in via PW_PER_USER_CLAUDE) ────────────────
