@@ -199,6 +199,15 @@ test('NO DRIFT: the shell consumer uses the same distinct configuration exit cod
 
 // --- end to end: the distinction that GOA-1 is about --------------------------
 
+// A short socket root: AF_UNIX sun_path is capped at 108 bytes, so a deep
+// per-session temp path makes tmux fail with "File name too long" — which is
+// easy to misread as a product failure.
+async function sockRoot(t) {
+  const dir = await fsp.mkdtemp(path.join(os.tmpdir(), 'pwsk-'));
+  t.after(() => fsp.rm(dir, { recursive: true, force: true }));
+  return dir;
+}
+
 async function restoreRun(t, { manifest, env = {} }) {
   const state = await fsp.mkdtemp(path.join(os.tmpdir(), 'pwenv-'));
   t.after(() => fsp.rm(state, { recursive: true, force: true }));
@@ -210,10 +219,14 @@ async function restoreRun(t, { manifest, env = {} }) {
   const res = await execFileAsync(RESTORE, [], {
     env: {
       ...process.env,
-      TMUX_TMPDIR: '/tmp/pwiso',
+      TMUX_TMPDIR: await sockRoot(t),
       PW_TMUX_SOCKET: `envtest-${Math.abs(Date.now() % 100000)}-${manifest ? 'm' : 'n'}`,
       PW_TMUX_STATE_DIR: state,
       PW_TMUX_RESTORE_CLAUDE: '0',
+      // Absent-but-creatable, inside our own temp tree. Without this the default
+      // /home/admin/pw-users is used, whose parent exists on a GOA instance and
+      // NOT on a CI runner — an environment-dependent assertion.
+      PW_USER_CRED_BASE: path.join(state, 'pw-users'),
       ...env,
     },
     timeout: 60000,
@@ -323,10 +336,11 @@ test('B-1: the configuration refusal does not depend on ANY helper being resolva
   const res = await execFileAsync(lone, [], {
     env: {
       ...process.env,
-      TMUX_TMPDIR: '/tmp/pwiso',
+      TMUX_TMPDIR: await sockRoot(t),
       PW_TMUX_SOCKET: `b1-${Math.abs(Date.now() % 100000)}`,
       PW_TMUX_STATE_DIR: state,
       PW_TMUX_RESTORE_CLAUDE: '0',
+      PW_USER_CRED_BASE: path.join(iso, 'pw-users'),
       PW_REGISTRY_PATH: '/nonexistent/projects.json',
       PW_APP_DIR: '/nonexistent/app',
     },
@@ -354,10 +368,11 @@ test('B-2: an unreadable manifest is a distinct configuration failure, not exit 
   const res = await execFileAsync(RESTORE, [], {
     env: {
       ...process.env,
-      TMUX_TMPDIR: '/tmp/pwiso',
+      TMUX_TMPDIR: await sockRoot(t),
       PW_TMUX_SOCKET: `b2-${Math.abs(Date.now() % 100000)}`,
       PW_TMUX_STATE_DIR: state,
       PW_TMUX_RESTORE_CLAUDE: '0',
+      PW_USER_CRED_BASE: path.join(state, 'pw-users'),
       PW_REGISTRY_PATH: path.join(REPO, 'app', 'package.json'),
       PW_APP_DIR: path.join(REPO, 'app'),
     },
