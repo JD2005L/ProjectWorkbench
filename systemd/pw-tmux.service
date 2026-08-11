@@ -10,15 +10,17 @@ Wants=network-online.target
 Type=simple
 Restart=on-failure
 RestartSec=5
+Delegate=yes
+Slice=pw-tmux.slice
 ExecStartPre=-/usr/bin/podman rm -f pw-tmux
 # Same image + same mounts as the app container so shells/agents in the panes see
 # identical workspaces, agent homes, npm-global CLIs and CA trust. The extra
 # -v .../run/tmux mount is the shared tmux socket dir; TMUX_TMPDIR points at it.
 ExecStart=/usr/bin/podman run --name pw-tmux \
-  --network=host --pid=host --privileged \
+  --network=host --pid=host --privileged --cgroupns=host --cgroup-parent=pw-tmux.slice \
   -e TMUX_TMPDIR=/opt/project-workbench/run/tmux \
   -e PW_DEPLOY_MODE=container \
-  -e PW_TMUX_OWNER_CGROUP=pw-tmux.service \
+  -e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \
   -e PW_TMUX_REQUIRE_CGROUP=1 \
   -e NPM_CONFIG_PREFIX=/opt/npm-global \
   -e PATH=/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \

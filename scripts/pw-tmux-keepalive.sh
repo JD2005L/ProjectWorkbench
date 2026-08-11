@@ -89,14 +89,19 @@ die() { echo "[pw-tmux-owner] $*" >&2; exit 1; }
 expected_owner_cgroup() {
 	if [[ -n "${PW_TMUX_OWNER_CGROUP:-}" ]]; then echo "$PW_TMUX_OWNER_CGROUP"; return; fi
 	if [[ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" == container ]]; then
-		echo 'pw-tmux.service'
+		echo 'pw-tmux.slice'
 	else
 		echo 'pw-tmux-server.service'
 	fi
 }
 
 owner_remediation() {
-	if [[ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" == container ]]; then
+	local mode default_cgroup
+	mode="$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')"
+	if [[ "$mode" == container ]]; then default_cgroup='pw-tmux.slice'; else default_cgroup='pw-tmux-server.service'; fi
+	if [[ -n "${PW_TMUX_OWNER_CGROUP:-}" && "$PW_TMUX_OWNER_CGROUP" != "$default_cgroup" ]]; then
+		echo "restart the configured tmux owner supervisor for cgroup $PW_TMUX_OWNER_CGROUP, then retry"
+	elif [[ "$mode" == container ]]; then
 		echo 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux.service'
 	else
 		echo 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service'
@@ -177,7 +182,16 @@ if [[ "${PW_TMUX_REQUIRE_CGROUP:-0}" == 1 && ! -r "$PROC_ROOT/$server_pid/cgroup
 	die "the live tmux server cgroup is not readable at $PROC_ROOT/$server_pid/cgroup — refusing to signal readiness"
 fi
 if [[ -r "$PROC_ROOT/$server_pid/cgroup" ]]; then
-	live_cgroup=$(sed -n 's/^0:://p' "$PROC_ROOT/$server_pid/cgroup" | head -n1)
+	live_cgroup=''
+	fallback_cgroup=''
+	while IFS=: read -r hierarchy controllers cgroup_path; do
+		if [[ "$hierarchy" == 0 && -z "$controllers" ]]; then
+			live_cgroup="$cgroup_path"
+			break
+		fi
+		[[ -n "$cgroup_path" ]] && fallback_cgroup="$cgroup_path"
+	done < "$PROC_ROOT/$server_pid/cgroup"
+	[[ -n "$live_cgroup" ]] || live_cgroup="$fallback_cgroup"
 	if [[ "${PW_TMUX_REQUIRE_CGROUP:-0}" == 1 ]]; then
 		case "/$live_cgroup/" in
 			*"/$expected_owner/"*) : ;;

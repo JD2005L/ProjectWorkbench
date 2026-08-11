@@ -89,7 +89,9 @@ function stagedOwnerExecStart(host) {
  *                          same-cgroup comparison on a CI runner proves nothing;
  *   PW_TMUX_EXIT_AFTER_READY — return after readiness instead of supervising
  *                          forever, which is the script's documented test hook.
- * PW_TMUX_REQUIRE_CGROUP is NOT overridden: it comes from the unit.
+ * PW_TMUX_REQUIRE_CGROUP normally comes from the unit. Two bootstrap-only calls
+ * below override it just long enough to learn the private test server PID; the
+ * strict positive and negative controlled-/proc proofs then use the unit value.
  */
 function runStagedExecStart(host, { procRoot, extraEnv = {} } = {}) {
   const { argv, env: unitEnv, unitDest } = stagedOwnerExecStart(host);
@@ -130,10 +132,13 @@ function serverPid(host) {
 }
 
 /** A controlled /proc placing the given pid in the cgroup the owner unit expects. */
-function procRootFor(host, pid, cgroup) {
-  const root = path.join(host.stageRoot, `proc-${pid}`);
+function procRootFor(host, pid, cgroup, { v1 = false } = {}) {
+  const root = path.join(host.stageRoot, `proc-${pid}-${v1 ? 'v1' : 'v2'}`);
   fs.mkdirSync(path.join(root, String(pid)), { recursive: true });
-  fs.writeFileSync(path.join(root, String(pid), 'cgroup'), `0::/system.slice/${cgroup}\n`);
+  const body = v1
+    ? `12:pids:/system.slice/${cgroup}\n11:memory:/system.slice/${cgroup}\n`
+    : `0::/system.slice/${cgroup}\n`;
+  fs.writeFileSync(path.join(root, String(pid), 'cgroup'), body);
   return root;
 }
 
@@ -199,6 +204,11 @@ needTmux('the staged ExecStart satisfies the unit\'s OWN cgroup requirement', ()
 
     const ok = runStagedExecStart(host, { procRoot: procRootFor(host, pid, 'pw-tmux-server.service') });
     assert.equal(ok.r.status, 0, `the owner refused its own cgroup:\n${ok.r.stdout}${ok.r.stderr}`);
+
+    const v1 = runStagedExecStart(host, {
+      procRoot: procRootFor(host, pid, 'pw-tmux-server.service', { v1: true }),
+    });
+    assert.equal(v1.r.status, 0, `the owner refused its own cgroup-v1 path:\n${v1.r.stdout}${v1.r.stderr}`);
 
     // Negative control: the same run against a terminal's cgroup must refuse, or
     // the check above is passing for the wrong reason.

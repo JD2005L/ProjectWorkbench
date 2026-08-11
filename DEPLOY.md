@@ -24,8 +24,12 @@ mode does not weaken this check. In the supported rootful-Podman/systemd
 topology, `systemd/pw-tmux.service` starts the sidecar with:
 
 - `PW_DEPLOY_MODE=container`
-- `PW_TMUX_OWNER_CGROUP=pw-tmux.service`
+- `PW_TMUX_OWNER_CGROUP=pw-tmux.slice`
 - `PW_TMUX_REQUIRE_CGROUP=1`
+
+The sidecar runs with `--cgroupns=host`, under the delegated `pw-tmux.slice`, so
+the tmux PID's real `/proc/<pid>/cgroup` contains the stable segment the strict
+gate expects. Do not remove the cgroup namespace/parent options independently.
 
 The unit and application clients therefore resolve the same owner segment, and
 the sidecar refuses to stamp or supervise a server when `/proc/<pid>/cgroup` is
@@ -85,7 +89,7 @@ previous config on failure before reloading.
 | `PW_DEPLOY_MODE` | `host` | `host` \| `container` terminal model |
 | `PW_BASE_PATH` | `''` | serve the whole app under a URL prefix (e.g. `/workbench`) |
 | `PW_TMUX_SOCKET` | (auto in isolated tests) | tmux `-L` socket name for container mode |
-| `PW_TMUX_OWNER_CGROUP` | mode default | expected owner cgroup segment (`pw-tmux-server.service` for host, `pw-tmux.service` for the supported container sidecar); override for another supervisor topology |
+| `PW_TMUX_OWNER_CGROUP` | mode default | expected owner cgroup segment (`pw-tmux-server.service` for host, `pw-tmux.slice` for the supported container sidecar); override for another supervisor topology |
 | `PW_NGINX_TEST_CMD` / `PW_NGINX_RELOAD_CMD` | (built-in) | override the nginx validate/reload commands |
 | `PW_AUTH_MODE` | `local` | `local` (password) or `ldap` (directory bind) |
 | `PW_AUTH_ENFORCE` | `false` | require login (soft mode treats anon as admin) |

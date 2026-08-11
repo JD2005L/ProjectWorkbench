@@ -99,8 +99,12 @@ test('the owner unit is Type=notify with NotifyAccess=all', () => {
 
 test('container sidecar declares the same strict owner contract its clients resolve', () => {
   const src = read('systemd/pw-tmux.service');
+  assert.match(src, /^Delegate=yes$/m, 'Podman must be delegated a child cgroup');
+  assert.match(src, /^Slice=pw-tmux\.slice$/m, 'the sidecar needs a stable deployment-owned cgroup parent');
+  assert.match(src, /--cgroupns=host\b/, 'strict readiness must see the host cgroup path rather than namespace-relative /');
+  assert.match(src, /--cgroup-parent=pw-tmux\.slice\b/, 'the payload must be placed below the configured stable owner segment');
   assert.match(src, /-e PW_DEPLOY_MODE=container\b/, 'sidecar bootstrap must resolve container defaults');
-  assert.match(src, /-e PW_TMUX_OWNER_CGROUP=pw-tmux\.service\b/, 'sidecar and clients must name one owner cgroup');
+  assert.match(src, /-e PW_TMUX_OWNER_CGROUP=pw-tmux\.slice\b/, 'sidecar and clients must name one owner cgroup');
   assert.match(src, /-e PW_TMUX_REQUIRE_CGROUP=1\b/, 'sidecar bootstrap must validate its cgroup before supervising');
 });
 

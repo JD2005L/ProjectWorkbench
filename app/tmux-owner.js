@@ -51,15 +51,16 @@ export const OWNER_MARKER_OPTION = '@pw_owner';
 // The value we stamp. Constant, non-secret, and not environment-specific.
 export const OWNER_MARKER_VALUE = 'pw-owner';
 
-// Default owner unit per deployment mode. `PW_TMUX_OWNER_CGROUP` overrides both,
+// Default owner cgroup per deployment mode. `PW_TMUX_OWNER_CGROUP` overrides both,
 // so a topology we have not anticipated is configuration rather than a fork.
 export const HOST_OWNER_UNIT = 'pw-tmux-server.service';
+export const CONTAINER_OWNER_CGROUP = 'pw-tmux.slice';
 export const CONTAINER_OWNER_UNIT = 'pw-tmux.service';
 
 export function expectedOwnerCgroup(env = {}) {
   if (env.PW_TMUX_OWNER_CGROUP) return env.PW_TMUX_OWNER_CGROUP;
   return String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container'
-    ? CONTAINER_OWNER_UNIT
+    ? CONTAINER_OWNER_CGROUP
     : HOST_OWNER_UNIT;
 }
 
@@ -67,6 +68,11 @@ export function expectedOwnerCgroup(env = {}) {
 // but telling a container operator to restart the host-only unit is not useful.
 export function ownerRemediation(env = {}) {
   const container = String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container';
+  const defaultCgroup = container ? CONTAINER_OWNER_CGROUP : HOST_OWNER_UNIT;
+  const configuredCgroup = env.PW_TMUX_OWNER_CGROUP;
+  if (configuredCgroup && configuredCgroup !== defaultCgroup) {
+    return `restart the configured tmux owner supervisor for cgroup ${configuredCgroup}, then retry`;
+  }
   const unit = container ? CONTAINER_OWNER_UNIT : HOST_OWNER_UNIT;
   return `pw-tmux-save && tmux kill-server && systemctl restart ${unit}`;
 }
