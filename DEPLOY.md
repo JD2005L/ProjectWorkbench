@@ -16,6 +16,41 @@ node-managed `ttyd` attached to a tmux server. For terminals to survive an app
 (node) restart, point tmux at a **persistent sidecar** socket via `TMUX_TMPDIR`
 (the sidecar owns the tmux server; the app is just a client).
 
+### tmux owner contract
+
+All non-bootstrap clients accept the shared tmux server only when **both** the
+server marker and its process cgroup identify the configured owner. Container
+mode does not weaken this check. In the supported rootful-Podman/systemd
+topology, `systemd/pw-tmux.service` starts the sidecar with:
+
+- `PW_DEPLOY_MODE=container`
+- `PW_TMUX_OWNER_CGROUP=pw-tmux.slice`
+- `PW_TMUX_REQUIRE_CGROUP=1`
+
+The sidecar runs with `--cgroupns=host`, under the delegated `pw-tmux.slice`, so
+the tmux PID's real `/proc/<pid>/cgroup` contains the stable segment the strict
+gate expects. Do not remove the cgroup namespace/parent options independently.
+
+The unit and application clients therefore resolve the same owner segment, and
+the sidecar refuses to stamp or supervise a server when `/proc/<pid>/cgroup` is
+unreadable or does not contain that segment. Other container supervisors must
+set `PW_TMUX_OWNER_CGROUP` to a stable path segment present in the tmux server
+process's cgroup; it is intentionally a deployment adapter rather than part of
+the restore-path environment schema. Keep cgroup validation enabled.
+
+For a refusal, save state and stop clients before killing the foreign server,
+then restart the owner for the active mode (`pw-tmux-server.service` on a host,
+`pw-tmux.service` for the documented container topology).
+
+### Isolated test runs
+
+Run tests from a dependency-complete disposable worktree with a writable private
+npm cache and private tmux runtime/socket state. For example, set
+`npm_config_cache` and `TMUX_TMPDIR` to directories owned by the test identity;
+do not chmod/chown a production cache, socket, or runtime directory to make a
+suite pass. CI executes the full suite explicitly in both `host` and `container`
+deployment modes.
+
 ```bash
 podman build -t project-workbench:latest .
 podman run -d --name project-workbench \
@@ -54,6 +89,7 @@ previous config on failure before reloading.
 | `PW_DEPLOY_MODE` | `host` | `host` \| `container` terminal model |
 | `PW_BASE_PATH` | `''` | serve the whole app under a URL prefix (e.g. `/workbench`) |
 | `PW_TMUX_SOCKET` | (auto in isolated tests) | tmux `-L` socket name for container mode |
+| `PW_TMUX_OWNER_CGROUP` | mode default | expected owner cgroup segment (`pw-tmux-server.service` for host, `pw-tmux.slice` for the supported container sidecar); override for another supervisor topology |
 | `PW_NGINX_TEST_CMD` / `PW_NGINX_RELOAD_CMD` | (built-in) | override the nginx validate/reload commands |
 | `PW_AUTH_MODE` | `local` | `local` (password) or `ldap` (directory bind) |
 | `PW_AUTH_ENFORCE` | `false` | require login (soft mode treats anon as admin) |

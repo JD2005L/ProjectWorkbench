@@ -26,6 +26,7 @@ import path from 'node:path';
 import {
   OWNER_MARKER_OPTION,
   expectedOwnerCgroup,
+  ownerRemediation,
   readProcessCgroup,
   cgroupMatchesOwner,
   assessOwnership,
@@ -62,7 +63,7 @@ test('expectedOwnerCgroup resolves the host owner unit by default', () => {
 });
 
 test('expectedOwnerCgroup resolves the container sidecar owner in container mode', () => {
-  assert.equal(expectedOwnerCgroup({ PW_DEPLOY_MODE: 'container' }), 'pw-tmux.service');
+  assert.equal(expectedOwnerCgroup({ PW_DEPLOY_MODE: 'container' }), 'pw-tmux.slice');
 });
 
 test('expectedOwnerCgroup is overridable by configuration for other topologies', () => {
@@ -72,6 +73,17 @@ test('expectedOwnerCgroup is overridable by configuration for other topologies',
     'custom-owner.service',
     'an explicit override wins over the mode default',
   );
+});
+
+test('a custom owner adapter never recommends restarting an unrelated default unit', () => {
+  const message = ownerRemediation({
+    PW_DEPLOY_MODE: 'container',
+    PW_TMUX_OWNER_CGROUP: 'custom-owner.scope',
+  });
+  assert.match(message, /custom-owner\.scope/);
+  assert.match(message, /configured.*supervisor/i);
+  assert.doesNotMatch(message, /systemctl restart pw-tmux(?:-server)?\.service/);
+  assert.doesNotMatch(message, /tmux kill-server/);
 });
 
 // ---------------------------------------------------------------------------
@@ -86,6 +98,11 @@ test('readProcessCgroup reads the cgroup v2 line for a pid', () => {
 test('readProcessCgroup handles a cgroup v1 style file by preferring the unified line', () => {
   const proc = fakeProc(7, `12:pids:/system.slice/other.service\n0::${HOST_OWNER_CGROUP}\n`);
   assert.equal(readProcessCgroup({ pid: 7, procRoot: proc }), HOST_OWNER_CGROUP);
+});
+
+test('readProcessCgroup supports a pure cgroup v1 process file', () => {
+  const proc = fakeProc(8, `12:pids:${HOST_OWNER_CGROUP}\n11:memory:${HOST_OWNER_CGROUP}\n`);
+  assert.equal(readProcessCgroup({ pid: 8, procRoot: proc }), HOST_OWNER_CGROUP);
 });
 
 test('readProcessCgroup returns null for a pid that is gone, rather than guessing', () => {

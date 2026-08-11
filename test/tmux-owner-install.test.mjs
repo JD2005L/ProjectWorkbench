@@ -97,6 +97,17 @@ test('the owner unit is Type=notify with NotifyAccess=all', () => {
   assert.equal(/^Type=simple$/m.test(src), false, 'Type=simple is the defect');
 });
 
+test('container sidecar declares the same strict owner contract its clients resolve', () => {
+  const src = read('systemd/pw-tmux.service');
+  assert.match(src, /^Delegate=yes$/m, 'Podman must be delegated a child cgroup');
+  assert.match(src, /^Slice=pw-tmux\.slice$/m, 'the sidecar needs a stable deployment-owned cgroup parent');
+  assert.match(src, /--cgroupns=host\b/, 'strict readiness must see the host cgroup path rather than namespace-relative /');
+  assert.match(src, /--cgroup-parent=pw-tmux\.slice\b/, 'the payload must be placed below the configured stable owner segment');
+  assert.match(src, /-e PW_DEPLOY_MODE=container\b/, 'sidecar bootstrap must resolve container defaults');
+  assert.match(src, /-e PW_TMUX_OWNER_CGROUP=pw-tmux\.slice\b/, 'sidecar and clients must name one owner cgroup');
+  assert.match(src, /-e PW_TMUX_REQUIRE_CGROUP=1\b/, 'sidecar bootstrap must validate its cgroup before supervising');
+});
+
 // ---------------------------------------------------------------------------
 // C8 — MemoryHigh must not clamp
 // ---------------------------------------------------------------------------
@@ -157,4 +168,12 @@ test('the workflow does not claim required-check enforcement it cannot make', ()
   const wf = read('.github/workflows/test.yml');
   assert.equal(/required check|branch protection is enforced|blocks merge/i.test(wf), false,
     'required-check enforcement is external; the workflow must not claim it');
+});
+
+test('CI runs the full suite in explicit host and container modes with stable check names', () => {
+  const wf = read('.github/workflows/test.yml');
+  assert.match(wf, /matrix:/, 'deployment modes must be a CI matrix, not an implicit default lane');
+  assert.match(wf, /deploy-mode:\s*\[host, container\]/, 'both supported deployment modes must run');
+  assert.match(wf, /name:\s*node-test \(\$\{\{ matrix\.deploy-mode \}\}\)/, 'matrix checks need stable distinct names');
+  assert.match(wf, /PW_DEPLOY_MODE:\s*\$\{\{ matrix\.deploy-mode \}\}/, 'each lane must explicitly set its deployment mode');
 });

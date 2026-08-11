@@ -57,14 +57,18 @@ function opts(dir, overrides = {}) {
 // not resolve" still can, by pointing this at a name that provably doesn't
 // exist (see the REGRESSION test below), portably rather than relying on the
 // current host's incidental account list.
-async function withHostTerminalUser(user, fn) {
+async function withHostTerminalUser(user, fn, { deployMode } = {}) {
   const prev = process.env.PW_HOST_TERMINAL_USER;
+  const prevMode = process.env.PW_DEPLOY_MODE;
   process.env.PW_HOST_TERMINAL_USER = user;
+  if (deployMode) process.env.PW_DEPLOY_MODE = deployMode;
   try {
     return await fn();
   } finally {
     if (prev === undefined) delete process.env.PW_HOST_TERMINAL_USER;
     else process.env.PW_HOST_TERMINAL_USER = prev;
+    if (prevMode === undefined) delete process.env.PW_DEPLOY_MODE;
+    else process.env.PW_DEPLOY_MODE = prevMode;
   }
 }
 const REAL_ACCOUNT = os.userInfo().username;
@@ -114,7 +118,7 @@ test('REGRESSION: a configured terminal user that does not resolve to any real a
   await withHostTerminalUser('pw-test-nonexistent-account-793d', () => assert.rejects(
     resolveLaneCredentials({ ...opts(dir), projectId: 'demo', perUserEnabled: true }),
     /did not resolve|credential materialization failed/i,
-  ));
+  ), { deployMode: 'host' });
   await fsp.rm(dir, { recursive: true, force: true });
 });
 

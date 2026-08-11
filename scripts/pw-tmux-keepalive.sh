@@ -89,9 +89,22 @@ die() { echo "[pw-tmux-owner] $*" >&2; exit 1; }
 expected_owner_cgroup() {
 	if [[ -n "${PW_TMUX_OWNER_CGROUP:-}" ]]; then echo "$PW_TMUX_OWNER_CGROUP"; return; fi
 	if [[ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" == container ]]; then
-		echo 'pw-tmux.service'
+		echo 'pw-tmux.slice'
 	else
 		echo 'pw-tmux-server.service'
+	fi
+}
+
+owner_remediation() {
+	local mode default_cgroup
+	mode="$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')"
+	if [[ "$mode" == container ]]; then default_cgroup='pw-tmux.slice'; else default_cgroup='pw-tmux-server.service'; fi
+	if [[ -n "${PW_TMUX_OWNER_CGROUP:-}" && "$PW_TMUX_OWNER_CGROUP" != "$default_cgroup" ]]; then
+		echo "restart the configured tmux owner supervisor for cgroup $PW_TMUX_OWNER_CGROUP, then retry"
+	elif [[ "$mode" == container ]]; then
+		echo 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux.service'
+	else
+		echo 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service'
 	fi
 }
 
@@ -106,7 +119,7 @@ if tmux_ list-sessions >/dev/null 2>&1; then
 		die "refusing to adopt a foreign tmux server already running on this socket (no owner marker).
   It was created by something other than this owner unit, so its sessions live in the wrong cgroup.
   Migrate deliberately, then start this unit again:
-    pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service"
+    $(owner_remediation)"
 	fi
 fi
 
@@ -145,7 +158,7 @@ if [[ "$had_server" == 0 ]]; then
 		die "refusing to adopt a tmux server created by another process while this unit was starting.
   Sessions present that this owner did not create: $(echo "$foreign_sessions" | tr '\n' ' ')
   Migrate deliberately, then start this unit again:
-    pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service"
+    $(owner_remediation)"
 	fi
 fi
 
@@ -162,11 +175,23 @@ live_marker=$(tmux_ show-options -sv "$OWNER_MARKER_OPTION" 2>/dev/null || true)
 
 tmux_ has-session -t _keepalive 2>/dev/null || die "the keepalive session is not present — refusing to signal readiness"
 
-# The cgroup half. Only enforced where a cgroup is meaningful and readable; a
-# missing /proc entry is never read as a match.
+# The cgroup half. A strict deployment must prove the process cgroup; unreadable
+# metadata is a refusal, never permission to stamp or supervise the server.
 expected_owner=$(expected_owner_cgroup)
+if [[ "${PW_TMUX_REQUIRE_CGROUP:-0}" == 1 && ! -r "$PROC_ROOT/$server_pid/cgroup" ]]; then
+	die "the live tmux server cgroup is not readable at $PROC_ROOT/$server_pid/cgroup — refusing to signal readiness"
+fi
 if [[ -r "$PROC_ROOT/$server_pid/cgroup" ]]; then
-	live_cgroup=$(sed -n 's/^0:://p' "$PROC_ROOT/$server_pid/cgroup" | head -n1)
+	live_cgroup=''
+	fallback_cgroup=''
+	while IFS=: read -r hierarchy controllers cgroup_path; do
+		if [[ "$hierarchy" == 0 && -z "$controllers" ]]; then
+			live_cgroup="$cgroup_path"
+			break
+		fi
+		[[ -n "$cgroup_path" ]] && fallback_cgroup="$cgroup_path"
+	done < "$PROC_ROOT/$server_pid/cgroup"
+	[[ -n "$live_cgroup" ]] || live_cgroup="$fallback_cgroup"
 	if [[ "${PW_TMUX_REQUIRE_CGROUP:-0}" == 1 ]]; then
 		case "/$live_cgroup/" in
 			*"/$expected_owner/"*) : ;;
