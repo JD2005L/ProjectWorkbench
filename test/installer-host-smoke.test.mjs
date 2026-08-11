@@ -156,7 +156,12 @@ test('the staged install puts an executable file at the owner unit\'s ExecStart 
 needTmux('the staged ExecStart runs to readiness — no 203/EXEC, no missing-helper path', () => {
   const host = stageHost();
   try {
-    const { r, execFailure, unitDest } = runStagedExecStart(host);
+    // This smoke proves the staged executable/readiness path. The separate test
+    // below supplies controlled /proc and proves the unit's strict cgroup gate.
+    // A first start cannot know the tmux PID needed to construct that fixture.
+    const { r, execFailure, unitDest } = runStagedExecStart(host, {
+      extraEnv: { PW_TMUX_REQUIRE_CGROUP: '0' },
+    });
     assert.equal(execFailure, undefined, execFailure);
 
     const output = `${r.stdout || ''}${r.stderr || ''}`;
@@ -180,7 +185,12 @@ needTmux('the staged ExecStart satisfies the unit\'s OWN cgroup requirement', ()
   // idempotent, so re-running it against the live server is the real second start.
   const host = stageHost();
   try {
-    assert.equal(runStagedExecStart(host).r.status, 0, 'first start failed');
+    // Bootstrap only far enough to learn the private server PID. The next run
+    // restores the shipped strict setting and validates it against controlled
+    // /proc; the negative control then proves the gate can reject.
+    assert.equal(runStagedExecStart(host, {
+      extraEnv: { PW_TMUX_REQUIRE_CGROUP: '0' },
+    }).r.status, 0, 'first start failed');
     const pid = serverPid(host);
     assert.match(pid, /^\d+$/, 'no live tmux server to interrogate');
 
