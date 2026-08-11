@@ -66,7 +66,103 @@ tmux_sock_args=()
 [[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
 tmux() { command tmux "${tmux_sock_args[@]}" "$@"; }
 
+# A genuinely absent manifest is a clean no-op and always has been. Everything
+# below this line only runs when there IS something to replay — which is exactly
+# what keeps "nothing to restore" distinguishable from "this instance is
+# misconfigured".
 [[ -f "$MANIFEST" ]] || { log "no manifest; nothing to restore"; exit 0; }
+
+# ---- configuration preflight -------------------------------------------------
+#
+# The non-secret environment contract is declared once in app/env-schema.js; this
+# list is its shell-side consumer and test/env-contract.test.mjs asserts the two
+# cannot drift. Deliberately NOT resolved by invoking node: PW_APP_DIR is one of
+# the things being validated, so depending on it to validate itself would fail in
+# the one case that matters.
+#
+# Why this exists: a container-mode instance keeps its registry somewhere other
+# than the host default, and no restore unit exported the override. This script
+# therefore resolved the host default, found nothing, refused EVERY session, and
+# still exited 0 — a total refusal that read as a clean no-op. Reproduced as an
+# A/B differing only in PW_REGISTRY_PATH: default path gave 0 sessions and exit
+# 0; the real path gave 1 session and exit 0.
+CONFIG_ERROR_EXIT=78     # EX_CONFIG (sysexits.h): misconfigured, not a crash
+config_failures=()
+
+require_readable() {
+	local var="$1" pathv="$2" kind="$3"
+	if [[ -z "$pathv" ]]; then config_failures+=("$var: unset with no default"); return; fi
+	if [[ "$pathv" != /* ]]; then config_failures+=("$var=$pathv: not an absolute path"); return; fi
+	if [[ ! -e "$pathv" ]]; then config_failures+=("$var=$pathv: does not exist"); return; fi
+	if [[ "$kind" == dir && ! -d "$pathv" ]]; then config_failures+=("$var=$pathv: is not a directory"); return; fi
+	if [[ "$kind" == file && ! -f "$pathv" ]]; then config_failures+=("$var=$pathv: is not a regular file"); return; fi
+	# Readability by THIS account, not mere existence: PW_APP_DIR's default is
+	# root-owned 0700 on a container-mode instance, so it exists and is still
+	# unusable to the account restore runs as.
+	if [[ ! -r "$pathv" ]]; then config_failures+=("$var=$pathv: not readable by $(id -un)"); return; fi
+	if [[ "$kind" == dir && ! -x "$pathv" ]]; then config_failures+=("$var=$pathv: not searchable by $(id -un)"); fi
+}
+
+# B-2 (Round 8): a manifest that exists but cannot be read is MISCONFIGURATION,
+# not an empty manifest. Without this the read redirect below fails, the loop body
+# never runs, and the script exits 0 having restored nothing — the unit reports
+# success. Checked here so it travels the same distinct-nonzero path as every other
+# configuration failure, and therefore reaches pw-tmux-persist.service.
+[[ -r "$MANIFEST" ]] || config_failures+=("PW_TMUX_STATE_DIR=$STATE_DIR: manifest exists but is not readable by $(id -un) ($MANIFEST)")
+
+# The credential base is the one required entry that legitimately may not exist
+# yet: app/user-credentials.js creates it on first use (mkdirChecked with
+# recursive:true). Demanding it pre-exist would fail every instance that has not
+# yet written a per-user credential — and did break 24 existing fail-closed
+# regressions whose fixtures never create it. So: if present it must be a usable
+# directory; if absent its parent must be able to hold it.
+require_cred_base() {
+	local var="PW_USER_CRED_BASE" pathv="$1" parent
+	if [[ -z "$pathv" ]]; then config_failures+=("$var: unset with no default"); return; fi
+	if [[ "$pathv" != /* ]]; then config_failures+=("$var=$pathv: not an absolute path"); return; fi
+	if [[ -e "$pathv" ]]; then
+		[[ -d "$pathv" ]] || { config_failures+=("$var=$pathv: exists but is not a directory"); return; }
+		[[ -r "$pathv" && -x "$pathv" ]] || config_failures+=("$var=$pathv: not readable/searchable by $(id -un)")
+		return
+	fi
+	parent=$(dirname -- "$pathv")
+	[[ -d "$parent" ]] || { config_failures+=("$var=$pathv: absent and its parent $parent does not exist"); return; }
+	[[ -w "$parent" ]] || config_failures+=("$var=$pathv: absent and its parent $parent is not writable by $(id -un)")
+}
+
+require_readable PW_REGISTRY_PATH  "$REGISTRY_JSON" file
+require_readable PW_APP_DIR        "$APP_DIR"       dir
+require_readable PW_TMUX_STATE_DIR "$STATE_DIR"     dir
+[[ -r "$APP_DIR/project-terminal-credentials.mjs" ]] || \
+	config_failures+=("PW_APP_DIR=$APP_DIR: required helper project-terminal-credentials.mjs is missing or unreadable")
+
+# Only when the per-user feature is on: a shared-login instance is not obliged to
+# configure credential inputs it never reads.
+if [[ "${PW_PER_USER_CLAUDE:-}" == "true" ]]; then
+	require_readable PW_USERS_PATH     "${PW_USERS_PATH:-/etc/project-workbench/users.json}" file
+	require_cred_base "${PW_USER_CRED_BASE:-/home/admin/pw-users}"
+	# PW_SECRET_KEY_PATH is deliberately NOT preflighted here. This script never
+	# reads the key: it propagates the path to app/project-terminal-credentials.mjs,
+	# which decrypts as the credential owner and already fails closed per session on
+	# an unreadable key or an undecryptable token. Requiring it here would preempt
+	# that per-session refusal — and the key is typically 0600 to an account this
+	# script does not run as, so it would also fail on a correctly configured host.
+	# The contract names registry, app helper, users path and credential base; the
+	# schema still carries PW_SECRET_KEY_PATH so it is documented and propagated.
+fi
+
+if (( ${#config_failures[@]} > 0 )); then
+	log "CONFIGURATION ERROR: a manifest is present but required configuration is unusable; restored NOTHING"
+	for f in "${config_failures[@]}"; do log "  $f"; done
+	log "see app/env-schema.js for the contract; pw-tmux-persist.service is the observing unit"
+	# pw-tmux-persist.service invokes this script WITHOUT systemd's `-` prefix, so
+	# this exit surfaces as a failed unit. The tmux owner unit keeps its `-` on
+	# purpose — a restore failure must never tear down the server that owns every
+	# live session — which is why the persist unit is the authoritative observer.
+	exit "$CONFIG_ERROR_EXIT"
+fi
+# ------------------------------------------------------------------------------
+
 tmux start-server 2>/dev/null || true
 
 # Conversations already running right now (idempotency guard).
@@ -310,5 +406,19 @@ while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
 	fi
 done <"$MANIFEST"
 
-log "restore complete; launched $claude_count Claude session(s)"
+# Report what actually happened. The old unconditional "restore complete" was
+# emitted even when every session had been refused, which is precisely how a
+# total failure read as a success. A refusal is not necessarily a
+# misconfiguration — a project whose owner no longer resolves is a legitimate
+# per-project refusal — so this stays exit 0; it simply must not claim to have
+# restored anything it did not.
+refused=0
+for s in "${!CREATED[@]}"; do [[ "${CREATED[$s]}" == "skip" ]] && refused=$((refused + 1)); done
+created=0
+for s in "${!CREATED[@]}"; do [[ "${CREATED[$s]}" == "own" ]] && created=$((created + 1)); done
+if (( refused > 0 )); then
+	log "restore finished WITH REFUSALS: created $created session(s), refused $refused; launched $claude_count Claude session(s)"
+else
+	log "restore complete; created $created session(s); launched $claude_count Claude session(s)"
+fi
 exit 0

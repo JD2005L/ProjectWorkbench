@@ -196,6 +196,33 @@ install -d -m 0755 /etc/systemd/system/project-workbench.service.d
   install -m 0644 "$SRC_DIR/systemd/project-workbench.service.d/auth.conf" /etc/systemd/system/project-workbench.service.d/auth.conf
 systemctl daemon-reload
 
+# The one non-secret environment contract (app/env-schema.js). Rendered from the
+# schema rather than duplicated here, so this file cannot drift from the module
+# the consumers validate against. Seeded only when absent: an operator's tuning
+# must survive an update, exactly like auth.conf.
+#
+# NON-SECRET ONLY — paths, one enum, one boolean. Key MATERIAL never lands here;
+# PW_SECRET_KEY_PATH names where the key lives, which is configuration.
+if [ ! -f /etc/project-workbench/pw.env ]; then
+  if command -v node >/dev/null 2>&1; then
+    install -d -m 0755 /etc/project-workbench
+    if node --input-type=module -e "
+      import { renderEnvFile } from '$SRC_DIR/app/env-schema.js';
+      process.stdout.write(renderEnvFile(process.env));
+    " > /etc/project-workbench/pw.env.tmp 2>/dev/null; then
+      mv /etc/project-workbench/pw.env.tmp /etc/project-workbench/pw.env
+      chmod 0644 /etc/project-workbench/pw.env
+      log "Seeded /etc/project-workbench/pw.env from the environment contract"
+    else
+      rm -f /etc/project-workbench/pw.env.tmp
+      warn "could not render /etc/project-workbench/pw.env — units fall back to schema defaults"
+    fi
+  else
+    warn "node not found; skipped seeding /etc/project-workbench/pw.env"
+  fi
+fi
+
+
 # tmux-session persistence: restore-on-boot unit + periodic snapshot timer.
 # enable --now so the timer starts snapshotting immediately and the persist unit
 # is armed (its restore is a no-op until a manifest exists).

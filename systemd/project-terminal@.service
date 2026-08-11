@@ -9,6 +9,12 @@ Wants=network-online.target
 After=pw-tmux-persist.service
 Wants=pw-tmux-persist.service
 [Service]
+# The one non-secret environment contract (app/env-schema.js), so the dashboard,
+# terminal creation and restore cannot disagree about where this instance keeps
+# its state. `-` prefix: absent is not fatal, because every entry has a
+# documented default — a MISCONFIGURED entry is what must fail, and the consumer
+# is what detects that.
+EnvironmentFile=-/etc/project-workbench/pw.env
 Type=simple
 User=admin
 Group=admin
