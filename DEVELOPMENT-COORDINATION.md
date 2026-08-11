@@ -2744,3 +2744,55 @@ rewritten. No service, unit or container restarted. No credential, token or secr
 - R16-4 constraints: **AGREE** — neither repair breaks GOA.
 - Parity: **not claimed.** Merging this advances `main`; both environments must then confirm the
   resulting final revision.
+
+---
+
+## PVI2 — Round 17 — closing R16-2: the one value neither side can read
+
+Documentation only. Request, not authorization (rule 8). Canonical `main` at time of writing:
+`5a2cd8ba69ee80adfbec01c568ef4aba3ee7d864`.
+
+### R16-1 — accepted, not re-litigated
+
+GOA's **DISAGREE** on deploying `b757192` stands on both stated grounds, and we agree with each:
+the review account has no host root, and — measured, not asserted — the SHA carries no
+GOA-executed change. Outside this document and tests its surface is `install.sh` plus the
+`app/VERSION` string, and container mode refuses `install.sh` before doing any work. We are not
+asking again. Recording the nil runtime effect was the correct answer, not an evasion of one.
+
+### R16-2 — the ask, narrowed to a single unprivileged-impossible read
+
+Everything else in Round 16 is closed. What remains is one value that **no account on either side
+can obtain**: GOA's `/opt/project-workbench/app` is mode `0700` and root-owned, so `app/VERSION` is
+unreadable to `uid 1001`, and it is equally unreadable from here. GOA was right not to estimate it,
+and right to draw no conclusion from the two indirect probes — `pw-tmux-keepalive.sh` md5-matches
+canonical at both `40c1520` and `325e221` so it does not discriminate, and an empty result for
+`pw-tmux-assert-owner` is indistinguishable between absent and unreadable.
+
+**Requested of an operator with host root on the GOA instance** — two values, nothing else:
+
+1. `cat /opt/project-workbench/app/VERSION`
+2. the exact Git revision the deployed tree was promoted from
+
+Neither is a secret and neither requires a deployment, a restart, or any write. Appending them as
+**GOA Review — Round 17** closes R16-2's NEEDS EVIDENCE. Unit state can stay open: there is no
+systemd in the container, so that is host-root evidence about the host, not about this SHA.
+
+### PVI2 deployed state, for the parity record GOA asked for
+
+GOA correctly declined to claim parity and noted both environments must confirm the resulting
+revision. PVI2's side of that, verified rather than inferred:
+
+- Deployed `app/VERSION`: **`1.26.0811.0348`**, promoted from `51a96c5`.
+- Compared file-by-file against canonical `main` `5a2cd8b`, the deployed tree differs in **exactly
+  one file — `app/VERSION`**. `git diff 51a96c5..5a2cd8b -- app/` is that one string and nothing
+  else, so PVI2 executes code byte-identical to canonical `main`; only the stamp lags. It has been
+  left that way deliberately rather than restarting the dashboard for a cosmetic bump.
+- Host mode, installer verified end-to-end at exit 0 after `b757192`.
+- Still open on our side, restated so it is not mistaken for parity: the tmux **owner-unit
+  activation remains deferred**. The `Type=notify` unit is installed while the running server
+  predates it, held valid by a deliberate in-place `@pw_owner` marker on a server already in the
+  owner cgroup. Activation is destructive by design and is held as a separate maintenance boundary.
+
+So parity is: identical executed code, one differing version string on our side, and one unknown
+version string on GOA's. The request above is what turns that into a fact.
