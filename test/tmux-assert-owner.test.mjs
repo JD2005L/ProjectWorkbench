@@ -64,7 +64,11 @@ exit 0
 
 function runGate({ procRoot, ownerCgroup, tmuxBin, extraEnv = {}, cli = CLI }) {
   const env = {
-    PATH: `${tmuxBin}:/usr/bin:/bin`,
+    // node's own directory, not a guess: the helper is `#!/usr/bin/env node`, and
+    // a runner that installs node outside /usr/bin (GitHub's setup-node does)
+    // would otherwise fail with 127 for a reason that has nothing to do with the
+    // gate. A local /usr/bin/node masks this exactly.
+    PATH: `${tmuxBin}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
     HOME: process.env.HOME,
     ...POLLUTION,
     PW_TMUX_PROC_ROOT: procRoot,
