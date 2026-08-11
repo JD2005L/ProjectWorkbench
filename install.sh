@@ -195,13 +195,30 @@ install -m 0755 "$SRC_DIR/scripts/project-preview-start"  /usr/local/bin/project
 install -m 0755 "$SRC_DIR/scripts/setup-terminal-start"   /usr/local/bin/setup-terminal-start
 install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update-claude-code
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
-# Every server-creation seam refuses unless this is on PATH — a missing helper is
-# a refusal, not a skip. Shipping it is therefore not optional: without it the
-# project and setup terminals, restore and the persist path all refuse on a real
-# host. (Test fixtures supplied a temporary copy, which is what hid this.)
-install -m 0755 "$SRC_DIR/scripts/pw-tmux-assert-owner"   /usr/local/bin/pw-tmux-assert-owner
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+
+# The ownership gate is installed BESIDE app/, then symlinked onto PATH.
+#
+# Every server-creation seam refuses unless this is on PATH — a missing helper is a
+# refusal, not a skip — so shipping it is not optional. But shipping it is not
+# sufficient either, and that is the part a presence check cannot see:
+# pw-tmux-assert-owner is an ES module that imports `../app/tmux-owner.js` RELATIVE
+# TO ITSELF, deliberately, so the shell gate and the JS gate share one verdict
+# function and cannot drift. Installed flat into /usr/local/bin, that resolves to
+# /usr/local/app/tmux-owner.js, which no deployment has — so the helper died with
+# ERR_MODULE_NOT_FOUND and exited nonzero on EVERY invocation. Since the seams
+# treat "cannot execute the helper" as fatal, that is a total host-mode outage: no
+# project or setup terminal starts, and pw-tmux-restore refuses, so sessions are
+# never restored at boot.
+#
+# Installing under $PW_INSTALL_DIR/scripts puts app/ exactly one level up, so the
+# relative import is correct by construction. The /usr/local/bin symlink keeps it
+# on PATH for the seams; node resolves an ES module's imports against its REALPATH,
+# so reaching it through the link lands on the same app/ directory.
+install -d -m 0755 "$PW_INSTALL_DIR/scripts"
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-assert-owner"   "$PW_INSTALL_DIR/scripts/pw-tmux-assert-owner"
+ln -sfn "$PW_INSTALL_DIR/scripts/pw-tmux-assert-owner"    /usr/local/bin/pw-tmux-assert-owner
 # The owner unit's ExecStart. It has to be installed BEFORE the unit is enabled at
 # the end of this script, and it has to be installed at all: a controlled host
 # deployment failed here with 203/EXEC because the host unit named the CONTAINER
