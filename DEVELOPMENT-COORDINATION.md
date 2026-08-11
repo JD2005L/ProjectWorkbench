@@ -1864,3 +1864,167 @@ abandoned; it exists to stop convergence stalling, not to take the lane.
 Candidate C starts only after Candidate B is merged. **No deployment is authorized** — merge and
 deployment remain separate gates, and this integration candidate authorizes neither a PVI/PVE nor a
 GOA rollout.
+
+
+---
+
+## Hermes-James — Round 13 — Candidate C PR #38 exact-head block
+
+Immutable exact-head review on the PVI2 lane. This entry is a review record only. Per rule 1 and
+rule 8 it authorizes neither merge nor deployment.
+
+Numbered 13 because Round 12 is carried on the PR #38 branch and is not yet on `main`; when both
+land, both sections should be preserved in round order rather than either being rewritten (rule 2).
+
+### Binding
+
+- Candidate: PR #38, exact head `4189cdaad8aced8c895ca33c11a6ee340a2980ed`
+- Target/base and merge base: `fb42c320ae7b1cea658dc43826b0c7d9947f8d7e` (canonical `main`)
+- Superseded / reference-only: PR #38 first head `7be00ea1cfafbc6fafc38823c47c04f90f2ccfc0`;
+  PR #24 head `43625e4c059f1f5d85ed9430dc1ac81988a90c4e`
+- Both exact-head CI runs green: `push` run `31446944995`, `pull_request` run `31446947088`, attempt 1
+- Canonical `npm test` at the exact head: **1011 tests, 1008 pass, 0 fail, 3 skipped, 0 todo**
+- Focused Candidate C suites: **49/49 pass, 0 skipped**
+- Environment for every reproduction below: PVI2 review host, Node v22, throwaway temp fixtures only.
+  No GOA instance and no live service were exercised.
+
+### Status: BLOCKED — do not merge or deploy this reviewed head.
+
+The direction is right and the readiness/race work is a genuine improvement on PR #24. Both blockers
+below are packaging/configuration gaps rather than logic errors in the ownership model itself, and
+both are invisible to the current suite because a fixture supplies what production does not.
+
+### HJ-38-1 — The ownership gate helper is never installed; every terminal seam refuses after a host install (P0)
+
+**Evidence**
+
+- `scripts/pw-tmux-assert-owner` is mode `100755` with `#!/usr/bin/env node`.
+- All three shell seams resolve it **only** through `PATH`, with no repo-relative or sibling
+  fallback: `scripts/project-terminal-start:27`, `scripts/setup-terminal-start:17`,
+  `scripts/pw-tmux-restore:173`, each `gate=$(command -v pw-tmux-assert-owner) || gate=""`.
+- A missing helper is a deliberate refusal (`exit 1`), which is the correct fail-closed choice.
+- `install.sh` installs seven scripts from `scripts/`. The helper is not among them:
+  `grep -c 'scripts/pw-tmux-assert-owner' install.sh` returns `0`, and the name appears nowhere else
+  in `install.sh`. The Candidate C installer delta adds only the container refusal and the
+  owner-unit block.
+- Reproduced with a `PATH` built from exactly what `install.sh` installs:
+
+      PATH after a faithful install.sh run:
+        project-preview-start project-terminal-start pw-tmux-restore pw-tmux-save
+        setup-terminal-start tmux
+      gate helper present: NO
+
+      pw-tmux-restore -> [restore] refusing: the tmux ownership helper
+                         pw-tmux-assert-owner is not installed        exit=1
+
+- Blast radius on a host install/upgrade: every `project-terminal@*` unit, `project-setup-terminal`,
+  and `pw-tmux-persist.service` — which invokes restore **without** systemd's `-` prefix, so the
+  refusal surfaces as a failed unit. The `Requires=pw-tmux-server.service` added to the client units
+  compounds this.
+- Why the suite is green: `test/tmux-seam-gate.test.mjs:74` **writes a stub** `pw-tmux-assert-owner`
+  into a temporary `PATH` directory, and the mutation cases rely on the runner's `PATH`. No test
+  asserts that `install.sh` ships the helper; `test/tmux-owner-install.test.mjs` covers the unit,
+  `MemoryHigh` and the container refusal only.
+
+**Required resolution properties**
+
+- `install.sh` must install the gate helper alongside the other seam scripts, at a path on the
+  service `PATH`, with the same mode as the other installed scripts.
+- A test must assert that **every** helper referenced by a seam is installed by the installer —
+  derived from the seam sources rather than a hand-maintained list, so a future seam cannot
+  reintroduce this.
+- At least one seam test must exercise the **installed** helper rather than a stub written by the
+  fixture.
+
+### HJ-38-2 — The cgroup half of the ownership test is not enforced at the JS seams in shipped configuration (P1)
+
+**Evidence**
+
+- `app/tmux-owner.js` states ownership is "TWO independent facts, and both must hold" (marker and
+  cgroup), and `assessOwnership` implements exactly that.
+- `scripts/pw-tmux-assert-owner` enforces both unconditionally, via `verdict.owned`.
+- `app/tmux-owner-gate.js:68` makes the cgroup half conditional:
+  `const requireCgroup = String(env.PW_TMUX_REQUIRE_CGROUP || '') === '1';`
+- Only `systemd/pw-tmux-server.service` sets that variable. `project-workbench.service`,
+  `project-terminal@.service`, `project-setup-terminal.service` and `pw-tmux-persist.service` do
+  not, and `/etc/project-workbench/pw.env` cannot supply it — it is rendered from
+  `app/env-schema.js`, which contains no `PW_TMUX_*` entry.
+- Both JS seams therefore run marker-only in production: `app/server.js:908` (dashboard
+  create / new-window / recycle) and `app/orchestrator/session.js:184`.
+- `assertTmuxOwner` **returns** a verdict whose own `owned` field is `false` instead of throwing, and
+  both callers ignore the return value.
+- Reproduced against the module's own "adopt-don't-move" case — marker present, cgroup
+  `project-terminal@ui3.service`, controlled `/proc`:
+
+      assessOwnership -> {"owned":false,"markerOk":true,"cgroupOk":false}
+        reason: ...carries the owner marker but its cgroup .../project-terminal@ui3.service
+                is not pw-tmux-server.service - it is being supervised, not owned
+
+      JS gate:    [ACCEPTS] shipped dashboard env         -> owned=false, seam proceeds
+                  [REFUSES] with PW_TMUX_REQUIRE_CGROUP=1 -> PW_TMUX_FOREIGN_SERVER
+      Shell gate: [REFUSES] shipped shell env             -> exit 1
+
+- The marker is a tmux **server option**, settable by anything that can reach the socket, so
+  marker-only is not equivalent to the documented two-fact test.
+- `test/tmux-owner-fixture.mjs:78-79` describes its environment as "the environment a shipped unit
+  provides. `PW_TMUX_REQUIRE_CGROUP=1` matches `systemd/pw-tmux-server.service` and the client
+  units." That is accurate for the owner unit and inaccurate for all four client units, so the seam
+  tests pass under an environment production never supplies.
+
+**Required resolution properties**
+
+- The JS gate and the shell gate must apply the same ownership test. Either enforce the cgroup half
+  unconditionally in `app/tmux-owner-gate.js`, or set `PW_TMUX_REQUIRE_CGROUP=1` in every client unit
+  **and** assert that in the unit tests.
+- `assertTmuxOwner` must throw whenever `verdict.owned` is false; returning a not-owned verdict on
+  the success path should not be reachable.
+- A test must derive the seam environment from the shipped unit files rather than asserting a
+  hand-written constant that describes them.
+
+### HJ-38-3 — Owner unit references an environment file that nothing creates (P2, non-blocking)
+
+**Evidence**
+
+- `systemd/pw-tmux-server.service:35` reads `EnvironmentFile=-/etc/project-workbench/pw-env`
+  (hyphen). Every other unit and `install.sh` use `/etc/project-workbench/pw.env` (dot), and nothing
+  in the repository creates `pw-env`.
+- The reference is `-`-optional, so the unit still starts; the effect is that the owner unit runs on
+  schema defaults instead of the instance's environment contract, which defeats the Candidate B
+  invariant that all consumers agree about where the instance keeps its state.
+- `test/env-contract.test.mjs:414` enumerates four unit names literally, so a newly added unit is not
+  covered by the "one place" guard.
+
+**Required resolution properties**
+
+- Correct the filename, and make the contract guard enumerate the units on disk rather than a
+  literal list, so the next unit added is covered automatically.
+
+### Verified sound at this exact head
+
+- Readiness proves the marker and a live server before `systemd-notify`; a pre-existing foreign
+  server makes the unit fail rather than adopt; no signal is sent if the server dies mid-proof.
+- Cold-start race, `Type=notify` with `NotifyAccess=all`, and `Requires=`/`After=` (not `Wants=`) on
+  all three client units.
+- Mutations are non-vacuous: `Type=notify` to `Type=simple` fails the unit assertion; removing the
+  owner marker stamp fails two readiness assertions including the cold-start race, for the intended
+  reason.
+- Adapter scope is genuinely private-socket-only: `app/orchestrator/session.js:183` gates whenever
+  the adapter socket equals `PW_TMUX_SOCKET`, which is how production resolves it.
+- Installer refuses container mode and an enabled sidecar owner; `MemoryHigh` uses 64-bit shell
+  arithmetic, checked against real mawk.
+- GOA-2 and GOA-5 dispositions preserved: no restore-on-start switch, container supervision
+  retained, host remains the default mode with no new ambiguity refusal.
+- Hermetic harnesses, private short socket, CI on every branch and pull request with an explicit note
+  that required-check enforcement is branch protection outside this repository.
+- Candidates A and B are intact: `app/git-credentials.js`, `app/credential-domain-lock.js`,
+  `app/credential-writer.mjs`, `scripts/pw-git-credential-audit.mjs` and `app/env-schema.js` are
+  byte-identical to `fb42c320ae7b1cea658dc43826b0c7d9947f8d7e`; `app/server.js` is +10/-0, the gate
+  wiring only.
+- `app/VERSION` moves `1.26.0810.2352` to `1.26.0811.0042`; secret scan and diff check clean.
+
+### Not run — environment-owned, reported as not run rather than as a pass
+
+- Real systemd `Type=notify` readiness handshake on a GOA instance.
+- Live cold-start boot race with real units.
+- Container sidecar topology.
+- Real cgroup placement observation of the live tmux server.
