@@ -21,9 +21,9 @@ Wants=pw-tmux-persist.service
 # is what detects that.
 EnvironmentFile=-/etc/project-workbench/pw.env
 Type=simple
-User=admin
-Group=admin
-Environment=HOME=/home/admin
+User=@PW_USER@
+Group=@PW_GROUP@
+Environment=HOME=@PW_HOME@
 ExecStart=/usr/local/bin/project-terminal-start %i
 Restart=on-failure
 RestartSec=3

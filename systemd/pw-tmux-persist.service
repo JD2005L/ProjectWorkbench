@@ -23,9 +23,9 @@ Type=oneshot
 RemainAfterExit=yes
 # Never let stopping/restarting this unit tear down the shared tmux server.
 KillMode=none
-User=admin
-Group=admin
-Environment=HOME=/home/admin
+User=@PW_USER@
+Group=@PW_GROUP@
+Environment=HOME=@PW_HOME@
 Environment=LANG=C.UTF-8
 Environment=LC_ALL=C.UTF-8
 ExecStart=/usr/local/bin/pw-tmux-restore

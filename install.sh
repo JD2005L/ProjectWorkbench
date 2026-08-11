@@ -218,15 +218,42 @@ if [ -f "$SRC_DIR/config/tmux.conf" ]; then
 fi
 
 log "Installing systemd units…"
-install -m 0644 "$SRC_DIR/systemd/project-workbench.service"       /etc/systemd/system/project-workbench.service
-install -m 0644 "$SRC_DIR/systemd/project-terminal@.service"      /etc/systemd/system/project-terminal@.service
-install -m 0644 "$SRC_DIR/systemd/project-setup-terminal.service" /etc/systemd/system/project-setup-terminal.service
-install -m 0644 "$SRC_DIR/systemd/project-preview@.service"       /etc/systemd/system/project-preview@.service
-install -m 0644 "$SRC_DIR/systemd/claude-code-update.service"     /etc/systemd/system/claude-code-update.service
-install -m 0644 "$SRC_DIR/systemd/claude-code-update.timer"       /etc/systemd/system/claude-code-update.timer
-install -m 0644 "$SRC_DIR/systemd/pw-tmux-persist.service"        /etc/systemd/system/pw-tmux-persist.service
-install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.service"           /etc/systemd/system/pw-tmux-save.service
-install -m 0644 "$SRC_DIR/systemd/pw-tmux-save.timer"             /etc/systemd/system/pw-tmux-save.timer
+# Units are RENDERED, not copied. They used to hard-code /opt/project-workbench and
+# the `admin` account, which made two advertised contracts untrue: PW_INSTALL_DIR
+# produced an install whose units pointed at a tree nothing populated, and the tmux
+# owner unit named an account the installer had not necessarily created. The owner
+# unit's account is load-bearing — tmux's default socket is per-UID, so an owner on
+# the wrong account supervises a socket no seam ever looks at.
+PW_GROUP="${PW_GROUP:-$PW_USER}"
+PW_HOME="$(getent passwd "$PW_USER" 2>/dev/null | cut -d: -f6)"
+[ -n "$PW_HOME" ] || PW_HOME="/home/$PW_USER"
+
+render_unit() {
+  render_tmp="$(mktemp)"
+  sed -e "s|@PW_INSTALL_DIR@|$PW_INSTALL_DIR|g" \
+      -e "s|@PW_USER@|$PW_USER|g" \
+      -e "s|@PW_GROUP@|$PW_GROUP|g" \
+      -e "s|@PW_HOME@|$PW_HOME|g" \
+      "$1" > "$render_tmp"
+  # A placeholder that survives rendering would reach systemd verbatim, so it is
+  # fatal here rather than a warning discovered by a failing unit later.
+  if grep -qE '@PW_[A-Z_]+@' "$render_tmp"; then
+    rm -f "$render_tmp"
+    die "unit $1 still contains an unrendered @PW_…@ placeholder"
+  fi
+  install -m 0644 "$render_tmp" "$2"
+  rm -f "$render_tmp"
+}
+
+render_unit "$SRC_DIR/systemd/project-workbench.service"       /etc/systemd/system/project-workbench.service
+render_unit "$SRC_DIR/systemd/project-terminal@.service"       /etc/systemd/system/project-terminal@.service
+render_unit "$SRC_DIR/systemd/project-setup-terminal.service"  /etc/systemd/system/project-setup-terminal.service
+render_unit "$SRC_DIR/systemd/project-preview@.service"        /etc/systemd/system/project-preview@.service
+render_unit "$SRC_DIR/systemd/claude-code-update.service"      /etc/systemd/system/claude-code-update.service
+render_unit "$SRC_DIR/systemd/claude-code-update.timer"        /etc/systemd/system/claude-code-update.timer
+render_unit "$SRC_DIR/systemd/pw-tmux-persist.service"         /etc/systemd/system/pw-tmux-persist.service
+render_unit "$SRC_DIR/systemd/pw-tmux-save.service"            /etc/systemd/system/pw-tmux-save.service
+render_unit "$SRC_DIR/systemd/pw-tmux-save.timer"              /etc/systemd/system/pw-tmux-save.timer
 # Drop-in for app-level auth enforcement (Phase 1: defaults to OFF for safe
 # rollout — flip PW_AUTH_ENFORCE=true after creating an admin via `pw-user`).
 # Only seed the default when none exists: a redeploy must never silently flip an
@@ -407,7 +434,7 @@ printf '────────────────────────
 # The shared tmux server must live in ITS OWN cgroup, not in whichever terminal
 # happened to create it first. Failure here is FATAL: a half-installed owner is
 # how the server ends up back inside a ttyd unit.
-install -m 0644 "$SRC_DIR/systemd/pw-tmux-server.service" /etc/systemd/system/pw-tmux-server.service
+render_unit "$SRC_DIR/systemd/pw-tmux-server.service" /etc/systemd/system/pw-tmux-server.service
 
 # Soft memory ceiling for the owner. 64-BIT SHELL ARITHMETIC ON PURPOSE: the
 # obvious `awk '{printf "%d", ...}'` clamps at INT_MAX under mawk (the default awk

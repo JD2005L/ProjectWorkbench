@@ -11,6 +11,7 @@
 // never ships — is precisely what a hand-maintained list forgets.
 import fs from 'node:fs';
 import path from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
 export const REPO = fileURLToPath(new URL('..', import.meta.url));
@@ -36,8 +37,40 @@ export function installPrefix(installSh) {
  * wrong, and would have forced this check to be weakened until it passed.
  */
 export function installedUnits(installSh) {
-  return [...installSh.matchAll(/install\s+-m\s+0644\s+"\$SRC_DIR\/(systemd\/[^"]+)"\s+(\/etc\/systemd\/system\/\S+)/g)]
+  // Two shapes: a verbatim `install -m 0644`, and `render_unit`, which substitutes
+  // the deployment's prefix and account before writing. Both must be in scope, or
+  // moving a unit to the rendering path would silently drop it out of every check.
+  return [...installSh.matchAll(/(?:install\s+-m\s+0644|render_unit)\s+"\$SRC_DIR\/(systemd\/[^"]+)"\s+(\/etc\/systemd\/system\/\S+)/g)]
     .map((m) => ({ source: m[1], dest: m[2] }));
+}
+
+/**
+ * The placeholders install.sh substitutes when it renders a unit, and the values a
+ * default install would give them.
+ *
+ * `PW_INSTALL_DIR` is an advertised override. Until units were rendered, every
+ * `/opt/project-workbench` in a unit file was a literal, so setting the override
+ * produced an install whose units pointed at a tree that was never populated —
+ * the advertised knob was a lie. The same applies to the account: the owner unit
+ * must name the account the installer actually created.
+ */
+export function installDefaults(installSh) {
+  const user = /^PW_USER=([A-Za-z0-9._-]+)/m.exec(installSh);
+  if (!user) throw new Error('install.sh no longer declares PW_USER');
+  return { prefix: installPrefix(installSh), user: user[1], home: `/home/${user[1]}` };
+}
+
+export function renderUnit(text, { prefix, user, home }) {
+  return text
+    .replaceAll('@PW_INSTALL_DIR@', prefix)
+    .replaceAll('@PW_USER@', user)
+    .replaceAll('@PW_GROUP@', user)
+    .replaceAll('@PW_HOME@', home);
+}
+
+/** Any placeholder left unrendered — a live unit must never contain one. */
+export function unrenderedPlaceholders(text) {
+  return [...new Set([...text.matchAll(/@[A-Z][A-Z0-9_]*@/g)].map((m) => m[0]))];
 }
 
 /** Executables install.sh installs, keyed by destination path. */
@@ -87,18 +120,34 @@ export function unitEnvironment(unitText) {
  * through $PATH (`command -v pw-tmux-assert-owner`), or by absolute /usr/local
  * path. Both are read out of the sources.
  */
-export function seamReferences() {
-  const seamFiles = [
-    ...fs.readdirSync(path.join(REPO, 'scripts')).map((f) => `scripts/${f}`),
-    ...fs.readdirSync(path.join(REPO, 'app')).filter((f) => f.endsWith('.js')).map((f) => `app/${f}`),
-  ].filter((p) => fs.statSync(path.join(REPO, p)).isFile());
+export function seamFiles() {
+  // RECURSIVE, and `.mjs` as well as `.js`. A flat readdir of app/ missed every
+  // orchestrator seam — app/orchestrator/config.js names /usr/local/bin/claude —
+  // so a helper reached only from a subdirectory was invisible to this audit.
+  const out = [];
+  const walk = (rel) => {
+    for (const entry of fs.readdirSync(path.join(REPO, rel), { withFileTypes: true })) {
+      const child = `${rel}/${entry.name}`;
+      if (entry.isDirectory()) {
+        if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
+        walk(child);
+      } else if (entry.isFile() && (rel.startsWith('scripts') || /\.(js|mjs)$/.test(entry.name))) {
+        out.push(child);
+      }
+    }
+  };
+  walk('scripts');
+  walk('app');
+  return out;
+}
 
+export function seamReferences() {
   const refs = new Map(); // name -> Set(seam files)
   const note = (name, file) => {
     if (!refs.has(name)) refs.set(name, new Set());
     refs.get(name).add(file);
   };
-  for (const file of seamFiles) {
+  for (const file of seamFiles()) {
     const src = read(file);
     for (const m of src.matchAll(/command -v\s+([A-Za-z0-9._-]+)/g)) note(m[1], file);
     for (const m of src.matchAll(/\/usr\/local\/(?:bin|sbin)\/([A-Za-z0-9._-]+)/g)) note(m[1], file);
@@ -199,26 +248,110 @@ export function auditThisRepo(overrides = {}) {
 }
 
 /**
- * Replay install.sh's file manifest into a staging root, using the real
- * `install(1)` with the real modes. This is the installer's OWN manifest — parsed
- * out of install.sh, never restated — so what gets staged is what a host receives.
+ * Replay install.sh's file manifest into a staging root, through the real
+ * `install(1)` with the real modes — the same program install.sh runs, so the
+ * staged mode and ownership semantics are the installer's, not a reimplementation
+ * of them. (An earlier revision of this comment claimed `install(1)` while the
+ * code used copyFileSync + chmod. It now does what it says.)
  *
- * Returns the destinations written, relative to the host paths they represent.
+ * Units go through the same placeholder rendering install.sh applies, so a staged
+ * unit is byte-for-byte what a host of that shape receives. `vars` lets a test
+ * stage a NON-DEFAULT PW_INSTALL_DIR / account and prove the override is real.
+ *
+ * This is the installer's OWN manifest — parsed out of install.sh, never restated.
  */
-export function stageInstall(stageRoot, installSh) {
-  const staged = { units: [], helpers: [] };
-  const put = (source, dest, mode) => {
-    const target = path.join(stageRoot, dest);
-    fs.mkdirSync(path.dirname(target), { recursive: true });
-    fs.copyFileSync(path.join(REPO, source), target);
-    fs.chmodSync(target, mode);
-    return { source, dest, target, mode };
+export function stageInstall(stageRoot, installSh, vars = null) {
+  const values = vars ?? installDefaults(installSh);
+  const staged = { units: [], helpers: [], vars: values };
+
+  // BATCHED, by (destination directory, mode). `install -m MODE src… DIR` is one
+  // process for a whole group instead of one per file.
+  //
+  // This is not micro-optimisation. Staging happens in every test in three files,
+  // and a per-file spawn made it ~300 extra processes per suite run — enough, on a
+  // loaded host, to push the orchestrator's process-kill timing assertions past
+  // their deadlines and fail a suite that has nothing to do with the installer.
+  // Verified: the reviewed head passes the full gate on the same machine where the
+  // unbatched version failed it.
+  const groups = new Map();
+  const single = [];
+  const queue = (sourceAbs, dest, mode) => {
+    // Batching relies on `install` preserving the basename into a directory, so a
+    // destination that renames its source must still go one at a time.
+    if (path.basename(sourceAbs) !== path.basename(dest)) {
+      single.push({ sourceAbs, dest, mode });
+      return;
+    }
+    const key = `${path.dirname(dest)} ${mode}`;
+    if (!groups.has(key)) groups.set(key, { dir: path.dirname(dest), mode, sources: [] });
+    groups.get(key).sources.push(sourceAbs);
   };
+
   for (const [dest, entry] of helperManifest(installSh)) {
-    staged.helpers.push(put(entry.source, dest, entry.mode));
+    queue(path.join(REPO, entry.source), dest, entry.mode);
+    staged.helpers.push({ source: entry.source, dest, target: path.join(stageRoot, dest), mode: entry.mode });
   }
   for (const unit of installedUnits(installSh)) {
-    staged.units.push(put(unit.source, unit.dest, 0o644));
+    // Render first, into a scratch file, then install THAT — mirroring install.sh.
+    const scratch = path.join(stageRoot, '.render', path.basename(unit.dest));
+    fs.mkdirSync(path.dirname(scratch), { recursive: true });
+    fs.writeFileSync(scratch, renderUnit(read(unit.source), values));
+    queue(scratch, unit.dest, 0o644);
+    staged.units.push({ source: unit.source, dest: unit.dest, target: path.join(stageRoot, unit.dest), mode: 0o644 });
+  }
+
+  const mode8 = (m) => m.toString(8).padStart(4, '0');
+  for (const { dir, mode, sources } of groups.values()) {
+    const targetDir = path.join(stageRoot, dir);
+    fs.mkdirSync(targetDir, { recursive: true });
+    execFileSync('install', ['-m', mode8(mode), ...sources, targetDir]);
+  }
+  for (const { sourceAbs, dest, mode } of single) {
+    const target = path.join(stageRoot, dest);
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    execFileSync('install', ['-m', mode8(mode), sourceAbs, target]);
   }
   return staged;
+}
+
+// ---------------------------------------------------------------------------
+// Owner <-> executor socket identity
+// ---------------------------------------------------------------------------
+
+/**
+ * tmux's default socket, as tmux itself computes it: `$TMUX_TMPDIR/tmux-<uid>/<name>`,
+ * with TMUX_TMPDIR defaulting to /tmp and the name defaulting to `default`.
+ *
+ * This rule is not taken on trust — test/tmux-owner-socket-parity.test.mjs verifies
+ * it against the real tmux binary inside a private TMUX_TMPDIR before relying on it.
+ */
+export function tmuxDefaultSocket({ tmuxTmpdir, uid, name = 'default' }) {
+  return `${tmuxTmpdir || '/tmp'}/tmux-${uid}/${name}`;
+}
+
+/**
+ * The uid an account resolves to.
+ *
+ * Returns a real number where the account exists (a deployment host), and a stable
+ * symbolic token where it does not (a CI runner has no `admin`). The token keeps the
+ * parity comparison meaningful everywhere instead of skipping: two sides agree iff
+ * they name the same account, which is precisely the invariant under test, and a
+ * mutation that changes the account still breaks it.
+ */
+export function resolveUid(user) {
+  try {
+    const out = execFileSync('getent', ['passwd', user], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const fields = out.split('\n')[0].split(':');
+    if (fields.length === 7 && /^\d+$/.test(fields[2])) return Number(fields[2]);
+  } catch { /* no such account here; fall through to the symbolic form */ }
+  return `uid(${user})`;
+}
+
+/** `User=` / `Group=` as a rendered unit declares them. Absent means root. */
+export function unitAccount(unitText) {
+  const pick = (key) => {
+    const m = new RegExp(`^\\s*${key}=(.*)$`, 'm').exec(unitText.replace(/\\\n\s*/g, ' '));
+    return m ? m[1].trim() : null;
+  };
+  return { user: pick('User'), group: pick('Group') };
 }

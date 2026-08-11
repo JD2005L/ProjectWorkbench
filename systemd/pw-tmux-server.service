@@ -21,6 +21,22 @@ Wants=network-online.target
 Type=notify
 NotifyAccess=all
 
+# THE ACCOUNT IS PART OF THE OWNERSHIP CONTRACT, not an incidental detail.
+#
+# tmux's default socket is per-UID (/tmp/tmux-<uid>/default). The dashboard drives
+# and probes tmux as the pane account via `sudo -u <account>`, and the terminal
+# units run as that account. An owner running as root therefore creates its server
+# on ROOT's socket — a different, empty one — and every seam refuses against a
+# healthy host while this unit reports active and ready. Running as the same
+# account is what makes the readiness signal mean anything.
+#
+# These are placeholders: install.sh renders them from the account it actually
+# created ($PW_USER), so the unit cannot name an account that does not exist, and
+# a deployment that uses a different account gets a unit that matches it.
+User=@PW_USER@
+Group=@PW_GROUP@
+Environment=HOME=@PW_HOME@
+
 # The readiness signal is sent by scripts/pw-tmux-keepalive.sh only after it has
 # PROVEN, about the live server: that it exists on the intended socket, that it
 # carries the owner marker (a tmux server option, so no client can have inherited
@@ -32,7 +48,11 @@ TimeoutStartSec=60
 Environment=PW_TMUX_HOST_MODE=1
 Environment=PW_TMUX_OWNER_BOOTSTRAP=1
 Environment=PW_TMUX_REQUIRE_CGROUP=1
-EnvironmentFile=-/etc/project-workbench/pw-env
+# pw.env, not pw-env. install.sh seeds /etc/project-workbench/pw.env from the
+# environment contract and project-workbench.service reads that same file; the
+# hyphenated name never existed, so this optional load silently matched nothing
+# and the owner ran without the deployment's configured PW_TMUX_SOCKET.
+EnvironmentFile=-/etc/project-workbench/pw.env
 # HOST path, not the container one. This unit previously named
 # /opt/project-workbench/scripts/pw-tmux-keepalive.sh — the layout the Containerfile
 # creates (COPY scripts/ → /opt/project-workbench/scripts/) and the sidecar
