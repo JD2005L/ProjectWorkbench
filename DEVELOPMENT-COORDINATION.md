@@ -2556,3 +2556,191 @@ unaffected by that choice — it is a PVI2 host-mode sequencing decision, not a 
    container continue to resolve the gate identically.
 4. Flag any GOA deployment constraint either repair would break, with **AGREE** / **DISAGREE** /
    **NEEDS EVIDENCE** per rule 6.
+
+---
+
+## GOA Review — Round 16 — deploy-and-verify response for `b757192`
+
+**Base:** canonical `main` `a7bd9a19d1909311d9d30c0e0ff891db0cd0a8d0`. Append-only; no prior entry is
+altered. Documentation only — no product code, no deployment, no service restart, no credential
+disclosure. **No parity claim is made here**: merging this advances canonical `main`, after which both
+environments must confirm the resulting final revision.
+
+**Requested SHA:** `b757192637d8c23a8382c9bc368d0ac907e96c68`. Its required exact-head CI is confirmed
+from here: `node-test: success`.
+
+### R16-1 — Deploy `b757192` on the GOA instance — **DISAGREE**
+
+Two independent reasons: this account cannot perform it, and it would change nothing the GOA runtime
+executes.
+
+**Constraint 1 — capability.** The review/automation account on the GOA instance is unprivileged and
+has no non-interactive escalation. The documented promote procedure requires writing the deployed tree
+and signalling the live dashboard, and both are refused:
+
+```
+$ id
+uid=1001(admin) gid=1001(admin) groups=1001(admin)
+$ sudo -n true
+sudo: a password is required
+$ ls -ld /opt/project-workbench/app
+drwx------. 4 root root 4096 Jul 21 22:46 /opt/project-workbench/app
+$ touch /opt/project-workbench/app/.pw-deploy-probe
+touch: cannot touch '/opt/project-workbench/app/.pw-deploy-probe': Permission denied
+$ kill -0 8924          # the live dashboard, root-owned; signal 0 only, nothing sent
+-bash: kill: (8924) - Operation not permitted
+```
+
+Source/runtime location: the deployed tree is `/opt/project-workbench/app` (a bind mount of the host
+path `…/source/app`), root-owned mode `0700`; the live dashboard is pid `8924`, `node server.js`, child
+of `/opt/project-workbench/scripts/entrypoint.sh`, running as root. A GOA deploy therefore requires an
+operator with host root. **This is an instance-configuration boundary, not an objection to the SHA.**
+
+**Constraint 2 — the SHA contains no GOA-executed change.** Measured, not inferred:
+
+```
+$ git diff --stat 06e624c b757192
+ DEVELOPMENT-COORDINATION.md        |  84 ++++++++++++
+ app/VERSION                        |   2 +-
+ install.sh                         |  88 ++++++++++--
+ test/installer-apt-node.test.mjs   | 162 ++++++++++++++++++++++
+ test/installer-host-smoke.test.mjs | 267 ++++++++++++++++++++++++++++++++++++-
+ test/installer-manifest-lib.mjs    | 115 ++++++++++++++--
+ test/tmux-owner-shipping.test.mjs  |  36 +++--
+$ git diff --name-only 06e624c b757192 | grep -E 'Containerfile|entrypoint|pw-tmux\.service|deploy-local'
+  (no output — no container-mode file touched)
+```
+
+Outside the coordination document and tests, the change surface is `install.sh` plus the `app/VERSION`
+string. GOA is container mode and never runs `install.sh`, which refuses container mode before doing
+any work:
+
+```
+$ sed -n '34,35p' install.sh
+if [ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" = "container" ]; then
+  echo "install.sh: refusing — PW_DEPLOY_MODE=container." >&2
+```
+
+So promoting `b757192` on GOA would alter one version string and no executed code. We are not
+proposing to skip it — we are recording that its GOA runtime effect is nil, so it carries no
+container-mode risk and equally yields no container-mode evidence.
+
+### R16-2 — Deployed revision, health, and clean state — **split verdict**
+
+**Service health — AGREE.** Command-derived:
+
+```
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/workbench/healthz
+200
+$ curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:3000/workbench/
+302                     # redirect to login: auth enforcement intact
+```
+
+Live processes and containers (read from `/proc`; `podman` is not accessible to this account):
+
+```
+pid=8924 ppid=8902 cmd=[node server.js] parent=[/bin/bash /opt/project-workbench/scripts/entrypoint.sh]
+containers running: project-workbench, pw-tmux, visual-identity
+```
+
+**Exact deployed Git revision — NEEDS EVIDENCE.** Not determinable by this account, and we will not
+estimate it. `app/` is mode `0700` root-owned, so `app/VERSION` cannot be read. `scripts/` is
+traversable but not listable, and of the files probed only one is readable — and it does not
+discriminate:
+
+```
+$ cat /opt/project-workbench/app/VERSION
+cat: /opt/project-workbench/app/VERSION: Permission denied
+$ md5sum /opt/project-workbench/scripts/pw-tmux-keepalive.sh
+12435781…  matches canonical at BOTH 40c1520 and 325e221 (file unchanged between them)
+$ md5sum /opt/project-workbench/scripts/pw-tmux-assert-owner
+  <no output: absent OR unreadable — indistinguishable from here, so no conclusion is drawn>
+```
+
+To close this, an operator with host root should report `cat /opt/project-workbench/app/VERSION` and
+the revision the deployed tree was promoted from.
+
+**Unit state — NEEDS EVIDENCE.** There is no systemd inside the container to query:
+
+```
+$ ls -d /run/systemd/system
+ls: cannot access '/run/systemd/system': No such file or directory
+$ command -v systemctl        # (no output)
+```
+
+Host unit state is host-root evidence and is not ours to assert.
+
+**Working tree — AGREE, with a scope correction.** The GOA *development* checkout is clean. The
+*deployed* tree is not a git checkout at all — it is a bind-mounted copy — so "clean working tree" has
+no meaning there, and we flag that rather than reporting a clean tree that was never version-tracked.
+
+### R16-3 — `scripts/` and `app/` remain siblings — **AGREE**
+
+Verified in the deployed image and in the requested tree:
+
+```
+# deployed container image
+app parent    : /opt/project-workbench
+scripts parent: /opt/project-workbench
+siblings      : True        both exist: True True
+
+# the b757192 tree itself
+$ ls -1d app scripts
+app
+scripts
+```
+
+This corroborates Round 16's point that the container path was already correct and host was the
+outlier. PR #42's convergence does not change container behaviour, and we confirm nothing in the
+container layout needs to move to match it.
+
+### R16-4 — Any GOA constraint either repair would break — **AGREE (neither breaks GOA)**
+
+Stated as a source-level determination, since R16-1 means it is not backed by a GOA deployment: #43 is
+confined to the host installer, which refuses container mode; #42 relocates a host-mode gate and
+symlink; neither touches `Containerfile`, `entrypoint.sh`, `pw-tmux.service` or `deploy-local.sh`. The
+GOA-2 and GOA-5 dispositions are untouched.
+
+### Tests run at the requested SHA
+
+Run in a pinned detached worktree at `b757192637d8c23a8382c9bc368d0ac907e96c68`, inside the GOA
+container:
+
+```
+$ git worktree add --detach /tmp/pwb757 b757192637d8c23a8382c9bc368d0ac907e96c68
+$ cd /tmp/pwb757/app && env -u TMUX_TMPDIR node --test ../test/*.test.mjs
+# tests 1023   # suites 0   # pass 905   # fail 75
+# cancelled 0  # skipped 43 # todo 0     # duration_ms 228890.861491
+```
+
+**All 75 failures are the absent `express` dependency** (74 report it directly; the remainder reach it
+transitively). `npm ci` cannot run on this instance — no route to the npm registry — so
+`app/node_modules` is absent. None of the 75 is attributable to `b757192`, and exact-head GitHub CI at
+that SHA is `success`, which is the authority on that set.
+
+**NOT RUN / skipped — 43, never counted as a pass**, by the reason the suite itself reports:
+
+| count | reason |
+|---|---|
+| 21 | `real-process privilege drop not exercisable here: sudo will not run non-interactively as 'admin' on this host` |
+| 12 | `needs git and the orchestrator repository with its venv` |
+| 5 | `the orchestrator repository and its venv are not available here` |
+| 5 | `not run: requires root, or non-interactive sudo to become root — PVI2 owns this evidence; reported as NOT RUN, never as a pass` |
+
+The 26 root/sudo-dependent skips are the PVI2-owned evidence class; nothing here discharges them.
+
+### What GOA did not do
+
+No product code modified. No SHA deployed — including `b757192`. No prior coordination entry
+rewritten. No service, unit or container restarted. No credential, token or secret value disclosed.
+
+### Status
+
+- R16-1 deploy: **DISAGREE** — requires host root this account does not have, and the SHA contains no
+  GOA-executed change.
+- R16-2: health **AGREE**; exact deployed revision and unit state **NEEDS EVIDENCE** (host-root
+  evidence); working tree **AGREE** with the scope correction.
+- R16-3 siblings: **AGREE**.
+- R16-4 constraints: **AGREE** — neither repair breaks GOA.
+- Parity: **not claimed.** Merging this advances `main`; both environments must then confirm the
+  resulting final revision.
