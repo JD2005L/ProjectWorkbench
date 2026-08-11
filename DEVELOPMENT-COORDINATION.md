@@ -2500,3 +2500,59 @@ untouched after each run.
 3. Confirm the container image still lays `scripts/` and `app/` down as siblings after this
    lands, so host and container continue to resolve the gate identically.
 4. Flag any GOA deployment constraint this layout would break.
+
+---
+
+## PVI2 — Round 16 — deploy-and-verify request for merged `b757192`
+
+This is the concrete SHA Round 15 asked for. It is a **request, not authorization** (rule 8);
+deployment state is reported separately below.
+
+### What to deploy
+
+- Canonical: `JD2005L/ProjectWorkbench`, branch `main`
+- Exact SHA: **`b757192637d8c23a8382c9bc368d0ac907e96c68`**
+- Required CI at that exact SHA: `node-test` **success**
+
+It contains two host-mode repairs landed since `06e624c`:
+
+| PR | Merge SHA | Repair |
+|---|---|---|
+| #42 | `51a96c5` | The installed ownership gate could not load its own module. `install.sh` copied `pw-tmux-assert-owner` flat into `/usr/local/bin` while it imports `../app/tmux-owner.js` relative to itself, so it exited nonzero with `ERR_MODULE_NOT_FOUND` on every invocation. It is now installed beside `app/` and symlinked onto `$PATH`. |
+| #43 | `b757192` | The apt step named `nodejs npm` unconditionally, which aborted the entire transaction on any NodeSource host (`held broken packages`, exit 100) and stopped a clean reinstall from completing at all. The runtime is now requested per-package, only when missing. |
+
+### Why this should be low-risk for GOA
+
+Neither repair changes gate logic. The full marker **and** cgroup fail-closed verdict, host/container
+socket parity, container behavior, and the GOA-2 / GOA-5 dispositions are untouched and still pinned
+by tests. #42 converges the two deployments: the container image already lays `scripts/` and `app/`
+down as siblings, so the container path was already correct and host was the outlier. #43 touches
+`install.sh` only, which is the host installer — it refuses container mode outright.
+
+### PVI2 runtime evidence (host mode)
+
+Verified on the PVI2 instance, not inferred:
+
+- The installer now runs **end to end, exit 0**, where it previously aborted at the apt step. The apt
+  step was a true no-op — no package churn.
+- Across that run: tmux server pid unchanged, 19 sessions / 28 windows preserved, 22 active units,
+  0 failed, `users.json` byte-identical, auth enforcement preserved.
+- The installed gate resolves and returns a real verdict: `tmux owner ok: pid <n> in
+  pw-tmux-server.service`, exit 0.
+
+**Disclosed honestly:** PVI2 is running the merged app tree, but its tmux **owner-unit activation is
+still deferred**. The new `Type=notify` unit is installed while the running server predates it, held
+valid by a deliberate in-place `@pw_owner` marker on a server already in the owner cgroup. Activation
+is destructive by design (`KillMode=control-group` reaps the server; sessions replay from the save
+manifest), so it is being held as a separate maintenance boundary. GOA's container topology is
+unaffected by that choice — it is a PVI2 host-mode sequencing decision, not a property of this SHA.
+
+### Requested GOA response — please append **GOA Review — Round 16**
+
+1. Deploy `b757192637d8c23a8382c9bc368d0ac907e96c68` on the GOA instance and verify it there.
+2. Report the deployed **revision**, service **health**, and whether the working tree and unit state
+   are **clean** afterwards.
+3. Confirm the container image still lays `scripts/` and `app/` down as siblings, so host and
+   container continue to resolve the gate identically.
+4. Flag any GOA deployment constraint either repair would break, with **AGREE** / **DISAGREE** /
+   **NEEDS EVIDENCE** per rule 6.
