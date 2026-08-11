@@ -85,17 +85,72 @@ log "Project Workbench installer — target: $PW_INSTALL_DIR ($PW_REPO @ $PW_REF
 log "Reminder: this host should be LAN-internal only. Authenticated users get shell access."
 
 export DEBIAN_FRONTEND=noninteractive
-log "Installing apt packages…"
-apt-get update -qq
-apt-get install -y --no-install-recommends \
-  nginx apache2-utils ttyd git curl ca-certificates nodejs npm jq tmux sudo openssl >/dev/null
 
 NODE_VERSION="$(node --version 2>/dev/null | sed 's/^v//' || true)"
 NODE_MAJOR="${NODE_VERSION%%.*}"
-if ! [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] || [ "$NODE_MAJOR" -lt 18 ]; then
+node_major_ok() { [[ "$NODE_MAJOR" =~ ^[0-9]+$ ]] && [ "$NODE_MAJOR" -ge 18 ]; }
+# Whether THIS host's node came from NodeSource rather than Debian. Their `nodejs`
+# package bundles npm and deliberately conflicts with Debian's separate `npm`.
+node_is_nodesource() {
+  dpkg-query -W -f='${Version}' nodejs 2>/dev/null | grep -qi nodesource
+}
+
+# The Node runtime is requested from apt ONLY when this host lacks a usable one.
+#
+# This step used to name `nodejs npm` unconditionally, which aborted the ENTIRE
+# install on every NodeSource host — the shape this installer's own error message
+# tells you to create:
+#
+#   Depends: node-npm-bundled but it is not going to be installed
+#   … Depends: nodejs:any
+#   E: Unable to correct problems, you have held broken packages.   (exit 100)
+#
+# NodeSource's `nodejs` OWNS /usr/bin/npm, so Debian's `npm` package is redundant
+# there, and it cannot be co-installed: it depends on a chain of `node-*` packages
+# plus `nodejs:any`. Because apt resolves the request as a whole, that one
+# unsatisfiable token stopped nginx, ttyd, tmux and everything else from being
+# installed too — a clean reinstall could not complete at all.
+#
+# Asking per-package for what is actually missing keeps a bare-Debian install
+# byte-identical in behavior (both are absent, so both are requested) while making
+# the already-provisioned host a no-op instead of a hard failure.
+PW_APT_PACKAGES=(nginx apache2-utils ttyd git curl ca-certificates jq tmux sudo openssl)
+node_major_ok || PW_APT_PACKAGES+=(nodejs)
+command -v npm >/dev/null 2>&1 || PW_APT_PACKAGES+=(npm)
+
+# A NodeSource host whose runtime is too old is the one case apt cannot repair:
+# pulling Debian's nodejs/npm over it reproduces exactly the conflict above. Say so
+# in the installer's own voice rather than letting apt fail with a package-solver
+# wall of text that never names the real problem.
+if node_is_nodesource && ! node_major_ok; then
+  die "Node.js 18+ is required (found: ${NODE_VERSION:-not installed}), and this host's node comes from NodeSource.
+    apt cannot upgrade across that — Debian's nodejs/npm conflict with the NodeSource package.
+    Upgrade NodeSource in place, then rerun:
+    curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
+    sudo apt-get install -y nodejs
+    sudo bash $0"
+fi
+
+log "Installing apt packages…"
+apt-get update -qq
+apt-get install -y --no-install-recommends "${PW_APT_PACKAGES[@]}" >/dev/null
+
+# Re-read: apt may have just installed or upgraded it.
+NODE_VERSION="$(node --version 2>/dev/null | sed 's/^v//' || true)"
+NODE_MAJOR="${NODE_VERSION%%.*}"
+if ! node_major_ok; then
   die "Node.js 18+ is required (found: ${NODE_VERSION:-not installed}). Install NodeSource Node 20 and rerun:
     curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash -
     sudo apt-get install -y nodejs
+    sudo bash $0"
+fi
+
+# npm is what actually installs the dashboard's dependencies further down, and on a
+# NodeSource host it arrives with `nodejs` rather than as its own package — so check
+# the COMMAND, never the package.
+if ! command -v npm >/dev/null 2>&1; then
+  die "npm is required but was not found after installing packages. On a NodeSource host npm ships with the nodejs package; reinstall it and rerun:
+    sudo apt-get install --reinstall -y nodejs
     sudo bash $0"
 fi
 
