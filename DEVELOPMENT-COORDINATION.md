@@ -2002,11 +2002,28 @@ structural answer to the first of those.
 Evidence at the repaired head: canonical **1019 tests, 1016 pass, 0 fail, 3 skipped**; focused
 Candidate C suites **57/57**.
 
-## PVI2 — Round 13 — deployment failure of exact merged main `6a9e8cd`, rollback, and installer-manifest repair
+## PVI2 — Round 13 — two deployment blockers against exact merged main `6a9e8cd`, rollback, and the combined release repair
 
 **No deployment is claimed by this section.** It records a failed controlled deployment, a completed
-rollback, and a repair branch offered for immutable review. Merge and deployment remain separate
-gates and neither is authorized here.
+rollback, verified live health on the prior release, and a single repair branch offered for immutable
+review. Merge and deployment remain separate gates and neither is authorized here.
+
+Two independent, real blockers were found against the same merged main. Both are integrated into one
+release-repair lane by a normal two-parent merge — no rebase, no force-push, and neither side's
+semantics or tests altered:
+
+| # | Blocker | Symptom on a real host | Origin |
+|---|---|---|---|
+| 1 | `install.sh` never ships the owner unit's `ExecStart` helper | `pw-tmux-server.service` exits **`203/EXEC`**; install fails | this branch |
+| 2 | The root dashboard's ownership gate probes **root's empty socket** | every new-session / new-window / recycle refused on a healthy host | `c53f34c` on `fix/tmux-gate-terminal-user-hop` |
+
+They share one cause worth naming: **a check that inspected something other than what a real host
+uses.** Blocker 1's manifest derivation never read the unit files; blocker 2's gate tests all injected
+`capture`, so none ever exercised the default probe.
+
+---
+
+## Blocker 1 — the installer never shipped the owner unit's `ExecStart`
 
 ### The deployment failure
 
@@ -2132,21 +2149,91 @@ Installer container refusals re-verified directly, not only through the suite:
 | `PW_DEPLOY_MODE=container` | exits `1`, **systemd never touched** (no `systemctl` call at all) |
 | Sidecar owner `pw-tmux.service` enabled | exits `1` after only two read-only queries (`list-unit-files`, `is-enabled`); no `enable`, `start` or `daemon-reload` |
 
-### Evidence at this head
+---
+
+## Blocker 2 — the root dashboard's gate probed the wrong tmux socket
+
+Integrated verbatim as `c53f34c` (`fix/tmux-gate-terminal-user-hop`). Its semantics and its
+`test/tmux-gate-probe-socket.test.mjs` are carried across **unchanged** — both files are byte-identical
+to the source commit at this head; the only merge resolution was `app/VERSION`.
+
+### The failure
+
+`project-workbench.service` runs as **root**, but the shared tmux server lives on the **pane
+account's** per-user socket — which is why `server.js`'s `tmux()` hops through `sudo -u <account>`.
+The gate's default probe exec'd a bare `tmux`, so as root it inspected **root's own, empty** default
+socket, found nothing, and threw `PW_TMUX_FOREIGN_SERVER` — "no running tmux server on the target
+socket" — about a perfectly healthy host. Every new-session, new-window and terminal recycle was
+refused, permanently.
+
+The refusal text made it worse: it sent the operator to
+`pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service`, which destroys every
+live session **and could not have fixed it**, because the replacement server lands on the pane
+account's socket too.
+
+Verified as root on CT2115 against the live server: the bare probe reports no server; the fixed probe
+finds pid 3406243 in `pw-tmux-server.service`.
+
+### Why it escaped CI
+
+Every existing gate test injects `capture`, so they all verify the verdict logic against a supplied
+answer and **none ever exercised the default probe**. The shell seams were never affected —
+`project-terminal@.service` already runs as the pane account, so `pw-tmux-assert-owner` was on the
+right socket by virtue of its unit — and the orchestrator adapter injects its own executor. Only this
+one seam could drift.
+
+### The repair
+
+`tmuxProbeArgv()` resolves the account through `terminal-owner.js`'s `hostTerminalUser()`, exactly as
+`tmux()` does, so probe and executor cannot name different accounts; container mode keeps its
+no-sudo path. **The gate logic is untouched and no invariant is relaxed** — the fixed gate still
+refuses the current host, now for the true reason (server in the expected cgroup, owner marker
+absent, because it predates the owner unit), which is the documented migration case.
+
+Non-vacuity: reverting to the bare probe fails 6 of the suite's 7 assertions.
+
+---
+
+## Combined evidence at the merged head
+
+### Rollback and live health — re-verified at this head
 
 | Check | Result |
 |---|---|
-| Canonical `npm ci && npm test` | **1031 tests, 1028 pass, 0 fail, 3 skipped** |
-| Baseline at `6a9e8cd` | 1019 / 1016 / 0 / 3 — the delta is exactly the 12 new tests |
-| New suites (manifest + staged smoke) | **12/12** |
+| `pw-tmux-server.service` | **active** |
+| `project-workbench.service` | **active** |
+| `GET /healthz` | **200** |
+| tmux sessions | **19** |
+| Failed units | **0** |
+| Release reported | prior release `1.26.0810.2352` |
+
+The deadman rollback is complete and live PVI2 is healthy on the prior release. **Nothing in this
+branch has been applied to it**, and the installed unit still carries the prior release's `ExecStart`.
+
+### Gates
+
+| Check | Result |
+|---|---|
+| Canonical `npm ci && npm test` on the combined frozen head | **1038 tests, 1035 pass, 0 fail, 3 skipped** |
+| Baseline at `6a9e8cd` | 1019 / 1016 / 0 / 3 — the delta is exactly the 19 new tests (12 + 7) |
+| Combined focused: installer + probe + ownership | **130/130** |
+| New installer suites (manifest + staged smoke) | **12/12** |
+| Probe-socket suite carried from `c53f34c` | **7/7** |
 | Candidate C focused suites | **100/100** |
 | Release guard | **4/4** |
-| Secret scan (6 changed/new files) | **0 matches** — the 10 raw hits are pre-existing variable names and prose in unchanged regions of `install.sh` |
-| Production diff | 3 files, +16 / −2 (`install.sh`, `systemd/pw-tmux-server.service`, `app/VERSION`) |
-| Version | `1.26.0811.0057` → **`1.26.0811.0128`** |
+| Secret scan (all changed/new files) | **0 matches** — the raw hits are pre-existing variable names and prose in unchanged regions of `install.sh` |
+| Production diff vs `6a9e8cd` | 4 files (`install.sh`, `systemd/pw-tmux-server.service`, `app/tmux-owner-gate.js`, `app/VERSION`) |
+| Version | `1.26.0811.0057` → **`1.26.0811.0139`**, forward of **both** parents (`0128` ours, `0125` theirs) |
 
 The 3 skips are the pre-existing orchestrator privilege-drop assertions, which self-declare they
 cannot fail when the suite runs as the workspace account. No new skips.
+
+### Version resolution
+
+The two lanes bumped independently (`1.26.0811.0128` here, `1.26.0811.0125` in `c53f34c`). The merge
+resolves to a single **`1.26.0811.0139`** — one truthful forward release, strictly greater than both
+parents and than the base. Neither parent's identifier is preserved, because two release identifiers
+for one release is the condition the guard exists to prevent.
 
 ### Observation recorded, not fixed here
 
@@ -2159,6 +2246,13 @@ here.
 
 ### Sequencing
 
-Pushed for immutable review at the exact head. **Not merged and not deployed by PVI2.** A future
-deployment of this branch is a separate authorization, and the same controlled-deployment discipline
-that caught this failure should be applied to it.
+One pull request, against current main `6a9e8cd`, carrying both blockers. Pushed for immutable review
+at the exact combined head. **Not merged and not deployed by PVI2.** A future deployment of this
+branch is a separate authorization, and the same controlled-deployment discipline that caught both
+failures should be applied to it.
+
+Note for the reviewer: blocker 2 is a *runtime* defect and blocker 1 is an *install-time* defect, so
+neither would have surfaced the other. The `203/EXEC` failure stopped the install before the
+dashboard ever ran; had the install succeeded, the gate would then have refused every terminal
+operation. Both had to be fixed for a deployment of this topology to work at all — which is why they
+are in one lane rather than two.
