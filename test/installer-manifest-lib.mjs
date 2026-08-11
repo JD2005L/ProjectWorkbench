@@ -73,13 +73,61 @@ export function unrenderedPlaceholders(text) {
   return [...new Set([...text.matchAll(/@[A-Z][A-Z0-9_]*@/g)].map((m) => m[0]))];
 }
 
-/** Executables install.sh installs, keyed by destination path. */
-export function helperManifest(installSh) {
+/**
+ * Expand the shell variables install.sh uses in a destination path, so the audit
+ * and the staging replay both reason about the path a host really receives. Left
+ * unexpanded, `$PW_INSTALL_DIR/scripts/…` would be compared as a literal and
+ * staged into a directory named `$PW_INSTALL_DIR`.
+ */
+export function expandDest(dest, prefix) {
+  return dest.replace(/\$\{?PW_INSTALL_DIR\}?/g, prefix);
+}
+
+/**
+ * Executables install.sh installs, keyed by destination path.
+ *
+ * `prefix` is a parameter, not a constant read back out of install.sh, because a
+ * NON-DEFAULT PW_INSTALL_DIR has to produce a manifest pointing into that tree —
+ * otherwise staging an override would write the default paths and the portability
+ * claim would be tested against the very thing it is supposed to vary.
+ */
+export function helperManifest(installSh, prefix = installPrefix(installSh)) {
   const manifest = new Map();
-  for (const m of installSh.matchAll(/install\s+-m\s+([0-7]{3,4})\s+"\$SRC_DIR\/(scripts\/[^"]+)"\s+(\S+)/g)) {
-    manifest.set(m[3], { mode: parseInt(m[1], 8), source: m[2] });
+  for (const m of installSh.matchAll(/install\s+-m\s+([0-7]{3,4})\s+"\$SRC_DIR\/(scripts\/[^"]+)"\s+"?([^"\s]+)"?/g)) {
+    manifest.set(expandDest(m[3], prefix), { mode: parseInt(m[1], 8), source: m[2] });
   }
   return manifest;
+}
+
+/**
+ * Symlinks install.sh creates, keyed by link path -> target.
+ *
+ * A helper does not have to be a regular file at its PATH location. The ownership
+ * gate is deliberately installed beside app/ (its `../app/tmux-owner.js` import is
+ * relative to itself) and symlinked onto PATH, so a manifest that only understood
+ * `install` would report the PATH entry as missing and force the fix to be reverted
+ * to the very layout that breaks it.
+ */
+export function symlinkManifest(installSh, prefix = installPrefix(installSh)) {
+  const links = new Map();
+  for (const m of installSh.matchAll(/ln\s+-sfn\s+"?([^"\s]+)"?\s+"?([^"\s]+)"?/g)) {
+    links.set(expandDest(m[2], prefix), expandDest(m[1], prefix));
+  }
+  return links;
+}
+
+/**
+ * Resolve a destination through install.sh's symlinks to the path that actually
+ * has to be an installed, executable file. Bounded, so a link cycle cannot hang.
+ */
+export function resolveInstalledPath(absPath, links) {
+  let seen = new Set();
+  let cur = absPath;
+  while (links.has(cur) && !seen.has(cur)) {
+    seen.add(cur);
+    cur = links.get(cur);
+  }
+  return cur;
 }
 
 /**
@@ -173,12 +221,17 @@ export function auditInstallerManifest({ installSh, unitFor, scriptsOnDisk, seam
 
   const appDir = `${installPrefix(installSh)}/app/`;
   const manifest = helperManifest(installSh);
+  const links = symlinkManifest(installSh);
 
-  const requireInstalled = (absPath, why) => {
+  const requireInstalled = (refPath, why) => {
+    // A PATH entry may be a symlink to the real file; follow install.sh's own links
+    // before asking whether anything was installed there.
+    const absPath = resolveInstalledPath(refPath, links);
+    const via = absPath === refPath ? '' : ` (via symlink ${refPath} -> ${absPath})`;
     const entry = manifest.get(absPath);
     if (!entry) {
       violations.push(
-        `${why} references ${absPath}, which install.sh never installs — ` +
+        `${why} references ${refPath}${via}, which install.sh never installs — ` +
         'on a real host that path does not exist (systemd reports 203/EXEC)',
       );
       return;
@@ -222,15 +275,27 @@ export function auditInstallerManifest({ installSh, unitFor, scriptsOnDisk, seam
 
   for (const [name, files] of seamRefs) {
     if (!scriptsOnDisk.has(name)) continue; // not ours to ship (claude, node, tmux…)
-    const dests = [...manifest.keys()].filter((d) => path.basename(d) === name);
+    const why = `seam(s) ${[...files].join(', ')}`;
+    // A symlinked PATH entry is a real entry, so link paths count as destinations.
+    const dests = [...new Set([...manifest.keys(), ...links.keys()])]
+      .filter((d) => path.basename(d) === name);
     if (dests.length === 0) {
       violations.push(
-        `seam(s) ${[...files].join(', ')} invoke ${name}, which install.sh never installs — ` +
+        `${why} invoke ${name}, which install.sh never installs — ` +
         'a missing helper is a refusal, not a skip',
       );
       continue;
     }
-    for (const dest of dests) requireInstalled(dest, `seam(s) ${[...files].join(', ')}`);
+    // A seam invoking a bare name finds it through $PATH, so SOMETHING has to land
+    // in a PATH directory — installing only beside app/ would satisfy the manifest
+    // while `command -v` still found nothing.
+    if (!dests.some((d) => /^\/usr\/local\/(bin|sbin)\//.test(d))) {
+      violations.push(
+        `${why} invoke ${name} by bare name, but install.sh puts it only at ` +
+        `${dests.join(', ')} — nothing lands on $PATH, so command -v finds nothing`,
+      );
+    }
+    for (const dest of dests) requireInstalled(dest, why);
   }
 
   return { violations, checked: [...new Set(checked)], external };
@@ -287,7 +352,7 @@ export function stageInstall(stageRoot, installSh, vars = null) {
     groups.get(key).sources.push(sourceAbs);
   };
 
-  for (const [dest, entry] of helperManifest(installSh)) {
+  for (const [dest, entry] of helperManifest(installSh, values.prefix)) {
     queue(path.join(REPO, entry.source), dest, entry.mode);
     staged.helpers.push({ source: entry.source, dest, target: path.join(stageRoot, dest), mode: entry.mode });
   }
@@ -310,6 +375,36 @@ export function stageInstall(stageRoot, installSh, vars = null) {
     const target = path.join(stageRoot, dest);
     fs.mkdirSync(path.dirname(target), { recursive: true });
     execFileSync('install', ['-m', mode8(mode), sourceAbs, target]);
+  }
+
+  // The app tree, mirroring install.sh's `cp -a "$SRC_DIR/app/." "$APP_DIR/"`.
+  //
+  // Staging this is what makes an EXECUTABLE smoke possible. Without app/, a staged
+  // helper that imports `../app/…` cannot resolve regardless of where it was put, so
+  // the staging could never tell a correct layout from a broken one — and the flat
+  // /usr/local/bin install shipped for two rounds with a green suite behind it.
+  if (/cp -a "\$SRC_DIR\/app\/\." "\$APP_DIR\/"/.test(installSh)) {
+    const appTarget = path.join(stageRoot, values.prefix, 'app');
+    fs.mkdirSync(appTarget, { recursive: true });
+    fs.cpSync(path.join(REPO, 'app'), appTarget, {
+      recursive: true,
+      // node_modules is an npm artefact of a working checkout, not part of the
+      // manifest, and copying it makes staging pathologically slow.
+      filter: (src) => !/(^|\/)(node_modules|\.[^/]+)$/.test(src),
+    });
+    staged.appDir = appTarget;
+  }
+
+  // Symlinks last: their targets must already exist for a realpath-based resolution
+  // to mean anything.
+  staged.links = [];
+  for (const [linkPath, target] of symlinkManifest(installSh, values.prefix)) {
+    const linkAbs = path.join(stageRoot, linkPath);
+    const targetAbs = path.join(stageRoot, target);
+    fs.mkdirSync(path.dirname(linkAbs), { recursive: true });
+    fs.rmSync(linkAbs, { force: true });
+    fs.symlinkSync(targetAbs, linkAbs);
+    staged.links.push({ link: linkPath, target, linkAbs, targetAbs });
   }
   return staged;
 }

@@ -45,22 +45,42 @@ function helpersReferencedBySeams() {
   return [...found];
 }
 
-test('every helper a seam invokes by name is installed by install.sh', () => {
+test('every helper a seam invokes by name lands on $PATH', () => {
   const install = read('install.sh');
   const referenced = helpersReferencedBySeams();
   assert.ok(referenced.length > 0, 'expected the seams to reference at least one helper');
   for (const helper of referenced) {
-    assert.match(
-      install,
-      new RegExp(`install -m 0755 [^\\n]*scripts/${helper}[^\\n]*/usr/local/bin/${helper}`),
-      `install.sh never ships ${helper}, so every seam that calls it refuses on a real host`,
-    );
+    // What a seam needs is /usr/local/bin/<helper> to EXIST. Whether install.sh
+    // gets it there with `install` or with a symlink is not the seam's concern —
+    // and demanding a direct copy here is what forced the ownership gate into
+    // /usr/local/bin, where its relative import cannot resolve.
+    const direct = new RegExp(`install -m 0755 [^\\n]*scripts/${helper}[^\\n]*/usr/local/bin/${helper}`).test(install);
+    const linked = new RegExp(`ln -sfn [^\\n]*${helper}[^\\n]*/usr/local/bin/${helper}`).test(install);
+    assert.ok(direct || linked,
+      `install.sh never puts ${helper} on $PATH, so every seam that calls it refuses on a real host`);
   }
 });
 
-test('the ownership helper is shipped executable, beside the other helpers', () => {
+test('the ownership helper is installed where its relative import resolves', () => {
   const install = read('install.sh');
-  assert.match(install, /install -m 0755 "\$SRC_DIR\/scripts\/pw-tmux-assert-owner"\s+\/usr\/local\/bin\/pw-tmux-assert-owner/);
+  // THE DEFECT THIS PINS. The helper imports `../app/tmux-owner.js` relative to
+  // itself, so a flat copy into /usr/local/bin resolves to /usr/local/app/ — a
+  // path no deployment has. It then exits nonzero with ERR_MODULE_NOT_FOUND on
+  // every invocation, and because a missing helper is a refusal rather than a
+  // skip, every seam refuses: no terminal starts and restore never runs.
+  assert.match(
+    install,
+    /install -m 0755 "\$SRC_DIR\/scripts\/pw-tmux-assert-owner"\s+"\$PW_INSTALL_DIR\/scripts\/pw-tmux-assert-owner"/,
+    'the gate must be installed beside app/, not flat into /usr/local/bin',
+  );
+  assert.match(
+    install,
+    /ln -sfn "\$PW_INSTALL_DIR\/scripts\/pw-tmux-assert-owner"\s+\/usr\/local\/bin\/pw-tmux-assert-owner/,
+    'the gate must still be reachable on $PATH',
+  );
+  // The import that layout exists to satisfy.
+  assert.match(read('scripts/pw-tmux-assert-owner'), /from '\.\.\/app\/tmux-owner\.js'/);
+
   // And it must be executable in the repository too, or the install copies a
   // non-executable file into place.
   const mode = fs.statSync(path.join(repo, 'scripts/pw-tmux-assert-owner')).mode & 0o777;

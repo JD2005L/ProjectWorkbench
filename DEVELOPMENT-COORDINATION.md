@@ -2416,3 +2416,87 @@ were removed by socket prefix; the live shared server and both owner PIDs were u
 and verified alive afterwards. Not a defect in this change, and not fixed here — the
 fixtures are pre-existing and out of scope — but recorded so the next session does not
 mistake the accumulation for a leak introduced by this branch.
+
+---
+
+## PVI2 — Round 15 — the installed ownership gate cannot load its own module
+
+### Live finding
+
+Against exact merged main `06e624ca9a743bb028828c7334f3f5121dfda855`, the ownership gate
+is shipped but **cannot run**. `install.sh` copies `scripts/pw-tmux-assert-owner` flat into
+`/usr/local/bin`, while the script imports `../app/tmux-owner.js` *relative to itself* —
+deliberately, so the shell gate and the JS gate share one verdict function. From
+`/usr/local/bin` that resolves to `/usr/local/app/tmux-owner.js`, which no deployment has.
+
+Observed on the PVI2 host, running the shipped file as the seams would:
+
+```
+Error [ERR_MODULE_NOT_FOUND]: Cannot find module '/usr/local/app/tmux-owner.js'
+  imported from /usr/local/bin/pw-tmux-assert-owner
+exit status 1
+```
+
+It exits nonzero on **every** invocation, on every host, for every caller. Because the
+seams treat "cannot execute the helper" as fatal — correctly — this is a total host-mode
+outage wherever the gated seams are installed: no project or setup terminal starts, and
+`pw-tmux-restore` refuses, so sessions are never restored at boot.
+
+**Why Round 13's manifest audit did not catch it.** That audit asks whether a file was
+installed at the referenced path with an executable mode. Both are true here. Shipping a
+helper and shipping a *working* helper are different claims, and only the first was
+checked. This is the same recurring shape Rounds 12 and 13 each named one level higher:
+the thing under test was not the thing a real host runs.
+
+**Current PVI2 exposure: latent, not active.** The host still carries the pre-gate
+`project-terminal-start` / `setup-terminal-start` (2026-05-19) and a `pw-tmux-restore`
+with no gate call, so nothing invokes the broken helper today. Terminals and boot restore
+are working. A fresh `install.sh` run — or any deploy that installs the gated seams —
+converts this from latent to total.
+
+### The repair
+
+`pw-tmux-assert-owner` is installed to `$PW_INSTALL_DIR/scripts/`, one level below `app/`,
+so the relative import is correct *by construction*, and symlinked onto `/usr/local/bin`
+for the seams' `command -v`. Node resolves an ES main module against its realpath, so the
+link lands on the same `app/`. No gate logic changes: the full marker **and** cgroup
+fail-closed verdict, host/container socket parity, container behavior and the A/B/C
+repairs are untouched. No marker is adopted or forged — the live-server migration is a
+deployment concern and is not in this change.
+
+**This converges host with container.** The container image already lays `scripts/` and
+`app/` down as siblings, so the container path was accidentally correct all along and the
+host was the outlier. After this change both deployments resolve the gate the same way,
+from the same relative position, which is the outcome the "one ownership implementation"
+rule wanted in the first place.
+
+**The realpath behavior is load-bearing, so it is pinned rather than trusted.** Node's
+`--preserve-symlinks-main` resolves the main module against the *link* path instead, which
+puts the import back at `/usr/local/app` and breaks the layout. The suite therefore asserts
+both directions: the default resolves, and that flag must break it. If the mutation ever
+stops failing, the guarantee has moved and this layout needs re-examining.
+
+### Exact evidence
+
+| Check | Result |
+|---|---|
+| Staged install executes the real `/usr/local/bin/pw-tmux-assert-owner` | reaches a metadata verdict naming the server pid |
+| Marker absent, cgroup correct | refuses: *"in the expected cgroup but carries no owner marker"* |
+| Marker present, cgroup correct | accepts: *"tmux owner ok: pid N in pw-tmux-server.service"* |
+| Marker present, cgroup foreign | refuses on cgroup — fail-closed preserved |
+| Old flat-copy layout, same staged tree | `ERR_MODULE_NOT_FOUND` (negative control) |
+| MUTATION: direct copy to `/usr/local/bin` | caught by the staged smoke |
+| Non-default `PW_INSTALL_DIR` | gate resolves under the overridden prefix |
+
+Fixtures are private only: a private tmux socket under a private root, and a controlled
+`/proc` per the Round 8 rule. The live shared server is never consulted, and was verified
+untouched after each run.
+
+### Requested GOA response — please append **GOA Review — Round 15**
+
+1. Deploy the **merged exact SHA** of this repair once it lands, and verify it there.
+2. Report the deployed **revision**, service **health**, and whether the working tree and
+   unit state are **clean** afterwards.
+3. Confirm the container image still lays `scripts/` and `app/` down as siblings after this
+   lands, so host and container continue to resolve the gate identically.
+4. Flag any GOA deployment constraint this layout would break.
