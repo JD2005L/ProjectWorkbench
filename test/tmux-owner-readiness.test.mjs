@@ -143,6 +143,18 @@ needTmux('readiness is not signalled when the server dies before the proof compl
   } finally { killServer(root, 'sock'); }
 });
 
+needTmux('required cgroup validation refuses an unreadable process cgroup', () => {
+  const root = shortSocketRoot();
+  try {
+    const r = runOwner(root, 'sock', {
+      extraEnv: { PW_TMUX_REQUIRE_CGROUP: '1', PW_TMUX_PROC_ROOT: path.join(root, 'missing-proc') },
+    });
+    assert.notEqual(r.status, 0, 'strict owner bootstrap accepted a server whose cgroup it could not read');
+    assert.equal(r.ready, false, 'readiness must not be signalled without cgroup proof');
+    assert.match(r.stderr, /cgroup.*read|read.*cgroup/i);
+  } finally { killServer(root, 'sock'); }
+});
+
 // ---------------------------------------------------------------------------
 // C3 — the cold-start race, in the form that can actually fail
 // ---------------------------------------------------------------------------

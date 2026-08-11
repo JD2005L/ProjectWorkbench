@@ -17,6 +17,9 @@ ExecStartPre=-/usr/bin/podman rm -f pw-tmux
 ExecStart=/usr/bin/podman run --name pw-tmux \
   --network=host --pid=host --privileged \
   -e TMUX_TMPDIR=/opt/project-workbench/run/tmux \
+  -e PW_DEPLOY_MODE=container \
+  -e PW_TMUX_OWNER_CGROUP=pw-tmux.service \
+  -e PW_TMUX_REQUIRE_CGROUP=1 \
   -e NPM_CONFIG_PREFIX=/opt/npm-global \
   -e PATH=/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -e "NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection" \

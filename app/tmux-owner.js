@@ -63,6 +63,14 @@ export function expectedOwnerCgroup(env = {}) {
     : HOST_OWNER_UNIT;
 }
 
+// Operator recovery follows the active topology. Ownership checks may be shared,
+// but telling a container operator to restart the host-only unit is not useful.
+export function ownerRemediation(env = {}) {
+  const container = String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container';
+  const unit = container ? CONTAINER_OWNER_UNIT : HOST_OWNER_UNIT;
+  return `pw-tmux-save && tmux kill-server && systemctl restart ${unit}`;
+}
+
 // The cgroup of a process, from `/proc/<pid>/cgroup`. `procRoot` is injectable so
 // the discriminating case can be exercised against controlled contents instead of
 // against a runner where every process shares one cgroup.

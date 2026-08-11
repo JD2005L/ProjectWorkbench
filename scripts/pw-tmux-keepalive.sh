@@ -95,6 +95,14 @@ expected_owner_cgroup() {
 	fi
 }
 
+owner_remediation() {
+	if [[ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" == container ]]; then
+		echo 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux.service'
+	else
+		echo 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service'
+	fi
+}
+
 # --- refuse a pre-existing foreign server -------------------------------------
 # If a server is already live on this socket, it is ours only if it carries the
 # marker. Anything else is the adopt-don't-move case and must not be adopted.
@@ -106,7 +114,7 @@ if tmux_ list-sessions >/dev/null 2>&1; then
 		die "refusing to adopt a foreign tmux server already running on this socket (no owner marker).
   It was created by something other than this owner unit, so its sessions live in the wrong cgroup.
   Migrate deliberately, then start this unit again:
-    pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service"
+    $(owner_remediation)"
 	fi
 fi
 
@@ -145,7 +153,7 @@ if [[ "$had_server" == 0 ]]; then
 		die "refusing to adopt a tmux server created by another process while this unit was starting.
   Sessions present that this owner did not create: $(echo "$foreign_sessions" | tr '\n' ' ')
   Migrate deliberately, then start this unit again:
-    pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service"
+    $(owner_remediation)"
 	fi
 fi
 
@@ -162,9 +170,12 @@ live_marker=$(tmux_ show-options -sv "$OWNER_MARKER_OPTION" 2>/dev/null || true)
 
 tmux_ has-session -t _keepalive 2>/dev/null || die "the keepalive session is not present — refusing to signal readiness"
 
-# The cgroup half. Only enforced where a cgroup is meaningful and readable; a
-# missing /proc entry is never read as a match.
+# The cgroup half. A strict deployment must prove the process cgroup; unreadable
+# metadata is a refusal, never permission to stamp or supervise the server.
 expected_owner=$(expected_owner_cgroup)
+if [[ "${PW_TMUX_REQUIRE_CGROUP:-0}" == 1 && ! -r "$PROC_ROOT/$server_pid/cgroup" ]]; then
+	die "the live tmux server cgroup is not readable at $PROC_ROOT/$server_pid/cgroup — refusing to signal readiness"
+fi
 if [[ -r "$PROC_ROOT/$server_pid/cgroup" ]]; then
 	live_cgroup=$(sed -n 's/^0:://p' "$PROC_ROOT/$server_pid/cgroup" | head -n1)
 	if [[ "${PW_TMUX_REQUIRE_CGROUP:-0}" == 1 ]]; then

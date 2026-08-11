@@ -184,6 +184,27 @@ test('MUTATION: an unmarked private server makes a seam refuse, naming the marke
   }
 });
 
+test('ownedTmuxFixture is hermetic when the parent test suite runs in container mode', async () => {
+  const { ownedTmuxFixture } = await import('./tmux-owner-fixture.mjs');
+  const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pw-mode-fixture-')));
+  const socket = `pwmode-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const previousMode = process.env.PW_DEPLOY_MODE;
+  process.env.PW_DEPLOY_MODE = 'container';
+  try {
+    const env = ownedTmuxFixture({ socket, dir });
+    assert.equal(env.PW_DEPLOY_MODE, 'host', 'a host fixture must override its parent suite mode');
+    const ok = spawnSync('pw-tmux-assert-owner', [], {
+      encoding: 'utf8', env: { ...process.env, ...env, PW_TMUX_SOCKET: socket },
+    });
+    assert.equal(ok.status, 0, `fixture mode and fake cgroup drifted: ${ok.stderr}`);
+  } finally {
+    if (previousMode === undefined) delete process.env.PW_DEPLOY_MODE;
+    else process.env.PW_DEPLOY_MODE = previousMode;
+    spawnSync('tmux', ['-L', socket, 'kill-server']);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('MUTATION: removing the real helper from PATH makes a seam refuse, naming the helper', () => {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pw-mut-')));
   const bin = path.join(dir, 'bin');

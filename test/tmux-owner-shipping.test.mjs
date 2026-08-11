@@ -166,3 +166,24 @@ test('the JS gate and the shell gate agree on the same verdict function', () => 
   assert.match(read('app/tmux-owner-gate.js'), /assessOwnership/);
   assert.match(read('scripts/pw-tmux-assert-owner'), /assessOwnership/);
 });
+
+test('ownership refusal remediation names the owner for the active deployment mode', async () => {
+  const dir = fs.mkdtempSync('/tmp/pwship-');
+  const procRoot = foreignCgroupProc(dir, 4245);
+  await assert.rejects(
+    assertTmuxOwner({
+      env: { PW_DEPLOY_MODE: 'container', PW_TMUX_PROC_ROOT: procRoot },
+      capture: captureFor({ pid: 4245, marker: 'pw-owner' }),
+    }),
+    (error) => {
+      assert.match(error.message, /pw-tmux\.service/);
+      assert.doesNotMatch(error.message, /restart pw-tmux-server\.service/);
+      return true;
+    },
+  );
+
+  const helper = read('scripts/pw-tmux-assert-owner');
+  assert.match(helper, /ownerRemediation/, 'the shell gate must share the mode-aware remediation');
+  const keepalive = read('scripts/pw-tmux-keepalive.sh');
+  assert.match(keepalive, /systemctl restart pw-tmux\.service/, 'container bootstrap refusal must name its sidecar owner');
+});

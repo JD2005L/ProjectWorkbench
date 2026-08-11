@@ -11,7 +11,14 @@ on:
   pull_request:
 jobs:
   node-test:
+    name: node-test (${{ matrix.deploy-mode }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        deploy-mode: [host, container]
+    env:
+      PW_DEPLOY_MODE: ${{ matrix.deploy-mode }}
     steps:
       - uses: actions/checkout@v4
         with:

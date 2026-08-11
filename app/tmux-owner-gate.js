@@ -21,7 +21,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
-import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, assessOwnership, expectedOwnerCgroup } from './tmux-owner.js';
+import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, assessOwnership, expectedOwnerCgroup, ownerRemediation } from './tmux-owner.js';
 import { hostTerminalUser } from './terminal-owner.js';
 
 const execFileAsync = promisify(execFile);
@@ -105,7 +105,7 @@ export async function assertTmuxOwner({ env = process.env, capture = tmuxCapture
   throw new TmuxOwnershipError(
     `refusing to create a tmux session: ${verdict.reason}. `
     + `Expected owner cgroup ${expectedOwner}. `
-    + 'If this host ran terminals before the owner unit existed, migrate deliberately: '
-    + 'pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service',
+    + 'If terminals ran before the configured owner existed, migrate deliberately: '
+    + ownerRemediation(env),
   );
 }

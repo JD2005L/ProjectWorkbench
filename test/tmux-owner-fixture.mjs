@@ -84,6 +84,10 @@ export function ownerEnv({ procRoot }) {
 // One call for the common case: helper on PATH, server marked, env produced.
 export function ownedTmuxFixture({ socket, dir, basePath = process.env.PATH, env = {} }) {
   const bin = installOwnerHelper(dir);
-  const { procRoot } = markOwnedServer({ socket, dir, env });
-  return { PATH: `${bin}:${basePath}`, ...ownerEnv({ procRoot }) };
+  // A fixture with no explicit mode models the backward-compatible host owner.
+  // Return that decision to the spawned helper as well as using it to build fake
+  // /proc; otherwise a container-mode parent makes the two halves disagree.
+  const fixtureEnv = { PW_DEPLOY_MODE: 'host', ...env };
+  const { procRoot } = markOwnedServer({ socket, dir, env: fixtureEnv });
+  return { PATH: `${bin}:${basePath}`, ...fixtureEnv, ...ownerEnv({ procRoot }) };
 }

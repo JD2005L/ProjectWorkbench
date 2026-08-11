@@ -25,7 +25,7 @@
 //   PW_TMUX_PROC_ROOT     /proc root, injectable so the cgroup branch is testable
 import { execFileSync } from 'node:child_process';
 
-import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, assessOwnership, expectedOwnerCgroup } from '../app/tmux-owner.js';
+import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, assessOwnership, expectedOwnerCgroup, ownerRemediation } from '../app/tmux-owner.js';
 
 function tmuxCapture(args) {
   const socket = process.env.PW_TMUX_SOCKET ? ['-L', process.env.PW_TMUX_SOCKET] : [];
@@ -66,8 +66,8 @@ function main() {
   process.stderr.write(
     `pw-tmux-assert-owner: refusing to use this tmux server.\n  ${verdict.reason}\n`
     + `  expected owner cgroup: ${expectedOwner}\n`
-    + '  If this host ran terminals before the owner unit existed, migrate deliberately:\n'
-    + '    pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service\n',
+    + '  If terminals ran before the configured owner existed, migrate deliberately:\n'
+    + `    ${ownerRemediation(process.env)}\n`,
   );
   process.exitCode = 1;
 }
