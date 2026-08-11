@@ -1956,3 +1956,48 @@ exact head, GOA is asked to run and report:
 
 No deployment is authorized. Merge and deployment remain separate gates, and this candidate
 authorizes neither a PVI/PVE nor a GOA rollout.
+
+### Round 12 addendum — two P1 blockers repaired
+
+Immutable review of `4189cdaa` blocked on two P1 findings. Both were real; both are repaired
+test-first, and both are recorded because they share a cause worth naming.
+
+**P1-1 — the installer never shipped the helper every seam requires.** `install.sh` omitted
+`scripts/pw-tmux-assert-owner`, so on a real host `command -v` finds nothing and every project and
+setup terminal, restore and the persist path refuse. The test fixtures supplied a temporary copy,
+which is exactly what hid it.
+
+Repaired: the helper installs to `/usr/local/bin/pw-tmux-assert-owner` mode `0755` beside the other
+helpers. The manifest test that guards it is **derived from the seams**, not hand-listed — it reads
+what the seam scripts invoke and requires `install.sh` to ship each one — so a helper a seam starts
+depending on later cannot be forgotten the same way. It also asserts every script `install.sh` claims
+to ship actually exists, and that the helper is executable in the repository.
+
+**P1-2 — the JS gate was fail-open relative to the shell gate in shipped configuration.**
+`assessOwnership` correctly returns `owned:false` for a marker-only/foreign-cgroup server, and the
+shell gate refuses it unconditionally — but `tmux-owner-gate.js` accepted that state unless
+`PW_TMUX_REQUIRE_CGROUP=1`, which only `pw-tmux-server.service` set. The dashboard and every other JS
+seam therefore ran with the weaker rule, against precisely the adopt-don't-move state the whole unit
+exists to prevent.
+
+Repaired: the shared-server JS gate now requires the full `owned` verdict **unconditionally** — the
+conditional is gone, so there is no flag that reaches the weaker branch. Tests exercise the SHIPPED
+environment with no special flag and prove a marker-only/foreign-cgroup server is refused, including
+with `PW_TMUX_REQUIRE_CGROUP` unset, `0`, and empty. A source assertion fails the build if a
+fail-open conditional is reintroduced, and both gates are required to reach the same
+`assessOwnership` contract rather than deciding locally.
+
+Round 8's warning is unchanged and still honoured: a same-cgroup comparison proves nothing, so the
+cgroup branch is exercised against a CONTROLLED `/proc`, and fixtures supply a `/proc` saying what a
+real host would say rather than switching the check off. The private-socket test-adapter scope is
+untouched — it is provably not the shared production socket, which `orchestrator/config.js` resolves
+from `PW_TMUX_SOCKET`.
+
+**The recurring cause, stated plainly:** four times in this candidate a fixture made a check pass that
+a real host would fail — a temp helper, a vacuous race client, two restore fixtures exiting at
+Candidate B's config preflight, and a `PATH` without node. Every one was caught by a mutation proof,
+by exact-head CI, or by review, and none by reading the code. The manifest test above is the
+structural answer to the first of those.
+
+Evidence at the repaired head: canonical **1019 tests, 1016 pass, 0 fail, 3 skipped**; focused
+Candidate C suites **57/57**.

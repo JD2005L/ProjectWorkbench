@@ -195,6 +195,11 @@ install -m 0755 "$SRC_DIR/scripts/project-preview-start"  /usr/local/bin/project
 install -m 0755 "$SRC_DIR/scripts/setup-terminal-start"   /usr/local/bin/setup-terminal-start
 install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update-claude-code
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
+# Every server-creation seam refuses unless this is on PATH — a missing helper is
+# a refusal, not a skip. Shipping it is therefore not optional: without it the
+# project and setup terminals, restore and the persist path all refuse on a real
+# host. (Test fixtures supplied a temporary copy, which is what hid this.)
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-assert-owner"   /usr/local/bin/pw-tmux-assert-owner
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
 

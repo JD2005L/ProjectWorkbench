@@ -58,15 +58,22 @@ export async function assertTmuxOwner({ env = process.env, capture = tmuxCapture
 
   const verdict = assessOwnership({ pid, procRoot, expectedOwner, expectedMarker: OWNER_MARKER_VALUE, marker });
 
-  // The MARKER is always required: it is a server option only the owner sets, so
-  // a client-created server can never carry it. The CGROUP half is defence in
-  // depth against something that can set options on the server, and is enforced
-  // where a cgroup comparison is meaningful — the owner unit and the client units
-  // set PW_TMUX_REQUIRE_CGROUP=1. Round 8 recorded that a same-cgroup comparison
-  // proves nothing, so the cgroup branch is exercised against a controlled /proc
-  // (test/tmux-owner.test.mjs) and is never presented as proof on its own.
-  const requireCgroup = String(env.PW_TMUX_REQUIRE_CGROUP || '') === '1';
-  if (verdict.markerOk && (verdict.cgroupOk || !requireCgroup)) return verdict;
+  // THE FULL VERDICT, UNCONDITIONALLY. Ownership is one contract and it does not
+  // get to be weaker on the side that runs as root.
+  //
+  // This previously accepted a marker-only/foreign-cgroup server unless
+  // PW_TMUX_REQUIRE_CGROUP=1 — a flag only the owner unit set. So the dashboard
+  // and every other JS seam ran fail-open against precisely the adopt-don't-move
+  // state the shell gate refuses outright: markerOk true, cgroupOk false,
+  // owned false, shell refuses, JS accepted. There is no flag to reach that
+  // branch with any more, because there is no branch.
+  //
+  // Round 8's warning still holds and is honoured elsewhere: a same-cgroup
+  // comparison proves nothing, so the cgroup branch is exercised against a
+  // CONTROLLED /proc (test/tmux-owner.test.mjs, test/tmux-owner-shipping.test.mjs)
+  // and fixtures supply a /proc saying what a real host would say — they do not
+  // switch the check off.
+  if (verdict.owned) return verdict;
 
   throw new TmuxOwnershipError(
     `refusing to create a tmux session: ${verdict.reason}. `
