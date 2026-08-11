@@ -1,0 +1,46 @@
+[Unit]
+Description=Project Workbench tmux server owner (host mode)
+Documentation=https://github.com/JD2005L/ProjectWorkbench
+After=network-online.target
+Wants=network-online.target
+
+# HOST MODE ONLY. The container deployment's owner is the pw-tmux sidecar
+# (pw-tmux.service); this unit must never be installed beside it — install.sh
+# refuses that combination rather than standing up a second, invisible server on
+# the per-user default socket.
+
+[Service]
+# Type=notify, NOT Type=simple. With Type=simple systemd considers the unit
+# active the moment it forks, so the After= barrier releases before the tmux
+# server exists — and the first terminal to run `tmux new-session` becomes the
+# server's creator, putting every project's sessions in that terminal's cgroup.
+# That is the whole defect this unit exists to close.
+#
+# NotifyAccess=all because the readiness call comes from the keepalive shell's
+# `systemd-notify` child rather than from the main PID.
+Type=notify
+NotifyAccess=all
+
+# The readiness signal is sent by scripts/pw-tmux-keepalive.sh only after it has
+# PROVEN, about the live server: that it exists on the intended socket, that it
+# carries the owner marker (a tmux server option, so no client can have inherited
+# it), that the keepalive session is present, and that it did not join a server
+# some other process created while this unit was starting. A pre-existing foreign
+# server makes this unit FAIL rather than adopt it — see the migration note in
+# that script.
+TimeoutStartSec=60
+Environment=PW_TMUX_HOST_MODE=1
+Environment=PW_TMUX_OWNER_BOOTSTRAP=1
+Environment=PW_TMUX_REQUIRE_CGROUP=1
+EnvironmentFile=-/etc/project-workbench/pw-env
+ExecStart=/opt/project-workbench/scripts/pw-tmux-keepalive.sh
+
+Restart=on-failure
+RestartSec=5
+
+# The point of the unit: the tmux server is a child of THIS cgroup, so restarting
+# the dashboard, a project terminal, or the setup terminal cannot reap it.
+KillMode=control-group
+
+[Install]
+WantedBy=multi-user.target

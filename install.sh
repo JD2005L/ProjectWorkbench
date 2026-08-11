@@ -20,6 +20,35 @@
 
 set -euo pipefail
 
+# ---- host-mode only ----------------------------------------------------------
+# DEPLOY.md defines this installer as the bare-metal/VM HOST path; container mode
+# is covered separately by that document. The portable invariant that matters:
+# this must never stand up the host tmux owner beside an active container sidecar
+# owner, because the two would own DIFFERENT sockets — the host unit taking the
+# per-user default socket while the real server lives on the bind-mounted one.
+# That is the "second, invisible server" failure, reached from the other side.
+#
+# So: refuse, loudly and early. Do NOT conditionally install a partial container
+# topology here — inventing container owner topology in this script is explicitly
+# out of scope.
+if [ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" = "container" ]; then
+  echo "install.sh: refusing — PW_DEPLOY_MODE=container." >&2
+  echo "  This installer is the host-mode path only. Container deployments are covered by DEPLOY.md" >&2
+  echo "  and are owned by the pw-tmux sidecar; installing the host owner unit beside it would create" >&2
+  echo "  a second tmux server on a different socket." >&2
+  exit 1
+fi
+if command -v systemctl >/dev/null 2>&1; then
+  if systemctl list-unit-files pw-tmux.service >/dev/null 2>&1 && systemctl is-enabled pw-tmux.service >/dev/null 2>&1; then
+    echo "install.sh: refusing — the container sidecar owner pw-tmux.service is enabled on this host." >&2
+    echo "  Installing the host owner unit beside it would stand up a competing tmux server owner." >&2
+    echo "  Disable the sidecar owner first, or install on a host that is not running container mode." >&2
+    exit 1
+  fi
+fi
+
+
+
 PW_INSTALL_DIR="${PW_INSTALL_DIR:-/opt/project-workbench}"
 PW_HTTP_PORT="${PW_HTTP_PORT:-80}"
 PW_REPO="${PW_REPO:-https://github.com/JD2005L/ProjectWorkbench.git}"
@@ -362,3 +391,23 @@ printf '       Until then, anonymous browser requests are treated as an implicit
 printf '\n'
 printf '  Re-run this installer at any time — it is idempotent and preserves users.json/sessions.\n'
 printf '────────────────────────────────────────────────\n'
+
+# ---- tmux owner unit (host mode) --------------------------------------------
+# The shared tmux server must live in ITS OWN cgroup, not in whichever terminal
+# happened to create it first. Failure here is FATAL: a half-installed owner is
+# how the server ends up back inside a ttyd unit.
+install -m 0644 "$SRC_DIR/systemd/pw-tmux-server.service" /etc/systemd/system/pw-tmux-server.service
+
+# Soft memory ceiling for the owner. 64-BIT SHELL ARITHMETIC ON PURPOSE: the
+# obvious `awk '{printf "%d", ...}'` clamps at INT_MAX under mawk (the default awk
+# on Debian), which would impose a ~2 GiB ceiling on every host with more than
+# ~2.73 GiB of RAM — throttling exactly the workload this ceiling protects.
+pw_mem_kb=$(sed -n 's/^MemTotal:[[:space:]]*\([0-9]*\).*/\1/p' /proc/meminfo)
+if [ -n "$pw_mem_kb" ]; then
+  pw_mem_high=$(( pw_mem_kb * 1024 * 3 / 4 ))
+  mkdir -p /etc/systemd/system/pw-tmux-server.service.d
+  printf '[Service]\nMemoryHigh=%s\n' "$pw_mem_high" > /etc/systemd/system/pw-tmux-server.service.d/memory.conf
+fi
+
+systemctl daemon-reload
+systemctl enable --now pw-tmux-server.service

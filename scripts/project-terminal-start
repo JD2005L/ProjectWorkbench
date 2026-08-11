@@ -16,6 +16,25 @@ primary_user=$(jq -r --arg n "$name" '.[] | select(.name==$n) | .primaryUser // 
 # test/project-terminal-start.test.mjs); unset (the default, always true in
 # production) means the normal per-user default socket, byte-identical to
 # before this variable existed. Mirrors app/server.js's own PW_TMUX_SOCKET.
+
+# ---- tmux ownership gate ------------------------------------------------------
+# Whoever creates the shared tmux server decides which cgroup it lands in, and
+# therefore what can reap it. Before creating one, prove the live server is the
+# owner unit's. A MISSING helper is a REFUSAL, not a skip: a partially-upgraded
+# host is exactly where the old code created the server anyway.
+pw_assert_tmux_owner() {
+	local gate
+	gate=$(command -v pw-tmux-assert-owner) || gate=""
+	if [[ -z "$gate" ]]; then
+		echo "[project-terminal-start] refusing: the tmux ownership helper pw-tmux-assert-owner is not installed" >&2
+		exit 1
+	fi
+	if ! "$gate"; then
+		echo "[project-terminal-start] refusing: the live tmux server is not owned by the workbench owner unit" >&2
+		exit 1
+	fi
+}
+
 tmux_sock_args=()
 [[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
 # Same pattern for the ttyd binary itself: unset (the default, always true in
@@ -226,6 +245,7 @@ if [[ "$already_exists" -eq 1 ]]; then
     fi
   fi
 else
+  pw_assert_tmux_owner
   tmux "${tmux_sock_args[@]}" -u new-session -d -s "$session" -c "$real_path" "$tab_env"
   # Stamp the same non-secret fingerprint app/server.js stamps on sessions it
   # creates (@pw_cred_key), so GET /api/projects/status's staleness check
@@ -262,4 +282,5 @@ exec "${PW_TTYD_BIN:-/usr/bin/ttyd}" \
   --client-option letterSpacing=0 \
   --client-option disableLeaveAlert=true \
   --check-origin \
+  pw_assert_tmux_owner
   tmux "${tmux_sock_args[@]}" -u new-session -A -s "$session" -c "$real_path" "$tab_env"

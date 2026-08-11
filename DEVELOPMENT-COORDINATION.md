@@ -1864,3 +1864,95 @@ abandoned; it exists to stop convergence stalling, not to take the lane.
 Candidate C starts only after Candidate B is merged. **No deployment is authorized** — merge and
 deployment remain separate gates, and this integration candidate authorizes neither a PVI/PVE nor a
 GOA rollout.
+
+---
+
+## Hermes-James — Round 12 — Candidate C: dedicated tmux owner unit (replacement for PR #24)
+
+Appended, not a revision. Rounds 1-11 stand unchanged.
+
+Candidate C is implemented on a fresh branch cut from canonical `main`
+`fb42c320ae7b1cea658dc43826b0c7d9947f8d7e` (Candidates A and B merged). PR #24 head `43625e4` was
+never merged, amended, or cherry-picked; it remains reference-only. It was **greenfield** on this
+base — nothing from PR #24 existed in `install.sh`, `systemd/` or `scripts/`.
+
+### What it does
+
+The shared tmux server must live in the OWNER's cgroup. Whichever process creates it decides what can
+reap it, so a terminal winning that race puts every project's sessions inside one ttyd unit.
+
+- `systemd/pw-tmux-server.service` — `Type=notify` + `NotifyAccess=all`. Readiness is signalled only
+  after the owner proves, about the LIVE server: it exists on the intended socket, it carries the
+  owner marker (a tmux SERVER option, so no client can inherit it), the keepalive session is present,
+  and it did not JOIN a server another process created while the unit was starting.
+- A pre-existing foreign server makes the unit FAIL rather than adopt it, and the refusal documents
+  the `pw-tmux-save && tmux kill-server && systemctl restart` migration.
+- `app/tmux-owner.js` + `scripts/pw-tmux-assert-owner` + `app/tmux-owner-gate.js` — one ownership
+  implementation, used by all six seams so they cannot drift: project and setup terminal entrypoints,
+  the dashboard's `tmux()` (which covers create/new-window/recycle — the Round 8 bypass), restore,
+  and the orchestrator adapter. A MISSING helper is a refusal, never a skip.
+- `install.sh` stays host-only: fatal on `PW_DEPLOY_MODE=container` or a detected sidecar owner, no
+  container topology invented, owner enable/readiness failure fatal. `MemoryHigh` uses 64-bit shell
+  arithmetic — no `awk`/`printf` clamp.
+- CI now runs on every pushed branch and every pull request. **Required-check enforcement is branch
+  protection outside this repository and is NOT claimed here.**
+
+Dispositions preserved and pinned by tests: **GOA-2** (container supervision retained, replay
+deferred, no opt-in restore-on-start) and **GOA-5** (documented host default retained, no new
+ambiguity refusal).
+
+### Mutation evidence — each safety regression can actually fail
+
+| Claim | Proof |
+|---|---|
+| Cold-start race test is non-vacuous | Reverting readiness to fire before server creation (the `Type=simple` shape) makes it FAIL; restoring makes it pass |
+| Owner does not adopt a racer's server | The same mutation surfaced a real design gap — the owner stamped its marker onto whatever server was live. Repaired, then re-proved |
+| Fixture marker is load-bearing | Removing `@pw_owner` from a migrated fixture's private server makes the seam refuse, **naming the marker** |
+| Fixture helper is load-bearing | Removing the real helper from PATH makes restore refuse, **naming the helper** |
+
+Two errors of ours were caught by these proofs rather than by review, and are recorded because the
+pattern keeps recurring: the first race test passed against the defect, and two restore fixtures were
+passing at exit 78 (Candidate B's config preflight) without ever reaching the gate.
+
+### Harness migration
+
+Five fixtures that stand up a private tmux server were migrated to represent a real deployment:
+`pw-tmux-restore`, `project-terminal-start`, `user-lifecycle`, `user-lifecycle-locking`,
+`projects-lock`. Each installs the REAL assertion helper on PATH and stamps the same owner marker the
+owner unit stamps, with `PW_TMUX_REQUIRE_CGROUP=1` — the value the shipped units set — left ON and the
+cgroup branch exercised against a CONTROLLED `/proc`, which is what Round 8 prescribed for a runner
+where every process shares one cgroup. The expected cgroup is resolved by production's own function,
+so the fixture cannot drift from the unit a deployment expects.
+
+Explicitly NOT used, because each is a fail-open the contract forbids: a bypass/enforcement flag,
+reuse of the owner's bootstrap exemption, or a private-socket exemption.
+
+### PVI2 evidence at this head
+
+| Check | Result |
+|---|---|
+| Canonical `npm ci && npm test` | **1011 tests, 1008 pass, 0 fail, 3 skipped** |
+| Focused: ownership core / gate CLI / seams / readiness+race / installer / dispositions | 12, 7, 8, 4, 11, 7 — all green |
+| Release guard | 4/4 |
+| Secret scan (29 files) | 0 matches |
+
+The 3 skips are the pre-existing orchestrator privilege-drop assertions that self-declare they cannot
+fail when the suite runs as the workspace account.
+
+### Requested of GOA — same-SHA evidence PVI2 cannot produce
+
+PVI2 verified on the PVI/PVE host only. **No GOA runtime property is claimed here.** Against this
+exact head, GOA is asked to run and report:
+
+1. The dependency-free / container-mode checks GOA owns, on the same SHA.
+2. That the container sidecar owner (`pw-tmux.service`) still supervises exactly as before, and that
+   the readiness mechanism is genuinely optional there — `systemd-notify` absent must not stop
+   supervision, which is the Round 2 constraint PVI2 cannot exercise without a sidecar.
+3. That `install.sh` refuses on a real container-mode host with the sidecar owner enabled.
+4. **Exact totals** — tests / pass / fail / skipped — plus an explicit list of anything **not run**,
+   reported as not run rather than as a pass.
+
+### Sequencing
+
+No deployment is authorized. Merge and deployment remain separate gates, and this candidate
+authorizes neither a PVI/PVE nor a GOA rollout.

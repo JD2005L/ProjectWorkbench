@@ -1,4 +1,9 @@
 [Unit]
+# Fail CLOSED on the tmux owner: with Wants= a terminal starts anyway and
+# creates the shared server itself, in its own cgroup — the exact topology the
+# owner unit exists to prevent.
+Requires=pw-tmux-server.service
+After=pw-tmux-server.service
 Description=ttyd setup/auth terminal for Project Workbench Setup Wizard
 After=network-online.target
 Wants=network-online.target

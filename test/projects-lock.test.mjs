@@ -18,6 +18,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ownedTmuxFixture } from './tmux-owner-fixture.mjs';
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
@@ -31,11 +32,15 @@ function makeSharedInstance() {
   fs.writeFileSync(secretKeyPath, crypto.randomBytes(32).toString('hex') + '\n');
   const registryPath = path.join(dir, 'registry', 'projects.json');
   fs.writeFileSync(registryPath, '[]');
+  // Private, owner-marked tmux socket — see the note in test/tmux-owner-fixture.mjs.
+  const tmuxSocket = `pwpl-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const owned = ownedTmuxFixture({ socket: tmuxSocket, dir, env: { PW_DEPLOY_MODE: 'container' } });
   return {
     dir,
     registryPath,
     env: {
-      PATH: process.env.PATH,
+      ...owned,
+      PW_TMUX_SOCKET: tmuxSocket,
       HOME: process.env.HOME,
       LANG: process.env.LANG || 'C.UTF-8',
       PW_ISOLATED: '1',
