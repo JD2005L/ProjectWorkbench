@@ -1,0 +1,75 @@
+#!/usr/bin/env node
+// The ownership gate every server-creation seam must pass.
+//
+// Exits 0 only when the LIVE tmux server on the target socket is genuinely ours:
+// it carries our server-scoped owner marker AND its process lives in the expected
+// owner cgroup. Anything else — a foreign server, a marker-less server, no server
+// at all, an unreadable /proc — exits nonzero with an actionable, metadata-only
+// diagnostic.
+//
+// Why a helper rather than an inline check in each seam: there are six places
+// that can create the server (two shell entrypoints, the dashboard, restore, the
+// orchestrator adapter, and the owner itself). Six copies of a security check
+// drift. This is the single implementation; `app/tmux-owner.js` holds the logic
+// so the JS seams import it directly and the shell seams exec this.
+//
+// FAILING TO FIND THIS HELPER IS A REFUSAL, NOT A SKIP. Round 8 found the
+// superseded candidate skipped the gate when the helper was absent from PATH —
+// the shape of any partially-upgraded host — and created the server anyway. The
+// seams therefore treat "cannot execute the helper" as fatal.
+//
+// Configuration only; no deployment is named here:
+//   PW_TMUX_OWNER_CGROUP  expected owner unit (default: mode-appropriate)
+//   PW_DEPLOY_MODE        host (default) | container
+//   PW_TMUX_SOCKET        -L socket name, when the deployment uses one
+//   PW_TMUX_PROC_ROOT     /proc root, injectable so the cgroup branch is testable
+import { execFileSync } from 'node:child_process';
+
+import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, assessOwnership, expectedOwnerCgroup } from '../app/tmux-owner.js';
+
+function tmuxCapture(args) {
+  const socket = process.env.PW_TMUX_SOCKET ? ['-L', process.env.PW_TMUX_SOCKET] : [];
+  try {
+    return String(execFileSync('tmux', [...socket, ...args], {
+      encoding: 'utf8',
+      timeout: 10000,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })).trim();
+  } catch {
+    return null;
+  }
+}
+
+function main() {
+  const expectedOwner = expectedOwnerCgroup(process.env);
+  const procRoot = process.env.PW_TMUX_PROC_ROOT || '/proc';
+
+  // The server's own pid. A dead server answers nothing, which is itself a
+  // refusal — never an invitation to create one here.
+  const pidText = tmuxCapture(['display-message', '-p', '#{pid}']);
+  const pid = pidText && /^\d+$/.test(pidText) ? Number(pidText) : null;
+  const marker = pid ? (tmuxCapture(['show-options', '-sv', OWNER_MARKER_OPTION]) || '') : '';
+
+  const verdict = assessOwnership({
+    pid,
+    procRoot,
+    expectedOwner,
+    expectedMarker: OWNER_MARKER_VALUE,
+    marker,
+  });
+
+  if (verdict.owned) {
+    process.stdout.write(`tmux owner ok: pid ${verdict.pid} in ${expectedOwner}\n`);
+    return;
+  }
+
+  process.stderr.write(
+    `pw-tmux-assert-owner: refusing to use this tmux server.\n  ${verdict.reason}\n`
+    + `  expected owner cgroup: ${expectedOwner}\n`
+    + '  If this host ran terminals before the owner unit existed, migrate deliberately:\n'
+    + '    pw-tmux-save && tmux kill-server && systemctl restart pw-tmux-server.service\n',
+  );
+  process.exitCode = 1;
+}
+
+main();

@@ -14,6 +14,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ownedTmuxFixture } from './tmux-owner-fixture.mjs';
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
@@ -39,8 +40,16 @@ function makeInstance(port, extraEnv = {}) {
   const secretKeyPath = path.join(dir, '.secret-key');
   const secretKey = crypto.randomBytes(32).toString('hex');
   fs.writeFileSync(secretKeyPath, secretKey + '\n');
+  // Isolate tmux onto a PRIVATE socket and mark that server as owned, exactly as
+  // the owner unit marks the real one, with the REAL assertion helper on PATH.
+  // These instances previously reached the developer's default tmux server; the
+  // ownership gate correctly refuses an unmarked server, and a test must not be
+  // mutating the real one either way.
+  const tmuxSocket = extraEnv.PW_TMUX_SOCKET || `pwlc-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+  const owned = ownedTmuxFixture({ socket: tmuxSocket, dir, basePath: `${makeFakeTtydDir(dir)}:${process.env.PATH}`, env: extraEnv });
   const env = {
-    PATH: `${makeFakeTtydDir(dir)}:${process.env.PATH}`,
+    ...owned,
+    PW_TMUX_SOCKET: tmuxSocket,
     HOME: process.env.HOME,
     LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port),

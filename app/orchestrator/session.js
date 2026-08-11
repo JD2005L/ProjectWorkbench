@@ -25,6 +25,7 @@ import { laneNaming } from './config.js';
 import { resolveWorkspacePath } from './projects.js';
 import { defaultLaneCredentialResolver } from './lane-credentials.js';
 import { sessionCredentialState } from '../user-credentials.js';
+import { assertTmuxOwner } from '../tmux-owner-gate.js';
 
 const execFileAsync = promisify(execFile);
 
@@ -165,6 +166,33 @@ export class TmuxAdapter {
   }
 
   async newSession(session, cwd, command) {
+    // Same ownership gate as every other server-creation seam: an orchestrator
+    // lane must not be the process that creates the SHARED server in the wrong
+    // cgroup. Refuses on a foreign server and when the gate cannot be evaluated.
+    //
+    // Scope, deliberately: the requirement is about the deployment's shared tmux
+    // server — the one whose cgroup decides what can reap every project's
+    // sessions. An adapter pointed at an explicitly DIFFERENT private socket is
+    // by construction not that server, so nothing is at stake there. Production
+    // resolves this socket from PW_TMUX_SOCKET (see orchestrator/config.js), so
+    // the production path is always gated.
+    //
+    // The check runs through this.raw, so it uses the adapter's own socket and
+    // its own injected executor rather than reaching around them.
+    const sharedSocket = String(process.env.PW_TMUX_SOCKET || '');
+    if (String(this.socket || '') === sharedSocket) {
+      await assertTmuxOwner({
+        env: process.env,
+        capture: async (_env, argv) => {
+          try {
+            const { stdout } = await this.raw(argv);
+            return String(stdout || '').trim();
+          } catch {
+            return null;
+          }
+        },
+      });
+    }
     await this.raw(['new-session', '-d', '-s', session, '-c', cwd, ...(command ? [command] : [])]);
   }
 

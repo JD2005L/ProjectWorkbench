@@ -1,4 +1,9 @@
 [Unit]
+# Fail CLOSED on the tmux owner: with Wants= a terminal starts anyway and
+# creates the shared server itself, in its own cgroup — the exact topology the
+# owner unit exists to prevent.
+Requires=pw-tmux-server.service
+After=pw-tmux-server.service
 Description=Project Workbench: restore tmux sessions on boot, snapshot on stop
 # Restore must finish before the per-project ttyd terminals attach, so that
 # `tmux new-session -A` in project-terminal-start attaches to a restored session

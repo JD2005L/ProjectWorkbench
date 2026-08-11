@@ -1,7 +1,13 @@
 name: test
 on:
+  # No branch allow-list. A reviewed head that produced no check run is how a
+  # failing gate reached review unnoticed: pushes to any branch, and every pull
+  # request, must produce a run.
+  #
+  # NOTE: this makes the workflow RUN. Whether a run is a *required* check is
+  # branch-protection configuration outside this repository, and nothing here
+  # should be read as claiming that enforcement.
   push:
-    branches: [ main, goa-deploy ]
   pull_request:
 jobs:
   node-test:

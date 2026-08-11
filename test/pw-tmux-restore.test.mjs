@@ -26,6 +26,7 @@ import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { ownedTmuxFixture } from './tmux-owner-fixture.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -83,8 +84,13 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
   await fsp.mkdir(stateDir, { recursive: true });
   const sock = tmuxSock();
   const session = 'pw_' + name;
+  // The private server this fixture stands up is marked as owned, exactly as the
+  // owner unit marks the real one, and the REAL assertion helper is put on PATH.
+  // Without this the seams correctly refuse an unmarked server — which is the
+  // state that cannot occur in production.
+  const owned = ownedTmuxFixture({ socket: sock, dir });
   const env = {
-    PATH: process.env.PATH,
+    ...owned,
     HOME: dir,
     PW_REGISTRY_PATH: path.join(dir, 'projects.json'),
     PW_USERS_PATH: path.join(dir, 'users.json'),

@@ -20,6 +20,7 @@ import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { withLifecycleLock } from './lifecycle-lock.js';
 import { makeCredentialLockDomain } from './credential-domain-lock.js';
+import { assertTmuxOwner } from './tmux-owner-gate.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
@@ -896,7 +897,16 @@ async function stopPreviewUnit(name){
   if(state.proc && state.proc.exitCode === null) state.proc.kill('SIGKILL');
  }
 }
+// Commands that can bring a tmux server into existence. Anything here must pass
+// the ownership gate first — the dashboard creating a session from its OWN
+// service cgroup is exactly the bypass Round 8 found, and the terminal recycle
+// path reaches it.
+const TMUX_SERVER_CREATING = new Set(['new-session','start-server','new-window']);
 async function tmux(args,opts={}){
+ if(TMUX_SERVER_CREATING.has(args[0])){
+  // Refuses on a foreign server AND when the helper is unavailable; never skips.
+  await assertTmuxOwner({ env: process.env });
+ }
  if(DEPLOY_MODE === 'container') return execFileAsync('tmux',['-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),...args],{timeout:10000,...opts});
  // hostTerminalUser() (not a literal) so the account panes run as and the account
  // per-user credential files are chowned to cannot drift apart — see terminal-owner.js.
