@@ -15,9 +15,9 @@ Wants=network-online.target
 # is what detects that.
 EnvironmentFile=-/etc/project-workbench/pw.env
 Type=simple
-User=admin
-Group=admin
-Environment=HOME=/home/admin
+User=@PW_USER@
+Group=@PW_GROUP@
+Environment=HOME=@PW_HOME@
 ExecStart=/usr/local/bin/setup-terminal-start
 Restart=on-failure
 RestartSec=3

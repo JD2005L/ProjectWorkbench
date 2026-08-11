@@ -10,8 +10,8 @@ Wants=network-online.target
 # is what detects that.
 EnvironmentFile=-/etc/project-workbench/pw.env
 Type=simple
-WorkingDirectory=/opt/project-workbench/app
-ExecStart=/usr/bin/node /opt/project-workbench/app/server.js
+WorkingDirectory=@PW_INSTALL_DIR@/app
+ExecStart=/usr/bin/node @PW_INSTALL_DIR@/app/server.js
 Restart=on-failure
 RestartSec=3
 User=root

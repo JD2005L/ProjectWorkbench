@@ -43,15 +43,35 @@
 set -u
 
 # --- configuration (no deployment is named here) ------------------------------
-: "${TMUX_TMPDIR:=/opt/project-workbench/run/tmux}"
-export TMUX_TMPDIR
-mkdir -p "$TMUX_TMPDIR" 2>/dev/null || true
-chmod 0700 "$TMUX_TMPDIR" 2>/dev/null || true
-
 OWNER_MARKER_OPTION='@pw_owner'
 OWNER_MARKER_VALUE='pw-owner'
 HOST_MODE="${PW_TMUX_HOST_MODE:-0}"
 PROC_ROOT="${PW_TMUX_PROC_ROOT:-/proc}"
+
+# WHICH SOCKET DIRECTORY? The two deployments answer differently, and answering
+# with the container's value on a host is how the owner ends up supervising a
+# server that nothing else can see.
+#
+# HOST: the seams reach the server through `sudo -u <account> tmux` with no
+# TMUX_TMPDIR, i.e. that account's PER-USER DEFAULT socket (/tmp/tmux-<uid>/…).
+# So the owner must use the per-user default too — which means actively clearing
+# any TMUX_TMPDIR it inherited, not merely declining to set one. Defaulting it to
+# the container's bind-mount path put the host owner on <prefix>/run/tmux, a
+# directory a host install never even creates, while every terminal, the restore
+# path and the dashboard's probe looked at the per-user socket. The unit then
+# reported active and ready about a server no seam could reach.
+#
+# CONTAINER: the sidecar passes an explicit -e TMUX_TMPDIR pointing at the
+# bind-mounted socket dir, and that must be honoured exactly as before. The
+# fallback below only applies when the sidecar did not set one.
+if [[ "$HOST_MODE" == 1 ]]; then
+	unset TMUX_TMPDIR
+else
+	: "${TMUX_TMPDIR:=/opt/project-workbench/run/tmux}"
+	export TMUX_TMPDIR
+	mkdir -p "$TMUX_TMPDIR" 2>/dev/null || true
+	chmod 0700 "$TMUX_TMPDIR" 2>/dev/null || true
+fi
 
 # An explicit socket PATH (tests, and any deployment that wants one) or the
 # deployment's normal default socket.
