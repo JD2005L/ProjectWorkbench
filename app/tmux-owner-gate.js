@@ -22,13 +22,40 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 
 import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, assessOwnership, expectedOwnerCgroup } from './tmux-owner.js';
+import { hostTerminalUser } from './terminal-owner.js';
 
 const execFileAsync = promisify(execFile);
 
-async function tmuxCapture(env, args) {
+// The probe must reach the SAME tmux server the seam it guards will drive.
+//
+// A gate is only meaningful if it inspects the server the executor talks to. In
+// host mode the dashboard process runs as root while the panes — and therefore
+// the shared server — live on the pane account's per-user socket, which is why
+// server.js's tmux() hops through `sudo -u <account>`. This capture used to exec
+// a bare `tmux`, so as root it inspected root's OWN (empty) default socket and
+// reported "no running tmux server on the target socket" about a perfectly
+// healthy host: the gate refused every new-session/new-window/recycle, and the
+// refusal text sent the operator to a save/kill/restart migration that could not
+// fix it because the new server would land on the pane account's socket too.
+//
+// The shell seams never had this bug — project-terminal@.service already runs as
+// the pane account, so `pw-tmux-assert-owner` was on the right socket by virtue
+// of its unit. The orchestrator adapter injects its own executor. Only this
+// default capture, used by the root-running dashboard, could drift — so it now
+// resolves the account through hostTerminalUser(), exactly as tmux() does, and
+// the two cannot name different accounts.
+export function tmuxProbeArgv(env, args) {
   const socket = env.PW_TMUX_SOCKET ? ['-L', env.PW_TMUX_SOCKET] : [];
+  const argv = [...socket, ...args];
+  return String(env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'container'
+    ? ['tmux', argv]
+    : ['sudo', ['-u', hostTerminalUser(env), 'tmux', ...argv]];
+}
+
+async function tmuxCapture(env, args) {
+  const [command, argv] = tmuxProbeArgv(env, args);
   try {
-    const { stdout } = await execFileAsync('tmux', [...socket, ...args], { timeout: 10000, env });
+    const { stdout } = await execFileAsync(command, argv, { timeout: 10000, env });
     return String(stdout || '').trim();
   } catch {
     return null;
