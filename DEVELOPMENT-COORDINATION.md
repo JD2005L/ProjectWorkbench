@@ -2001,3 +2001,164 @@ structural answer to the first of those.
 
 Evidence at the repaired head: canonical **1019 tests, 1016 pass, 0 fail, 3 skipped**; focused
 Candidate C suites **57/57**.
+
+## PVI2 — Round 13 — deployment failure of exact merged main `6a9e8cd`, rollback, and installer-manifest repair
+
+**No deployment is claimed by this section.** It records a failed controlled deployment, a completed
+rollback, and a repair branch offered for immutable review. Merge and deployment remain separate
+gates and neither is authorized here.
+
+### The deployment failure
+
+A controlled host deployment of the exact merged main
+`6a9e8cd401a8f00d74e2fe91964bb8d17f49958c` **FAILED** while starting the new owner unit.
+
+| | |
+|---|---|
+| Attempted SHA | `6a9e8cd401a8f00d74e2fe91964bb8d17f49958c` (exact merged main) |
+| Failing step | `systemctl enable --now pw-tmux-server.service` — the last line of `install.sh` |
+| Failure | `pw-tmux-server.service` exited **`203/EXEC`** |
+| Unit `ExecStart` | `/opt/project-workbench/scripts/pw-tmux-keepalive.sh` |
+| Installed by `install.sh`? | **No.** The installer ships `pw-tmux-assert-owner`, `pw-tmux-save` and `pw-tmux-restore`, and never ships `scripts/pw-tmux-keepalive.sh` at all |
+
+### Rollback — completed, verified
+
+The deadman rollback restored the prior exact main. Verified on the live instance at the time of
+writing, and again at the head of this repair branch:
+
+| Check | Result |
+|---|---|
+| `pw-tmux-server.service` | **active** |
+| tmux sessions | **19** |
+| Failed units | **0** |
+| Release reported | prior release `1.26.0810.2352` |
+
+Live PVI2 is healthy on the prior release. Nothing in this repair branch has been applied to it.
+
+### Root cause
+
+`203/EXEC` is systemd's verdict for "the `ExecStart` program could not be executed" — the file was
+not there.
+
+`/opt/project-workbench/scripts/…` is the **container** layout. `Containerfile:72` does
+`COPY scripts/ /opt/project-workbench/scripts/`, and the container sidecar `systemd/pw-tmux.service`
+runs its keepalive from that path legitimately. On a **host**, `install.sh` clones the repository to
+`$PW_INSTALL_DIR/source` and installs helpers into `/usr/local/bin`; nothing ever creates
+`/opt/project-workbench/scripts/`. The host owner unit had borrowed a path that exists only in the
+other deployment, and the installer shipped the helper nowhere.
+
+Both halves had to be wrong for this to reach a merged main, and both were.
+
+### Why the existing guards did not catch it
+
+`test/tmux-owner-shipping.test.mjs` already derives a helper manifest — that was Round 12's
+structural answer to exactly this class of defect, chosen over a hand-list so it could not recur. But
+its derivation reads only what the **seam scripts** invoke by bare name (`command -v pw-…`). **No
+check ever read the systemd unit files.** A helper referenced solely by a unit's `ExecStart`
+therefore sat outside every derivation in the repository.
+
+This is the same recurring cause Round 12 named: a check that passes because the thing it reads is
+not the thing a real host uses. Round 12 widened the derivation; it did not widen it far enough.
+
+### The repair — strict RED/GREEN
+
+**1. `test/installer-manifest.test.mjs` + `test/installer-manifest-lib.mjs` — derived, not curated.**
+The audit is computed from three real sources and hand-lists none of them:
+
+- the units `install.sh` actually installs, parsed out of `install.sh`;
+- **every** `Exec*` directive in those units (`ExecStart`, `ExecStartPre`, `ExecStartPost`,
+  `ExecStop`, `ExecStopPost`, `ExecReload`, `ExecCondition`), parsed from the unit files, handling
+  line continuations and systemd's `-@+!:` prefix characters;
+- every helper the seams invoke, read from `scripts/` and `app/*.js`.
+
+Anything repository-owned that those references reach must be installed by `install.sh`, at that
+exact destination, with an executable mode. `systemd/pw-tmux.service` is deliberately **out** of
+scope — it is the container sidecar, which this host installer never installs and refuses to run
+beside; scoping a host installer to a container unit's paths would have forced the check to be
+weakened until it passed.
+
+RED at `6a9e8cd`: one violation, verbatim —
+`systemd/pw-tmux-server.service ExecStart= references /opt/project-workbench/scripts/pw-tmux-keepalive.sh, which install.sh never installs`.
+
+**2. `install.sh` ships the helper.**
+`install -m 0755 "$SRC_DIR/scripts/pw-tmux-keepalive.sh" /usr/local/bin/pw-tmux-keepalive.sh`,
+beside the other tmux helpers and well before the unit is enabled. `systemd/pw-tmux-server.service`
+`ExecStart` is repointed to `/usr/local/bin/pw-tmux-keepalive.sh`, the host helper location.
+
+**3. `test/installer-host-smoke.test.mjs` — a staged host install that actually executes.**
+The manifest audit is a source-level claim. What failed on the host was one level down. The smoke
+therefore replays `install.sh`'s **own** manifest into a private staging root and runs the owner
+unit's **exact `ExecStart`, read from the staged unit file**, with the unit's **own `Environment=`
+lines** applied verbatim — including `PW_TMUX_REQUIRE_CGROUP=1`.
+
+This is deliberately not what `tmux-owner-readiness.test.mjs` does. That suite runs the keepalive
+from the **repository**, which is the very shape of fixture that hid this defect: the repository copy
+exists no matter what `install.sh` does. Here the subject is the **staged file at the unit's own
+`ExecStart` path**, so an installer that ships nothing fails the way the host failed.
+
+Three test-only environment variables are added on top of the unit's own, and each is stated in the
+test rather than hidden: `PW_TMUX_SOCKET_PATH` (private socket), `PW_TMUX_PROC_ROOT` (a controlled
+`/proc`, per Round 8 — a same-cgroup comparison on a shared runner proves nothing), and
+`PW_TMUX_EXIT_AFTER_READY` (the script's own documented test hook). `PW_TMUX_REQUIRE_CGROUP` is
+**not** overridden; it comes from the unit.
+
+**No live service changes.** Every install destination is rerooted under a temp directory;
+`systemctl` is a recording stub on `PATH` asserted never to be called; the tmux server runs on a
+private socket under a short `/tmp` root and is killed in cleanup. A test asserts all of this.
+
+### Mutation evidence — every new check can actually fail
+
+| Claim | Proof |
+|---|---|
+| The manifest audit catches a dropped install line | Removing the `pw-tmux-keepalive.sh` install line produces a violation naming the helper |
+| It catches **the exact `6a9e8cd` defect** | Repointing the host unit back to `/opt/project-workbench/scripts/…` produces a violation naming that path and `203/EXEC` |
+| It catches a non-executable install mode | `-m 0755` → `-m 0644` produces a "not executable" violation |
+| It has not lost Round 12's coverage | Removing the `pw-tmux-assert-owner` install line still produces a violation |
+| The staged smoke would have caught the deployment blocker | Staged from an `install.sh` with the keepalive line removed, the smoke fails as `203/EXEC` |
+| The smoke's cgroup pass is not passing for the wrong reason | A controlled `/proc` placing the live server in `project-terminal@…` makes the owner refuse, and readiness is not signalled |
+
+### Candidate C invariants — preserved
+
+All Candidate C suites pass unchanged at this head: ownership core, gate CLI, seams, readiness and
+the cold-start race, dispositions (GOA-2 / GOA-5), the installer, and the shipping manifest —
+**100/100**. `Type=notify` + `NotifyAccess=all`, the `Requires=`/`After=` fail-closed client wiring,
+the unconditional JS gate, no `ExecStartPost` on the owner unit, and the 64-bit `MemoryHigh`
+arithmetic are all untouched.
+
+Installer container refusals re-verified directly, not only through the suite:
+
+| Refusal | Result |
+|---|---|
+| `PW_DEPLOY_MODE=container` | exits `1`, **systemd never touched** (no `systemctl` call at all) |
+| Sidecar owner `pw-tmux.service` enabled | exits `1` after only two read-only queries (`list-unit-files`, `is-enabled`); no `enable`, `start` or `daemon-reload` |
+
+### Evidence at this head
+
+| Check | Result |
+|---|---|
+| Canonical `npm ci && npm test` | **1031 tests, 1028 pass, 0 fail, 3 skipped** |
+| Baseline at `6a9e8cd` | 1019 / 1016 / 0 / 3 — the delta is exactly the 12 new tests |
+| New suites (manifest + staged smoke) | **12/12** |
+| Candidate C focused suites | **100/100** |
+| Release guard | **4/4** |
+| Secret scan (6 changed/new files) | **0 matches** — the 10 raw hits are pre-existing variable names and prose in unchanged regions of `install.sh` |
+| Production diff | 3 files, +16 / −2 (`install.sh`, `systemd/pw-tmux-server.service`, `app/VERSION`) |
+| Version | `1.26.0811.0057` → **`1.26.0811.0128`** |
+
+The 3 skips are the pre-existing orchestrator privilege-drop assertions, which self-declare they
+cannot fail when the suite runs as the workspace account. No new skips.
+
+### Observation recorded, not fixed here
+
+`test/release-version.test.mjs` classifies release content as `install.sh` plus `app/`. **`systemd/`
+is not classified as deployable**, so a change to a unit file alone carries no release-bump
+obligation — even though unit files are part of what a deployed instance runs. This repair bumps the
+version regardless (because `install.sh` changed), so it is not a blocker for this branch. Widening
+the classifier is a separate change with its own regression surface and is deliberately **not** made
+here.
+
+### Sequencing
+
+Pushed for immutable review at the exact head. **Not merged and not deployed by PVI2.** A future
+deployment of this branch is a separate authorization, and the same controlled-deployment discipline
+that caught this failure should be applied to it.

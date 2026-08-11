@@ -33,7 +33,15 @@ Environment=PW_TMUX_HOST_MODE=1
 Environment=PW_TMUX_OWNER_BOOTSTRAP=1
 Environment=PW_TMUX_REQUIRE_CGROUP=1
 EnvironmentFile=-/etc/project-workbench/pw-env
-ExecStart=/opt/project-workbench/scripts/pw-tmux-keepalive.sh
+# HOST path, not the container one. This unit previously named
+# /opt/project-workbench/scripts/pw-tmux-keepalive.sh — the layout the Containerfile
+# creates (COPY scripts/ → /opt/project-workbench/scripts/) and the sidecar
+# pw-tmux.service legitimately runs from. On a host, install.sh clones to
+# $PW_INSTALL_DIR/source and installs helpers into /usr/local/bin; nothing ever
+# creates /opt/project-workbench/scripts/. Starting this unit therefore failed
+# 203/EXEC on a real deployment. Host helpers live in /usr/local/bin, and
+# install.sh ships this one there beside the rest.
+ExecStart=/usr/local/bin/pw-tmux-keepalive.sh
 
 Restart=on-failure
 RestartSec=5

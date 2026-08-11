@@ -202,6 +202,12 @@ install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-use
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-assert-owner"   /usr/local/bin/pw-tmux-assert-owner
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+# The owner unit's ExecStart. It has to be installed BEFORE the unit is enabled at
+# the end of this script, and it has to be installed at all: a controlled host
+# deployment failed here with 203/EXEC because the host unit named the CONTAINER
+# path (/opt/project-workbench/scripts/…, which only the Containerfile creates)
+# and this installer shipped the file nowhere. Host mode keeps its helpers here.
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-keepalive.sh"   /usr/local/bin/pw-tmux-keepalive.sh
 
 # State dir for tmux-session persistence (manifest + captured scrollback).
 install -d -o "$PW_USER" -g "$PW_USER" -m 0755 /var/lib/project-workbench/tmux-persist
