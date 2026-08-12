@@ -36,6 +36,10 @@ if ! tmux has-session -t "$SESSION" 2>/dev/null; then
   tmux send-keys -t "$SESSION" "printf 'Project Workbench setup terminal.\nUse this shell to sign in to CLIs (claude /login, codex login, gh auth login, copilot, etc.). Tokens land in /home/admin and apply to every project.\n\n'" C-m
 fi
 
+# Server-creation seam, same as the `-d` one above: `new-session -A` creates the
+# session when it is absent, so it clears the same gate. Gate as its own
+# statement — a line inside the exec's argv is an ARGUMENT to ttyd, not a call.
+pw_assert_tmux_owner
 exec /usr/bin/ttyd \
   --interface 127.0.0.1 \
   --port "$PORT" \
@@ -48,5 +52,4 @@ exec /usr/bin/ttyd \
   --client-option letterSpacing=0 \
   --client-option disableLeaveAlert=true \
   --check-origin \
-  pw_assert_tmux_owner
   tmux -u new-session -A -s "$SESSION" -c "$HOME_DIR" "$tab_env"

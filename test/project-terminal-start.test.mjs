@@ -74,16 +74,34 @@ function encryptToken(secretKeyHex, plaintext) {
 // Real production ttyd blocks forever serving the terminal — this script's
 // `exec ttyd ...` never returns while a session is live, which is exactly why
 // runScript() below has to time it out and treat that as success. A stub that
-// mimics the same "starts and blocks" shape (ignoring its args, which we
-// don't need — the tmux setup this script does happens entirely BEFORE the
-// ttyd exec) needs the same timeout-based proof, and needs no real ttyd
-// binary installed on the host at all. Fed to the script via PW_TTYD_BIN (see
-// scripts/project-terminal-start), never the real /usr/bin/ttyd path.
+// mimics the same "starts and blocks" shape needs the same timeout-based
+// proof, and needs no real ttyd binary installed on the host at all. Fed to
+// the script via PW_TTYD_BIN (see scripts/project-terminal-start), never the
+// real /usr/bin/ttyd path.
+//
+// The stub RECORDS its argv, and that is load-bearing. An earlier version
+// ignored its arguments on the reasoning that everything interesting happens
+// before the exec — but ttyd execvp()s whatever trails its own flags, so that
+// trailing argv is a production contract, and a stub blind to it cannot tell a
+// working attach command from one that dies with "execvp failed" the instant a
+// browser connects. It could not, and did not, catch exactly that shipping.
+const TTYD_ARGV_FILE = 'ttyd-argv.txt';
 function makeFakeTtyd(dir) {
   const binDir = fs.mkdtempSync(path.join(dir, 'ttyd-shim-'));
   const ttydBin = path.join(binDir, 'ttyd');
-  fs.writeFileSync(ttydBin, '#!/usr/bin/env bash\nexec sleep infinity\n', { mode: 0o755 });
+  const argvOut = path.join(dir, TTYD_ARGV_FILE);
+  fs.writeFileSync(
+    ttydBin,
+    `#!/usr/bin/env bash\nprintf '%s\\n' "$@" > ${JSON.stringify(argvOut)}\nexec sleep infinity\n`,
+    { mode: 0o755 },
+  );
   return ttydBin;
+}
+
+// The argv the script handed ttyd, in order, as ttyd itself would see it.
+async function recordedTtydArgv(ctx) {
+  const raw = await fsp.readFile(path.join(ctx.dir, TTYD_ARGV_FILE), 'utf8');
+  return raw.split('\n').filter(a => a !== '');
 }
 
 async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
@@ -166,6 +184,36 @@ test('no primaryUser: unchanged shared-login behavior even with the feature on',
     const result = await runScript(ctx);
     assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
     assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', 'pw_' + ctx.name]));
+  } finally { await teardown(ctx); }
+});
+
+// REGRESSION (shipped, PR #38): the ownership gate for the `new-session -A`
+// seam was written as a line INSIDE the exec's argv, between `--check-origin \`
+// and the tmux line. Bash does not read that as a call — the backslash-free
+// line ends the exec, so ttyd was handed the literal word `pw_assert_tmux_owner`
+// as its command and the tmux line below became dead code after an exec. Every
+// terminal started from then on showed `execvp failed: No such file or
+// directory` and reconnect-looped, while the script's own exit code, the tmux
+// session, and every pre-exec assertion above stayed perfectly green.
+test('REGRESSION: ttyd is exec\'d a runnable tmux attach command, never the gate function\'s name', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  try {
+    const result = await runScript(ctx);
+    assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
+    const argv = await recordedTtydArgv(ctx);
+    // `--check-origin` takes no value and is the script's last flag, so ttyd's
+    // command — everything it will execvp() — begins at the next argument.
+    const flagIdx = argv.indexOf('--check-origin');
+    assert.notEqual(flagIdx, -1, `ttyd's flag block must be intact: ${JSON.stringify(argv)}`);
+    const cmd = argv.slice(flagIdx + 1);
+    assert.equal(argv.includes('pw_assert_tmux_owner'), false,
+      'the ownership gate is a shell FUNCTION; anywhere in ttyd\'s argv it is a command ttyd cannot exec');
+    assert.equal(cmd[0], 'tmux', `ttyd must exec tmux, got ${JSON.stringify(cmd)}`);
+    assert.ok(cmd.includes('new-session') && cmd.includes('-A') && cmd.includes('pw_' + ctx.name),
+      `ttyd must attach-or-create this project's session: ${JSON.stringify(cmd)}`);
+    // The direct expression of "execvp must succeed": the word ttyd will exec
+    // has to resolve to something executable on the PATH ttyd inherits.
+    await execFileAsync('bash', ['-c', `command -v -- "$1"`, 'sh', cmd[0]], { env: ctx.env });
   } finally { await teardown(ctx); }
 });
 

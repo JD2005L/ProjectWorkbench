@@ -270,6 +270,12 @@ else
   done < <(jq -r --arg n "$name" '.[] | select(.name==$n) | .tabs // [] | .[] | select(.autoStart==true) | "\(.name)\t\(.cmd // "")"' "$json")
   tmux "${tmux_sock_args[@]}" select-window -t "$session:0" 2>/dev/null || true
 fi
+# The `new-session -A` handed to ttyd below CREATES the session (and therefore
+# the server) when it does not already exist, so it is a server-creation seam
+# like the `-d` one above and has to clear the same gate. Gate here, as its own
+# statement: a line inside the exec's argv is an ARGUMENT to ttyd, not a call —
+# ttyd would exec the function name and die with "execvp failed".
+pw_assert_tmux_owner
 exec "${PW_TTYD_BIN:-/usr/bin/ttyd}" \
   --interface 127.0.0.1 \
   --port "$port" \
@@ -282,5 +288,4 @@ exec "${PW_TTYD_BIN:-/usr/bin/ttyd}" \
   --client-option letterSpacing=0 \
   --client-option disableLeaveAlert=true \
   --check-origin \
-  pw_assert_tmux_owner
   tmux "${tmux_sock_args[@]}" -u new-session -A -s "$session" -c "$real_path" "$tab_env"
