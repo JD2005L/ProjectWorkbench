@@ -1119,7 +1119,7 @@ async function ensureTmuxSession(p){
  // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
  // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
  // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
- const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
+ const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  const tabs = Array.isArray(p.tabs) ? p.tabs : [];
  const firstName = tabs[0]?.name || 'Base';
  await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash',...cred.shellArgs]);
