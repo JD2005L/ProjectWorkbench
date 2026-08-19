@@ -11,6 +11,11 @@ tools/verify/*.png
 **/node_modules
 app/node_modules
 
+# Per-machine Claude Code state. settings.local.json accumulates permission
+# grants naming absolute host paths, so it is local by definition — the shared
+# .claude/settings.json is the checked-in one.
+.claude/settings.local.json
+
 # Orchestration subsystem runtime state — durable job journal, snapshot, lock, evidence
 # artifacts, and the service-token file. None of these belong in the repository.
 orchestrator.journal
