@@ -205,8 +205,8 @@ if [ "$WITH_SCRIPTS" -eq 1 ]; then
 fi
 
 rollback(){
-  tar -C "$DST" --unlink-first -xf "$BAK"
-  [ "$WITH_SCRIPTS" -eq 1 ] && [ -f "$SBAK" ] && tar -C "$SDST" --unlink-first -xf "$SBAK"
+  tar -C "$DST" -xf "$BAK"
+  [ "$WITH_SCRIPTS" -eq 1 ] && [ -f "$SBAK" ] && tar -C "$SDST" -xf "$SBAK"
   return 0
 }
 
@@ -214,12 +214,42 @@ rollback(){
 hr "promote"
 # tar src -> dst preserves the tree; ownership is then normalised to root, because
 # the source is admin-owned and the live tree must not become agent-writable.
-# --unlink-first: replace the inode instead of truncating it in place. A shell
-# script currently being interpreted is read incrementally, so overwriting it
-# under a running process can feed that process garbage; unlinking first leaves
-# the old inode intact for anything still holding it open.
-( cd "$SRC" && tar -cf - "${ITEMS[@]}" ) | ( cd "$DST" && tar --unlink-first -xf - ) \
+# Replace each file by rename, not by truncating it in place. A shell script
+# being interpreted is read incrementally, so overwriting it under a running
+# process can feed that process garbage — entrypoint.sh is exactly that case.
+# rename() swaps the directory entry atomically and leaves the old inode intact
+# for anything still holding it open.
+#
+# tar's --unlink-first looks like the way to get this and is not: it tries to
+# unlink directories too, which fails on any non-empty one ("Cannot unlink:
+# Directory not empty") and aborts the extraction.
+#
+# The staging dir must live on the SAME filesystem as the destination, or mv
+# degrades to copy-then-unlink and truncates in place after all.
+STAGE=$(mktemp -d "$(dirname "$DST")/.promote-stage.XXXXXX") || die "could not create a staging dir"
+cleanup_stage(){ [ -n "${STAGE:-}" ] && rm -rf "$STAGE"; }
+trap cleanup_stage EXIT
+
+# mirror <from> <into> — directories created, then every non-directory entry moved
+# into place by rename. Deliberately not `-type f`: a symlink is not a regular
+# file, so that would skip one silently. Neither tree contains any today, and a
+# promote that quietly drops entries is not a failure mode worth leaving open.
+mirror(){
+  local from="$1" into="$2" d f
+  while IFS= read -r d; do [ -n "$d" ] && [ "$d" != "." ] && mkdir -p "$into/$d"; done \
+    < <(cd "$from" && find . -type d -printf '%P\n')
+  while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    mv -f "$from/$f" "$into/$f" || return 1
+  done < <(cd "$from" && find . ! -type d -printf '%P\n')
+  return 0
+}
+
+( cd "$SRC" && tar -cf - "${ITEMS[@]}" ) | ( cd "$STAGE" && tar -xf - ) \
+  || { rollback; die "staging the app tree failed; restored from backup"; }
+mirror "$STAGE" "$DST" \
   || { rollback; die "app copy failed; restored from backup"; }
+rm -rf "$STAGE"/* "$STAGE"/.[!.]* 2>/dev/null || true
 
 chown -R root:root "$DST" || { rollback; die "chown failed; restored from backup"; }
 find "$DST" -path "$DST/node_modules" -prune -o -type d -exec chmod 755 {} +
@@ -227,8 +257,12 @@ find "$DST" -path "$DST/node_modules" -prune -o -type f -exec chmod 644 {} +
 say "app/ copied, ownership normalised to root:root"
 
 if [ "$WITH_SCRIPTS" -eq 1 ]; then
-  ( cd "$SSRC" && tar -cf - . ) | ( cd "$SDST" && tar --unlink-first -xf - ) \
-    || { rollback; die "scripts copy failed; restored from backup"; }
+  SSTAGE=$(mktemp -d "$(dirname "$SDST")/.promote-sstage.XXXXXX") || { rollback; die "could not stage scripts"; }
+  ( cd "$SSRC" && tar -cf - . ) | ( cd "$SSTAGE" && tar -xf - ) \
+    || { rm -rf "$SSTAGE"; rollback; die "staging the scripts tree failed; restored from backup"; }
+  mirror "$SSTAGE" "$SDST" \
+    || { rm -rf "$SSTAGE"; rollback; die "scripts copy failed; restored from backup"; }
+  rm -rf "$SSTAGE"
   # Modes come across from the source, because the executable bit is load-bearing
   # here in a way it never is under app/ — a de-executable'd entrypoint is a dead
   # container. Only ownership is normalised, plus a belt-and-braces go-w so the
@@ -329,8 +363,8 @@ marker) once that sidecar is restarted — which ends every tmux session. Do tha
 deliberately: pw-tmux-save, then systemctl restart pw-tmux.service.
 
 Rollback (code):
-  tar -C '$DST' --unlink-first -xf '$BAK'
-  ${WITH_SCRIPTS:+tar -C '$SDST' --unlink-first -xf '$SBAK'}
+  tar -C '$DST' -xf '$BAK'
+  ${WITH_SCRIPTS:+tar -C '$SDST' -xf '$SBAK'}
   kill \$(pgrep -P \$(pgrep -o -f scripts/entrypoint.sh) -x node)
 
 Rollback (config, ONLY if the newer build migrated it and you are reverting the
