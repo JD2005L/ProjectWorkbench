@@ -25,14 +25,45 @@ RUN apt-get update && \
 # -------------------------------------------------------------------------------
 
 # --- OPTIONAL: Deployment Centre toolchain (PW_DEPLOY_CENTRE=true) --------------
-# The Windows (WinRM/SMB) deploy flow needs these; skip them otherwise.
-# RUN apt-get update && apt-get install -y --no-install-recommends smbclient libicu72 && \
-#     rm -rf /var/lib/apt/lists/*
-# RUN pip3 install --no-cache-dir --break-system-packages pywinrm
-# ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
-# RUN curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
-#     bash /tmp/dotnet-install.sh --channel 8.0 --install-dir /usr/share/dotnet && \
-#     ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet && rm -f /tmp/dotnet-install.sh
+# Still off by default — the Windows (WinRM/SMB) deploy flow is the only thing
+# that needs it and the .NET SDKs are large — but enabled by a BUILD ARG rather
+# than by editing this file, because "uncomment these lines" is a local diff every
+# such instance has to carry, and an instance that skips the diff installs the
+# toolchain by hand instead. One did exactly that: the SDK went into /root/.dotnet
+# (mode 0750), so `dotnet` was Permission-denied in every agent pane while
+# `which dotnet` found nothing, and a host systemd drop-in re-symlinked it and
+# re-apt-installed libicu/smbclient on every container start to compensate.
+#
+#   podman build -t project-workbench:latest \
+#     --build-arg PW_DEPLOY_TOOLCHAIN=1 \
+#     --build-arg PW_DOTNET_CHANNELS="8.0 10.0" .
+#
+# Installs to /usr/share/dotnet and world-readable, so the pane account can
+# actually run it — the whole point of not putting it in a private home.
+#
+# python3-pip is installed here rather than in the base layer because pip is only
+# needed for pywinrm: node:20-slim ships python3 but NOT pip3, so the previous
+# `pip3 install pywinrm` line could not have worked as written.
+ARG PW_DEPLOY_TOOLCHAIN=0
+ARG PW_DOTNET_CHANNELS="8.0"
+ENV DOTNET_CLI_TELEMETRY_OPTOUT=1 DOTNET_NOLOGO=1
+RUN if [ "$PW_DEPLOY_TOOLCHAIN" = "1" ]; then \
+      set -eux; \
+      apt-get update && \
+      apt-get install -y --no-install-recommends smbclient libicu72 python3-pip && \
+      rm -rf /var/lib/apt/lists/* && \
+      pip3 install --no-cache-dir --break-system-packages pywinrm && \
+      curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh && \
+      for channel in $PW_DOTNET_CHANNELS; do \
+        bash /tmp/dotnet-install.sh --channel "$channel" --install-dir /usr/share/dotnet; \
+      done && \
+      rm -f /tmp/dotnet-install.sh && \
+      ln -sf /usr/share/dotnet/dotnet /usr/local/bin/dotnet && \
+      chmod -R a+rX /usr/share/dotnet && \
+      dotnet --list-sdks && \
+      python3 -c 'import winrm' && \
+      command -v smbclient >/dev/null; \
+    fi
 # -------------------------------------------------------------------------------
 
 # UTF-8 locale

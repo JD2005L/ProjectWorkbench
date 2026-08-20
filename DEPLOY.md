@@ -116,4 +116,25 @@ enable environment-specific needs:
 - **Internal / AD CA** — for `PW_AUTH_MODE=ldap` when the directory's CA isn't
   publicly rooted (drop certs in `config/ca/`, uncomment the `COPY` + `update-ca-certificates`).
 - **Deploy Centre toolchain** — `smbclient` / `pywinrm` / .NET SDK for
-  `PW_DEPLOY_CENTRE=true`.
+  `PW_DEPLOY_CENTRE=true`. Not a commented section: it is a **build arg**, so an
+  instance that needs it does not have to carry a local diff.
+
+  ```bash
+  podman build -t project-workbench:latest \
+    --build-arg PW_DEPLOY_TOOLCHAIN=1 \
+    --build-arg PW_DOTNET_CHANNELS="8.0 10.0" .
+  ```
+
+  | build arg | default | meaning |
+  | --- | --- | --- |
+  | `PW_DEPLOY_TOOLCHAIN` | `0` | `1` installs smbclient, libicu, pywinrm and the .NET SDK(s) |
+  | `PW_DOTNET_CHANNELS` | `8.0` | space-separated channels; pass every one your projects target |
+
+  Set `PW_DOTNET_CHANNELS` from the `TargetFramework` values in the projects you
+  actually deploy — a `net10.0` project cannot be published by an 8.0-only SDK.
+  The SDK lands in `/usr/share/dotnet`, world-readable, because the pane account
+  has to be able to run it: installing it into a private home (e.g. `/root/.dotnet`,
+  mode 0750) leaves `dotnet` Permission-denied in every terminal while
+  `which dotnet` reports nothing, which is easy to misread as "not installed".
+  The build fails fast if any piece is missing — it runs `dotnet --list-sdks`,
+  imports `winrm`, and checks for `smbclient` before the layer is committed.
