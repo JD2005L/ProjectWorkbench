@@ -159,7 +159,12 @@ else
   fi
 fi
 
-base_tab_env="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+# DISABLE_AUTOUPDATER: a pane's environment is fixed at creation, so this has to be spelled out
+# in every seam that creates one — app/server.js's ensureTmuxSession/ensureProjectTmuxSession/
+# newTmuxWindow and scripts/pw-tmux-restore carry the identical token. Without it Claude Code
+# nags in the pane, and can self-update underneath a running agent. See
+# test/autoupdater-env.test.mjs.
+base_tab_env="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
 if [[ -n "$cred_config_dir" ]]; then
   printf -v quoted_cfg '%q' "CLAUDE_CONFIG_DIR=$cred_config_dir"
   if [[ -n "$cred_env_file" ]]; then

@@ -1153,7 +1153,11 @@ async function ensureProjectTmuxSession(p){
   if(!stamped.key) await stampSessionCredKey(sess, cred.key);
   return;
  }
- const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]).join(' ') + ' bash ' + cred.shellArgs.join(' ');
+ // DISABLE_AUTOUPDATER, here and in every other pane-creating seam (scripts/project-terminal-start,
+ // scripts/pw-tmux-restore, newTmuxWindow, ensureTmuxSession): a pane's environment is fixed at
+ // creation, so a seam that omits it produces panes Claude Code nags in — and may self-update
+ // under — for the life of the session. See test/autoupdater-env.test.mjs.
+ const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]).join(' ') + ' bash ' + cred.shellArgs.join(' ');
  await tmux(['new-session','-d','-s',sess,'-c',p.path,cmd]);
  await stampSessionCredKey(sess, cred.key);
  await tmux(['send-keys','-t',sess,`printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' ${shellQuote(p.path)} ${shellQuote('/usr/local/bin/claude')} ${shellQuote(sess)}`,'C-m']);
@@ -1240,7 +1244,7 @@ async function newTmuxWindow(p,name='new task',cmd=''){
   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to create a mixed-attribution window — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
  }
  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
- const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
+ const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  await tmux(['new-window','-t',sess,'-c',p.path,'-n',safeName,...winEnv,'bash',...cred.shellArgs]);
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
