@@ -29,11 +29,21 @@ DST=/opt/project-workbench/workspaces/canonical/app
 STAMP=$(date +%Y%m%d-%H%M%S)
 BAK="/opt/project-workbench/workspaces/canonical/app-backup-$STAMP.tar"
 CFGBAK="/opt/project-workbench/workspaces/canonical/config-backup-$STAMP.tar"
+SSRC=/opt/project-workbench/workspaces/ProjectWorkbench/scripts
+SDST=/opt/project-workbench/workspaces/canonical/scripts
+SBAK="/opt/project-workbench/workspaces/canonical/scripts-backup-$STAMP.tar"
 SELF=/opt/project-workbench/persistent/admin-home/promote-app.sh
 CONTAINER=project-workbench
 HEALTH_URL='https://127.0.0.1/workbench/'
 DRY=0
-[ "${1:-}" = "--dry-run" ] && DRY=1
+WITH_SCRIPTS=1
+for a in "$@"; do
+  case "$a" in
+    --dry-run)  DRY=1 ;;
+    --app-only) WITH_SCRIPTS=0 ;;
+    *) printf 'unknown option: %s\nusage: %s [--dry-run] [--app-only]\n' "$a" "$0" >&2; exit 2 ;;
+  esac
+done
 
 die(){ printf '\n[ABORT] %s\n' "$*" >&2; exit 1; }
 say(){ printf '[promote] %s\n' "$*"; }
@@ -50,6 +60,13 @@ fi
 command -v node >/dev/null 2>&1 || die "node not on the host PATH; cannot syntax-check before promoting"
 
 [ "$DRY" -eq 1 ] && say "DRY RUN — nothing will be written."
+if [ "$WITH_SCRIPTS" -eq 1 ]; then
+  [ -d "$SSRC" ] || die "scripts source not found: $SSRC (use --app-only to skip)"
+  [ -d "$SDST" ] || die "live scripts tree not found: $SDST (use --app-only to skip)"
+  say "promoting app/ AND scripts/"
+else
+  say "promoting app/ only (--app-only)"
+fi
 
 # ------------------------------------------------------------- manifest ------
 # Everything in the checkout app/ except node_modules.
@@ -118,7 +135,29 @@ while IFS= read -r rel; do
   elif ! cmp -s "$SRC/$rel" "$DST/$rel"; then CHANGED=$((CHANGED+1)); printf '  changed  %s\n' "$rel"
   else SAME=$((SAME+1)); fi
 done < <(cd "$SRC" && find "${ITEMS[@]}" -type f -printf '%p\n')
-say "new=$NEW changed=$CHANGED unchanged=$SAME"
+say "app/: new=$NEW changed=$CHANGED unchanged=$SAME"
+
+SNEW=0; SCHANGED=0; SSAME=0
+if [ "$WITH_SCRIPTS" -eq 1 ]; then
+  hr "preflight: scripts/ syntax + change summary"
+  # Shell scripts get the same treatment node files get: parsed before they can
+  # replace a live entrypoint. bash -n on a non-bash script is meaningless, so
+  # only files with a bash/sh shebang are checked.
+  FAIL=0
+  while IFS= read -r rel; do
+    case "$(head -c 80 "$SSRC/$rel" 2>/dev/null)" in
+      '#!'*bash*|'#!'*/sh*) bash -n "$SSRC/$rel" 2>/dev/null || { printf '  BAD SYNTAX: scripts/%s\n' "$rel"; FAIL=1; } ;;
+    esac
+  done < <(cd "$SSRC" && find . -type f -printf '%P\n')
+  [ "$FAIL" -eq 0 ] || die "scripts/ has syntax errors; nothing changed"
+  say "all shell scripts parse"
+  while IFS= read -r rel; do
+    if [ ! -e "$SDST/$rel" ]; then SNEW=$((SNEW+1)); printf '  new      scripts/%s\n' "$rel"
+    elif ! cmp -s "$SSRC/$rel" "$SDST/$rel"; then SCHANGED=$((SCHANGED+1)); printf '  changed  scripts/%s\n' "$rel"
+    else SSAME=$((SSAME+1)); fi
+  done < <(cd "$SSRC" && find . -type f -printf '%P\n')
+  say "scripts/: new=$SNEW changed=$SCHANGED unchanged=$SSAME"
+fi
 
 # Files the live tree has that the checkout does not. Reported, never deleted —
 # server.js is the only entry point, so stale extras are inert.
@@ -129,8 +168,8 @@ while IFS= read -r rel; do
 done < <(cd "$DST" && find . -type f -not -path './node_modules/*' -printf '%P\n')
 say "live-only files: $STALE"
 
-if [ "$NEW" -eq 0 ] && [ "$CHANGED" -eq 0 ]; then
-  say "live tree already matches the checkout — nothing to promote."
+if [ $((NEW+CHANGED+SNEW+SCHANGED)) -eq 0 ]; then
+  say "live trees already match the checkout — nothing to promote."
   [ "$DRY" -eq 1 ] && exit 0
   say "Skipping copy and restart. Exiting."
   exit 0
@@ -159,19 +198,54 @@ tar -C /etc/project-workbench -cf "$CFGBAK" . 2>/dev/null || die "config backup 
 chmod 600 "$CFGBAK"
 say "config backed up -> $CFGBAK ($(du -h "$CFGBAK" | cut -f1)) [secrets inside; mode 600]"
 
-rollback(){ tar -C "$DST" -xf "$BAK"; }
+if [ "$WITH_SCRIPTS" -eq 1 ]; then
+  tar -C "$SDST" -cf "$SBAK" . || die "scripts backup failed; nothing changed"
+  chmod 600 "$SBAK"
+  say "live scripts backed up -> $SBAK"
+fi
+
+rollback(){
+  tar -C "$DST" --unlink-first -xf "$BAK"
+  [ "$WITH_SCRIPTS" -eq 1 ] && [ -f "$SBAK" ] && tar -C "$SDST" --unlink-first -xf "$SBAK"
+  return 0
+}
 
 # -------------------------------------------------------------- promote ------
 hr "promote"
 # tar src -> dst preserves the tree; ownership is then normalised to root, because
 # the source is admin-owned and the live tree must not become agent-writable.
-( cd "$SRC" && tar -cf - "${ITEMS[@]}" ) | ( cd "$DST" && tar -xf - ) \
-  || { rollback; die "copy failed; restored from backup"; }
+# --unlink-first: replace the inode instead of truncating it in place. A shell
+# script currently being interpreted is read incrementally, so overwriting it
+# under a running process can feed that process garbage; unlinking first leaves
+# the old inode intact for anything still holding it open.
+( cd "$SRC" && tar -cf - "${ITEMS[@]}" ) | ( cd "$DST" && tar --unlink-first -xf - ) \
+  || { rollback; die "app copy failed; restored from backup"; }
 
 chown -R root:root "$DST" || { rollback; die "chown failed; restored from backup"; }
 find "$DST" -path "$DST/node_modules" -prune -o -type d -exec chmod 755 {} +
 find "$DST" -path "$DST/node_modules" -prune -o -type f -exec chmod 644 {} +
-say "copied and ownership normalised to root:root"
+say "app/ copied, ownership normalised to root:root"
+
+if [ "$WITH_SCRIPTS" -eq 1 ]; then
+  ( cd "$SSRC" && tar -cf - . ) | ( cd "$SDST" && tar --unlink-first -xf - ) \
+    || { rollback; die "scripts copy failed; restored from backup"; }
+  # Modes come across from the source, because the executable bit is load-bearing
+  # here in a way it never is under app/ — a de-executable'd entrypoint is a dead
+  # container. Only ownership is normalised, plus a belt-and-braces go-w so the
+  # tree root executes cannot be group/other writable.
+  chown -R root:root "$SDST" || { rollback; die "scripts chown failed; restored from backup"; }
+  chmod -R go-w "$SDST"
+  say "scripts/ copied, ownership normalised to root:root (modes preserved)"
+  hr "postflight: scripts/ parse in place"
+  FAIL=0
+  while IFS= read -r f; do
+    case "$(head -c 80 "$f" 2>/dev/null)" in
+      '#!'*bash*|'#!'*/sh*) bash -n "$f" 2>/dev/null || { printf '  BAD SYNTAX: %s\n' "$f"; FAIL=1; } ;;
+    esac
+  done < <(find "$SDST" -type f)
+  [ "$FAIL" -eq 0 ] || { rollback; die "live scripts failed syntax check; restored from backup"; }
+  say "live scripts parse"
+fi
 
 hr "postflight: syntax-check the LIVE tree"
 FAIL=0
@@ -249,8 +323,15 @@ What to look at:
   * the auto-update nag is gone in NEW tmux sessions (pane env is captured at
     'tmux new-session', so recycle a project's terminal to clear an old one).
 
+NOTE ON scripts/: promoting them does not restart the pw-tmux sidecar, so a new
+pw-tmux-keepalive.sh only takes effect (and only then stamps the tmux owner
+marker) once that sidecar is restarted — which ends every tmux session. Do that
+deliberately: pw-tmux-save, then systemctl restart pw-tmux.service.
+
 Rollback (code):
-  tar -C '$DST' -xf '$BAK' && kill \$(pgrep -P \$(pgrep -o -f scripts/entrypoint.sh) -x node)
+  tar -C '$DST' --unlink-first -xf '$BAK'
+  ${WITH_SCRIPTS:+tar -C '$SDST' --unlink-first -xf '$SBAK'}
+  kill \$(pgrep -P \$(pgrep -o -f scripts/entrypoint.sh) -x node)
 
 Rollback (config, ONLY if the newer build migrated it and you are reverting the
 code — inspect before extracting, this overwrites live config and secrets):
