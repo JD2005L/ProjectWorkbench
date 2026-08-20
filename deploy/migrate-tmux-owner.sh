@@ -97,18 +97,76 @@ else
 fi
 
 # ------------------------------------------------- preflight: unit diff ------
-hr "preflight: installed unit vs checkout"
-if diff -u <(systemctl cat "$UNIT_NAME" | sed '1d') "$UNIT_SRC" >/tmp/pw-unit.diff 2>&1; then
-  say "installed unit already matches the checkout"
-  UNIT_NEEDS_INSTALL=0
-else
-  UNIT_NEEDS_INSTALL=1
-  sed -n '1,60p' /tmp/pw-unit.diff
-fi
-for want in 'cgroup-parent=pw-tmux.slice' 'cgroupns=host' 'PW_TMUX_OWNER_CGROUP=pw-tmux.slice'; do
-  if grep -q -- "$want" "$UNIT_SRC"; then printf '  checkout has  %s\n' "$want"
-  else die "the checkout unit is missing '$want' — refusing to migrate to it"; fi
+# ------------------------------------------------- build the unit patch ------
+# The installed unit is NOT replaced with the checkout's. This host carries
+# GOA-local additions the canonical unit has no idea about — a goa-ca volume
+# mount, NODE_EXTRA_CA_CERTS, an ExecStartPost that installs GOA CA trust, and
+# drop-ins that re-harden sudoers and restore the .NET toolchain on every start.
+# Overwriting the unit would silently drop the ones living in the main file.
+#
+# So patch in only what the ownership contract actually needs, and leave
+# everything else exactly as the operator left it.
+hr "preflight: what the installed unit is missing"
+[ -f "$UNIT_DST" ] || die "expected the main unit at $UNIT_DST (found only drop-ins?)"
+
+NEED_CGROUPNS=0; NEED_PARENT=0; NEED_OWNERENV=0; NEED_SLICE=0; NEED_DELEGATE=0
+grep -q -- '--cgroupns=host'                    "$UNIT_DST" || NEED_CGROUPNS=1
+grep -q -- '--cgroup-parent=pw-tmux.slice'      "$UNIT_DST" || NEED_PARENT=1
+grep -q -- 'PW_TMUX_OWNER_CGROUP=pw-tmux.slice' "$UNIT_DST" || NEED_OWNERENV=1
+grep -qE '^\s*Slice=pw-tmux\.slice'             "$UNIT_DST" || NEED_SLICE=1
+grep -qE '^\s*Delegate=yes'                     "$UNIT_DST" || NEED_DELEGATE=1
+for pair in "--cgroupns=host:$NEED_CGROUPNS" "--cgroup-parent=pw-tmux.slice:$NEED_PARENT" \
+            "PW_TMUX_OWNER_CGROUP=pw-tmux.slice:$NEED_OWNERENV" "Slice=pw-tmux.slice:$NEED_SLICE" \
+            "Delegate=yes:$NEED_DELEGATE"; do
+  printf '  %-38s %s\n' "${pair%:*}" "$([ "${pair##*:}" -eq 1 ] && echo 'MISSING — will add' || echo present)"
 done
+UNIT_NEEDS_PATCH=$((NEED_CGROUPNS+NEED_PARENT+NEED_OWNERENV+NEED_SLICE+NEED_DELEGATE))
+
+say "GOA-local content that will be PRESERVED (not replaced):"
+grep -nE 'goa-ca|NODE_EXTRA_CA_CERTS|ExecStartPost' "$UNIT_DST" | sed 's/^/    /' || say "    (none in the main unit)"
+say "drop-ins (separate files, untouched):"
+ls -1 "/etc/systemd/system/$UNIT_NAME.d/" 2>/dev/null | sed 's/^/    /' || say "    (none)"
+
+# Produce the patched unit in a temp file so the change can be reviewed before
+# anything is written.
+PATCHED=$(mktemp)
+awk -v ns="$NEED_CGROUPNS" -v par="$NEED_PARENT" -v oe="$NEED_OWNERENV" \
+    -v sl="$NEED_SLICE" -v dg="$NEED_DELEGATE" '
+  BEGIN { added_env=0 }
+  # Insert the cgroup flags right after --privileged, keeping the continuation.
+  /--privileged/ && (ns==1 || par==1) {
+    extra=""
+    if (ns==1)  extra = extra " --cgroupns=host"
+    if (par==1) extra = extra " --cgroup-parent=pw-tmux.slice"
+    sub(/--privileged/, "--privileged" extra)
+  }
+  # Add the owner-cgroup env next to the mode env, so it travels with it.
+  /-e PW_DEPLOY_MODE=container/ && oe==1 && added_env==0 {
+    print; print "  -e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \\"; added_env=1; next
+  }
+  /^\[Service\]/ {
+    print
+    if (sl==1) print "Slice=pw-tmux.slice"
+    if (dg==1) print "Delegate=yes"
+    next
+  }
+  { print }
+' "$UNIT_DST" > "$PATCHED"
+
+# If PW_DEPLOY_MODE was absent the env line had nowhere to anchor; catch that
+# rather than restarting into a unit that is still missing the contract.
+if [ "$NEED_OWNERENV" -eq 1 ] && ! grep -q 'PW_TMUX_OWNER_CGROUP=pw-tmux.slice' "$PATCHED"; then
+  rm -f "$PATCHED"
+  die "could not find a '-e PW_DEPLOY_MODE=container' line to anchor the owner env to.
+      Patch $UNIT_DST by hand: add '-e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \\' to the podman args."
+fi
+
+if [ "$UNIT_NEEDS_PATCH" -gt 0 ]; then
+  hr "proposed unit change (installed -> patched)"
+  diff -u "$UNIT_DST" "$PATCHED" | sed 's/^/  /'
+else
+  say "installed unit already carries the whole contract — no unit change needed"
+fi
 
 hr "preflight: current ownership verdict"
 CUR_PID=$(TMUX_TMPDIR="$TMUX_TMPDIR_LIVE" tmux display-message -p '#{pid}' 2>/dev/null || true)
@@ -132,7 +190,13 @@ fi
 hr "refresh /usr/local/bin helpers from the checkout"
 for h in pw-tmux-save pw-tmux-restore pw-tmux-assert-owner; do
   if [ -f "$REPO/scripts/$h" ]; then
-    bash -n "$REPO/scripts/$h" 2>/dev/null || die "$h fails bash -n in the checkout; nothing changed"
+    # Not all of these are shell. pw-tmux-assert-owner is #!/usr/bin/env node, so
+    # syntax-check by shebang rather than assuming bash.
+    case "$(head -c 80 "$REPO/scripts/$h")" in
+      '#!'*node*)          node --check "$REPO/scripts/$h" >/dev/null 2>&1 || die "$h fails node --check in the checkout; nothing changed" ;;
+      '#!'*bash*|'#!'*/sh*) bash -n     "$REPO/scripts/$h" >/dev/null 2>&1 || die "$h fails bash -n in the checkout; nothing changed" ;;
+      *)                   say "  (no recognised shebang on $h — skipping syntax check)" ;;
+    esac
     [ -f "/usr/local/bin/$h" ] && cp -a "/usr/local/bin/$h" "/root/$h.bak-$STAMP"
     install -m 0755 "$REPO/scripts/$h" "/usr/local/bin/$h" || die "failed installing $h"
     printf '  installed %s\n' "/usr/local/bin/$h"
@@ -149,15 +213,22 @@ else
 fi
 
 # --------------------------------------------------------- install unit ------
-if [ "$UNIT_NEEDS_INSTALL" -eq 1 ]; then
-  hr "install the unit"
-  systemctl cat "$UNIT_NAME" | sed '1d' > "$UNIT_BAK" || die "could not back up the installed unit"
+if [ "$UNIT_NEEDS_PATCH" -gt 0 ]; then
+  hr "patch the unit"
+  # cp the real file, not `systemctl cat` — that concatenates the drop-ins and
+  # prepends path comments, so restoring it as the main unit would be corrupt.
+  cp -a "$UNIT_DST" "$UNIT_BAK" || die "could not back up $UNIT_DST"
   say "installed unit backed up -> $UNIT_BAK"
-  install -m 0644 "$UNIT_SRC" "$UNIT_DST" || die "failed to install $UNIT_DST"
-  systemctl daemon-reload || die "daemon-reload failed"
-  say "unit installed and daemon reloaded"
+  install -m 0644 "$PATCHED" "$UNIT_DST" || die "failed to write $UNIT_DST"
+  rm -f "$PATCHED"
+  systemctl daemon-reload || { install -m 0644 "$UNIT_BAK" "$UNIT_DST"; systemctl daemon-reload; die "daemon-reload failed; unit reverted"; }
+  if command -v systemd-analyze >/dev/null 2>&1; then
+    systemd-analyze verify "$UNIT_DST" 2>&1 | grep -vi 'Unknown key\|may be misspelled' | head -10
+  fi
+  say "unit patched and daemon reloaded"
 else
-  say "unit already current; skipping install"
+  rm -f "$PATCHED"
+  say "unit already carries the contract; nothing to patch"
 fi
 
 revert_unit(){
