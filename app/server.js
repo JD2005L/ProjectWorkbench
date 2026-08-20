@@ -231,6 +231,36 @@ async function terminalOwner(){
  terminalOwnerCache = owner;
  return owner;
 }
+// Who owns workspace content, and who runs workspace git. Never the literal
+// 'admin': the pane account is deployment-specific, which is the whole reason
+// terminal-owner.js exists and why tmux() resolves the account rather than
+// naming one. Falls back to the same hostTerminalUser() default tmux() uses, so
+// the two cannot disagree about whose files these are.
+//
+// The chown spec is numeric whenever the uid/gid are known, because a name does
+// not have to resolve inside this process's view of /etc/passwd — the container
+// deployment configures the owner by uid precisely because of that.
+async function workspaceOwner(){
+ let owner = null;
+ try { owner = await terminalOwner(); } catch { owner = null; }
+ const user = owner?.user || hostTerminalUser(process.env);
+ const spec = Number.isInteger(owner?.uid) && Number.isInteger(owner?.gid)
+  ? `${owner.uid}:${owner.gid}`
+  : `${user}:${user}`;
+ return { user, spec };
+}
+// The dashboard runs as root, so anything it writes into a workspace lands
+// root-owned inside a tree the pane account owns: the agent can read the file
+// but cannot rewrite or delete it, and the drift accumulates one upload at a
+// time. Hand new paths to the terminal owner instead. Best-effort by design — a
+// chown that fails must not fail an upload that already succeeded.
+async function adoptIntoWorkspace(...targets){
+ const paths = targets.filter(Boolean);
+ if(!paths.length) return;
+ const own = await workspaceOwner().catch(() => null);
+ if(!own) return;
+ await sh('chown',[own.spec, ...paths]).catch(()=>{});
+}
 // Credential-tree work is NEVER done by this root process: the tree lives under
 // an account every terminal shares, so a root write there is a symlink attack
 // away from being a local root escalation. We drop to that account and run
@@ -1488,8 +1518,9 @@ async function applyRouting(projects){
  if(!nginxReloadCmd) await sh('systemctl',['daemon-reload']);
 }
 async function cloneWorkspace(p, token){
+ const own = await workspaceOwner();
  await fs.mkdir(workspaceRoot,{recursive:true});
- try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R','admin:admin',p.path]).catch(()=>{}); return; } catch {}
+ try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R',own.spec,p.path]).catch(()=>{}); return; } catch {}
  if(!p.repo){
   // No repo configured: stand up an empty local workspace on demand and
   // initialise it as a git repo so Claude/tools get a sane git context, the
@@ -1497,9 +1528,9 @@ async function cloneWorkspace(p, token){
   // later from the terminal. An existing folder at this path is adopted in
   // place — git init never touches existing files.
   await fs.mkdir(p.path,{recursive:true});
-  await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
-  await sh('sudo',['-u','admin','git','-C',p.path,'init','-b','main']).catch(()=>{});
-  await sh('sudo',['-u','admin','git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
+  await sh('chown',['-R',own.spec,p.path]).catch(()=>{});
+  await sh('sudo',['-u',own.user,'git','-C',p.path,'init','-b','main']).catch(()=>{});
+  await sh('sudo',['-u',own.user,'git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
   return;
  }
  try { await fs.rm(p.path,{recursive:true,force:true}); } catch {}
@@ -1517,10 +1548,10 @@ async function cloneWorkspace(p, token){
    await execFileAsync('git',['-c','credential.helper=','-c','credential.helper=store --file=' + credFile,'clone','--',p.repo,p.path],{timeout:300000});
   } finally { await fs.rm(credDir,{recursive:true,force:true}).catch(()=>{}); }
  } else {
-  await sh('sudo',['-u','admin','git','clone',p.repo,p.path],{timeout:300000});
+  await sh('sudo',['-u',own.user,'git','clone',p.repo,p.path],{timeout:300000});
  }
- await sh('chown',['-R','admin:admin',p.path]).catch(()=>{});
- await sh('sudo',['-u','admin','git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
+ await sh('chown',['-R',own.spec,p.path]).catch(()=>{});
+ await sh('sudo',['-u',own.user,'git','-C',p.path,'config','--global','--add','safe.directory',p.path]).catch(()=>{});
 }
 async function trustClaudeProject(p){
  const script = `import json, os, sys
@@ -1547,7 +1578,7 @@ tmp=conf+'.tmp'
 json.dump(data, open(tmp,'w'), indent=2)
 os.replace(tmp, conf)
 `;
- await sh('sudo',['-u','admin','python3','-c',script,p.path]).catch(()=>{});
+ await sh('sudo',['-u',(await workspaceOwner()).user,'python3','-c',script,p.path]).catch(()=>{});
 }
 async function startProject(p){
  if(DEPLOY_MODE === 'container'){
@@ -1570,6 +1601,24 @@ async function startProject(p){
  await sh('systemctl',['enable',`project-terminal@${p.name}.service`]);
  await sh('systemctl',['restart',`project-terminal@${p.name}.service`]);
 }
+// applyRouting publishes a live nginx location; startProject is what makes
+// something listen behind it. Routing first means a failed start leaves nginx
+// proxying to a port nothing is on — a bare 502 with nothing saying why. That is
+// how a newly added project presented, and how every save blocked by the tmux
+// ownership gate presented: registry written, session already stopped, route
+// live, terminal gone, and the only symptom a gateway error.
+//
+// So: start, then route, and if the start fails say which half of the operation
+// succeeded. The caller's error handler surfaces this to the operator.
+async function startThenRoute(p, projects){
+ try { await startProject(p); }
+ catch(e){
+  const detail = e?.message || String(e);
+  console.error(`[manage] ${p.name}: registry saved but the terminal did not start: ${detail}`);
+  throw new Error(`Saved "${p.name}", but its terminal could not be started: ${detail}`);
+ }
+ await applyRouting(projects);
+}
 async function stopProject(name){
  if(DEPLOY_MODE === 'container'){
   if(projectTerminals.has(name)){ const t = projectTerminals.get(name); try { t.proc.kill(); } catch {} projectTerminals.delete(name); }
@@ -1577,7 +1626,7 @@ async function stopProject(name){
   await stopPreviewUnit(name);
   return;
  }
- await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await stopPreviewUnit(name); await sh('sudo',['-u','admin','tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{});
+ await sh('systemctl',['disable','--now',`project-terminal@${name}.service`]).catch(()=>{}); await stopPreviewUnit(name); await sh('sudo',['-u',(await workspaceOwner()).user,'tmux','kill-session','-t',`pw_${name.replace(/[^A-Za-z0-9_]/g,'_')}`]).catch(()=>{});
 }
 async function removeWorkspace(p){ const full = path.resolve(p.path); const root = path.resolve(workspaceRoot); if(!full.startsWith(root + path.sep)) throw new Error('Refusing to delete outside workspace root'); await fs.rm(full,{recursive:true,force:true}); }
 
@@ -2312,7 +2361,7 @@ app.post(BASE + '/manage/add', requireAdmin, async (req,res,next)=>{ try {
    fresh.push(p); await saveProjects(fresh);
    return fresh;
   });
-  await applyRouting(published); await startProject(p);
+  await startThenRoute(p, published);
   added = p;
  });
  // Outside the projects lock on purpose: this is a SHORT ordered transition
@@ -2382,7 +2431,7 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(oldPath !== p.path){ try { await fs.rename(oldPath,p.path); } catch { /* absent workspace is okay */ } }
  // Short registry transaction only; the stop/rename/start around it are long.
  await withProjectsLock(async () => { await saveProjects(projects); });
- await applyRouting(projects); await startProject(p);
+ await startThenRoute(p, projects);
  updated = p;
  });
  // Same reason as /manage/add: the credential transition is short and ordered,
@@ -2556,7 +2605,7 @@ app.get(BASE + '/files/:project/', requireInboxWrite, async (req,res)=>{
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Files</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;background:#0f172a;color:#e5e7eb}.f-header{display:flex;align-items:center;gap:1rem;padding:.95rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.f-header h1{margin:0;font-size:1.15rem}.f-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.f-header .back:hover{background:#1e293b;color:#fff}.f-header .grow{flex:1}.f-header .who{font-size:.85rem;color:#cbd5e1}.f-main{max-width:920px;margin:1.5rem auto;padding:0 1.5rem 3rem}.f-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.f-card h2{margin:0 0 .25rem;font-size:1.1rem;color:#bfdbfe}.f-card .muted{color:#94a3b8;font-size:.85rem;margin:.15rem 0 0}#drop{border:2px dashed #64748b;border-radius:14px;padding:42px 18px;text-align:center;background:#0b1220;cursor:pointer;color:#cbd5e1;font-size:.95rem;margin-top:.75rem}#drop:hover{background:#152033;border-color:#94a3b8}#drop.over{border-color:#60a5fa;background:#152033}#drop .hint{color:#94a3b8;font-size:.82rem;margin-top:.4rem}#status{margin-top:.65rem;font-size:.85rem;color:#bbf7d0;white-space:pre-wrap;min-height:1.3em}#status.err{color:#fca5a5}.ilist{display:flex;flex-direction:column;gap:.35rem;margin-top:.5rem}.irow{display:flex;align-items:center;gap:.65rem;padding:.5rem .65rem;background:#0b1220;border:1px solid #1f2937;border-radius:8px}.irow .thumb{width:36px;height:36px;background:#1f2937;border-radius:4px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:11px;font-weight:600;overflow:hidden}.irow .thumb img{width:100%;height:100%;object-fit:cover}.irow .nameCol{flex:1 1 auto;min-width:0;overflow:hidden}.irow .nameCol .name{color:#e5e7eb;font-size:.88rem;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.irow .nameCol .meta{color:#94a3b8;font-size:.75rem}.irow .copyBtn,.irow .del,.irow a{background:transparent;border:1px solid #334155;color:#cbd5e1;border-radius:6px;padding:3px 9px;font-size:.78rem;cursor:pointer;text-decoration:none}.irow .copyBtn:hover,.irow a:hover{background:#1e293b;color:#fff}.irow .del{color:#fca5a5;border-color:#7f1d1d}.irow .del:hover{background:#7f1d1d;color:#fff}.empty{color:#94a3b8;font-style:italic;font-size:.85rem;padding:.75rem 0}${statusBarCss}</style></head><body><header class="f-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Files — ${esc(p.name)}</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><main class="f-main"><div class="f-card"><h2>Drop or paste files</h2><p class="muted">Saved files go to <code>${esc(p.path)}/_inbox</code>. Click <b>Copy path</b> to grab the absolute path and hand it to whatever consumes the inbox (Claude conversation, PVIKPBot, etc.).</p><div id="drop" tabindex="0">Drop files here, paste from clipboard, or click to pick<div class="hint">PDF, text, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status"></div></div><div class="f-card"><h2>Inbox</h2><div class="ilist" id="ilist"><div class="empty">Loading…</div></div></div><div class="f-card"><h2>Outbox <span class="muted" style="font-weight:400">— files the agent left for you</span></h2><div class="ilist" id="olist"><div class="empty">Loading…</div></div></div></main>${footer}<script>const project=${projectJson};const drop=document.getElementById('drop');const file=document.getElementById('file');const status=document.getElementById('status');const ilist=document.getElementById('ilist');const olist=document.getElementById('olist');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(t,err){status.textContent=t||'';status.classList.toggle('err',!!err)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}async function refreshInbox(){try{const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){ilist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){ilist.innerHTML='<div class="empty">No saved files yet.</div>';return}ilist.innerHTML=files.map(f=>{const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);return '<div class="irow" data-n="'+esc(f.name)+'" data-p="'+esc(f.path)+'"><div class="thumb">'+(isImg?'<img src="'+esc(f.url)+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'" target="_blank" rel="noopener">Open</a><button class="copyBtn" type="button">Copy path</button><button class="del" type="button">Delete</button></div>'}).join('')}catch(e){ilist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}ilist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshInbox()}else if(e.target.classList.contains('copyBtn')){try{await navigator.clipboard.writeText(row.dataset.p);setStatus('Copied path: '+row.dataset.p)}catch(err){setStatus('Could not copy: '+err.message,true)}}});function uploadStream(blob,name){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','${BASE}/api/upload-stream/'+encodeURIComponent(project)+'?filename='+encodeURIComponent(name||'upload.bin'));x.setRequestHeader('Content-Type','application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable)setStatus('Uploading '+(name||'file')+'… '+Math.round(e.loaded/e.total*100)+'% ('+fmtSize(e.loaded)+' / '+fmtSize(e.total)+')')};x.onerror=()=>reject(new Error('Network error during upload'));x.onabort=()=>reject(new Error('Upload cancelled'));x.onload=()=>{let j=null;try{j=JSON.parse(x.responseText)}catch{}if(x.status>=200&&x.status<300&&j&&j.ok)resolve(j);else reject(new Error((j&&j.error)||('Upload failed (HTTP '+x.status+')')))};x.send(blob)})}async function upload(blob,name){if(!blob){setStatus('No file received.',true);return}try{let j;if(blob.size>8*1024*1024){j=await uploadStream(blob,name)}else{setStatus('Saving '+(name||'file')+'…');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const r=await fetch('${BASE}/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name||'clipboard-file',mime:blob.type||'application/octet-stream',data})});j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Upload failed')}try{await navigator.clipboard.writeText(j.path)}catch{}setStatus('Saved and path copied to clipboard:\\n'+j.path);refreshInbox()}catch(e){setStatus(e.message||String(e),true)}}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name);['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));['dragleave','dragend'].forEach(ev=>drop.addEventListener(ev,()=>drop.classList.remove('over')));/* drop handler removed — window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads. */window.addEventListener('paste',e=>{const item=[...(e.clipboardData?.items||[])].find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();upload(f,f?.name||'clipboard-file')},true);['dragenter','dragover'].forEach(ev=>window.addEventListener(ev,e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.classList.add('over')}},true));window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();drop.classList.remove('over');upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name)}},true);async function refreshOutbox(){try{const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){olist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){olist.innerHTML='<div class="empty">No files from the agent yet.</div>';return}olist.innerHTML=files.map(f=>'<div class="irow" data-n="'+esc(f.name)+'"><div class="thumb"><span>FILE</span></div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'">Download</a><button class="del" type="button">Delete</button></div>').join('')}catch(e){olist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}olist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project)+'/file/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshOutbox()}});refreshOutbox();refreshInbox();</script></body></html>`);
 });
 
-app.post(BASE + '/api/upload/:project', requireInboxWrite, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); await audit('upload', { project: p.name, filename: path.basename(full), bytes: Buffer.byteLength(data, 'base64') }, req); return res.json({ok:true,path:full,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
+app.post(BASE + '/api/upload/:project', requireInboxWrite, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); await adoptIntoWorkspace(inbox, full); await audit('upload', { project: p.name, filename: path.basename(full), bytes: Buffer.byteLength(data, 'base64') }, req); return res.json({ok:true,path:full,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
 // Streaming upload for large files: the raw request body is piped straight to
 // disk — no base64, no JSON, no whole-file buffering. The JSON path above tops
 // out around 75MB (100mb express/nginx caps ÷ base64 inflation) and the
@@ -2583,6 +2632,7 @@ app.post(BASE + '/api/upload-stream/:project', requireInboxWrite, async (req,res
   } catch(e){ await fs.rm(full,{force:true}).catch(()=>{}); throw e; }
   const st = await fs.stat(full);
   if(st.size === 0){ await fs.rm(full,{force:true}).catch(()=>{}); return res.status(400).json({ok:false,error:'Received 0 bytes'}); }
+  await adoptIntoWorkspace(inbox, full);
   await audit('upload', { project: p.name, filename: path.basename(full), bytes: st.size }, req);
   return res.json({ok:true,path:full,bytes:st.size,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`});
  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
@@ -2709,7 +2759,7 @@ app.post(BASE + '/api/setup/heal/dirs', requireAdminOrLocal, async (_req,res)=>{
   await fs.mkdir(d,{recursive:true}); steps.push(`ok dir: ${d}`);
  }
  // The Stop hook runs as admin and must be able to drop markers in pendingDir.
- await sh('chown',['admin:admin',pendingDir]).catch(()=>{}); steps.push(`ok owner admin: ${pendingDir}`);
+ const pendingOwner = await workspaceOwner(); await sh('chown',[pendingOwner.spec,pendingDir]).catch(()=>{}); steps.push(`ok owner ${pendingOwner.user}: ${pendingDir}`);
  try { await fs.access(emptyMcpPath); steps.push(`ok file: ${emptyMcpPath}`); }
  catch { await fs.writeFile(emptyMcpPath,'{}\n'); steps.push(`created: ${emptyMcpPath}`); }
  await syncWrapperEnv(await loadWorkbenchSettings()); steps.push(`refreshed: ${wrapperEnvPath}`);
