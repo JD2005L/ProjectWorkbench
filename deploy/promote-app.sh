@@ -28,6 +28,7 @@ SRC=/opt/project-workbench/workspaces/ProjectWorkbench/app
 DST=/opt/project-workbench/workspaces/canonical/app
 STAMP=$(date +%Y%m%d-%H%M%S)
 BAK="/opt/project-workbench/workspaces/canonical/app-backup-$STAMP.tar"
+CFGBAK="/opt/project-workbench/workspaces/canonical/config-backup-$STAMP.tar"
 SELF=/opt/project-workbench/persistent/admin-home/promote-app.sh
 CONTAINER=project-workbench
 HEALTH_URL='https://127.0.0.1/workbench/'
@@ -147,6 +148,17 @@ tar -C "$DST" --exclude=node_modules -cf "$BAK" . || die "backup failed; nothing
 chmod 600 "$BAK"
 say "live tree backed up -> $BAK ($(du -h "$BAK" | cut -f1))"
 
+# Snapshot the config too. The file rollback below restores CODE; it cannot undo
+# a state migration the newer build performs on first boot. This build adds
+# users-file.js / user-store.js / user-lifecycle.js where the live one has
+# users-compat.js, which is the shape of a users.json migration — so if we ever
+# do roll the code back, the data may need restoring too. Deliberately NOT
+# automatic: re-applying config wholesale could discard legitimate changes made
+# between now and then. Contains secrets, hence 600.
+tar -C /etc/project-workbench -cf "$CFGBAK" . 2>/dev/null || die "config backup failed; nothing changed"
+chmod 600 "$CFGBAK"
+say "config backed up -> $CFGBAK ($(du -h "$CFGBAK" | cut -f1)) [secrets inside; mode 600]"
+
 rollback(){ tar -C "$DST" -xf "$BAK"; }
 
 # -------------------------------------------------------------- promote ------
@@ -237,6 +249,11 @@ What to look at:
   * the auto-update nag is gone in NEW tmux sessions (pane env is captured at
     'tmux new-session', so recycle a project's terminal to clear an old one).
 
-Rollback:
+Rollback (code):
   tar -C '$DST' -xf '$BAK' && kill \$(pgrep -P \$(pgrep -o -f scripts/entrypoint.sh) -x node)
+
+Rollback (config, ONLY if the newer build migrated it and you are reverting the
+code — inspect before extracting, this overwrites live config and secrets):
+  tar -tf '$CFGBAK'
+  tar -C /etc/project-workbench -xf '$CFGBAK'
 EOF
