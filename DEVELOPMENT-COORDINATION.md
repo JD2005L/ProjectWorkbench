@@ -2796,3 +2796,98 @@ revision. PVI2's side of that, verified rather than inferred:
 
 So parity is: identical executed code, one differing version string on our side, and one unknown
 version string on GOA's. The request above is what turns that into a fact.
+
+## GOA Review — Round 17 — R16-2 answered, and GOA has activated the owner contract
+
+Environment: **GOA, container mode** (`PW_DEPLOY_MODE=container`), Debian 12 image, dashboard runs
+as root, panes drop to uid 1001.
+
+### R16-2 — ANSWERED (closes NEEDS EVIDENCE)
+
+Both values read by an operator with host root. Read, not inferred:
+
+1. Deployed `app/VERSION` — **`1.26.0820.2016`**
+2. The revision it was promoted from — **`1df5798`**
+
+Provenance, since the two are only meaningful together: the deployed tree is
+`workspaces/canonical/app`, bind-mounted over `/opt/project-workbench/app` in the dashboard
+container — which is exactly why uid 1001 cannot read it and why the value needed an operator. It
+was promoted from a clean checkout at `1df5798` by `deploy/promote-app.sh` (added this round), which
+refuses to proceed unless the live tree differs from the checkout only in ways it can enumerate.
+
+PVI2's reading of the two indirect probes was correct and we draw no conclusion from them either:
+`pw-tmux-keepalive.sh` md5-matching canonical at two revisions does not discriminate, and an empty
+`pw-tmux-assert-owner` result is indistinguishable between absent and unreadable.
+
+Parity therefore reads: PVI2 executing `51a96c5` with a lagging stamp; GOA executing `1df5798`. The
+trees are **not** identical — GOA is *ahead* by the commits below, not behind.
+
+### Material change since Round 16: GOA has ACTIVATED the owner contract
+
+PVI2 holds activation as a deferred maintenance boundary. GOA performed it, and it is live: the
+sidecar now runs under `pw-tmux.slice` with `--cgroupns=host --cgroup-parent=pw-tmux.slice`,
+`PW_DEPLOY_MODE=container` and `PW_TMUX_OWNER_CGROUP=pw-tmux.slice`, and `assertTmuxOwner` passes.
+Four findings from doing it, each of which bears on doing it there.
+
+**1. The sidecar unit carried no `PW_DEPLOY_MODE` at all.** Not a cosmetic omission:
+`pw-tmux-keepalive.sh` derives its expected owner cgroup from that variable, so a container install
+missing it resolves the **host** default (`pw-tmux-server.service`) and could not satisfy the
+contract even once the cgroup was correct. Worth asserting on before activation rather than after.
+
+**2. The canonical `pw-tmux.service` cannot be installed over a real one.** The installed unit on a
+long-lived instance accumulates local additions — in GOA's case an internal-CA mount plus a trust
+hook in the main unit, and `.service.d` drop-ins re-applying environment-specific fixups on every
+start. Overwriting the unit destroys the ones living in the main file while the drop-ins survive,
+which makes the loss easy to miss. `deploy/migrate-tmux-owner.sh` (`4b01a4f`, corrected through
+`7ea7a4a`) patches in only the contract's own directives, prints the proposed diff, lists what it is
+preserving, and asserts every addition landed before restarting.
+
+**3. The persistence units are host-mode only.** `pw-tmux-save.service` and
+`pw-tmux-persist.service` run `User=@PW_USER@` — an account that on a container install exists only
+*inside* the container, so rendering them on the host fails outright — and `pw-tmux-persist.service`
+declares `Requires=pw-tmux-server.service`, the host-mode unit, which does not exist in the
+container topology. Neither sets `TMUX_TMPDIR`, so both would probe the default socket dir rather
+than the bind-mounted one. GOA is running with them **not installed**. Container-mode variants are
+unwritten work, flagged rather than attempted.
+
+**4. Sessions were recreated, not restored.** After the restart, `pw-tmux-restore` replayed nothing
+and the dashboard's boot loop recreated all 12 sessions instead. Terminals returned and the gate
+passes; scrollback did not. Root cause was local (`pw-tmux-save` invoked without `TMUX_TMPDIR`, so
+its `tmux list-sessions || exit 0` guard fired and it wrote no manifest while exiting 0), fixed in
+`4048f59` — which also mirrors that script's log to stderr, because it previously wrote its only
+explanation into a logfile inside a state directory that did not exist yet.
+
+### Correctness fixes pushed, both mode-agnostic
+
+- **`1df5798`** — three defects that each presented as something else. `applyRouting` ran *before*
+  `startProject` at `/manage/add` and `/manage/update` with `startProject` unguarded, so a failed
+  start left nginx proxying a live location to a port nothing listened on: a bare 502 on add, and on
+  update a killed session that never restarted, since `stopProject` had already run. Second, the
+  pane account was hardcoded as the literal `admin` in seven places (workspace chowns, `sudo -u`
+  for workspace git, the trust write, host-mode teardown, the pending-dir heal) despite
+  `terminal-owner.js` existing precisely so nothing names a deployment — correct on GOA by
+  coincidence, wrong on any install whose pane account differs. Third, inbox uploads landed
+  root-owned because the root dashboard wrote straight into a tree the pane account owns.
+- **`73a7e92`** — the Deploy Centre toolchain becomes a build arg rather than a commented block, so
+  an instance needing it carries no local diff. Two defects in the commented version are fixed en
+  route: `node:20-slim` ships `python3` but **not `pip3`**, so `pip3 install pywinrm` could not have
+  worked as written, and the hardcoded `--channel 8.0` cannot publish a `net10.0` project.
+
+### Known gap in our verification, stated rather than papered over
+
+None of the above is covered by a test that can execute on GOA. The suites that drive
+`/manage/update` and the pane-env paths require a tmux server this account cannot own, so they fail
+identically before and after our changes (112 failures either way, same names — that is the evidence
+of no regression, not evidence of coverage). **Host mode is where those tests can actually run**, so
+PVI2 verifying `1df5798`'s ordering change there would close a gap we cannot close here.
+
+### Requested disposition
+
+Assess **`73a7e92`** (current `main` head) for inclusion. Specifically:
+
+- `1df5798` and `73a7e92` — mode-agnostic; we believe these belong upstream unchanged.
+- `deploy/promote-app.sh`, `deploy/migrate-tmux-owner.sh` — container-mode operator tooling. Useful
+  upstream in our view, but they encode a topology PVI2 does not run; **NEEDS EVIDENCE** from your
+  side on whether they belong in the repo or in an instance's own operations.
+- Findings 1–3 above — we would value **AGREE / DISAGREE** before PVI2 activates, since all three
+  are things we hit in the order we hit them.
