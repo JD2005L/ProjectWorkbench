@@ -18,6 +18,11 @@
 // local behaviour, `--no-renames` classification and shallow-checkout handling are unchanged; only
 // the push-to-the-release-branch case, which had no working answer, gained one.
 //
+// AND WHEN THE EVENT CANNOT ANSWER, THE RELEASE PUSH FAILS. There is no narrower fallback, because a
+// narrower range is a check that reports success while missing what shipped (see pushRange below),
+// and no skip, because a skipped test is a green run. Only the release branch fails closed this way;
+// every other caller keeps its existing skip-out-loud behaviour.
+//
 // This lives under test/ deliberately: it is CI logic, it never ships, and it must NOT be
 // deployable content itself (see isDeployable below — anything under app/ would oblige every edit
 // to this file to carry a release bump).
@@ -123,50 +128,76 @@ export function baseRef(repoDir, env = process.env) {
  * Returns one of:
  *   { kind, from, to }           — compare these; `to` is always the checked-out tree's HEAD
  *   { kind: 'on-base', ... }     — this checkout proposes nothing (local main, no event)
- *   { skip: reason }             — the range cannot be established here; say so out loud
+ *   { unresolved: true, reason } — a RELEASE push whose own range is unavailable: a refusal, which
+ *                                  evaluateRelease turns into a failing verdict, never a skip
+ *   { skip: reason }             — the range cannot be established, and nothing is shipping by way
+ *                                  of this event; say so out loud
  *
  * The rule, in order: a push to the release branch (or to a branch this runner cannot name) is
- * measured by the event's own before → HEAD; anything else is measured against its base branch; and
- * a push whose base branch is not in the checkout falls back to the event range rather than skipping,
- * because a push always knows its own range.
+ * measured by the event's own before → HEAD, and refuses if that range is unavailable; anything else
+ * is measured against its base branch; and a push whose base branch is not in the checkout falls back
+ * to the event range rather than skipping, because a push always knows its own range.
  *
- * It never returns a range whose endpoints are the same commit: that is the vacuous pass this
- * function exists to make impossible.
+ * It never returns a range whose endpoints are the same commit — that is the vacuous pass — and never
+ * a range NARROWER than what the event shipped, which is the same failure wearing a different face.
  */
 export function resolveComparison({ repoDir, env = process.env, event = readEvent(env) } = {}) {
   const eventName = String(env.GITHUB_EVENT_NAME || '');
 
-  /** What a push event itself says it introduced: `before` → HEAD. */
-  const pushRange = () => {
+  /**
+   * What a push event itself says it introduced: `before` → HEAD.
+   *
+   * On the release branch there is no weaker answer to fall back to. A push carries as many commits
+   * as the pusher had locally, so narrowing the range to HEAD's first parent inspects only the LAST
+   * of them: base A, commit B shipping `app/server.js` with no bump, commit C touching docs — and
+   * `HEAD^..HEAD` is docs-only, so the guard passes while B ships to every instance under a stale
+   * release identifier. That is worse than no check, because it reports success. Neither is a skip
+   * acceptable here: a skipped test is a green run, and this is the event that ships.
+   *
+   * So an unresolvable range on the release branch is returned as a REFUSAL, which the caller turns
+   * into a failing verdict.
+   */
+  const pushRange = ({ release }) => {
     const before = String(event?.before || '');
     if (before && before !== ZERO_SHA && gitVerify(repoDir, before)) {
-      return { kind: 'push-to-release-branch', from: before, to: 'HEAD' };
+      return { kind: release ? 'push-to-release-branch' : 'push-range', from: before, to: 'HEAD' };
     }
-    // No usable `before`: a branch just created (all-zero sentinel), a force-push whose old tip is
-    // no longer here, a shallow checkout, or a payload the runner did not supply. The first parent
-    // is still a real, different commit — narrower than the full push when it moved several commits
-    // at once, but never a comparison of HEAD with itself.
-    if (gitVerify(repoDir, 'HEAD^')) {
-      return {
-        kind: 'push-to-release-branch-parent',
-        from: 'HEAD^',
-        to: 'HEAD',
-        note: `no usable push 'before' SHA (${before || 'absent'}); compared against HEAD's first parent instead`,
-      };
-    }
-    return { skip: `push with no usable 'before' SHA (${before || 'absent'}) and no parent commit to compare against` };
+    if (!release) return null; // caller falls back to its own base-branch reasoning, or skips
+    // A branch just created (all-zero sentinel), a force-push whose old tip is gone, a shallow
+    // checkout, or a payload the runner did not supply.
+    return {
+      kind: 'push-to-release-branch',
+      unresolved: true,
+      before,
+      reason:
+        `this push to the release branch cannot be gated: its 'before' SHA (${before || 'absent'}) does not `
+        + 'resolve in this checkout, so what the push shipped cannot be established. Refusing to pass on a '
+        + "narrower guess — a push can carry several commits, and comparing only HEAD's first parent silently "
+        + 'omits every commit before it. Give the run the pushed range (actions/checkout with fetch-depth: 0, '
+        + 'and an event payload carrying before/after); if the branch was genuinely just created, audit its '
+        + 'release content deliberately rather than letting an ungateable push through.',
+    };
   };
 
   const branch = branchOf(env, event);
   // An UNIDENTIFIABLE branch is treated as the release branch on purpose. Guessing "some feature
   // branch" is the guess that reintroduces the vacuous pass when it is wrong; guessing "the release
   // branch" can only make the guard stricter.
-  if (eventName === 'push' && (branch === '' || branch === defaultBranchOf(event))) return pushRange();
+  if (eventName === 'push' && (branch === '' || branch === defaultBranchOf(event))) return pushRange({ release: true });
 
   // Pull requests, pushes to any other branch, and local runs: what this branch proposes against its
   // base. Unchanged — this is the case the original guard got right.
   const base = baseRef(repoDir, env);
-  const unestablished = (reason) => (eventName === 'push' ? pushRange() : { skip: reason });
+  // A push knows its own range even when the base branch is missing from this checkout, so it gets
+  // checked rather than skipped. A RELEASE push never reaches here — it was answered above, and
+  // refuses rather than falling through to anything weaker.
+  const unestablished = (reason) => {
+    if (eventName === 'push') {
+      const range = pushRange({ release: false });
+      if (range) return range;
+    }
+    return { skip: reason };
+  };
   if (!base) return unestablished('no base branch in this checkout, so what changed cannot be established');
   let mergeBase;
   try {
@@ -190,6 +221,12 @@ export function resolveComparison({ repoDir, env = process.env, event = readEven
  * backwards is caught rather than accepted for having touched the file.
  */
 export function evaluateRelease({ repoDir, version, comparison }) {
+  // Fail closed FIRST: a release push whose own range is unavailable is a failing check, never a
+  // skipped one. A skip is a green run, and green is exactly what must not happen when the gate
+  // cannot see what shipped.
+  if (comparison.unresolved) {
+    return { status: 'violation', code: 'unresolvable-release-range', reason: comparison.reason };
+  }
   if (comparison.skip) return { status: 'skipped', reason: comparison.skip };
   if (comparison.nothingProposed) return { status: 'nothing-proposed' };
 

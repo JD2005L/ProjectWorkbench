@@ -66,7 +66,7 @@ Status legend: `PASS` (verified by a run recorded below) · `FAIL` · `—` (not
 | 1 | `app/VERSION` advances from `1.26.0811.1605` by the `1.YY.MMDD.hhmm` convention, because `app/server.js` is deployable | PASS | `1.26.0811.1605` → `1.26.0820.1620` (UTC `date`, matching the repo convention); `app/version.js` accepts it; the repaired guard verifies it forwards against the merge base |
 | 2 | `DISABLE_AUTOUPDATER=1` reaches every new project pane/session in both deploy modes — `project-terminal-start` `base_tab_env`, `ensureTmuxSession`, `ensureProjectTmuxSession`, `newTmuxWindow` — preserving credential isolation and env/drop semantics | PASS | 5 seams carry it (3 in `app/server.js`, `base_tab_env`, and `pw-tmux-restore`'s 3 strings); per-user `CLAUDE_CONFIG_DIR`/`--rcfile` handling unchanged; `wrapAgentEnv` carries it through the setpriv drop exactly once (asserted) |
 | 3 | Focused real-process/argv or source-contract regressions that fail before the fix and prove the variable reaches each path after it | PASS | 4 real-process `/proc/<pane_pid>/environ` regressions + 4 source-contract tests; RED/GREEN logged below; harness proven non-vacuous by `assertNoAmbientPaneEnv` |
-| 4 | Release-version CI logic cannot compare main to itself and pass vacuously; event-aware before/after; PR behaviour, local fallback, `--no-renames`, shallow handling, explicit non-vacuous tests all preserved | PASS | `test/release-guard-lib.mjs` reads `GITHUB_EVENT_PATH`; superseded vs repaired guard run against the *same* defect repository, opposite results (below); 14 preserved-behaviour/non-vacuity tests |
+| 4 | Release-version CI logic cannot compare main to itself and pass vacuously; event-aware before/after; PR behaviour, local fallback, `--no-renames`, shallow handling, explicit non-vacuous tests all preserved | PASS | `test/release-guard-lib.mjs` reads `GITHUB_EVENT_PATH`; superseded vs repaired guard run against the *same* defect repository, opposite results (below); 15 preserved-behaviour/non-vacuity tests. **Round 2 replaced the `HEAD^` fallback with fail-closed — see below** |
 | 5 | GOA container mode and PVI host mode both stay supported; no forked product logic, no hardcoded PVI assumptions | PASS | Both dashboard modes and both shell entrypoints changed in the same shape; no mode conditionals added; default branch read from the CI event payload rather than hardcoded; deploy adapters untouched |
 | 6 | Only scoped tests/docs updated; this loop record created | PASS | changed files list below; `.github/workflows/test.yml` comment only (no behaviour change) |
 | 7 | Focused tests during RED/GREEN, canonical app suite once at frozen head; `node --check` and `git diff --check` clean | PASS | logs below |
@@ -125,9 +125,8 @@ not ok 14 - release: a change to deployable release content carries a release bu
 
 What the repair does: on `push` to the repository's default branch (read from the event payload, not
 hardcoded) the range is the event's own `before` → `HEAD`. An unusable `before` — the all-zero
-new-branch sentinel, a force-pushed-away commit, a shallow checkout, an absent payload — falls back to
-`HEAD^`, which is narrower but is never HEAD compared with itself, and says so in the verdict; with no
-parent at all it skips out loud. Pull requests, pushes to any other branch and local runs keep the
+new-branch sentinel, a force-pushed-away commit, a shallow checkout, an absent payload — **fails the
+run** (round 2, below). Pull requests, pushes to any other branch and local runs keep the
 merge-base-with-base-branch resolution unchanged.
 
 ## Changed files
@@ -140,11 +139,11 @@ merge-base-with-base-branch resolution unchanged.
 | `scripts/pw-tmux-restore` | `ENVBASH` and both per-user `cred_env_prefix` strings carry the token (post-reboot restore) |
 | `test/autoupdater-env.test.mjs` | **new** — real-process dashboard regressions + source contract across all five seams |
 | `test/pane-env-fixture.mjs` | **new** — scrubbed private tmux server + baseline assertion, so pane-env claims can fail |
-| `test/release-guard-lib.mjs` | **new** — event-aware comparison range and verdict, testable against a fixture repo |
-| `test/release-version.test.mjs` | rewritten onto the lib; adds the non-vacuity regression and the preserved-behaviour set |
+| `test/release-guard-lib.mjs` | **new** — event-aware comparison range and verdict, testable against a fixture repo; round 2 made an unresolvable release range fail closed |
+| `test/release-version.test.mjs` | rewritten onto the lib; adds the non-vacuity regression, the round 2 multi-commit fail-closed regression, and the preserved-behaviour set |
 | `test/project-terminal-start.test.mjs` | + 2 real-process pane-env regressions; harness server scrubbed |
 | `test/pw-tmux-restore.test.mjs` | + 2 real-process pane-env regressions; harness server scrubbed |
-| `.github/workflows/test.yml` | comment only: why full history is needed for the push event too |
+| `.github/workflows/test.yml` | comment only: why full history is needed for the push event too, and (round 2) why that depth is load-bearing rather than defensive |
 | `.goal-loops/fix-release-portability.md` | this record |
 
 ### The same defect, on this repository's own history
@@ -164,21 +163,84 @@ So canonical `main` is currently shipping an `app/server.js` newer than the iden
 `1.26.0811.1605` dates from 2026-08-11, the change from 2026-08-19. The bump in this branch corrects
 that drift as well as covering its own change.
 
-## Final verification (frozen head)
+## Round 2 follow-up: the narrower fallback was itself a release-control blocker
 
-Recorded after the last code change; this file is the only edit made after the canonical run, and it
-never ships and is never executed.
+**Reported by James, and correct.** Round 1 answered an unresolvable `before` by narrowing the range
+to `HEAD^`. A push carries as many commits as the pusher had locally, so that inspects only the LAST
+of them:
+
+```
+A  base
+B  ships app/server.js, no version bump
+C  docs only            <- main
+```
+
+`HEAD^..HEAD` is `B..C` — docs only — so the guard reports success while B ships to every instance
+under a stale release identifier. A narrower range is worse than no range, because it looks like a
+check. A skip is no better: a skipped test is a green run, and this is the event that ships.
+
+**RED**, on a fixture built to exactly that shape (`multiCommitPushFixture`), before any change:
+
+```
+not ok 7 - REGRESSION: a multi-commit release push with an unresolvable range FAILS CLOSED …
+    before="0000…0000" must not resolve to a range:
+      {"kind":"push-to-release-branch-parent","from":"HEAD^","to":"HEAD",
+       "note":"no usable push 'before' SHA (0000…0000); compared against HEAD's first parent instead"}
+not ok 9 - a release push with no parent at all fails closed too — a root commit is not an excuse to skip
+```
+
+The fixture proves the hole rather than asserting it: it first checks that
+`changedFiles(HEAD^, HEAD).filter(isDeployable)` really is empty while `changedFiles(A, C)` really is
+`['app/server.js']`. That is the whole defect, in two assertions.
+
+**Repair.** `pushRange({ release: true })` no longer has a fallback. An unavailable `before` returns
+`{ unresolved: true, reason }`, and `evaluateRelease` turns that into
+`{ status: 'violation', code: 'unresolvable-release-range' }` **before** any skip is considered, so it
+fails the CI test with an actionable message (give the run the pushed range — `fetch-depth: 0` plus an
+event payload carrying before/after; if the branch really was just created, audit its release content
+deliberately). Only the release branch fails closed this way:
+
+| Case | Behaviour | Changed in round 2? |
+|---|---|---|
+| Release push, `before` resolvable | gated `before` → HEAD | no |
+| Release push, `before` unavailable | **fails the run** (was: narrowed to `HEAD^`) | **yes** |
+| Release push, root commit | **fails the run** (was: skipped out loud) | **yes** |
+| Pull request | merge base with base branch | no |
+| Push to a non-default branch | branch vs base; the event range if the base is absent | no |
+| Local run (no CI event) | base branch; nothing proposed on the base branch itself | no |
+
+**GREEN:** `node --test ../test/release-version.test.mjs` → **17 tests, 17 pass, 0 fail, 0 skipped**.
+
+`app/VERSION` is deliberately NOT bumped again: round 2 touches `test/`, `.github/` and this record
+only, none of which is deployable content — the guard's own classifier says so — and the branch's
+existing bump still covers the `app/server.js` change it carries.
+
+## Final verification
+
+Recorded after the last code change of each round; this file is the only edit made after each
+canonical run, and it never ships and is never executed.
+
+Both rounds:
 
 - `node --check` on every file under `app/` (including `app/server.js`) — clean
 - `bash -n scripts/project-terminal-start`, `bash -n scripts/pw-tmux-restore` — clean
 - `git diff --check` — clean
-- Canonical suite, `cd app && npm test`: **1097 tests, 1094 pass, 0 fail, 3 skipped**, exit 0, 118s.
-  The 3 skips are pre-existing and environmental — `orch-privilege-real` assertions that cannot fail
-  when the suite already runs as the account it drops to (they ask for root, or `PW_TEST_DROP_USER`).
-- The GOA leg, `PW_DEPLOY_MODE=container` over the four touched suites plus `tmux-seam-gate`:
-  **96 tests, 96 pass, 0 fail, 0 skipped**.
+
+| Round | Frozen head | Canonical `cd app && npm test` | GOA leg (`PW_DEPLOY_MODE=container`) |
+|---|---|---|---|
+| 1 | `9f815a3` | 1097 tests, 1094 pass, 0 fail, 3 skipped (118s) | 96/96 over the touched suites + `tmux-seam-gate` |
+| 2 | the follow-up commit on this branch | 1098 tests, 1095 pass, 0 fail, 3 skipped (160s) | 17/17 on `release-version.test.mjs`, both `PW_DEPLOY_MODE` legs |
+
+The 3 local skips are pre-existing and environmental — `orch-privilege-real` assertions that cannot
+fail when the suite already runs as the account it drops to (they ask for root, or
+`PW_TEST_DROP_USER`). On a GitHub runner the count is 20: the same 3, plus 17 that need the
+orchestrator repository and its venv, which no runner has.
+
+Round 1 CI on `9f815a3`: `node-test (host)` and `node-test (container)` **pass** on both the push and
+pull_request runs; 1097 tests, 1077 pass, 0 fail, 20 skipped per leg. Log-verified that the new gates
+RAN rather than skipped.
 
 ## Release
 
-Committed, pushed to `fix/release-portability`, PR opened against `main`. **Not merged, not deployed** —
-Hermes-James reviews and performs both.
+Committed and pushed to `fix/release-portability`; PR #50 against `main`, with the round 2 follow-up
+pushed to the same branch. **Not merged, not deployed** — Hermes-James reviews and performs both.

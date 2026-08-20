@@ -25,11 +25,15 @@ jobs:
           # Full history, because the release guard in test/release-version.test.mjs has to ask what
           # changed: on a pull request, this branch relative to its base; on a push to the release
           # branch, the event's own `before` commit relative to HEAD. The default shallow checkout
-          # has neither the base branch nor the pre-push commit, so the guard would skip — and a
-          # check that skips in the one place it is meant to gate is not a check.
+          # has neither the base branch nor the pre-push commit, so on a pull request the guard would
+          # skip — and a check that skips in the one place it is meant to gate is not a check.
           #
           # The guard reads that event through GITHUB_EVENT_PATH (see test/release-guard-lib.mjs),
           # which the runner always provides, so nothing here has to forward the SHAs by hand.
+          #
+          # This depth is load-bearing, not defensive: a push to the release branch whose pushed range
+          # is not present FAILS the run rather than narrowing or skipping, because a push can carry
+          # several commits and a narrower comparison passes while missing the one that shipped.
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:

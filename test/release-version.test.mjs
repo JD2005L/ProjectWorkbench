@@ -195,22 +195,77 @@ test('a push to main that ships nothing deployable needs no bump', () => {
   } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
 });
 
-test('an unusable push "before" SHA falls back to a real parent, never to comparing HEAD with itself', () => {
-  const fx = releaseFixture();
+/**
+ * A release push carries as many commits as the pusher had locally. That is what makes a NARROWER
+ * comparison worse than no comparison: it looks like a check and reports success.
+ *
+ * A: base · B: ships app/server.js, no bump · C: docs only · main = C.
+ *
+ * With the event's `before` unavailable, HEAD^..HEAD is B..C — docs only — and the guard passes while
+ * B ships to every instance with a stale release identifier. Nothing about that run looks wrong.
+ */
+function multiCommitPushFixture() {
+  const dir = initRepo('pw-release-multi-');
+  fs.mkdirSync(path.join(dir, 'app'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app', 'VERSION'), '1.26.0101.0000\n');
+  fs.writeFileSync(path.join(dir, 'app', 'server.js'), 'console.log("v1");\n');
+  fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), '# plan\n');
+  runIn(dir, 'add', '-A');
+  runIn(dir, 'commit', '-q', '-m', 'A: base');
+  const a = runIn(dir, 'rev-parse', 'HEAD');
+
+  fs.writeFileSync(path.join(dir, 'app', 'server.js'), 'console.log("v2 SHIPPED, no bump");\n');
+  runIn(dir, 'add', '-A');
+  runIn(dir, 'commit', '-q', '-m', 'B: ship app/server.js without a bump');
+  const b = runIn(dir, 'rev-parse', 'HEAD');
+
+  fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), '# plan, revised\n');
+  runIn(dir, 'add', '-A');
+  runIn(dir, 'commit', '-q', '-m', 'C: docs only');
+  const c = runIn(dir, 'rev-parse', 'HEAD');
+
+  return { dir, a, b, c, version: fs.readFileSync(path.join(dir, 'app', 'VERSION'), 'utf8').trim() };
+}
+
+test('REGRESSION: a multi-commit release push with an unresolvable range FAILS CLOSED — a narrower comparison would have missed the shipping commit', () => {
+  const fx = multiCommitPushFixture();
   try {
+    // The hole, measured rather than described: the narrow range really does miss the shipping file.
+    assert.deepEqual(changedFiles(fx.dir, 'HEAD^', 'HEAD').filter(isDeployable), [],
+      'sanity: HEAD^..HEAD is docs-only, which is why reducing the range to it passes');
+    assert.deepEqual(changedFiles(fx.dir, fx.a, fx.c).filter(isDeployable), ['app/server.js'],
+      'sanity: the push as a whole DOES ship deployable content');
+
     for (const before of [ZERO_SHA, '', 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef']) {
-      const env = actionsEnv(fx.dir, 'push', pushEvent({ before, after: fx.after }), { GITHUB_REF_NAME: 'main' });
+      const env = actionsEnv(fx.dir, 'push', pushEvent({ before, after: fx.c }), { GITHUB_REF_NAME: 'main' });
       const comparison = resolveComparison({ repoDir: fx.dir, env });
-      assert.equal(comparison.kind, 'push-to-release-branch-parent', `before=${JSON.stringify(before)}: ${JSON.stringify(comparison)}`);
-      assert.equal(comparison.from, 'HEAD^');
-      assert.ok(comparison.note, 'the narrower comparison must say so rather than pass silently');
+      assert.equal(comparison.unresolved, true, `before=${JSON.stringify(before)} must not resolve to a range: ${JSON.stringify(comparison)}`);
+      assert.equal(comparison.from, undefined, 'an unresolvable release push must not fall back to a narrower range');
+      assert.equal(comparison.skip, undefined, 'an unresolvable release push must not become a skipped test either');
+
       const verdict = evaluateRelease({ repoDir: fx.dir, version: fx.version, comparison });
-      assert.equal(verdict.status, 'violation', `the missing bump must still be caught: ${JSON.stringify(verdict)}`);
+      assert.equal(verdict.status, 'violation', `must fail the CI test, not pass or skip: ${JSON.stringify(verdict)}`);
+      assert.equal(verdict.code, 'unresolvable-release-range');
+      assert.match(verdict.reason, /fetch-depth/, 'the failure must tell an operator how to make the range available');
     }
   } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
 });
 
-test('a push to main with no parent to compare against SKIPS OUT LOUD rather than passing', () => {
+test('the SAME multi-commit push is gated normally once its range is available', () => {
+  const fx = multiCommitPushFixture();
+  try {
+    const env = actionsEnv(fx.dir, 'push', pushEvent({ before: fx.a, after: fx.c }), { GITHUB_REF_NAME: 'main' });
+    const comparison = resolveComparison({ repoDir: fx.dir, env });
+    assert.equal(comparison.kind, 'push-to-release-branch');
+    assert.equal(comparison.from, fx.a);
+    const verdict = evaluateRelease({ repoDir: fx.dir, version: fx.version, comparison });
+    assert.equal(verdict.status, 'violation', JSON.stringify(verdict));
+    assert.match(verdict.reason, /app\/server\.js/, 'the commit that actually shipped must be named');
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
+});
+
+test('a release push with no parent at all fails closed too — a root commit is not an excuse to skip', () => {
   const dir = initRepo('pw-release-root-');
   try {
     fs.mkdirSync(path.join(dir, 'app'), { recursive: true });
@@ -220,8 +275,10 @@ test('a push to main with no parent to compare against SKIPS OUT LOUD rather tha
     runIn(dir, 'commit', '-q', '-m', 'root');
     const env = actionsEnv(dir, 'push', pushEvent({ before: ZERO_SHA, after: runIn(dir, 'rev-parse', 'HEAD') }), { GITHUB_REF_NAME: 'main' });
     const comparison = resolveComparison({ repoDir: dir, env });
-    assert.ok(comparison.skip, `expected an explicit skip, got ${JSON.stringify(comparison)}`);
-    assert.equal(evaluateRelease({ repoDir: dir, version: '1.26.0101.0000', comparison }).status, 'skipped');
+    assert.equal(comparison.unresolved, true, JSON.stringify(comparison));
+    const verdict = evaluateRelease({ repoDir: dir, version: '1.26.0101.0000', comparison });
+    assert.equal(verdict.status, 'violation');
+    assert.equal(verdict.code, 'unresolvable-release-range');
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
