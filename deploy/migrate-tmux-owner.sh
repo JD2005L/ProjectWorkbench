@@ -227,9 +227,27 @@ done
 
 # ------------------------------------------------------------ save state -----
 hr "save tmux session state"
+# TMUX_TMPDIR is mandatory, not decorative: the socket lives on the bind-mounted
+# dir, and pw-tmux-save's first act is `tmux list-sessions || exit 0`. Run it
+# from a shell without it and tmux inspects the default /tmp/tmux-0, finds no
+# server, and exits 0 having saved nothing — a silent no-op that reads as success.
+# The unit that normally runs it sets this; an ad-hoc invocation must too.
+STATE_DIR=${PW_TMUX_STATE_DIR:-/var/lib/project-workbench/tmux-persist}
+install -d -m 0755 "$STATE_DIR" "$STATE_DIR/content" 2>/dev/null || true
 if command -v pw-tmux-save >/dev/null 2>&1; then
-  if pw-tmux-save; then say "sessions saved"
-  else say "WARNING: pw-tmux-save returned non-zero — sessions may not restore"; fi
+  TMUX_TMPDIR="$TMUX_TMPDIR_LIVE" pw-tmux-save \
+    || say "WARNING: pw-tmux-save returned non-zero"
+  # Trust the artefact, not the exit code.
+  if [ -s "$STATE_DIR/manifest.tsv" ]; then
+    say "sessions saved: $(wc -l < "$STATE_DIR/manifest.tsv") entries in $STATE_DIR/manifest.tsv"
+  else
+    say "WARNING: no manifest was written to $STATE_DIR — there will be NOTHING to restore."
+    say "         Sessions will be recreated fresh by the dashboard instead (scrollback lost)."
+    printf '\n'
+    read -r -p "  Continue anyway? [y/N] " ans
+    case "$ans" in [yY]*) say "continuing without a snapshot" ;;
+      *) die "stopped at your request; nothing has been changed" ;; esac
+  fi
 else
   say "WARNING: pw-tmux-save not found; continuing without a session snapshot"
 fi
@@ -301,7 +319,7 @@ say "ownership holds: marker present AND cgroup under $EXPECT_CGROUP"
 # -------------------------------------------------------------- restore ------
 hr "restore saved sessions"
 if command -v pw-tmux-restore >/dev/null 2>&1; then
-  pw-tmux-restore || say "WARNING: pw-tmux-restore returned non-zero — see output above"
+  TMUX_TMPDIR="$TMUX_TMPDIR_LIVE" pw-tmux-restore || say "WARNING: pw-tmux-restore returned non-zero — see output above"
 else
   say "pw-tmux-restore not found; sessions must be recreated by opening projects"
 fi

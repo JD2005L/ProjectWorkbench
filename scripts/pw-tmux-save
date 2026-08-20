@@ -28,7 +28,14 @@ EXCLUDE=" pw_setup "
 # adjacent separators the way it does with tab/space.
 SEP=$'\x1f'
 
-log() { printf '%s save: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null || true; }
+# Also to stderr. The log lives inside STATE_DIR, so on an install where that
+# directory does not exist yet every explanation of why nothing was saved was
+# written into the void — including the "no tmux server" one, which is the single
+# most likely reason an operator running this by hand gets an empty snapshot.
+log() {
+	[[ -d ${LOG%/*} ]] && printf '%s save: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null
+	printf 'pw-tmux-save: %s\n' "$*" >&2
+}
 
 # No tmux server → nothing to snapshot. Do NOT clobber an existing manifest, so
 # a save that fires after the server is already gone can't erase a good one.
