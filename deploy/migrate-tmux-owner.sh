@@ -109,18 +109,36 @@ fi
 hr "preflight: what the installed unit is missing"
 [ -f "$UNIT_DST" ] || die "expected the main unit at $UNIT_DST (found only drop-ins?)"
 
-NEED_CGROUPNS=0; NEED_PARENT=0; NEED_OWNERENV=0; NEED_SLICE=0; NEED_DELEGATE=0
+NEED_CGROUPNS=0; NEED_PARENT=0; NEED_OWNERENV=0; NEED_MODEENV=0; NEED_SLICE=0; NEED_DELEGATE=0
 grep -q -- '--cgroupns=host'                    "$UNIT_DST" || NEED_CGROUPNS=1
 grep -q -- '--cgroup-parent=pw-tmux.slice'      "$UNIT_DST" || NEED_PARENT=1
 grep -q -- 'PW_TMUX_OWNER_CGROUP=pw-tmux.slice' "$UNIT_DST" || NEED_OWNERENV=1
+# PW_DEPLOY_MODE is not cosmetic here: pw-tmux-keepalive.sh picks its expected
+# owner cgroup from it, so a sidecar without it has been applying HOST defaults
+# (pw-tmux-server.service) on a container install.
+grep -q -- 'PW_DEPLOY_MODE=container'           "$UNIT_DST" || NEED_MODEENV=1
 grep -qE '^\s*Slice=pw-tmux\.slice'             "$UNIT_DST" || NEED_SLICE=1
 grep -qE '^\s*Delegate=yes'                     "$UNIT_DST" || NEED_DELEGATE=1
 for pair in "--cgroupns=host:$NEED_CGROUPNS" "--cgroup-parent=pw-tmux.slice:$NEED_PARENT" \
+            "PW_DEPLOY_MODE=container:$NEED_MODEENV" \
             "PW_TMUX_OWNER_CGROUP=pw-tmux.slice:$NEED_OWNERENV" "Slice=pw-tmux.slice:$NEED_SLICE" \
             "Delegate=yes:$NEED_DELEGATE"; do
   printf '  %-38s %s\n' "${pair%:*}" "$([ "${pair##*:}" -eq 1 ] && echo 'MISSING — will add' || echo present)"
 done
-UNIT_NEEDS_PATCH=$((NEED_CGROUPNS+NEED_PARENT+NEED_OWNERENV+NEED_SLICE+NEED_DELEGATE))
+UNIT_NEEDS_PATCH=$((NEED_CGROUPNS+NEED_PARENT+NEED_OWNERENV+NEED_MODEENV+NEED_SLICE+NEED_DELEGATE))
+
+# The env lines are inserted after the --privileged line, which is the one line
+# the cgroup flags already prove exists. It has to be a continuation line, or an
+# inserted `-e … \` would land after the command has ended.
+PRIV_LINE=$(grep -n -- '--privileged' "$UNIT_DST" | head -1 | cut -d: -f1)
+[ -n "$PRIV_LINE" ] || die "no '--privileged' line in $UNIT_DST to anchor the patch to; patch it by hand"
+case "$(sed -n "${PRIV_LINE}p" "$UNIT_DST")" in
+  *\\) : ;;
+  *) die "the '--privileged' line in $UNIT_DST does not end in a backslash, so inserting
+      continuation args after it would break the command. Patch it by hand: add
+      --cgroupns=host --cgroup-parent=pw-tmux.slice and
+      -e PW_DEPLOY_MODE=container -e PW_TMUX_OWNER_CGROUP=pw-tmux.slice" ;;
+esac
 
 say "GOA-local content that will be PRESERVED (not replaced):"
 grep -nE 'goa-ca|NODE_EXTRA_CA_CERTS|ExecStartPost' "$UNIT_DST" | sed 's/^/    /' || say "    (none in the main unit)"
@@ -131,18 +149,22 @@ ls -1 "/etc/systemd/system/$UNIT_NAME.d/" 2>/dev/null | sed 's/^/    /' || say "
 # anything is written.
 PATCHED=$(mktemp)
 awk -v ns="$NEED_CGROUPNS" -v par="$NEED_PARENT" -v oe="$NEED_OWNERENV" \
-    -v sl="$NEED_SLICE" -v dg="$NEED_DELEGATE" '
-  BEGIN { added_env=0 }
-  # Insert the cgroup flags right after --privileged, keeping the continuation.
-  /--privileged/ && (ns==1 || par==1) {
-    extra=""
-    if (ns==1)  extra = extra " --cgroupns=host"
-    if (par==1) extra = extra " --cgroup-parent=pw-tmux.slice"
-    sub(/--privileged/, "--privileged" extra)
-  }
-  # Add the owner-cgroup env next to the mode env, so it travels with it.
-  /-e PW_DEPLOY_MODE=container/ && oe==1 && added_env==0 {
-    print; print "  -e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \\"; added_env=1; next
+    -v me="$NEED_MODEENV" -v sl="$NEED_SLICE" -v dg="$NEED_DELEGATE" '
+  BEGIN { done_env=0 }
+  # One anchor for everything on the podman command: extend the --privileged line
+  # with the cgroup flags, then insert any missing -e args straight after it.
+  /--privileged/ && done_env==0 {
+    if (ns==1 || par==1) {
+      extra=""
+      if (ns==1)  extra = extra " --cgroupns=host"
+      if (par==1) extra = extra " --cgroup-parent=pw-tmux.slice"
+      sub(/--privileged/, "--privileged" extra)
+    }
+    print
+    if (me==1) print "  -e PW_DEPLOY_MODE=container \\"
+    if (oe==1) print "  -e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \\"
+    done_env=1
+    next
   }
   /^\[Service\]/ {
     print
@@ -153,13 +175,13 @@ awk -v ns="$NEED_CGROUPNS" -v par="$NEED_PARENT" -v oe="$NEED_OWNERENV" \
   { print }
 ' "$UNIT_DST" > "$PATCHED"
 
-# If PW_DEPLOY_MODE was absent the env line had nowhere to anchor; catch that
-# rather than restarting into a unit that is still missing the contract.
-if [ "$NEED_OWNERENV" -eq 1 ] && ! grep -q 'PW_TMUX_OWNER_CGROUP=pw-tmux.slice' "$PATCHED"; then
-  rm -f "$PATCHED"
-  die "could not find a '-e PW_DEPLOY_MODE=container' line to anchor the owner env to.
-      Patch $UNIT_DST by hand: add '-e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \\' to the podman args."
-fi
+# Never restart into a unit that is still missing the contract: assert every
+# piece actually landed rather than trusting the edit.
+for want in 'cgroupns=host' 'cgroup-parent=pw-tmux.slice' 'PW_DEPLOY_MODE=container' \
+            'PW_TMUX_OWNER_CGROUP=pw-tmux.slice' 'Slice=pw-tmux.slice' 'Delegate=yes'; do
+  grep -q -- "$want" "$PATCHED" || { rm -f "$PATCHED"; die "the patched unit is still missing '$want'.
+      Nothing was written. Patch $UNIT_DST by hand."; }
+done
 
 if [ "$UNIT_NEEDS_PATCH" -gt 0 ]; then
   hr "proposed unit change (installed -> patched)"
