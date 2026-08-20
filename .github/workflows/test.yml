@@ -23,9 +23,13 @@ jobs:
       - uses: actions/checkout@v4
         with:
           # Full history, because the release guard in test/release-version.test.mjs has to ask what
-          # this branch changed relative to its base. The default shallow checkout has no base branch
-          # and no merge base, so the guard would skip — and a check that skips in the one place it
-          # is meant to gate is not a check.
+          # changed: on a pull request, this branch relative to its base; on a push to the release
+          # branch, the event's own `before` commit relative to HEAD. The default shallow checkout
+          # has neither the base branch nor the pre-push commit, so the guard would skip — and a
+          # check that skips in the one place it is meant to gate is not a check.
+          #
+          # The guard reads that event through GITHUB_EVENT_PATH (see test/release-guard-lib.mjs),
+          # which the runner always provides, so nothing here has to forward the SHAs by hand.
           fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
