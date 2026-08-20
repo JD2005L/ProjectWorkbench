@@ -76,12 +76,24 @@ systemctl cat "$UNIT_NAME" >/dev/null 2>&1 || die "$UNIT_NAME is not installed o
 hr "preflight: are the marker-stamping scripts in place?"
 KEEP="$LIVE_SCRIPTS/pw-tmux-keepalive.sh"
 [ -f "$KEEP" ] || die "not found: $KEEP"
-if grep -q "set-option -s .*@pw_owner" "$KEEP"; then
+# The marker option is referenced through a variable — OWNER_MARKER_OPTION='@pw_owner'
+# then `set-option -s "$OWNER_MARKER_OPTION" …` — so the literal never appears on
+# the set-option line. Match the two facts independently instead of assuming they
+# share a line, and print what was found so a miss is diagnosable rather than just
+# an assertion.
+HAS_MARKER=0; HAS_SETOPT=0
+grep -q '@pw_owner' "$KEEP" && HAS_MARKER=1
+grep -q 'set-option -s' "$KEEP" && HAS_SETOPT=1
+printf '  %s references @pw_owner   : %s\n' "$(basename "$KEEP")" "$([ "$HAS_MARKER" -eq 1 ] && echo yes || echo NO)"
+printf '  %s calls set-option -s    : %s\n' "$(basename "$KEEP")" "$([ "$HAS_SETOPT" -eq 1 ] && echo yes || echo NO)"
+if [ "$HAS_MARKER" -eq 1 ] && [ "$HAS_SETOPT" -eq 1 ]; then
   say "live keepalive stamps the owner marker — good"
 else
-  die "the live keepalive does NOT stamp the @pw_owner marker, so restarting the
+  die "the live keepalive does not stamp the @pw_owner marker, so restarting the
       sidecar would come back just as unowned. Promote scripts/ first:
-        sudo bash /opt/project-workbench/persistent/admin-home/promote-app.sh"
+        sudo bash /opt/project-workbench/persistent/admin-home/promote-app.sh
+      If you have already promoted, compare the live copy against the checkout:
+        diff $KEEP $REPO/scripts/pw-tmux-keepalive.sh"
 fi
 
 # ------------------------------------------------- preflight: unit diff ------
