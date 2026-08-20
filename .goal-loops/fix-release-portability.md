@@ -139,8 +139,8 @@ merge-base-with-base-branch resolution unchanged.
 | `scripts/pw-tmux-restore` | `ENVBASH` and both per-user `cred_env_prefix` strings carry the token (post-reboot restore) |
 | `test/autoupdater-env.test.mjs` | **new** — real-process dashboard regressions + source contract across all five seams |
 | `test/pane-env-fixture.mjs` | **new** — scrubbed private tmux server + baseline assertion, so pane-env claims can fail |
-| `test/release-guard-lib.mjs` | **new** — event-aware comparison range and verdict, testable against a fixture repo; round 2 made an unresolvable release range fail closed |
-| `test/release-version.test.mjs` | rewritten onto the lib; adds the non-vacuity regression, the round 2 multi-commit fail-closed regression, and the preserved-behaviour set |
+| `test/release-guard-lib.mjs` | **new** — event-aware comparison range and verdict, testable against a fixture repo; round 2 made an unresolvable release range fail closed; round 3 made push ranges two-dot |
+| `test/release-version.test.mjs` | rewritten onto the lib; adds the non-vacuity regression, the round 2 multi-commit fail-closed regression, the round 3 divergent-force-push regression, and the preserved-behaviour set |
 | `test/project-terminal-start.test.mjs` | + 2 real-process pane-env regressions; harness server scrubbed |
 | `test/pw-tmux-restore.test.mjs` | + 2 real-process pane-env regressions; harness server scrubbed |
 | `.github/workflows/test.yml` | comment only: why full history is needed for the push event too, and (round 2) why that depth is load-bearing rather than defensive |
@@ -215,6 +215,59 @@ deliberately). Only the release branch fails closed this way:
 only, none of which is deployable content — the guard's own classifier says so — and the branch's
 existing bump still covers the `app/server.js` change it carries.
 
+## Round 3 follow-up: the push range was three-dot, which forgives a rollback
+
+**Found by independent immutable review of `9a92454`, and correct.** `resolveComparison` picked the
+right endpoints for a release push, but `changedFiles` always diffed `before...HEAD`. Three dots means
+"merge-base(before, HEAD) → HEAD" — what has been ADDED since the two tips last agreed. For a push
+that is the wrong question: `before` and `after` are the branch's OLD and NEW tips, and a force-push
+REPLACES the tree rather than adding to it.
+
+```
+A  server.js=v1, VERSION 1.26.0101.0000
+B  old release tip, from A — server.js=v2, VERSION 1.26.0102.0000
+C  force-pushed replacement, from A — docs only          <- main, event before=B
+```
+
+`B...C` is measured from A, so it reports only what C added since A: docs, and a VERSION that moved
+*forward*. The rollback of `app/server.js` from v2 back to v1 — a real change to what every instance
+runs — is not in the diff at all, and the guard returned `no-deployable-change`.
+
+**RED**, on that exact shape, before any change:
+
+```
+not ok 12 - REGRESSION: a divergent force-push is measured old tree -> new tree, not from the merge base
+    sanity: old tree -> new tree DOES contain the rollback
+not ok 13 - a force-push that rolls the release identifier BACKWARDS is a violation
+not ok 19 - PRESERVED: proposal comparisons stay three-dot, so a branch is never blamed for what landed on its base
+```
+
+The first sanity assertion in that test — `changedFiles(B, C, 'three-dot').filter(isDeployable)` is
+`[]` — PASSED while RED. That is the defect, measured rather than described.
+
+**Repair.** `changedFiles` takes an explicit `diffMode` (`'two-dot' | 'three-dot'`, unknown values
+throw), and every comparison carries the one it means:
+
+| Comparison | Range | Why |
+|---|---|---|
+| Release push, and the non-default-branch push fallback | **two-dot** `before..HEAD` | the endpoints are the old and new tips; a replaced tree must be diffed against the tree it replaced |
+| Pull request, branch, local run | **three-dot** `mergeBase...HEAD` | a proposal, which must not be blamed for what landed on its base without it |
+
+A fast-forward push is unaffected — when `before` is an ancestor, the two forms are identical, and a
+test asserts exactly that so the change cannot quietly alter the ordinary case. Backwards/rollback
+identifiers on a force-push are now violations by both signals independently: the rolled-back
+`app/server.js` appears in the deployable list (proved with the replacement carrying B's identifier
+unchanged), and the identifier moving `1.26.0102.0000` → `1.26.0101.0000` fails the forwards check.
+
+Proposal semantics are proved rather than assumed: a docs-only branch cut before somebody else's
+`app/server.js` landed on main is shown to be blamed for that file under an old-tree/new-tree diff
+against main's tip, and not blamed under the three-dot comparison the guard actually uses — across the
+pull-request, branch-push and local forms.
+
+**GREEN:** `node --test ../test/release-version.test.mjs` → **21 tests, 21 pass, 0 fail, 0 skipped**.
+
+No `app/VERSION` bump: like round 2, this round touches `test/`, `.github/` and this record only.
+
 ## Final verification
 
 Recorded after the last code change of each round; this file is the only edit made after each
@@ -230,6 +283,7 @@ Both rounds:
 |---|---|---|---|
 | 1 | `9f815a3` | 1097 tests, 1094 pass, 0 fail, 3 skipped (118s) | 96/96 over the touched suites + `tmux-seam-gate` |
 | 2 | the follow-up commit on this branch | 1098 tests, 1095 pass, 0 fail, 3 skipped (160s) | 17/17 on `release-version.test.mjs`, both `PW_DEPLOY_MODE` legs |
+| 3 | the second follow-up commit on this branch | 1102 tests, 1099 pass, 0 fail, 3 skipped (264s) | 21/21 on `release-version.test.mjs`, both `PW_DEPLOY_MODE` legs |
 
 The 3 local skips are pre-existing and environmental — `orch-privilege-real` assertions that cannot
 fail when the suite already runs as the account it drops to (they ask for root, or

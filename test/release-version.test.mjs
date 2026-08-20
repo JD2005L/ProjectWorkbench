@@ -310,6 +310,94 @@ test('a push whose base branch is not in the checkout is still checked, from the
   } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
 });
 
+/**
+ * A force-push replaces the branch's tree; it does not add to it. The authoritative question is
+ * therefore "what does the NEW tree contain that the OLD tree did not", and three-dot cannot ask it:
+ * `B...C` diffs merge-base(B, C) against C, so everything B introduced and C rolled back is invisible.
+ *
+ * A: server.js=v1, VERSION 1.26.0101.0000
+ * B: the old release tip, from A — server.js=v2, VERSION 1.26.0102.0000
+ * C: the force-pushed replacement, from A — docs only (optionally carrying B's VERSION forward)
+ *
+ * main = C, and the push event says before=B. `B...C` is measured from A, so it reports only what C
+ * added since A — docs, and a VERSION that moved FORWARD. The rollback of app/server.js from v2 to v1
+ * — a real change to what every instance runs — does not appear at all.
+ */
+function forcePushFixture({ keepVersion = false } = {}) {
+  const dir = initRepo('pw-release-force-');
+  fs.mkdirSync(path.join(dir, 'app'), { recursive: true });
+  fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'app', 'VERSION'), '1.26.0101.0000\n');
+  fs.writeFileSync(path.join(dir, 'app', 'server.js'), 'console.log("v1");\n');
+  fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), '# plan\n');
+  runIn(dir, 'add', '-A');
+  runIn(dir, 'commit', '-q', '-m', 'A: base');
+  const a = runIn(dir, 'rev-parse', 'HEAD');
+
+  fs.writeFileSync(path.join(dir, 'app', 'server.js'), 'console.log("v2");\n');
+  fs.writeFileSync(path.join(dir, 'app', 'VERSION'), '1.26.0102.0000\n');
+  runIn(dir, 'add', '-A');
+  runIn(dir, 'commit', '-q', '-m', 'B: old release tip');
+  const b = runIn(dir, 'rev-parse', 'HEAD');
+
+  // The force-push: main is moved back to A and a different commit is built there. B stays a real,
+  // resolvable object — this is the "divergent but resolvable" case, not the unresolvable one.
+  runIn(dir, 'checkout', '-q', '-B', 'main', a);
+  fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), '# plan, rewritten\n');
+  if (keepVersion) fs.writeFileSync(path.join(dir, 'app', 'VERSION'), '1.26.0102.0000\n');
+  runIn(dir, 'add', '-A');
+  runIn(dir, 'commit', '-q', '-m', 'C: force-pushed replacement');
+  const c = runIn(dir, 'rev-parse', 'HEAD');
+
+  return { dir, a, b, c, version: fs.readFileSync(path.join(dir, 'app', 'VERSION'), 'utf8').trim() };
+}
+
+test('REGRESSION: a divergent force-push is measured old tree -> new tree, not from the merge base', () => {
+  const fx = forcePushFixture({ keepVersion: true });
+  try {
+    // The hole, measured: three-dot sees no deployable change at all, two-dot sees the rollback.
+    assert.deepEqual(changedFiles(fx.dir, fx.b, fx.c, 'three-dot').filter(isDeployable), [],
+      'sanity: from the merge base, the rolled-back file is invisible — which is why the guard passed');
+    assert.deepEqual(changedFiles(fx.dir, fx.b, fx.c, 'two-dot').filter(isDeployable), ['app/server.js'],
+      'sanity: old tree -> new tree DOES contain the rollback');
+
+    const env = actionsEnv(fx.dir, 'push', pushEvent({ before: fx.b, after: fx.c }), { GITHUB_REF_NAME: 'main' });
+    const comparison = resolveComparison({ repoDir: fx.dir, env });
+    assert.equal(comparison.from, fx.b, 'the range still starts at the pushed-away tip');
+    assert.equal(comparison.diffMode, 'two-dot', 'a push range is an old-tree/new-tree question, never a merge-base one');
+
+    const verdict = evaluateRelease({ repoDir: fx.dir, version: fx.version, comparison });
+    assert.equal(verdict.status, 'violation', `a rolled-back app/server.js must be caught: ${JSON.stringify(verdict)}`);
+    assert.match(verdict.reason, /app\/server\.js/, 'the rolled-back file must be named');
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
+});
+
+test('a force-push that rolls the release identifier BACKWARDS is a violation', () => {
+  const fx = forcePushFixture({ keepVersion: false });
+  try {
+    // C carries A's identifier, so relative to the tip it replaced the release number moved backwards.
+    assert.equal(fx.version, '1.26.0101.0000');
+    const env = actionsEnv(fx.dir, 'push', pushEvent({ before: fx.b, after: fx.c }), { GITHUB_REF_NAME: 'main' });
+    const verdict = evaluateRelease({ repoDir: fx.dir, version: fx.version, comparison: resolveComparison({ repoDir: fx.dir, env }) });
+    assert.equal(verdict.status, 'violation', JSON.stringify(verdict));
+    assert.match(verdict.reason, /move forwards|1\.26\.0102\.0000/, 'the backwards move must be named, not just the file list');
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
+});
+
+test('a fast-forward push is unaffected: both range forms agree when the old tip is an ancestor', () => {
+  const fx = releaseFixture();
+  try {
+    assert.deepEqual(
+      changedFiles(fx.dir, fx.before, fx.after, 'two-dot'),
+      changedFiles(fx.dir, fx.before, fx.after, 'three-dot'),
+      'the ordinary case must not change meaning',
+    );
+    const env = actionsEnv(fx.dir, 'push', pushEvent({ before: fx.before, after: fx.after }), { GITHUB_REF_NAME: 'main' });
+    const verdict = evaluateRelease({ repoDir: fx.dir, version: fx.version, comparison: resolveComparison({ repoDir: fx.dir, env }) });
+    assert.equal(verdict.status, 'violation', JSON.stringify(verdict));
+  } finally { fs.rmSync(fx.dir, { recursive: true, force: true }); }
+});
+
 // --- everything the repair had to leave alone ---------------------------------
 
 test('PRESERVED: a pull request still compares against its base branch, not against push before/after', () => {
@@ -364,6 +452,50 @@ test('PRESERVED: a checkout with no base branch at all skips out loud rather tha
     runIn(dir, 'branch', '-m', 'main', 'detached-work'); // no main, no origin/main: a tarball or shallow export
     const comparison = resolveComparison({ repoDir: dir, env: {} });
     assert.match(comparison.skip || '', /no base branch/);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+});
+
+test('PRESERVED: proposal comparisons stay three-dot, so a branch is never blamed for what landed on its base', () => {
+  const dir = initRepo('pw-release-proposal-');
+  try {
+    fs.mkdirSync(path.join(dir, 'app'), { recursive: true });
+    fs.mkdirSync(path.join(dir, 'docs'), { recursive: true });
+    fs.writeFileSync(path.join(dir, 'app', 'VERSION'), '1.26.0101.0000\n');
+    fs.writeFileSync(path.join(dir, 'app', 'server.js'), 'console.log("v1");\n');
+    fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), '# plan\n');
+    runIn(dir, 'add', '-A');
+    runIn(dir, 'commit', '-q', '-m', 'A: base');
+    const a = runIn(dir, 'rev-parse', 'HEAD');
+
+    // Somebody else's work lands on main, with its own bump.
+    fs.writeFileSync(path.join(dir, 'app', 'server.js'), 'console.log("v2, landed on main");\n');
+    fs.writeFileSync(path.join(dir, 'app', 'VERSION'), '1.26.0102.0000\n');
+    runIn(dir, 'add', '-A');
+    runIn(dir, 'commit', '-q', '-m', 'D: landed on main');
+    const d = runIn(dir, 'rev-parse', 'HEAD');
+
+    // A docs-only branch cut from A, which knows nothing about D.
+    runIn(dir, 'checkout', '-q', '-b', 'feature', a);
+    fs.writeFileSync(path.join(dir, 'docs', 'plan.md'), '# plan, edited on the branch\n');
+    runIn(dir, 'add', '-A');
+    runIn(dir, 'commit', '-q', '-m', 'E: docs only');
+
+    // This is what three-dot is FOR: measured from main's tip, the branch would appear to change
+    // app/server.js (backwards, to v1) purely because main moved on without it.
+    assert.deepEqual(changedFiles(dir, d, 'HEAD', 'two-dot').filter(isDeployable), ['app/server.js'],
+      'sanity: an old-tree/new-tree comparison against the base TIP would blame the branch for D');
+
+    for (const env of [
+      actionsEnv(dir, 'pull_request', { pull_request: { number: 1 } }, { GITHUB_REF_NAME: 'feature', GITHUB_BASE_REF: 'main' }),
+      actionsEnv(dir, 'push', pushEvent({ before: a, after: runIn(dir, 'rev-parse', 'HEAD'), branch: 'feature' }), { GITHUB_REF_NAME: 'feature' }),
+      {},
+    ]) {
+      const comparison = resolveComparison({ repoDir: dir, env });
+      assert.equal(comparison.diffMode, 'three-dot', `a proposal must keep merge-base semantics: ${JSON.stringify(comparison)}`);
+      assert.equal(comparison.from, a, 'a proposal is measured from its merge base');
+      assert.equal(evaluateRelease({ repoDir: dir, version: '1.26.0101.0000', comparison }).status, 'no-deployable-change',
+        'a docs-only branch must not be blamed for main\'s landed app change');
+    }
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 

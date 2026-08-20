@@ -23,6 +23,14 @@
 // and no skip, because a skipped test is a green run. Only the release branch fails closed this way;
 // every other caller keeps its existing skip-out-loud behaviour.
 //
+// AND A PUSH RANGE IS TWO-DOT, not three-dot. `before` and `after` are the branch's OLD and NEW tips,
+// so the question is "what does the new tree contain that the old one did not" — not "what has been
+// added since their common ancestor". Under three-dot a divergent force-push is measured from a merge
+// base that neither tip is, so everything the old tip shipped and the new tip rolled back vanishes
+// from the diff: a rollback of `app/server.js` reads as no deployable change at all. Proposals (pull
+// requests, branches, local runs) keep three-dot, because a branch must not be blamed for work that
+// landed on its base without it. See changedFiles.
+//
 // This lives under test/ deliberately: it is CI logic, it never ships, and it must NOT be
 // deployable content itself (see isDeployable below — anything under app/ would oblige every edit
 // to this file to carry a release bump).
@@ -51,9 +59,25 @@ export function gitVerify(repoDir, ref) {
  * name and the deployable source name would never appear in the diff at all — a version bump
  * requirement erased by a `git mv`. `--no-renames` turns every rename back into an independent
  * delete + add pair so both names surface and get classified on their own.
+ *
+ * TWO RANGE FORMS, because the guard asks two genuinely different questions.
+ *
+ * `three-dot` (`A...B`) diffs merge-base(A, B) against B: "what does this branch PROPOSE on top of
+ * its base". That is right for a pull request, a branch, or a local run — a branch must not be
+ * blamed for work that landed on main without it, which is exactly what a merge base filters out.
+ *
+ * `two-dot` (`A..B`) diffs the A tree against the B tree: "what does the new tree contain that the
+ * old one did not". That is the only correct question for a PUSH, whose endpoints are the branch's
+ * old and new tips. A force-push REPLACES the tree, so under three-dot everything the old tip shipped
+ * and the new tip rolled back is measured from a common ancestor that neither of them is — and a
+ * rollback of `app/server.js`, a real change to what every instance runs, disappears from the diff.
  */
-export function changedFiles(repoDir, fromRef, toRef) {
-  return git(repoDir, ['diff', '--no-renames', '--name-only', `${fromRef}...${toRef}`])
+export function changedFiles(repoDir, fromRef, toRef, diffMode = 'three-dot') {
+  if (diffMode !== 'two-dot' && diffMode !== 'three-dot') {
+    throw new Error(`unknown diff mode: ${diffMode}`);
+  }
+  const range = diffMode === 'two-dot' ? `${fromRef}..${toRef}` : `${fromRef}...${toRef}`;
+  return git(repoDir, ['diff', '--no-renames', '--name-only', range])
     .split('\n').filter(Boolean);
 }
 
@@ -126,7 +150,9 @@ export function baseRef(repoDir, env = process.env) {
  * The two endpoints the guard compares, chosen from what the CI event actually is.
  *
  * Returns one of:
- *   { kind, from, to }           — compare these; `to` is always the checked-out tree's HEAD
+ *   { kind, from, to, diffMode } — compare these; `to` is always the checked-out tree's HEAD, and
+ *                                  diffMode says HOW: two-dot for a push's old tree -> new tree,
+ *                                  three-dot for a proposal against its base (see changedFiles)
  *   { kind: 'on-base', ... }     — this checkout proposes nothing (local main, no event)
  *   { unresolved: true, reason } — a RELEASE push whose own range is unavailable: a refusal, which
  *                                  evaluateRelease turns into a failing verdict, never a skip
@@ -134,9 +160,10 @@ export function baseRef(repoDir, env = process.env) {
  *                                  of this event; say so out loud
  *
  * The rule, in order: a push to the release branch (or to a branch this runner cannot name) is
- * measured by the event's own before → HEAD, and refuses if that range is unavailable; anything else
- * is measured against its base branch; and a push whose base branch is not in the checkout falls back
- * to the event range rather than skipping, because a push always knows its own range.
+ * measured by the event's own before → HEAD as an old-tree/new-tree diff, and refuses if that range
+ * is unavailable; anything else is measured against its base branch from the merge base; and a push
+ * whose base branch is not in the checkout falls back to the event range rather than skipping,
+ * because a push always knows its own range.
  *
  * It never returns a range whose endpoints are the same commit — that is the vacuous pass — and never
  * a range NARROWER than what the event shipped, which is the same failure wearing a different face.
@@ -160,7 +187,7 @@ export function resolveComparison({ repoDir, env = process.env, event = readEven
   const pushRange = ({ release }) => {
     const before = String(event?.before || '');
     if (before && before !== ZERO_SHA && gitVerify(repoDir, before)) {
-      return { kind: release ? 'push-to-release-branch' : 'push-range', from: before, to: 'HEAD' };
+      return { kind: release ? 'push-to-release-branch' : 'push-range', from: before, to: 'HEAD', diffMode: 'two-dot' };
     }
     if (!release) return null; // caller falls back to its own base-branch reasoning, or skips
     // A branch just created (all-zero sentinel), a force-push whose old tip is gone, a shallow
@@ -210,7 +237,7 @@ export function resolveComparison({ repoDir, env = process.env, event = readEven
   if (mergeBase === git(repoDir, ['rev-parse', 'HEAD'])) {
     return { kind: 'on-base', base, nothingProposed: true };
   }
-  return { kind: eventName.startsWith('pull_request') ? 'pull-request' : 'branch', from: mergeBase, to: 'HEAD', base };
+  return { kind: eventName.startsWith('pull_request') ? 'pull-request' : 'branch', from: mergeBase, to: 'HEAD', base, diffMode: 'three-dot' };
 }
 
 /**
@@ -230,7 +257,10 @@ export function evaluateRelease({ repoDir, version, comparison }) {
   if (comparison.skip) return { status: 'skipped', reason: comparison.skip };
   if (comparison.nothingProposed) return { status: 'nothing-proposed' };
 
-  const deployable = changedFiles(repoDir, comparison.from, comparison.to).filter(isDeployable);
+  // The comparison carries its own range form: a push is an old-tree/new-tree question, a proposal is
+  // a merge-base one (see changedFiles). resolveComparison always sets it; a hand-built comparison
+  // without one gets the proposal form, the conservative default for "what did this add".
+  const deployable = changedFiles(repoDir, comparison.from, comparison.to, comparison.diffMode || 'three-dot').filter(isDeployable);
   if (deployable.length === 0) return { status: 'no-deployable-change', deployable };
 
   let previous;
