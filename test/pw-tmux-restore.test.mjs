@@ -27,6 +27,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ownedTmuxFixture } from './tmux-owner-fixture.mjs';
+import { assertNoAmbientPaneEnv, startCleanTmuxServer } from './pane-env-fixture.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -88,6 +89,9 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
   // owner unit marks the real one, and the REAL assertion helper is put on PATH.
   // Without this the seams correctly refuse an unmarked server — which is the
   // state that cannot occur in production.
+  // Panes inherit the tmux SERVER's environment, so the private server comes up scrubbed of the
+  // pane-environment names these tests assert on — see test/pane-env-fixture.mjs.
+  startCleanTmuxServer(sock);
   const owned = ownedTmuxFixture({ socket: sock, dir });
   const env = {
     ...owned,
@@ -420,6 +424,41 @@ test('a genuinely well-formed shared:false response (real string types, valid fi
     assert.equal(env.CLAUDE_CONFIG_DIR, `${ctx.dir}/fake-claude-config`);
     const stamped = (await tmux(ctx.sock, ['show-options', '-t', ctx.session, '-v', '@pw_cred_key'])).stdout.trim();
     assert.equal(stamped, '1234567890abcdef');
+  } finally { await teardown(ctx); }
+});
+
+// REGRESSION: a reboot recreates every project session through THIS script, so a pane environment
+// missing here means the autoupdater nag (and unattended self-updates) come back on every restart,
+// no matter what the dashboard and the systemd terminal entrypoint set. Both variants are covered:
+// the shared-login shell and the per-user credential prefix, which are separate strings.
+test('REGRESSION: a restored shared-login pane carries DISABLE_AUTOUPDATER=1', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  try {
+    await assertNoAmbientPaneEnv(ctx.sock);
+    await runScript(ctx);
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', ctx.session]), 'the session must have been restored');
+    const env = await paneEnviron(ctx.sock, ctx.session);
+    assert.equal(env.DISABLE_AUTOUPDATER, '1', 'a restored project pane must disable the Claude Code autoupdater');
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION: a restored OWNED pane carries DISABLE_AUTOUPDATER=1 alongside its credentials', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_realtoken') }] }));
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+  ]);
+  try {
+    await assertNoAmbientPaneEnv(ctx.sock);
+    await runScript(ctx);
+    const env = await paneEnviron(ctx.sock, ctx.session);
+    assert.equal(env.DISABLE_AUTOUPDATER, '1', 'a restored owned pane must disable the autoupdater too');
+    assert.match(env.CLAUDE_CONFIG_DIR || '', /pw-users.*alice.*claude/, 'credential isolation must be unchanged');
   } finally { await teardown(ctx); }
 });
 

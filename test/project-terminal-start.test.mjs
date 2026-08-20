@@ -23,6 +23,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { ownedTmuxFixture } from './tmux-owner-fixture.mjs';
+import { assertNoAmbientPaneEnv, startCleanTmuxServer } from './pane-env-fixture.mjs';
 
 const execFileAsync = promisify(execFile);
 const REPO = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
@@ -121,6 +122,10 @@ async function setup({ primaryUser = null, users = [], enabled = false } = {}) {
   // owner unit marks the real one, and the REAL assertion helper is put on PATH.
   // Without this the seams correctly refuse an unmarked server — which is the
   // state that cannot occur in production.
+  // Panes inherit the tmux SERVER's environment, so the private server comes up scrubbed of the
+  // pane-environment names these tests assert on — otherwise a runner that already exports them
+  // (a ProjectWorkbench terminal does) makes every such assertion pass on an unpatched tree.
+  startCleanTmuxServer(sock);
   const owned = ownedTmuxFixture({ socket: sock, dir });
   const env = {
     ...owned,
@@ -231,6 +236,41 @@ test('enabled + valid owner: the session carries the owner\'s CLAUDE_CONFIG_DIR 
     assert.match(env.CLAUDE_CONFIG_DIR || '', /pw-users.*alice.*claude/);
     const key = (await tmux(ctx.sock, ['show-options', '-t', session, '-qv', '@pw_cred_key'])).stdout.trim();
     assert.match(key, /^[0-9a-f]{16}$/, 'the session must be stamped with the real per-user fingerprint, matching app/server.js\'s contract');
+  } finally { await teardown(ctx); }
+});
+
+// REGRESSION: this is the HOST-MODE production terminal — every project terminal on a PVI host is
+// started by project-terminal@.service, which runs this script. Its pane environment was assembled
+// independently of the dashboard's and never carried DISABLE_AUTOUPDATER, so host-mode terminals
+// nagged (and could self-update Claude Code under a running agent) no matter what the dashboard did.
+// A pane's environment is fixed at creation, so this can only be proven by reading the real pane.
+test('REGRESSION: the host-mode terminal pane carries DISABLE_AUTOUPDATER=1', { timeout: 15000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  try {
+    await assertNoAmbientPaneEnv(ctx.sock);
+    const result = await runScript(ctx);
+    assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
+    const session = 'pw_' + ctx.name;
+    assert.ok(await tmuxOk(ctx.sock, ['has-session', '-t', session]), 'the tmux session must have been created');
+    const env = await paneEnviron(ctx.sock, session);
+    assert.equal(env.DISABLE_AUTOUPDATER, '1', 'a host-mode project pane must disable the Claude Code autoupdater');
+  } finally { await teardown(ctx); }
+});
+
+// The per-user credential variant builds its OWN env string, so a project WITH an owner is a
+// separate seam from the shared-login one above — and was the one most likely to be missed.
+test('REGRESSION: an owned project\'s host-mode pane carries DISABLE_AUTOUPDATER=1 alongside its credentials', { timeout: 15000 }, async () => {
+  const secretKey = crypto.randomBytes(32).toString('hex');
+  const ctx = await setup({ enabled: true, primaryUser: 'alice', users: [{ username: 'alice' }] });
+  await fsp.writeFile(ctx.env.PW_SECRET_KEY_PATH, secretKey);
+  await fsp.writeFile(ctx.env.PW_USERS_PATH, JSON.stringify({ users: [{ username: 'alice', ghToken: encryptToken(secretKey, 'ghp_realtoken') }] }));
+  try {
+    await assertNoAmbientPaneEnv(ctx.sock);
+    const result = await runScript(ctx);
+    assert.ok(result.timedOut || result.code === 0, JSON.stringify(result));
+    const env = await paneEnviron(ctx.sock, 'pw_' + ctx.name);
+    assert.equal(env.DISABLE_AUTOUPDATER, '1', 'an owned project pane must disable the autoupdater too');
+    assert.match(env.CLAUDE_CONFIG_DIR || '', /pw-users.*alice.*claude/, 'credential isolation must be unchanged');
   } finally { await teardown(ctx); }
 });
 

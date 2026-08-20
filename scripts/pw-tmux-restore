@@ -51,7 +51,9 @@ NODE_BIN=$(command -v node || echo /usr/bin/node)
 # Shared-login shell, used ONLY for the legitimate off/no-owner case (a
 # resolved cred_env_prefix of exactly this) — never as a fallback for a
 # resolution failure.
-ENVBASH='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
+# DISABLE_AUTOUPDATER: identical to the token app/server.js and scripts/project-terminal-start put
+# in every pane they create — a session restored after a reboot must not be the one that nags.
+ENVBASH='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
 
 log() { printf '%s restore: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null || true; }
 
@@ -345,9 +347,9 @@ resolve_session_credentials() {
 		printf -v quoted_cfg '%q' "CLAUDE_CONFIG_DIR=$cred_config_dir"
 		if [[ -n "$cred_env_file" ]]; then
 			printf -v quoted_rcfile '%q' "$cred_env_file"
-			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --rcfile $quoted_rcfile"
+			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --rcfile $quoted_rcfile"
 		else
-			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --norc"
+			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --norc"
 		fi
 	else
 		cred_env_prefix="$ENVBASH"
