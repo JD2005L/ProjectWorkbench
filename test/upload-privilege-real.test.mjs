@@ -77,18 +77,18 @@ import fs from 'node:fs/promises';
 import { Readable } from 'node:stream';
 import { makePasswdLookup, resolveTerminalOwner } from '${APP_DIR}terminal-owner.js';
 import { credentialExecutionPlan } from '${APP_DIR}user-credentials.js';
-import { inboxWriteArgv, runInboxWrite } from '${APP_DIR}workspace-file.js';
+import { workspaceJobArgv, runWorkspaceWrite } from '${APP_DIR}workspace-file.js';
 
 const execFileAsync = promisify(execFile);
 const owner = await resolveTerminalOwner(process.env, makePasswdLookup({ execFile: execFileAsync, readFile: fs.readFile }));
 const currentUid = process.getuid();
 const plan = credentialExecutionPlan({ owner, currentUid });
-const argv = inboxWriteArgv({ plan, execPath: process.execPath, helperPath: '${APP_DIR}workspace-writer.mjs' });
+const argv = workspaceJobArgv({ plan, execPath: process.execPath, helperPath: '${APP_DIR}workspace-writer.mjs' });
 const report = { currentUid, expectedUid: Number(owner.uid), ownerUser: owner.user, drop: plan.drop, argv0: argv[0], argv };
 try {
-  report.result = await runInboxWrite({
+  report.result = await runWorkspaceWrite({
     spawn, argv,
-    job: { action: 'inbox-write', projectPath: ${JSON.stringify(tree.projectPath)}, name: ${JSON.stringify(name)} },
+    job: { action: 'box-write', box: '_inbox', projectPath: ${JSON.stringify(tree.projectPath)}, name: ${JSON.stringify(name)} },
     source: Readable.from([Buffer.from('REAL PAYLOAD')]),
     timeoutMs: 60000,
   });

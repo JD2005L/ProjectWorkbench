@@ -17,7 +17,7 @@ import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './term
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
-import { inboxWriteArgv, runInboxWrite } from './workspace-file.js';
+import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv } from './workspace-file.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { withLifecycleLock } from './lifecycle-lock.js';
@@ -251,38 +251,60 @@ async function workspaceOwner(){
   : `${user}:${user}`;
  return { user, spec };
 }
-// Workspace file drops are NEVER written by this process.
+// NOTHING under `<project>/_inbox` or `<project>/_outbox` is touched by this
+// process.
 //
-// `<project>/_inbox` belongs to the pane account, so replacing it with a symlink
-// is within that account's authority — and this dashboard runs as root. The
+// Both boxes belong to the pane account, so replacing either with a symlink is
+// within that account's authority — and this dashboard runs as root. The
 // superseded upload path did a root mkdir, a root writeFile and then
 // `chown <owner> <_inbox> <file>`, and every one of those follows a link at the
 // final component (GNU chown takes no -h and no -P here): with
 // `_inbox -> /some/root/dir` the chown converted the TARGET and left the link
-// untouched. That is a local privilege escalation from "has a project terminal"
-// to root, and no amount of lstat-ing first repairs it, because check-then-use
+// untouched. The same substitution made every other route on both boxes a root
+// primitive as well — readdir/stat disclosed a root-only directory, sendFile and
+// download served root-only bytes, `rm <box>/<name>` deleted an arbitrary root
+// file by basename, and the recursive clear-all emptied an arbitrary root
+// directory. No amount of lstat-ing first repairs that, because check-then-use
 // is still a race.
 //
-// So the bytes go to app/workspace-writer.mjs running AS the terminal owner,
-// through the same fixed-argv drop the credential helper uses, with the payload
-// streamed on its stdin. No chown is needed: the file is created by its eventual
-// owner. See app/workspace-file.js for the whole argument.
+// So every box operation goes to app/workspace-writer.mjs running AS the
+// terminal owner, through the same fixed-argv drop the credential helper uses,
+// with payloads streamed on its stdin/stdout. No chown is needed for a write:
+// the file is created by its eventual owner. See app/workspace-file.js.
 const WORKSPACE_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), 'workspace-writer.mjs');
-// A handover that cannot be arranged FAILS the upload. Falling back to a root
-// write is the defect itself, and swallowing the failure — as the old
+// A handover that cannot be arranged FAILS the request. Falling back to doing
+// the work as root is the defect itself, and swallowing the failure — as the old
 // best-effort chown did — makes the boundary invisible rather than present.
-async function inboxWriter(project, name, source, { allowEmpty = false } = {}){
+async function workspaceArgv(){
  let owner;
  try { owner = await terminalOwner(); }
  catch(e){
-  throw new Error(`Upload refused: the terminal owner could not be resolved, and the dashboard will not write into a workspace as root (${e?.message || e})`);
+  throw new Error(`Refused: the terminal owner could not be resolved, and the dashboard will not touch a workspace as root (${e?.message || e})`);
  }
  const plan = credentialExecutionPlan({ owner, currentUid: process.getuid?.() ?? null });
- const argv = inboxWriteArgv({ plan, execPath: process.execPath, helperPath: WORKSPACE_HELPER });
- return runInboxWrite({
-  spawn, argv, source,
-  job: { action:'inbox-write', projectPath: project.path, name, allowEmpty },
+ return workspaceJobArgv({ plan, execPath: process.execPath, helperPath: WORKSPACE_HELPER });
+}
+async function boxWrite(project, box, name, source, { allowEmpty = false } = {}){
+ return runWorkspaceWrite({
+  spawn, argv: await workspaceArgv(), source,
+  job: { action:'box-write', projectPath: project.path, box, name, allowEmpty },
  });
+}
+async function boxJob(project, box, action, name){
+ return runWorkspaceJob({ spawn, argv: await workspaceArgv(), job: { action, projectPath: project.path, box, name } });
+}
+async function boxRead(project, box, name){
+ return runWorkspaceRead({ spawn, argv: await workspaceArgv(), job: { action:'box-read', projectPath: project.path, box, name } });
+}
+// The absolute path and download URL a listing carries. Pure string composition —
+// the dashboard learns the NAMES from the worker and never touches the directory.
+function boxFileFacts(p, box, name){
+ return {
+  path: path.join(p.path, box, name),
+  url: box === OUTBOX_DIR
+   ? `${BASE}/api/outbox/${encodeURIComponent(p.name)}/file/${encodeURIComponent(name)}`
+   : `${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(name)}`,
+ };
 }
 // An upload name is always `<ISO stamp>-<slug><ext>`, built here so the worker
 // only ever receives a single, already-safe path component.
@@ -293,6 +315,36 @@ function inboxUploadName(filename, ext){
 }
 // `Received 0 bytes` is the streaming route's own 400, not a server fault.
 function uploadStatus(e){ return e?.code === 'empty-payload' ? 400 : 500; }
+// RFC 6266, the same shape express's res.download produced. Built here rather
+// than pulled from express's transitive `content-disposition` dependency, which
+// this app does not declare.
+function attachmentHeader(name){
+ const ascii = name.replace(/[^\x20-\x7e]/g, '_').replace(/["\\]/g, '_');
+ return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+}
+// Stream one box entry to the client through the dropped worker. Replaces
+// res.sendFile/res.download, which resolved the path in THIS process and would
+// therefore still traverse a substituted box; an O_NOFOLLOW open here would not
+// help either, because it only guards the final component.
+async function sendBoxFile(res, p, box, rawName, { attachment = false } = {}){
+ const name = path.basename(String(rawName || ''));
+ let out;
+ try {
+  out = await boxRead(p, box, name);
+ } catch(e){
+  return res.status(e?.code === 'not-found' ? 404 : 500).send(e?.code === 'not-found' ? 'Not found' : 'Could not read file');
+ }
+ res.type(path.extname(name) || 'application/octet-stream');
+ res.setHeader('Content-Length', String(out.result.bytes));
+ // No byte ranges: a range would cost a second privileged round trip per
+ // request, and nothing in the drawer seeks within a file drop.
+ res.setHeader('Accept-Ranges', 'none');
+ if(attachment) res.setHeader('Content-Disposition', attachmentHeader(name));
+ const stop = ()=>{ try { out.child.kill('SIGTERM'); } catch {} };
+ res.on('close', stop);
+ out.stream.on('error', ()=>{ stop(); res.destroy(); });
+ return out.stream.pipe(res);
+}
 // Credential-tree work is NEVER done by this root process: the tree lives under
 // an account every terminal shares, so a root write there is a symlink attack
 // away from being a local root escalation. We drop to that account and run
@@ -2659,7 +2711,7 @@ app.post(BASE + '/api/upload/:project', requireInboxWrite, async (req,res)=>{ tr
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const {filename='clipboard-file', mime='', data=''} = req.body || {};
  const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin');
- const out = await inboxWriter(p, inboxUploadName(filename, ext), Readable.from([Buffer.from(data, 'base64')]), {allowEmpty:true});
+ const out = await boxWrite(p, INBOX_DIR, inboxUploadName(filename, ext), Readable.from([Buffer.from(data, 'base64')]), {allowEmpty:true});
  await audit('upload', { project: p.name, filename: path.basename(out.path), bytes: out.bytes }, req);
  return res.json({ok:true,path:out.path,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(out.path))}`});
 } catch(e){ return res.status(uploadStatus(e)).json({ok:false,error:e.message}); } });
@@ -2677,21 +2729,23 @@ app.post(BASE + '/api/upload-stream/:project', requireInboxWrite, async (req,res
   // an upload of any size still never lands in this process's memory — and an
   // abort mid-stream stands the worker down, which unlinks its temp rather than
   // publishing a truncated file.
-  const out = await inboxWriter(p, inboxUploadName(filename, ext), req);
+  const out = await boxWrite(p, INBOX_DIR, inboxUploadName(filename, ext), req);
   await audit('upload', { project: p.name, filename: path.basename(out.path), bytes: out.bytes }, req);
   return res.json({ok:true,path:out.path,bytes:out.bytes,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(out.path))}`});
  } catch(e){ res.status(uploadStatus(e)).json({ok:false,error:e.message}); }
 });
-app.get(BASE + '/file/:project/:file', requireAuth, requireProjectAccess, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
+// The inbox download. A missing entry is now a 404 rather than the 500 express's
+// default error handler produced from sendFile's ENOENT — the outbox twin below
+// already answered 404, and the two had no business disagreeing.
+app.get(BASE + '/file/:project/:file', requireAuth, requireProjectAccess, async (req,res)=>{
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project');
+ return sendBoxFile(res, p, INBOX_DIR, req.params.file);
+});
 
 app.get(BASE + '/api/inbox/:project', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const inbox = path.join(p.path, '_inbox');
- let entries; try { entries = await fs.readdir(inbox, {withFileTypes:true}); } catch { return res.json({ok:true,files:[]}); }
- const files = await Promise.all(entries.filter(e=>e.isFile()).map(async e => {
-  const full = path.join(inbox, e.name); const st = await fs.stat(full);
-  return { name: e.name, size: st.size, mtime: st.mtime.toISOString(), path: full, url: `${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(e.name)}` };
- }));
+ const out = await boxJob(p, INBOX_DIR, 'box-list');
+ const files = out.files.map(f => ({ ...f, ...boxFileFacts(p, INBOX_DIR, f.name) }));
  files.sort((a,b)=>b.mtime.localeCompare(a.mtime));
  res.json({ok:true,files});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
@@ -2699,26 +2753,24 @@ app.get(BASE + '/api/inbox/:project', requireAuth, requireProjectAccess, async (
 app.delete(BASE + '/api/inbox/:project/:file', requireInboxWrite, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const name = path.basename(req.params.file); if(!name || name==='.' || name==='..') return res.status(400).json({ok:false,error:'Invalid file'});
- await fs.rm(path.join(p.path,'_inbox',name), {force:true});
+ await boxJob(p, INBOX_DIR, 'box-delete', name);
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.delete(BASE + '/api/inbox/:project', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const inbox = path.join(p.path, '_inbox');
- try { const entries = await fs.readdir(inbox); await Promise.all(entries.map(n => fs.rm(path.join(inbox,n),{force:true,recursive:true}))); } catch {}
+ // A clear-all that cannot be performed is now REPORTED. The superseded route
+ // swallowed every failure and answered ok, which is exactly how a refusal to
+ // touch a substituted box would have looked like a successful wipe.
+ await boxJob(p, INBOX_DIR, 'box-clear');
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 // _outbox: files an agent WRITES for the user to download (mirror of _inbox).
 // Listing/downloading needs project access; mutations need terminal access.
 app.get(BASE + '/api/outbox/:project', requireAuth, requireProjectAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const outbox = path.join(p.path, '_outbox');
- let entries; try { entries = await fs.readdir(outbox, {withFileTypes:true}); } catch { return res.json({ok:true,files:[]}); }
- const files = await Promise.all(entries.filter(e=>e.isFile()).map(async e => {
-  const full = path.join(outbox, e.name); const st = await fs.stat(full);
-  return { name: e.name, size: st.size, mtime: st.mtime.toISOString(), path: full, url: `${BASE}/api/outbox/${encodeURIComponent(p.name)}/file/${encodeURIComponent(e.name)}` };
- }));
+ const out = await boxJob(p, OUTBOX_DIR, 'box-list');
+ const files = out.files.map(f => ({ ...f, ...boxFileFacts(p, OUTBOX_DIR, f.name) }));
  files.sort((a,b)=>b.mtime.localeCompare(a.mtime));
  res.json({ok:true,files});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
@@ -2726,18 +2778,18 @@ app.get(BASE + '/api/outbox/:project', requireAuth, requireProjectAccess, async 
 app.get(BASE + '/api/outbox/:project/file/:name', requireAuth, requireProjectAccess, async (req,res)=>{
  const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project');
  const name = path.basename(req.params.name); if(!name || name==='.' || name==='..') return res.status(400).send('Invalid file');
- res.download(path.join(p.path, '_outbox', name), name, (err)=>{ if(err && !res.headersSent) res.status(404).send('Not found'); });
+ return sendBoxFile(res, p, OUTBOX_DIR, name, {attachment:true});
 });
 app.delete(BASE + '/api/outbox/:project/file/:name', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
  const name = path.basename(req.params.name); if(!name || name==='.' || name==='..') return res.status(400).json({ok:false,error:'Invalid file'});
- await fs.rm(path.join(p.path,'_outbox',name), {force:true});
+ await boxJob(p, OUTBOX_DIR, 'box-delete', name);
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 app.delete(BASE + '/api/outbox/:project', requireTerminalAccess, async (req,res)=>{ try {
  const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- const outbox = path.join(p.path, '_outbox');
- try { const entries = await fs.readdir(outbox); await Promise.all(entries.map(n => fs.rm(path.join(outbox,n),{force:true,recursive:true}))); } catch {}
+ // As with the inbox clear above: a refusal is reported rather than swallowed.
+ await boxJob(p, OUTBOX_DIR, 'box-clear');
  res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 app.get(BASE + '/api/preview/:project/status', requireAuth, requireProjectAccess, async (req,res)=>{ try {
