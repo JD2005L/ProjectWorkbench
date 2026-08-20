@@ -11,6 +11,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { selfOwnedTerminalEnv } from './terminal-owner-fixture.mjs';
+
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
 
@@ -30,6 +32,11 @@ function makeInstance(port, extraEnv = {}) {
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'),
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
+    // The box routes are served by a worker running as the resolved terminal
+    // owner, and the host-mode default for that is the literal `admin` — real
+    // on PVI2, absent on a GitHub runner. Name the account actually running
+    // this suite so the instance is hermetic instead of machine-dependent.
+    ...selfOwnedTerminalEnv(),
     ...extraEnv,
   };
   return { dir, env };

@@ -32,15 +32,22 @@
 // cockpit-drawer.test.mjs already use.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { execFile, spawn } from 'node:child_process';
 import fs from 'node:fs';
+import fsp from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+
+import { makePasswdLookup, resolveTerminalOwner, terminalOwnerPlan } from '../app/terminal-owner.js';
+import { credentialExecutionPlan } from '../app/user-credentials.js';
+import { selfOwnedTerminalEnv } from './terminal-owner-fixture.mjs';
+
+const execFileAsync = promisify(execFile);
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
-const MY_NAME = os.userInfo().username;
 
 const SECRET = 'VICTIM-ONLY-CONTENT-8f21\n';
 const SECRET_NAME = 'victim-secret.txt';
@@ -62,7 +69,7 @@ function makeInstance(port, extraEnv = {}) {
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
     PW_AUDIT_LOG: path.join(dir, 'audit.log'),
-    PW_HOST_TERMINAL_USER: MY_NAME,
+    ...selfOwnedTerminalEnv(),
     ...extraEnv,
   };
   return { dir, env };
@@ -262,5 +269,67 @@ test('PRESERVED: authentication and project scoping still gate every box route',
     }
     // Auth is checked before the project is even resolved.
     assert.equal((await fetch(`${base}/api/inbox/nope`)).status, 401, 'auth is checked before the project exists');
+  });
+});
+
+// --- the fixture itself --------------------------------------------------------
+
+test('REGRESSION: a hermetic fixture resolves its terminal owner in BOTH deploy modes, with no privilege drop', async () => {
+  // WHAT MADE EXACT-HEAD CI RED. Box routes are served by a worker running as the
+  // resolved terminal owner, and a dashboard that cannot resolve one refuses
+  // rather than doing the work as root. With no owner named, host mode resolves
+  // the literal `admin` — real on PVI2/CT2115, absent on a GitHub runner, where
+  // the suite runs as `runner`. So every list came back
+  //   {"ok":false,"error":"Refused: the terminal owner could not be resolved …"}
+  // and two pre-existing cockpit-drawer assertions failed. The refusal is correct
+  // production behaviour; the FIXTURE was the machine-dependent part.
+  assert.deepEqual(
+    terminalOwnerPlan({ PW_DEPLOY_MODE: 'host' }), { kind: 'named', user: 'admin' },
+    'an instance that names no owner depends on an account that need not exist on this machine',
+  );
+
+  const lookup = makePasswdLookup({ execFile: execFileAsync, readFile: fsp.readFile });
+  const me = os.userInfo();
+
+  if (Number(me.uid) === 0) {
+    // A root runner has no distinct unprivileged owner to name, by design. The
+    // helper says so with the shared-account shape, which needs no drop either.
+    const owner = await resolveTerminalOwner(selfOwnedTerminalEnv(), lookup);
+    assert.equal(owner, null, 'a root runner resolves to the shared-account shape');
+    assert.equal(credentialExecutionPlan({ owner, currentUid: 0 }).drop, false);
+    return;
+  }
+
+  for (const mode of ['host', 'container']) {
+    const env = { PW_DEPLOY_MODE: mode, ...selfOwnedTerminalEnv() };
+    const owner = await resolveTerminalOwner(env, lookup);
+    assert.ok(owner, `${mode}: an owner must resolve — this is the assertion CI failed on`);
+    assert.equal(Number(owner.uid), me.uid, `${mode}: and it must be the account running this suite`);
+    assert.equal(
+      credentialExecutionPlan({ owner, currentUid: me.uid }).drop, false,
+      `${mode}: a hermetic fixture must never need a privilege drop`,
+    );
+  }
+  // And the fixture helper is NOT a substitute for privilege evidence: the two
+  // uids are equal here on purpose, which is exactly why the root-controller
+  // suites exist separately.
+  assert.equal(Number((await resolveTerminalOwner({ ...selfOwnedTerminalEnv() }, lookup)).uid), me.uid);
+});
+
+test('PRESERVED: the same fixture serves box routes under PW_DEPLOY_MODE=container', { timeout: 30000 }, async () => {
+  const port = nextPort++;
+  const inst = makeInstance(port, { PW_DEPLOY_MODE: 'container' });
+  const t = seedProject(inst);
+  fs.mkdirSync(t.box('_outbox'), { recursive: true });
+  fs.writeFileSync(path.join(t.box('_outbox'), 'a.txt'), 'aa');
+
+  await withServer(inst, port, async (base) => {
+    const list = await (await fetch(`${base}/api/outbox/demo`)).json();
+    assert.equal(list.ok, true, `container mode must resolve an owner too: ${JSON.stringify(list)}`);
+    assert.deepEqual(list.files.map((f) => f.name), ['a.txt']);
+    const dl = await fetch(`${base}${list.files[0].url}`);
+    assert.equal(dl.status, 200);
+    assert.equal(await dl.text(), 'aa');
+    assert.equal((await (await fetch(`${base}/api/inbox/demo`)).json()).ok, true);
   });
 });

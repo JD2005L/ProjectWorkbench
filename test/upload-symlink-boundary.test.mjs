@@ -26,10 +26,11 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { selfOwnedTerminalEnv } from './terminal-owner-fixture.mjs';
+
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
 const ME = os.userInfo().uid;
-const MY_NAME = os.userInfo().username;
 
 function makeInstance(port, extraEnv = {}) {
   const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pw-upload-')));
@@ -48,10 +49,10 @@ function makeInstance(port, extraEnv = {}) {
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
     PW_AUDIT_LOG: path.join(dir, 'audit.log'),
-    // The pane account this deployment hands workspace files to, resolved from
-    // passwd exactly as a live instance resolves it — named explicitly so the
-    // test does not depend on an `admin` account existing on the runner.
-    PW_HOST_TERMINAL_USER: MY_NAME,
+    // The pane account this deployment hands workspace files to, named
+    // explicitly so the instance does not depend on an `admin` account
+    // existing on the runner, and portable across both deploy modes.
+    ...selfOwnedTerminalEnv(),
     ...extraEnv,
   };
   return { dir, env };
