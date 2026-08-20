@@ -4,6 +4,7 @@ import fsSync from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { execFile, spawn } from 'child_process';
+import { Readable } from 'stream';
 import { promisify } from 'util';
 import { RELEASE_VERSION } from './version.js';
 import { resolveIsolation } from './isolation.js';
@@ -16,6 +17,7 @@ import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './term
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
+import { inboxWriteArgv, runInboxWrite } from './workspace-file.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { withLifecycleLock } from './lifecycle-lock.js';
@@ -249,18 +251,48 @@ async function workspaceOwner(){
   : `${user}:${user}`;
  return { user, spec };
 }
-// The dashboard runs as root, so anything it writes into a workspace lands
-// root-owned inside a tree the pane account owns: the agent can read the file
-// but cannot rewrite or delete it, and the drift accumulates one upload at a
-// time. Hand new paths to the terminal owner instead. Best-effort by design — a
-// chown that fails must not fail an upload that already succeeded.
-async function adoptIntoWorkspace(...targets){
- const paths = targets.filter(Boolean);
- if(!paths.length) return;
- const own = await workspaceOwner().catch(() => null);
- if(!own) return;
- await sh('chown',[own.spec, ...paths]).catch(()=>{});
+// Workspace file drops are NEVER written by this process.
+//
+// `<project>/_inbox` belongs to the pane account, so replacing it with a symlink
+// is within that account's authority — and this dashboard runs as root. The
+// superseded upload path did a root mkdir, a root writeFile and then
+// `chown <owner> <_inbox> <file>`, and every one of those follows a link at the
+// final component (GNU chown takes no -h and no -P here): with
+// `_inbox -> /some/root/dir` the chown converted the TARGET and left the link
+// untouched. That is a local privilege escalation from "has a project terminal"
+// to root, and no amount of lstat-ing first repairs it, because check-then-use
+// is still a race.
+//
+// So the bytes go to app/workspace-writer.mjs running AS the terminal owner,
+// through the same fixed-argv drop the credential helper uses, with the payload
+// streamed on its stdin. No chown is needed: the file is created by its eventual
+// owner. See app/workspace-file.js for the whole argument.
+const WORKSPACE_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), 'workspace-writer.mjs');
+// A handover that cannot be arranged FAILS the upload. Falling back to a root
+// write is the defect itself, and swallowing the failure — as the old
+// best-effort chown did — makes the boundary invisible rather than present.
+async function inboxWriter(project, name, source, { allowEmpty = false } = {}){
+ let owner;
+ try { owner = await terminalOwner(); }
+ catch(e){
+  throw new Error(`Upload refused: the terminal owner could not be resolved, and the dashboard will not write into a workspace as root (${e?.message || e})`);
+ }
+ const plan = credentialExecutionPlan({ owner, currentUid: process.getuid?.() ?? null });
+ const argv = inboxWriteArgv({ plan, execPath: process.execPath, helperPath: WORKSPACE_HELPER });
+ return runInboxWrite({
+  spawn, argv, source,
+  job: { action:'inbox-write', projectPath: project.path, name, allowEmpty },
+ });
 }
+// An upload name is always `<ISO stamp>-<slug><ext>`, built here so the worker
+// only ever receives a single, already-safe path component.
+function inboxUploadName(filename, ext){
+ const safe = slug(path.basename(filename, path.extname(filename)));
+ const stamp = new Date().toISOString().replace(/[:.]/g,'-');
+ return `${stamp}-${safe}${ext}`;
+}
+// `Received 0 bytes` is the streaming route's own 400, not a server fault.
+function uploadStatus(e){ return e?.code === 'empty-payload' ? 400 : 500; }
 // Credential-tree work is NEVER done by this root process: the tree lives under
 // an account every terminal shares, so a root write there is a symlink attack
 // away from being a local root escalation. We drop to that account and run
@@ -837,10 +869,25 @@ function hasDeployConfigFor(projectName, cfg){
 // one-click script execution for whoever opens the menu. Anything unparseable or
 // off-scheme is dropped rather than escaped, because there is no safe way to
 // render it as a link at all.
+//
+// URL CREDENTIALS ARE DROPPED THE SAME WAY. `new URL(...).href` preserves
+// `username:password@` userinfo verbatim, and projectLinksMenu() renders the URL
+// twice — once in the href, once as VISIBLE TEXT in the menu row — so a repo
+// configured as a clone URL with a token in it (`https://user:ghp_…@github.com/…`)
+// published that token to everyone who could open the cockpit, and shipped it in
+// the href of every click. The whole link is omitted rather than stripped: a link
+// that silently drops half of what an operator configured is its own kind of
+// wrong, and there is no way to render the credential safely.
 function safeHttpUrl(v){
  const s = String(v ?? '').trim();
  if(!s) return '';
- try { const u = new URL(s); return (u.protocol === 'http:' || u.protocol === 'https:') ? u.href : ''; }
+ try {
+  const u = new URL(s);
+  if(u.protocol !== 'http:' && u.protocol !== 'https:') return '';
+  // Either half alone is userinfo: `https://:pw@host` carries no username.
+  if(u.username || u.password) return '';
+  return u.href;
+ }
  catch { return ''; }
 }
 // repo is stored as a clone URL; drop the .git so the link opens the browsable page.
@@ -2605,7 +2652,17 @@ app.get(BASE + '/files/:project/', requireInboxWrite, async (req,res)=>{
  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(p.name)} — Files</title><style>body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;min-height:100vh;background:#0f172a;color:#e5e7eb}.f-header{display:flex;align-items:center;gap:1rem;padding:.95rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.f-header h1{margin:0;font-size:1.15rem}.f-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.f-header .back:hover{background:#1e293b;color:#fff}.f-header .grow{flex:1}.f-header .who{font-size:.85rem;color:#cbd5e1}.f-main{max-width:920px;margin:1.5rem auto;padding:0 1.5rem 3rem}.f-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.f-card h2{margin:0 0 .25rem;font-size:1.1rem;color:#bfdbfe}.f-card .muted{color:#94a3b8;font-size:.85rem;margin:.15rem 0 0}#drop{border:2px dashed #64748b;border-radius:14px;padding:42px 18px;text-align:center;background:#0b1220;cursor:pointer;color:#cbd5e1;font-size:.95rem;margin-top:.75rem}#drop:hover{background:#152033;border-color:#94a3b8}#drop.over{border-color:#60a5fa;background:#152033}#drop .hint{color:#94a3b8;font-size:.82rem;margin-top:.4rem}#status{margin-top:.65rem;font-size:.85rem;color:#bbf7d0;white-space:pre-wrap;min-height:1.3em}#status.err{color:#fca5a5}.ilist{display:flex;flex-direction:column;gap:.35rem;margin-top:.5rem}.irow{display:flex;align-items:center;gap:.65rem;padding:.5rem .65rem;background:#0b1220;border:1px solid #1f2937;border-radius:8px}.irow .thumb{width:36px;height:36px;background:#1f2937;border-radius:4px;flex:0 0 36px;display:flex;align-items:center;justify-content:center;color:#64748b;font-size:11px;font-weight:600;overflow:hidden}.irow .thumb img{width:100%;height:100%;object-fit:cover}.irow .nameCol{flex:1 1 auto;min-width:0;overflow:hidden}.irow .nameCol .name{color:#e5e7eb;font-size:.88rem;text-overflow:ellipsis;overflow:hidden;white-space:nowrap}.irow .nameCol .meta{color:#94a3b8;font-size:.75rem}.irow .copyBtn,.irow .del,.irow a{background:transparent;border:1px solid #334155;color:#cbd5e1;border-radius:6px;padding:3px 9px;font-size:.78rem;cursor:pointer;text-decoration:none}.irow .copyBtn:hover,.irow a:hover{background:#1e293b;color:#fff}.irow .del{color:#fca5a5;border-color:#7f1d1d}.irow .del:hover{background:#7f1d1d;color:#fff}.empty{color:#94a3b8;font-style:italic;font-size:.85rem;padding:.75rem 0}${statusBarCss}</style></head><body><header class="f-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Files — ${esc(p.name)}</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><main class="f-main"><div class="f-card"><h2>Drop or paste files</h2><p class="muted">Saved files go to <code>${esc(p.path)}/_inbox</code>. Click <b>Copy path</b> to grab the absolute path and hand it to whatever consumes the inbox (Claude conversation, PVIKPBot, etc.).</p><div id="drop" tabindex="0">Drop files here, paste from clipboard, or click to pick<div class="hint">PDF, text, images, docs, etc.</div><input id="file" type="file" style="display:none"></div><div id="status"></div></div><div class="f-card"><h2>Inbox</h2><div class="ilist" id="ilist"><div class="empty">Loading…</div></div></div><div class="f-card"><h2>Outbox <span class="muted" style="font-weight:400">— files the agent left for you</span></h2><div class="ilist" id="olist"><div class="empty">Loading…</div></div></div></main>${footer}<script>const project=${projectJson};const drop=document.getElementById('drop');const file=document.getElementById('file');const status=document.getElementById('status');const ilist=document.getElementById('ilist');const olist=document.getElementById('olist');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(t,err){status.textContent=t||'';status.classList.toggle('err',!!err)}function fmtSize(b){if(b<1024)return b+' B';if(b<1024*1024)return Math.round(b/1024)+' KB';return (b/1024/1024).toFixed(1)+' MB'}async function refreshInbox(){try{const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){ilist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){ilist.innerHTML='<div class="empty">No saved files yet.</div>';return}ilist.innerHTML=files.map(f=>{const isImg=/\\.(png|jpe?g|webp|gif|bmp)$/i.test(f.name);return '<div class="irow" data-n="'+esc(f.name)+'" data-p="'+esc(f.path)+'"><div class="thumb">'+(isImg?'<img src="'+esc(f.url)+'">':'<span>FILE</span>')+'</div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'" target="_blank" rel="noopener">Open</a><button class="copyBtn" type="button">Copy path</button><button class="del" type="button">Delete</button></div>'}).join('')}catch(e){ilist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}ilist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('${BASE}/api/inbox/'+encodeURIComponent(project)+'/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshInbox()}else if(e.target.classList.contains('copyBtn')){try{await navigator.clipboard.writeText(row.dataset.p);setStatus('Copied path: '+row.dataset.p)}catch(err){setStatus('Could not copy: '+err.message,true)}}});function uploadStream(blob,name){return new Promise((resolve,reject)=>{const x=new XMLHttpRequest();x.open('POST','${BASE}/api/upload-stream/'+encodeURIComponent(project)+'?filename='+encodeURIComponent(name||'upload.bin'));x.setRequestHeader('Content-Type','application/octet-stream');x.upload.onprogress=e=>{if(e.lengthComputable)setStatus('Uploading '+(name||'file')+'… '+Math.round(e.loaded/e.total*100)+'% ('+fmtSize(e.loaded)+' / '+fmtSize(e.total)+')')};x.onerror=()=>reject(new Error('Network error during upload'));x.onabort=()=>reject(new Error('Upload cancelled'));x.onload=()=>{let j=null;try{j=JSON.parse(x.responseText)}catch{}if(x.status>=200&&x.status<300&&j&&j.ok)resolve(j);else reject(new Error((j&&j.error)||('Upload failed (HTTP '+x.status+')')))};x.send(blob)})}async function upload(blob,name){if(!blob){setStatus('No file received.',true);return}try{let j;if(blob.size>8*1024*1024){j=await uploadStream(blob,name)}else{setStatus('Saving '+(name||'file')+'…');const data=await new Promise((resolve,reject)=>{const r=new FileReader();r.onerror=()=>reject(new Error('Could not read file'));r.onload=()=>resolve(String(r.result).split(',')[1]);r.readAsDataURL(blob)});const r=await fetch('${BASE}/api/upload/'+encodeURIComponent(project),{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:name||'clipboard-file',mime:blob.type||'application/octet-stream',data})});j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||'Upload failed')}try{await navigator.clipboard.writeText(j.path)}catch{}setStatus('Saved and path copied to clipboard:\\n'+j.path);refreshInbox()}catch(e){setStatus(e.message||String(e),true)}}drop.onclick=()=>file.click();file.onchange=()=>upload(file.files[0],file.files[0]?.name);['dragover','dragenter'].forEach(ev=>drop.addEventListener(ev,e=>{e.preventDefault();drop.classList.add('over')}));['dragleave','dragend'].forEach(ev=>drop.addEventListener(ev,()=>drop.classList.remove('over')));/* drop handler removed — window-capture 'drop' below handles uploads for both the dropzone and anywhere-in-window. Two listeners caused duplicate uploads. */window.addEventListener('paste',e=>{const item=[...(e.clipboardData?.items||[])].find(i=>i.kind==='file');if(!item)return;e.preventDefault();const f=item.getAsFile();upload(f,f?.name||'clipboard-file')},true);['dragenter','dragover'].forEach(ev=>window.addEventListener(ev,e=>{if(e.dataTransfer?.types?.includes('Files')){e.preventDefault();drop.classList.add('over')}},true));window.addEventListener('drop',e=>{if(e.dataTransfer?.files?.length){e.preventDefault();drop.classList.remove('over');upload(e.dataTransfer.files[0],e.dataTransfer.files[0]?.name)}},true);async function refreshOutbox(){try{const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project),{cache:'no-store'});const j=await r.json();if(!j.ok){olist.innerHTML='<div class="empty">'+esc(j.error||'failed')+'</div>';return}const files=j.files||[];if(!files.length){olist.innerHTML='<div class="empty">No files from the agent yet.</div>';return}olist.innerHTML=files.map(f=>'<div class="irow" data-n="'+esc(f.name)+'"><div class="thumb"><span>FILE</span></div><div class="nameCol"><div class="name">'+esc(f.name)+'</div><div class="meta">'+fmtSize(f.size)+' · '+esc(f.mtime||'')+'</div></div><a href="'+esc(f.url)+'">Download</a><button class="del" type="button">Delete</button></div>').join('')}catch(e){olist.innerHTML='<div class="empty">'+esc(e.message)+'</div>'}}olist.addEventListener('click',async e=>{const row=e.target.closest('.irow');if(!row)return;if(e.target.classList.contains('del')){if(!confirm('Delete "'+row.dataset.n+'"?'))return;const r=await fetch('${BASE}/api/outbox/'+encodeURIComponent(project)+'/file/'+encodeURIComponent(row.dataset.n),{method:'DELETE'});const j=await r.json();setStatus(j.ok?'Deleted '+row.dataset.n:'Error: '+j.error,!j.ok);refreshOutbox()}});refreshOutbox();refreshInbox();</script></body></html>`);
 });
 
-app.post(BASE + '/api/upload/:project', requireInboxWrite, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'}); const {filename='clipboard-file', mime='', data=''} = req.body || {}; const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin'); const safe = slug(path.basename(filename, path.extname(filename))); const stamp = new Date().toISOString().replace(/[:.]/g,'-'); const inbox = path.join(p.path, '_inbox'); await fs.mkdir(inbox, {recursive:true}); const full = path.join(inbox, `${stamp}-${safe}${ext}`); await fs.writeFile(full, Buffer.from(data, 'base64')); await adoptIntoWorkspace(inbox, full); await audit('upload', { project: p.name, filename: path.basename(full), bytes: Buffer.byteLength(data, 'base64') }, req); return res.json({ok:true,path:full,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`}); });
+// `allowEmpty` keeps this route's long-standing behaviour: a genuinely empty
+// file is an odd but legitimate thing to drop here. The streaming route below
+// rejects 0 bytes, because there an empty body means the browser's read failed.
+app.post(BASE + '/api/upload/:project', requireInboxWrite, async (req,res)=>{ try {
+ const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+ const {filename='clipboard-file', mime='', data=''} = req.body || {};
+ const ext = path.extname(filename) || (mime.includes('jpeg') ? '.jpg' : mime.includes('png') ? '.png' : mime.includes('webp') ? '.webp' : mime.includes('gif') ? '.gif' : mime.includes('pdf') ? '.pdf' : mime.includes('text') ? '.txt' : '.bin');
+ const out = await inboxWriter(p, inboxUploadName(filename, ext), Readable.from([Buffer.from(data, 'base64')]), {allowEmpty:true});
+ await audit('upload', { project: p.name, filename: path.basename(out.path), bytes: out.bytes }, req);
+ return res.json({ok:true,path:out.path,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(out.path))}`});
+} catch(e){ return res.status(uploadStatus(e)).json({ok:false,error:e.message}); } });
 // Streaming upload for large files: the raw request body is piped straight to
 // disk — no base64, no JSON, no whole-file buffering. The JSON path above tops
 // out around 75MB (100mb express/nginx caps ÷ base64 inflation) and the
@@ -2616,26 +2673,14 @@ app.post(BASE + '/api/upload-stream/:project', requireInboxWrite, async (req,res
   const p = await projectByName(req.params.project); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
   const filename = String(req.query.filename || 'upload.bin');
   const ext = path.extname(filename) || '.bin';
-  const safe = slug(path.basename(filename, path.extname(filename)));
-  const stamp = new Date().toISOString().replace(/[:.]/g,'-');
-  const inbox = path.join(p.path, '_inbox');
-  await fs.mkdir(inbox, {recursive:true});
-  const full = path.join(inbox, `${stamp}-${safe}${ext}`);
-  try {
-   await new Promise((resolve,reject)=>{
-    const ws = fsSync.createWriteStream(full);
-    req.pipe(ws);
-    req.on('aborted', ()=>reject(new Error('Upload aborted')));
-    ws.on('error', reject);
-    ws.on('finish', resolve);
-   });
-  } catch(e){ await fs.rm(full,{force:true}).catch(()=>{}); throw e; }
-  const st = await fs.stat(full);
-  if(st.size === 0){ await fs.rm(full,{force:true}).catch(()=>{}); return res.status(400).json({ok:false,error:'Received 0 bytes'}); }
-  await adoptIntoWorkspace(inbox, full);
-  await audit('upload', { project: p.name, filename: path.basename(full), bytes: st.size }, req);
-  return res.json({ok:true,path:full,bytes:st.size,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(full))}`});
- } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+  // The request body is piped straight through to the (unprivileged) worker, so
+  // an upload of any size still never lands in this process's memory — and an
+  // abort mid-stream stands the worker down, which unlinks its temp rather than
+  // publishing a truncated file.
+  const out = await inboxWriter(p, inboxUploadName(filename, ext), req);
+  await audit('upload', { project: p.name, filename: path.basename(out.path), bytes: out.bytes }, req);
+  return res.json({ok:true,path:out.path,bytes:out.bytes,url:`${BASE}/file/${encodeURIComponent(p.name)}/${encodeURIComponent(path.basename(out.path))}`});
+ } catch(e){ res.status(uploadStatus(e)).json({ok:false,error:e.message}); }
 });
 app.get(BASE + '/file/:project/:file', requireAuth, requireProjectAccess, async (req,res)=>{ const p = await projectByName(req.params.project); if(!p) return res.status(404).send('Unknown project'); res.sendFile(path.join(p.path, '_inbox', path.basename(req.params.file))); });
 
