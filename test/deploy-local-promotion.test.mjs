@@ -244,6 +244,21 @@ function makeSourceRepo(dir) {
 }
 
 /**
+ * The release identifier a stale destination is seeded with.
+ *
+ * DELIBERATELY NOT DERIVED FROM GIT TOPOLOGY. `git merge-base HEAD origin/main`
+ * is HEAD itself on a direct-main checkout — which every push to main, and so
+ * every main CI run, is — and an archive of HEAD carries the CURRENT VERSION.
+ * Staleness inferred that way is a property of the branch the suite happens to
+ * run on rather than of the fixture, and it evaporates on the one branch that
+ * matters. A fixed identifier is the same on every runner: well-formed
+ * (1.YY.MMDD.hhmm, here 2000-01-01 00:00) so `app/version.js` accepts it and a
+ * stale destination still boots, and unambiguously older than any release this
+ * repository has ever shipped.
+ */
+const STALE_VERSION = '1.00.0101.0000';
+
+/**
  * A stage with a source tree (`$SRC`, what --full and the host hot path write
  * into) and a live tree (`$LIVE_APP`, what the inside-container path writes
  * into), each optionally pre-seeded.
@@ -278,11 +293,17 @@ function makeStage({ seed = 'empty' } = {}) {
   if (seed === 'stale') {
     // The faithful reported shape: the live tree carries the PREVIOUS release,
     // so only what this branch added is missing. `git archive` of the merge base
-    // is that release, without hardcoding which files are new.
+    // is that release, without hardcoding which files are new — kept because an
+    // old tree with files missing from it is the realism this seed exists for.
     const base = execFileSync('git', ['-C', REPO, 'merge-base', 'HEAD', 'origin/main'], { encoding: 'utf8' }).trim();
     for (const dest of [stage.srcApp, stage.live]) {
       const tar = execFileSync('git', ['-C', REPO, 'archive', base, 'app/'], { maxBuffer: 256 * 1024 * 1024 });
       execFileSync('tar', ['-x', '--strip-components=1', '-C', dest], { input: tar });
+      // The one thing that must NOT be left to topology. When the merge base is
+      // HEAD the archive above ships this checkout's own release identifier, and
+      // "the destination is behind" quietly stops being true. Overwrite it, in
+      // this disposable tree only, so the destination is behind by construction.
+      fs.writeFileSync(path.join(dest, 'VERSION'), `${STALE_VERSION}\n`);
     }
   }
   for (const dest of [stage.srcApp, stage.live]) {
@@ -575,12 +596,24 @@ test('the promoted artifact carries the release identifier this checkout ships',
   const stage = makeStage({ seed: 'stale' });
   try {
     const expected = fs.readFileSync(path.join(APP, 'VERSION'), 'utf8').trim();
-    const stale = fs.readFileSync(path.join(stage.srcApp, 'VERSION'), 'utf8').trim();
-    assert.notEqual(expected, stale, 'this checkout must ship a release identifier the seeded tree does not have');
+    const versionFile = path.join(stage.srcApp, 'VERSION');
+    const stale = fs.readFileSync(versionFile, 'utf8').trim();
+    // The staleness is a property of the FIXTURE, not of the branch the suite
+    // runs on: makeStage overwrites the seeded identifier, so this holds
+    // identically on a feature branch and on a direct-main checkout.
+    assert.equal(stale, STALE_VERSION, 'the stale destination must be seeded with the fixed stale identifier');
+    assert.notEqual(expected, STALE_VERSION,
+      `this checkout ships ${expected}; STALE_VERSION must name a release it does not ship`);
 
     runDeploy(stage, {});
 
-    assert.equal(fs.readFileSync(path.join(stage.srcApp, 'VERSION'), 'utf8').trim(), expected,
+    // Three distinct defects, three distinct failures: a promotion that drops
+    // VERSION altogether, one that leaves the destination's stale identifier
+    // sitting there, and one that lands anything other than what ships here.
+    assert.ok(fs.existsSync(versionFile), 'the promotion must land app/VERSION at all');
+    const promoted = fs.readFileSync(versionFile, 'utf8').trim();
+    assert.notEqual(promoted, stale, `the promotion left the stale ${stale} in place`);
+    assert.equal(promoted, expected,
       `the promoted artifact must carry ${expected}, not the stale ${stale}`);
     const boot = await bootPromoted(stage.srcApp, nextPort++);
     assert.ok(boot.up, `and version.js must accept it at startup\n--- log ---\n${boot.log}`);
