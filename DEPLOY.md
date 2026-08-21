@@ -130,6 +130,24 @@ enable environment-specific needs:
   | `PW_DEPLOY_TOOLCHAIN` | `0` | `1` installs smbclient, libicu, pywinrm and the .NET SDK(s) |
   | `PW_DOTNET_CHANNELS` | `8.0` | space-separated channels; pass every one your projects target |
 
+  This layer is the first one that needs the network, so it is where a host with
+  no DNS in the default container network shows up — `Temporary failure resolving
+  'deb.debian.org'`, then `Unable to locate package`. The earlier layers do not
+  hide a working network, they are simply cache hits. Add `--network=host` so the
+  build resolves the way the runtime containers already do (they all run
+  `--network=host`), or `--dns=<resolver>` if you want to keep the build
+  namespaced:
+
+  ```bash
+  podman build --network=host -t project-workbench:latest \
+    --build-arg PW_DEPLOY_TOOLCHAIN=1 \
+    --build-arg PW_DOTNET_CHANNELS="8.0 10.0" .
+  ```
+
+  Note that reachability tested from a *running* PW container proves nothing about
+  the build: those run `--network=host` and so borrow the host's resolvers, while
+  `podman build` defaults to its own network namespace.
+
   Set `PW_DOTNET_CHANNELS` from the `TargetFramework` values in the projects you
   actually deploy — a `net10.0` project cannot be published by an 8.0-only SDK.
   The SDK lands in `/usr/share/dotnet`, world-readable, because the pane account
