@@ -2092,7 +2092,17 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railKeys{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;padding:10px 6px 10px 0;display:flex;flex-direction:column;gap:7px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
 .pkey{position:relative;display:flex;align-items:center;gap:9px;height:46px;flex:0 0 46px;padding:0 10px 0 12px;border:1px solid var(--line);border-left:0;border-radius:0 11px 11px 0;background:linear-gradient(180deg,var(--panel),#0a1120);color:var(--dim);text-decoration:none;box-sizing:border-box;transition:transform .18s cubic-bezier(.34,1.4,.44,1),background .18s,border-color .18s,box-shadow .18s,color .18s,opacity .2s,filter .2s;animation:pkIn .5s cubic-bezier(.22,.9,.3,1) backwards;animation-delay:calc(var(--i)*38ms)}
 @keyframes pkIn{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:none}}
-.pkey:hover{transform:translateX(4px);color:#fff;border-color:var(--line2);background:linear-gradient(180deg,var(--panel2),#0c1424)}
+/* The pin is a sibling of the link, not a descendant: a button inside an <a> is
+   invalid content and was reachable only by mouse at tabindex="-1". So the ROW
+   owns the geometry and the slide-out, because a transform on the link alone
+   would leave the pin behind while the tile travels. Hover styling keys off the
+   row too, so pointing at the pin still lights its tile. */
+.railKeysList{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:7px}
+.pkeyRow{position:relative;flex:0 0 46px;transition:transform .18s cubic-bezier(.34,1.4,.44,1)}
+.pkeyRow:hover{transform:translateX(4px)}
+.pkeyRow.pinned{transform:translateX(10px)}
+.pkeyRow.pinned:hover{transform:translateX(12px)}
+.pkey:hover,.pkeyRow:hover .pkey{color:#fff;border-color:var(--line2);background:linear-gradient(180deg,var(--panel2),#0c1424)}
 .pkey:focus-visible{outline:2px solid var(--cyan);outline-offset:-2px}
 .pk-edge{position:absolute;left:0;top:8px;bottom:8px;width:3px;border-radius:0 3px 3px 0;background:hsl(var(--h) 50% 34% / .85);transition:background .2s,box-shadow .2s}
 .pkey.current{border-color:#2f65b0;background:linear-gradient(180deg,#10233f,#0b1830);color:#eaf4ff;box-shadow:inset 0 0 0 1px rgba(56,189,248,.13),0 0 18px -6px rgba(56,189,248,.5)}
@@ -2112,8 +2122,7 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pkey.lit .pk-mono{border-color:#b45309;color:#ffd98a;background:#271c04;box-shadow:0 0 14px -2px rgba(245,158,11,.35)}
 .pkey.lit .pk-dot{opacity:1;background:var(--amber);box-shadow:0 0 8px var(--amber);animation:pkGlow 1.8s ease-in-out infinite}
 @keyframes pkGlow{0%,100%{opacity:.6}50%{opacity:1}}
-.pkey.pinned{transform:translateX(10px);border-color:hsl(var(--h) 60% 45%);box-shadow:0 6px 18px -8px rgba(0,0,0,.95),0 0 14px -4px hsl(var(--h) 70% 55% / .5)}
-.pkey.pinned:hover{transform:translateX(12px)}
+.pkey.pinned{border-color:hsl(var(--h) 60% 45%);box-shadow:0 6px 18px -8px rgba(0,0,0,.95),0 0 14px -4px hsl(var(--h) 70% 55% / .5)}
 .pkey.pinned:not(.current):not(.lit) .pk-edge{background:hsl(var(--h) 65% 52% / .95);box-shadow:0 0 10px hsl(var(--h) 70% 55% / .6)}
 .pkey.pinned:not(.lit) .pk-mono{background:hsl(var(--h) 78% 58%);color:#070b12;border-color:hsl(var(--h) 90% 75%);box-shadow:0 0 12px -2px hsl(var(--h) 75% 60% / .6);font-weight:800}
 .railKeys.has-pins .pkey:not(.pinned):not(.current):not(.lit):not(.working){opacity:.5;filter:saturate(.5) brightness(.82)}
@@ -2132,10 +2141,14 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pkey.current .pk-edge{top:0;bottom:0;width:5px;border-radius:0}
 .pkey.current::after{content:'';position:absolute;top:-1px;bottom:-1px;left:100%;width:16px;background:linear-gradient(180deg,#10233f,#0b1830);border-top:1px solid #2f65b0;border-bottom:1px solid #2f65b0;pointer-events:none}
 .pkey.current.lit::after{background:linear-gradient(180deg,#221a06,#140f03);border-color:#a16207}
-.pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2}
-.pkey:hover .pk-pin{opacity:.55}
+.pk-pin{position:absolute;right:7px;top:50%;transform:translateY(-50%);width:22px;height:22px;display:none;place-items:center;font-size:11px;line-height:1;border-radius:6px;cursor:pointer;opacity:0;filter:grayscale(1) brightness(1.5);transition:opacity .15s,filter .15s,background .15s;user-select:none;z-index:2;appearance:none;background:transparent;border:0;color:inherit;font-family:inherit;padding:0}
+.pkeyRow:hover .pk-pin{opacity:.55}
+/* opacity:0 by default, so a keyboard user landing on it must be able to see it —
+   a focusable control that stays invisible while focused is worse than one that
+   cannot be focused at all. */
+.pk-pin:focus-visible{opacity:1;outline:2px solid var(--cyan);outline-offset:1px;background:rgba(255,255,255,.07)}
 .pk-pin:hover{opacity:1;background:rgba(255,255,255,.07)}
-.pkey.pinned .pk-pin{filter:none}
+.pkeyRow.pinned .pk-pin{filter:none;opacity:.9}
 .railAct.off .autoPinIco{filter:grayscale(1);opacity:.5}
 #autoPinState{color:var(--ok);font-weight:800}
 .railAct.off #autoPinState{color:var(--faint)}
@@ -2176,7 +2189,12 @@ function railHtml(projects, currentName, user, deployConfigured=false){
  const isAdmin = user.role === 'admin';
  const keys = projects.map((p,i)=>{
   const cur = p.name === currentName;
-  return `<a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}" style="--h:${projHue(p.name)};--i:${i}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-pin" role="button" tabindex="-1" title="Pin">📌</span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a>`;
+  // The pin is a real <button> beside the link, not a role="button" span inside
+  // it: <a> may not contain interactive content, and at tabindex="-1" the only
+  // way to pin was with a mouse. aria-pressed carries the state that the tile's
+  // colour used to carry alone. The custom properties sit on the row so both
+  // children inherit them.
+  return `<li class="pkeyRow" style="--h:${projHue(p.name)};--i:${i}"><a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a><button class="pk-pin" type="button" data-project="${esc(p.name)}" aria-pressed="false" aria-label="Pin ${esc(p.name)}"><span aria-hidden="true">📌</span></button></li>`;
  }).join('');
  const adminActs = isAdmin
   ? `<a class="railAct" id="manageEntry" href="${BASE}/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="${BASE}/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
@@ -2188,7 +2206,7 @@ function railHtml(projects, currentName, user, deployConfigured=false){
   ? `<span class="railWho" title="PW_AUTH_ENFORCE off — anonymous admin"><span class="railWhoDot"></span><span class="railWhoName">anonymous</span></span>`
   : `<span class="railWho" title="${esc(user.username)} · ${esc(user.role)}"><span class="railWhoDot"></span><span class="railWhoName">${esc(user.username)} · ${esc(user.role)}</span></span><button id="railLogout" class="railAct" type="button" title="Sign out"><span class="railActIco">↪</span><span class="railActLabel">Sign out</span></button>`;
  const autoPinBtn = `<button id="autoPinBtn" class="railAct" type="button" role="switch" aria-pressed="true" title="Auto-pin projects when a session finishes"><span class="railActIco autoPinIco">📌</span><span class="railActLabel">Auto-pin on done · <b id="autoPinState">on</b></span></button>`;
- return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div><nav id="railKeys" class="railKeys">${keys}</nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
+ return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div><nav id="railKeys" class="railKeys" aria-label="Projects"><ul class="railKeysList">${keys}</ul></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
 }
 
 const railScript = `<script>(function(){
@@ -2212,11 +2230,11 @@ if(logout)logout.onclick=async()=>{try{await fetch('${BASE}/api/auth/logout',{me
 let pinned=new Set();try{pinned=new Set(JSON.parse(localStorage.getItem('pwPinned')||'[]'))}catch{}
 let autoPin=true;try{autoPin=(localStorage.getItem('pwAutoPin')||'1')==='1'}catch{}
 function savePins(){try{localStorage.setItem('pwPinned',JSON.stringify([...pinned]))}catch{}}
-function applyPins(){KEYS.classList.toggle('has-pins',pinned.size>0);KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const pb=k.querySelector('.pk-pin');if(pb)pb.title=on?'Unpin':'Pin — lean this project out while you work with it'})}
+function applyPins(){KEYS.classList.toggle('has-pins',pinned.size>0);KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const row=k.closest('.pkeyRow');if(row)row.classList.toggle('pinned',on);const pb=row&&row.querySelector('.pk-pin');if(pb){pb.title=on?'Unpin':'Pin — lean this project out while you work with it';pb.setAttribute('aria-pressed',on?'true':'false');pb.setAttribute('aria-label',(on?'Unpin ':'Pin ')+n)}})}
 const autoBtn=document.getElementById('autoPinBtn');
 function renderAuto(){if(!autoBtn)return;autoBtn.setAttribute('aria-pressed',autoPin?'true':'false');autoBtn.classList.toggle('off',!autoPin);const st=document.getElementById('autoPinState');if(st)st.textContent=autoPin?'on':'off'}
 if(autoBtn)autoBtn.onclick=()=>{autoPin=!autoPin;try{localStorage.setItem('pwAutoPin',autoPin?'1':'0')}catch{}renderAuto()};
-KEYS.addEventListener('click',e=>{const pb=e.target.closest('.pk-pin');if(!pb)return;e.preventDefault();e.stopPropagation();const k=pb.closest('.pkey');if(!k)return;const n=k.dataset.project;if(pinned.has(n))pinned.delete(n);else pinned.add(n);savePins();applyPins()});
+KEYS.addEventListener('click',e=>{const pb=e.target.closest('.pk-pin');if(!pb)return;e.preventDefault();e.stopPropagation();const n=pb.dataset.project;if(!n)return;if(pinned.has(n))pinned.delete(n);else pinned.add(n);savePins();applyPins()});
 applyPins();renderAuto();
 const baseTitle=(CUR?CUR+' — ':'')+'Workbench';
 document.title=baseTitle;

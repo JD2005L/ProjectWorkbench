@@ -145,7 +145,54 @@ test('rail: the active key is marked by geometry, so it survives 64px and compos
 
     // The states this had to stop competing with are untouched.
     assert.match(css, /\.pkey\.lit\{[^}]*border-color:#a16207/, 'amber attention preserved');
-    assert.match(css, /\.pkey\.pinned\{[^}]*transform:translateX\(10px\)/, 'the pin lean-out preserved');
+    // The lean-out lives on the ROW, not the key. It moved there when the pin stopped being a
+    // role="button" span inside the <a> and became a sibling <button>: a transform on the link
+    // alone leaves the pin behind while the tile travels.
+    assert.match(css, /\.pkeyRow\.pinned\{[^}]*transform:translateX\(10px\)/, 'the pin lean-out preserved');
     assert.match(css, /\.pkey\.working \.pk-live\{[^}]*animation:pwLivePulse/, 'the working pulse preserved');
+  });
+});
+
+/** The whole row for one project — the link plus its sibling pin button. */
+function rowFor(html, project) {
+  const at = html.indexOf(`data-project="${project}"`);
+  assert.notEqual(at, -1, `no rail key for ${project}`);
+  const from = html.lastIndexOf('<li class="pkeyRow"', at);
+  assert.notEqual(from, -1, `no row wrapper for ${project}`);
+  return html.slice(from, html.indexOf('</li>', at) + 5);
+}
+
+test('rail: the pin is a real button beside the link, and the keys form a labelled list', { timeout: 30000 }, async () => {
+  const port = 3885;
+  const inst = makeInstance(port);
+  seedProjects(inst);
+  await withServer(inst, port, async (base) => {
+    const html = await (await fetch(`${base}/term/demo/`)).text();
+    const row = rowFor(html, 'demo');
+
+    // An <a> may not contain interactive content, and at tabindex="-1" the pin could only ever be
+    // reached with a mouse. Both are markup facts, so they are asserted on the markup.
+    assert.doesNotMatch(html, /role="button" tabindex="-1"/, 'no faux button inside a link');
+    assert.match(row, /<button class="pk-pin" type="button"/, 'the pin is a real button');
+
+    // It must be a SIBLING of the link, not a descendant: slice at the anchor's close and the pin
+    // has to fall on the far side of it.
+    const closeA = row.indexOf('</a>');
+    assert.ok(closeA > -1, 'the row still closes its anchor');
+    assert.ok(row.indexOf('pk-pin') > closeA, 'the pin must sit outside the anchor');
+
+    // Pin state reaches assistive technology instead of living only in the tile colour.
+    assert.match(row, /aria-pressed="false"/, 'pin state is exposed');
+    assert.match(row, /aria-label="Pin demo"/, 'the pin names the project it pins');
+
+    // A focusable control that is opacity:0 until hover has to become visible when focused, or
+    // keyboard users tab to something they cannot see.
+    const css = html;
+    assert.match(css, /\.pk-pin:focus-visible\{[^}]*opacity:1/, 'the pin reveals itself on focus');
+
+    // The rail was a run of bare links inside an unlabelled nav.
+    assert.match(html, /<nav id="railKeys"[^>]*aria-label="Projects"/, 'the nav is labelled');
+    assert.match(html, /<ul class="railKeysList">/, 'the keys form a list');
+    assert.match(row, /^<li class="pkeyRow"/, 'each key is a list item');
   });
 });
