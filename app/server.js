@@ -2076,7 +2076,20 @@ body.rail-open #railPanel{width:var(--rail-wo)}
 .railBrandName{flex:1 1 auto;text-align:left;font-size:11.5px;font-weight:800;letter-spacing:.16em;text-transform:uppercase;color:#dbe9fb;white-space:nowrap;opacity:0;transform:translateX(-8px);transition:opacity .2s .05s,transform .2s .05s}
 #railToggle .chev{display:inline-block;color:var(--faint);font-size:16px;line-height:1;opacity:0;transition:transform .3s cubic-bezier(.32,.72,.24,1),opacity .2s}
 body.rail-open #railToggle .chev{transform:rotate(180deg)}
-.railKeys{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;padding:10px 14px 10px 0;display:flex;flex-direction:column;gap:7px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
+/* overflow-x:hidden is load-bearing, not tidying: .pk-name is always in the DOM
+   with white-space:nowrap, so the clip is what hides project names while the rail
+   is collapsed and reveals them when the panel widens to --rail-wo. Do not
+   "fix" it to visible.
+   What the clip must never eat is the monogram. Budget across the collapsed
+   64px rail: 1px panel border + 12px tile padding-left + 32px .pk-mono
+   (flex:0 0 32px, so it does not shrink) = 45px that has to survive. A
+   scrollbar-less content box was 63-14=49px, leaving only 4px of slack; a thin
+   scrollbar takes ~8-12px out of that same box, so the monogram lost up to 12px
+   the moment a project list got long enough to scroll — clipped mid-glyph.
+   scrollbar-gutter:stable reserves that space whether or not the scrollbar is
+   present, so the collapsed geometry stops depending on how many projects exist,
+   and padding-right drops to 6px to pay for the reservation. */
+.railKeys{flex:1 1 auto;overflow-y:auto;overflow-x:hidden;scrollbar-gutter:stable;padding:10px 6px 10px 0;display:flex;flex-direction:column;gap:7px;scrollbar-width:thin;scrollbar-color:var(--line) transparent}
 .pkey{position:relative;display:flex;align-items:center;gap:9px;height:46px;flex:0 0 46px;padding:0 10px 0 12px;border:1px solid var(--line);border-left:0;border-radius:0 11px 11px 0;background:linear-gradient(180deg,var(--panel),#0a1120);color:var(--dim);text-decoration:none;box-sizing:border-box;transition:transform .18s cubic-bezier(.34,1.4,.44,1),background .18s,border-color .18s,box-shadow .18s,color .18s,opacity .2s,filter .2s;animation:pkIn .5s cubic-bezier(.22,.9,.3,1) backwards;animation-delay:calc(var(--i)*38ms)}
 @keyframes pkIn{from{opacity:0;transform:translateX(-26px)}to{opacity:1;transform:none}}
 .pkey:hover{transform:translateX(4px);color:#fff;border-color:var(--line2);background:linear-gradient(180deg,var(--panel2),#0c1424)}
