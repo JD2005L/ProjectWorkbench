@@ -73,7 +73,7 @@ const setupTmuxSession = 'pw_setup';
 const internalHandoffToken = process.env.PW_INTERNAL_HANDOFF_TOKEN || '';
 // `prompt` (safer default) makes Claude ask before each tool use; `skip` passes
 // --dangerously-skip-permissions and runs every tool unattended.
-const defaultWorkbenchSettings = { permissionMode:'prompt', mcpMode:'isolated', enabledClis:['claude'], updateClis:['claude'] };
+const defaultWorkbenchSettings = { permissionMode:'prompt', mcpMode:'isolated', enabledClis:['claude'], updateClis:['claude'], timezone:'' };
 const PERMISSION_MODES = ['prompt','skip'];
 function normalizePermissionMode(v){ return PERMISSION_MODES.includes(v) ? v : 'prompt'; }
 const SUPPORTED_CLIS = {
@@ -1453,7 +1453,27 @@ async function projectSignals(p){
   };
  } catch { return { bell:false, working:false, attached:false }; }
 }
-async function getClaudeVersion(){ try { const { stdout } = await sh('claude',['--version'],{timeout:5000}); return stdout.trim() || 'unknown'; } catch { return 'unavailable'; } }
+// The installed package's own version, which is the authoritative answer and does
+// not depend on which `claude` happens to be first on PATH — a wrapper, a stale
+// symlink, or the binary. `claude --version` also appends a product name
+// ("2.1.220 (Claude Code)") that reads as noise beside the "Claude Code:" label
+// already in the footer. Falls back to exec'ing the CLI where the package cannot
+// be located.
+async function readInstalledCliVersion(pkg){
+ try {
+  const { stdout } = await sh('npm',['root','-g'],{timeout:5000});
+  const root = stdout.trim();
+  if(!root) return null;
+  const raw = await fs.readFile(path.join(root, pkg, 'package.json'),'utf8');
+  const v = JSON.parse(raw).version;
+  return typeof v === 'string' && v ? v : null;
+ } catch { return null; }
+}
+async function getClaudeVersion(){
+ const fromPkg = await readInstalledCliVersion('@anthropic-ai/claude-code');
+ if(fromPkg) return fromPkg;
+ try { const { stdout } = await sh('claude',['--version'],{timeout:5000}); return stdout.trim().replace(/\s*\(.*\)\s*$/,'') || 'unknown'; } catch { return 'unavailable'; }
+}
 // Where the CLI updater records what it checked and when.
 //
 // It used to be inferred from the mtime of /var/log/claude-code-update.log, which
@@ -1464,10 +1484,28 @@ async function getClaudeVersion(){ try { const { stdout } = await sh('claude',['
 // updater stamps there and both sides genuinely see the same file. The log mtime
 // is kept as a fallback so a host install that predates the stamp still answers.
 const cliUpdateStampsPath = process.env.PW_CLI_UPDATE_STAMPS || '/etc/project-workbench/cli-updates.tsv';
-function fmtUpdateStamp(iso){
+// Which zone timestamps are shown in. UTC is correct for a log and wrong for a
+// glanceable footer: an operator comparing "checked at" against their own clock
+// should not have to do the offset in their head. Configurable rather than
+// hardcoded — PW_TIMEZONE wins, then workbench.json's `timezone`, then whatever
+// the process is running in (UTC, in a container). Not cached, so editing the
+// setting takes effect on the next render rather than on the next restart.
+async function displayTimeZone(){
+ let tz = String(process.env.PW_TIMEZONE || '').trim();
+ if(!tz){ try { tz = String((await loadWorkbenchSettings()).timezone || '').trim(); } catch { tz = ''; } }
+ if(!tz) tz = Intl.DateTimeFormat().resolvedOptions().timeZone || 'UTC';
+ // A bad zone must not throw on every page render.
+ try { new Intl.DateTimeFormat('en-CA', { timeZone: tz }); } catch { tz = 'UTC'; }
+ return tz;
+}
+function fmtUpdateStamp(iso, tz){
  const d = new Date(iso);
  if(Number.isNaN(d.getTime())) return null;
- return d.toISOString().replace('T',' ').replace(/:\d\d\.\d+Z$/,' UTC');
+ try {
+  const parts = new Intl.DateTimeFormat('en-CA', { timeZone: tz || 'UTC', year:'numeric', month:'2-digit', day:'2-digit',
+   hour:'2-digit', minute:'2-digit', hour12:false, timeZoneName:'short' }).format(d);
+  return parts.replace(',', '');
+ } catch { return d.toISOString().replace('T',' ').replace(/:\d\d\.\d+Z$/,' UTC'); }
 }
 async function readCliUpdateStamps(){
  try {
@@ -1485,7 +1523,7 @@ async function getClaudeUpdateStamp(){
  // The footer answers "when did the updater last run", so the most recent of the
  // per-CLI stamps is the honest value — not claude's specifically.
  const latest = Object.values(stamps).map(s => s.at).filter(Boolean).sort().pop();
- if(latest) return fmtUpdateStamp(latest) || 'never';
+ if(latest) return fmtUpdateStamp(latest, await displayTimeZone()) || 'never';
  try { const stat = await fs.stat('/var/log/claude-code-update.log'); return stat.mtime.toISOString().replace('T',' ').replace(/\.\d+Z$/,' UTC'); } catch { return 'never'; }
 }
 
@@ -1527,6 +1565,7 @@ async function getCliAuth(key){
 async function getCliStatuses(){
  const out = {};
  const stamps = await readCliUpdateStamps();
+ const tz = await displayTimeZone();
  for(const [key,cfg] of Object.entries(SUPPORTED_CLIS)){
   const [version, authenticated] = await Promise.all([getCliVersion(cfg.bin), getCliAuth(key)]);
   const stamp = stamps[key];
@@ -1535,7 +1574,7 @@ async function getCliStatuses(){
   out[key] = { key, label:cfg.label, notes:cfg.notes, installed:!!version, version: version || 'not installed', authenticated,
    // Per-CLI, because auto-update is a per-CLI switch: one CLI can be failing
    // its checks while another is current, and a single global date hides that.
-   lastUpdate: (stamp && fmtUpdateStamp(stamp.at)) || 'never',
+   lastUpdate: (stamp && fmtUpdateStamp(stamp.at, tz)) || 'never',
    lastUpdateOk: stamp ? stamp.status === 'ok' : null };
  }
  return out;

@@ -112,6 +112,34 @@ BASH
   chmod +x /usr/local/bin/claude
 }
 
+# WHERE the CLIs actually live, which is not necessarily where this script runs.
+#
+# On a container install the panes use /opt/npm-global INSIDE the containers — a
+# bind mount from persistent/npm-global that the host does not share. A host
+# `npm install -g` therefore writes the host's own prefix and the CLI the panes
+# execute never changes: the update reports success, the version stays pinned.
+# Found exactly that way, with an "ok" stamp against an unchanged 2.1.220.
+#
+# So resolve a target once: if a PW container is running, run npm inside it
+# (it has NPM_CONFIG_PREFIX=/opt/npm-global and writes the shared mount);
+# otherwise this is a host install and plain npm is correct.
+PW_UPDATE_CONTAINER="${PW_UPDATE_CONTAINER:-pw-tmux}"
+npm_target() {
+  if command -v podman >/dev/null 2>&1 \
+     && [[ "$(podman inspect -f '{{.State.Running}}' "$PW_UPDATE_CONTAINER" 2>/dev/null)" == "true" ]]; then
+    echo container
+  else
+    echo host
+  fi
+}
+in_target() {
+  if [[ "$(npm_target)" == container ]]; then
+    podman exec "$PW_UPDATE_CONTAINER" "$@"
+  else
+    "$@"
+  fi
+}
+
 update_one() {
   local cli="$1"
   local pkg
@@ -121,12 +149,14 @@ update_one() {
     return 1
   fi
   echo "----- $(date -Is) updating $cli ($pkg) -----"
-  if [[ "$cli" == "claude" ]]; then
-    echo "Before: $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
-  else
-    echo "Before: $(command -v "$cli" >/dev/null && "$cli" --version 2>/dev/null || echo missing)"
+  echo "Target: $(npm_target)$([[ "$(npm_target)" == container ]] && echo " ($PW_UPDATE_CONTAINER)")"
+  echo "Before: $(in_target "$cli" --version 2>/dev/null || echo missing)"
+  # Propagate npm's status. This used to be a bare call followed by an echo, so
+  # update_one() returned the echo's status and a failed install reported success.
+  if ! in_target npm install -g "$pkg@latest"; then
+    echo "npm install failed for $pkg"
+    return 1
   fi
-  npm install -g "$pkg@latest"
   if [[ "$cli" == "claude" ]]; then
     # Only refresh the wrapper on an instance that already launches claude through
     # one. Updating a CLI must not change HOW it is launched, and
@@ -141,9 +171,9 @@ update_one() {
     else
       echo "Wrapper refresh skipped: /usr/local/bin/claude is not a PW wrapper — launch path left as-is"
     fi
-    echo "After:  $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
+    echo "After:  $(in_target claude --version 2>/dev/null || echo missing)"
   else
-    echo "After:  $(command -v "$cli" >/dev/null && "$cli" --version 2>/dev/null || echo missing)"
+    echo "After:  $(in_target "$cli" --version 2>/dev/null || echo missing)"
   fi
 }
 
