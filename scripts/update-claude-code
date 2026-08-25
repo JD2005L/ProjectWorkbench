@@ -135,6 +135,31 @@ update_one() {
   fi
 }
 
+# Record when each CLI was last checked, somewhere the dashboard can actually read.
+#
+# The only previous signal was this script's own log mtime, and the dashboard reads
+# it from inside a container that does not mount /var/log — so the field was
+# structurally always "never" on a container install, however often the timer ran.
+# /etc/project-workbench IS bind-mounted 1:1 into the containers, so a stamp
+# written there is visible by construction.
+#
+# Tab-separated rather than JSON so this needs no jq to write (jq is only a
+# best-effort dependency above) and no escaping of anything.
+STAMPS=/etc/project-workbench/cli-updates.tsv
+stamp_cli() {
+  local cli="$1" status="$2" tmp
+  tmp="$(mktemp "${STAMPS}.XXXXXX" 2>/dev/null)" || return 0
+  {
+    [[ -f "$STAMPS" ]] && awk -F'\t' -v c="$cli" '$1 != c' "$STAMPS"
+    printf '%s\t%s\t%s\n' "$cli" "$(date -Is)" "$status"
+  } > "$tmp" 2>/dev/null
+  if chmod 0644 "$tmp" 2>/dev/null && mv -f "$tmp" "$STAMPS" 2>/dev/null; then
+    return 0
+  fi
+  rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
 read_update_clis() {
   if [[ -f "$WORKBENCH_JSON" ]] && command -v jq >/dev/null; then
     jq -r '(.updateClis // ["claude"]) | .[]' "$WORKBENCH_JSON"
@@ -151,7 +176,14 @@ read_update_clis() {
     CLIS=(claude)
   fi
   for cli in "${CLIS[@]}"; do
-    update_one "$cli" || echo "Failed to update $cli"
+    # Stamp the attempt either way: "checked and failed" is information the
+    # operator needs, and a missing stamp would read as "never checked".
+    if update_one "$cli"; then
+      stamp_cli "$cli" ok
+    else
+      echo "Failed to update $cli"
+      stamp_cli "$cli" failed
+    fi
   done
   systemctl restart project-workbench.service || true
   echo "===== $(date -Is) PW CLI update complete ====="
