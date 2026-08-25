@@ -1431,11 +1431,10 @@ async function sweepOrphanTmuxSessions(){
 const pendingDir = '/var/lib/project-workbench/pending';
 function pendingMarkerPath(p){ return path.join(pendingDir, p.name); }
 async function readPending(p){ try { const stat = await fs.stat(pendingMarkerPath(p)); return { pending: true, since: stat.mtime.toISOString() }; } catch { return { pending: false }; } }
-// Viewing suppresses re-latching: the cockpit GET clears the marker ~500ms
-// BEFORE the iframe's tmux client attaches, and the page's first status poll
-// lands inside that gap (bell still flagged, attached still false) — without
-// suppression it would re-latch a state the user is in the middle of viewing.
-// The visible page's 10s heartbeat keeps this fresh for the whole visit.
+// Explicit acknowledgement suppresses re-latching: the cockpit GET or a
+// successful terminal-window selection clears the marker shortly before tmux
+// attachment state settles. The grace period prevents that transient bell state
+// from immediately recreating a completion the user has just acknowledged.
 const recentlyViewed = new Map(); // project name → ms epoch of last clearPending
 async function clearPending(p){ recentlyViewed.set(p.name, Date.now()); await fs.rm(pendingMarkerPath(p), { force: true }).catch(()=>{}); }
 async function projectSignals(p){
@@ -2594,7 +2593,7 @@ app.get(BASE + '/api/projects/status', requireAuth, async (req,res)=>{ try {
   // visit, automation selecting windows) clears it. So the moment a poll
   // observes it, persist the done state as the pending marker; it then
   // survives everything and clears only when the user actually views the
-  // project (cockpit GET / visible-tab heartbeat → clearPending).
+  // project (cockpit GET / explicit terminal selection → clearPending).
   // …but never latch while a client is attached: the viewer's live flag
   // governs then, and re-latching would outlive their genuine view of the
   // finished tab. Leaving without viewing it re-latches on the next
@@ -2606,11 +2605,6 @@ app.get(BASE + '/api/projects/status', requireAuth, async (req,res)=>{ try {
   return { name: p.name, ...pend, bell: sig.bell, working: sig.working, pending: pend.pending || sig.bell, credentialsStale: await credentialsStale(p) };
  }));
  res.json({ ok:true, projects: out });
-} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
-
-app.post(BASE + '/api/projects/:name/clear-pending', requireAuth, requireProjectAccess, async (req,res)=>{ try {
- const p = await projectByName(req.params.name); if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
- await clearPending(p); res.json({ok:true});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.post(BASE + '/api/projects/reorder', requireAdmin, async (req,res)=>{ try {
