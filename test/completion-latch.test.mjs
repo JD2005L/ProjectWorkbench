@@ -48,3 +48,8 @@ test('opening a project route remains an explicit acknowledgement', () => {
   assert.match(cockpit, /await clearPending\(p\)/,
     'opening the project cockpit must still clear its completion marker');
 });
+
+test('legacy visible-page clients cannot clear completion through the obsolete endpoint', () => {
+  assert.doesNotMatch(server, /app\.post\(BASE \+ '\/api\/projects\/:name\/clear-pending'/,
+    'the obsolete heartbeat endpoint lets already-open old pages erase fresh completion markers');
+});
