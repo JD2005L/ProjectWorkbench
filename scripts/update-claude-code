@@ -128,7 +128,19 @@ update_one() {
   fi
   npm install -g "$pkg@latest"
   if [[ "$cli" == "claude" ]]; then
-    install_claude_wrapper
+    # Only refresh the wrapper on an instance that already launches claude through
+    # one. Updating a CLI must not change HOW it is launched, and
+    # install_claude_wrapper() is an rm -f plus a rewrite: on an instance that
+    # deliberately runs the npm binary directly (/usr/local/bin/claude being a
+    # symlink to it), an unconditional refresh newly imposes whatever
+    # claude-wrapper.env happens to say — which in practice has meant
+    # --dangerously-skip-permissions and an --mcp-config override that displaces
+    # user-scope MCP servers. Nobody enabling nightly updates is asking for that.
+    if [[ -f /usr/local/bin/claude ]] && [[ "$(head -c2 /usr/local/bin/claude 2>/dev/null)" == '#!' ]]; then
+      install_claude_wrapper
+    else
+      echo "Wrapper refresh skipped: /usr/local/bin/claude is not a PW wrapper — launch path left as-is"
+    fi
     echo "After:  $(/usr/local/bin/claude --version 2>/dev/null || echo missing)"
   else
     echo "After:  $(command -v "$cli" >/dev/null && "$cli" --version 2>/dev/null || echo missing)"
