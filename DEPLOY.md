@@ -94,6 +94,7 @@ previous config on failure before reloading.
 | `PW_AUTH_MODE` | `local` | `local` (password) or `ldap` (directory bind) |
 | `PW_AUTH_ENFORCE` | `false` | require login (soft mode treats anon as admin) |
 | `PW_AUTH_HEADER` | `''` | trust a reverse-proxy / AD pre-auth header (e.g. `x-remote-user`) |
+| `PW_LOGIN_ORG` | `your directory account` (ldap mode) | noun phrase in the login page's "Sign in with &hellip;" line, e.g. `your GOA account`. Read once at boot |
 | `PW_SSO_USER_HEADER` | `''` | emit the signed-in user from `/api/auth/check` for sibling-app SSO |
 | `PW_DEPLOY_CENTRE` | `false` | enable the Windows (WinRM/SMB) Deploy Centre |
 | `PW_EXTRA_NGINX` | `/etc/project-workbench/extra-nginx.conf` | inject env-specific sibling-app nginx locations (see `docs/consolidation/extra-nginx.example.conf`) |

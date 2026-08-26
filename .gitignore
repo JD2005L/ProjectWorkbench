@@ -25,3 +25,4 @@ orchestrator.lock
 orchestrator-tokens.json
 orchestrator-projects.json
 orchestrator-audit.log
+_outbox/
