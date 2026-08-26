@@ -1,8 +1,8 @@
 # Project Workbench — demo video script
 
-**Audience:** technical managers and directors. Assume they know what a reverse proxy, a service unit and a directory bind are, that they are assessing operational risk while you talk, and that they cannot ask you anything — this is prerecorded.
-**Length:** 622 spoken words — about 4:03 read aloud. Cut list at the bottom if you need to land under 3:30.
-**Register:** analytical. State the constraint, name the mechanism, then the consequence. Avoid adjectives; the architecture is the argument.
+**Audience:** technical managers and directors. They know what a directory bind and a reverse proxy are, they are judging operational risk while you talk, and they cannot ask you anything — this is prerecorded.
+**Length:** 616 spoken words — about 4:01 read aloud. Cut list at the bottom if you need the room.
+**Register:** describe what's on screen and what it does. Technical detail goes in where it carries weight — authentication, how completion is detected, the deployment record — and stays out of the rest. One idea per sentence; no stacked clauses.
 
 ---
 
@@ -10,167 +10,162 @@
 
 **ON SCREEN:** Start on the sign-in page.
 
-> Project Workbench is a browser front end for AI-assisted development. The problem it solves is fan-out: one
-> developer running several agent sessions across several repositories, where the constraint isn't the model,
-> it's tracking what's running where.
+> Project Workbench is a browser front end for AI-assisted development. The problem it solves is one of
+> organization: one developer running several agent sessions across several repositories, where the constraint
+> isn't the model, it's tracking what's running where.
 
 ---
 
-## 0:14 – 0:57 · Authentication and access model
+## 0:14 – 0:56 · Authentication and access model
 
 **ON SCREEN:** Stay on the sign-in page. Point at the “Sign in with your GOA account” line and the firstname.lastname field, then sign in with your own AD credentials.
 
-**Nobody can ask this afterwards, so it goes first and it goes in full.**
+**The one section that stays fully technical. Nobody can ask afterwards, so it goes in whole.**
 
-> Access first. The application stores no passwords. It authenticates by simple bind against GOA Active
-> Directory over LDAPS, with the domain controller's certificate validated against the trust store, and the bind
-> password passed as a private file rather than on a command line. A successful bind is necessary but not
-> sufficient: the account also has to exist in the local access record, which carries the role and project
-> grants. Sessions are server-side and revocable, administrative actions are audit-logged, and the site is
-> HTTPS-only on the internal network. The terminal processes themselves bind to loopback and are only reachable
-> through the authenticated proxy, so there is no unauthenticated route to a shell.
-
----
-
-## 0:57 – 1:14 · The aggregation layer
-
-**ON SCREEN:** Expand the project rail, then switch between two or three projects so the cost of a context switch is visibly near zero.
-
-> This is the aggregation layer: one key per project. The switch is a route change, not a reconnect — nginx maps
-> each project to its own terminal endpoint. Context switching costs nothing, which is the precondition for
-> running six projects rather than two.
+> The application stores no passwords. It authenticates by simple bind against GOA Active Directory over LDAPS,
+> with the domain controller's certificate validated against the trust store, and the bind password passed as a
+> private file rather than on a command line. A successful bind is necessary but the account also has to exist
+> in the local access record, which carries the role and project grants. Sessions are server-side and revocable,
+> administrative actions are audit-logged, and the site is HTTPS-only on the internal network. The terminal
+> processes themselves bind to loopback and are only reachable through the authenticated proxy, so there is no
+> unauthenticated route to a shell.
 
 ---
 
-## 1:14 – 1:40 · Session model, and why the CLI runs server-side
+## 0:56 – 1:14 · The project rail
 
-**ON SCREEN:** Open the + menu, add a window, rename a tab. End on three or four named tabs: refactor, tests, build watcher.
+**ON SCREEN:** Hover the rail so it expands, then click between two or three projects. Let the terminal swap under each click — the speed is the point.
 
-> Inside a project I can open as many named tmux windows as I want. The tmux server runs in a sidecar container,
-> so redeploying the dashboard doesn't disturb a single session. And because the CLI runs on an always-on server
-> rather than my laptop, its context survives disconnects, and whoever picks the session up next inherits it. At
-> this fan-out, naming is how thirty windows stay legible.
-
----
-
-## 1:40 – 2:12 · Completion signalling
-
-**ON SCREEN:** A window that has just finished, tab pulsing amber. Switch to a different project so the finished one is still lit in the rail. Point out the auto-pin toggle and the pinned project at the top.
-
-**Slow down. This is the section that differentiates the tool.**
-
-> Completion is event-driven rather than screen-scraped. The CLI's stop hook writes a marker when a turn ends,
-> and the dashboard also reads each window's bell flag. The tab carries the window-level signal, the rail the
-> project-level one, so I'm told a run finished in a project I'm not looking at. The bell is one-shot, so the
-> poller persists it rather than trusting me to be watching. With auto-pin on, a finished project promotes
-> itself to the top of the rail.
+> Every project I have is a key down the left-hand rail. I hover to expand it, click a project, and that
+> project's terminal loads in place. No new window, no reopening folders. Switching is one click, which is what
+> makes running six at once practical.
 
 ---
 
-## 2:12 – 2:38 · Workspace isolation, and deliberate cross-project reach
+## 1:14 – 1:41 · Sessions, named and persistent
 
-**ON SCREEN:** Manage modal → General: the workspace path and the GitHub remote. Then ask the agent in a terminal to read another project's implementation of something and summarise the pattern.
+**ON SCREEN:** Open the + menu, add a session, click a tab name and rename it. End on a strip of three or four named tabs: refactor, tests, build watcher.
 
-> Each project is a workspace directory cloned from its own GitHub repository, with its own proxy routes and
-> service units, so nothing here exists only inside the tool. The agent's working directory is that workspace,
-> so scoping is the default. But the workspaces are siblings on one filesystem, so on request I can point the
-> agent at another project and have it lift a pattern across.
-
----
-
-## 2:38 – 2:56 · Multi-user model
-
-**ON SCREEN:** Settings → Users & Roles: add a user, set a role, assign projects. Then a second client attached to the same session, both showing identical output.
-
-> Authorisation is per project and role-based, and roles differentiate on capability, not visibility: a content
-> editor can drop files into a project without getting a shell in it. And because the session is server-side,
-> two people can attach to the same window and see the same stream.
+> Inside a project I can open as many tmux sessions as I want, and name them: refactor, tests, build watcher.
+> The plus button adds one; the tab strip keeps them in reach. They run on the server rather than in my browser,
+> so I can close the tab, go home, and come back to everything still running. At a dozen sessions, the names are
+> what keep it legible.
 
 ---
 
-## 2:56 – 3:10 · Inbox and outbox
+## 1:41 – 2:13 · Completion notices and auto-pin
 
-**ON SCREEN:** Drag a screenshot onto the window, show it land in Inbox with the path injected into the terminal. Switch to Outbox and download a file.
+**ON SCREEN:** A session that has just finished, tab pulsing amber. Then switch to a different project so the finished one is still lit in the rail. Point out the “Auto-pin on done” toggle and the pinned project at the top.
 
-> Each project has an inbox and an outbox: an upload lands in the inbox with its absolute path injected into the
-> active terminal, and anything the agent writes to the outbox is downloadable from the same drawer.
+**Slow down here. This is the part that lands.**
 
----
-
-## 3:10 – 3:19 · Preview
-
-**ON SCREEN:** Open Preview, let it render, reload after a change if you can.
-
-> Preview runs the project's own development server under its own service unit, proxied with WebSocket upgrade,
-> so it survives closing the window.
+> This is the part I use most. Tasks take minutes and I'm not going to sit and watch. When a session finishes
+> the tab lights up amber, and so does the project key in the rail, so I'm told even when I'm working elsewhere.
+> That signal comes from the CLI reporting the end of its own turn, not from watching the screen. And with
+> auto-pin on, a finished project promotes itself to the top of the rail, so the work queues itself.
 
 ---
 
-## 3:19 – 3:45 · Deployment slots and audit history
+## 2:13 – 2:33 · Workspaces and scope
 
-**ON SCREEN:** Deployment Centre: the dev and prod cards with versions and the “source newer” badge, then the History tab — time, target, result, version, user, duration.
+**ON SCREEN:** Manage modal → General: the workspace path and the GitHub repo. Then in a terminal, ask the assistant to read another project's implementation of something and summarise it.
 
-**Hold on the history table. This is the part that decides whether it gets near production.**
-
-> Deployment is modelled as two slots per project, dev and prod. Each slot is a script plus a version-check
-> command, so the target can be a Windows server, a container or a file share. It probes the deployed version,
-> compares it against the working copy and flags the drift, and every run appends to a log: who ran it, which
-> target, which version, and whether it succeeded.
+> Every project has its own workspace folder on the server, backed by its own GitHub repository, so nothing here
+> exists only inside the tool. The assistant works inside that folder and sees that project only. But I can also
+> point it at another project and have it bring a pattern across.
 
 ---
 
-## 3:45 – 4:03 · Close
+## 2:33 – 2:55 · Assigning projects to people
 
-**ON SCREEN:** Sweep the Settings sidebar, then back to the dashboard with the full rail visible. Hold the frame.
+**ON SCREEN:** Settings → Users & Roles: add a user, set a role, assign projects. Then a second browser or your phone on the same session, both showing the same output.
 
-> Architecturally, then: one Node service, nginx in front, per-project service units, agent CLIs on an always-on
-> server, and Active Directory as the single identity source. It's sized for an individual developer or a small
-> team, it runs on our own infrastructure, and it was built in-house.
+> Projects are assigned per person. In Users and Roles I add someone, set a role, and pick their projects. Roles
+> differ by capability, not visibility: a content editor can hand files in without getting a terminal. And
+> because the sessions live on the server, two of us can open the same one and watch the same output.
 
 ---
 
-## Objections this script answers on camera
+## 2:55 – 3:13 · Files drawer
 
-Prerecorded, so nothing can be asked live. Each of these is already carried by a sentence in the narration —
-if you cut the sentence, you lose the answer.
+**ON SCREEN:** Drag a screenshot onto the window, show it land in Inbox with the path dropped into the terminal. Switch to Outbox and download a file.
 
-| Objection | Where it's answered |
+> Every project has a files drawer: an inbox and an outbox. I drag a screenshot or a spec in and it lands in the
+> inbox, with the path handed straight to the assistant. Anything it produces for me comes back in the outbox to
+> download.
+
+---
+
+## 3:13 – 3:24 · Preview
+
+**ON SCREEN:** Open Preview, let the app render, reload it after a change if you can.
+
+> Preview opens the project's running app in a window here, so I can see a change work without any local setup.
+> It keeps running when I close the window.
+
+---
+
+## 3:24 – 3:48 · Deployment slots and history
+
+**ON SCREEN:** Deployment Centre: the dev and prod cards with their versions and the “⬆ source newer” badge, then the History tab — time, target, result, version, user, duration.
+
+**Hold on the history table for a couple of seconds. This is the part directors read.**
+
+> Deployment has its own page: a dev card and a prod card for every project. Each shows the version actually
+> running out there, flags it when my working copy is newer, and deploys with one button. The History tab
+> records every run — who deployed, which target, which version, and whether it succeeded. That is the audit
+> trail, per project.
+
+---
+
+## 3:48 – 4:01 · Close
+
+**ON SCREEN:** Sweep the Settings sidebar (Users & Roles, CLIs & Sign-in, Environment, System & Updates), then back to the dashboard with the full rail visible. Hold that frame.
+
+> It's all managed centrally: projects, deployment targets, users and settings in one place. It's built for an
+> individual developer or a small team, it runs on our own infrastructure, and it was built in-house.
+
+---
+
+## What each section has to land
+
+Prerecorded, so nothing can be asked live. If you cut one of these sentences, you lose the answer with it.
+
+| The question in their head | The sentence that answers it |
 |---|---|
-| "Is it just encrypted, or actually verified?" | Authentication — the DC certificate is validated against the trust store |
-| "Can someone reach a shell without logging in?" | Authentication — terminals bind to loopback, reachable only through the authenticated proxy |
-| "Is directory membership alone enough to get in?" | Authentication — the bind is necessary but not sufficient; the local record carries the grants |
-| "What if the server dies?" | Workspace isolation — each workspace is a clone with its own remote |
-| "Is completion detection guesswork?" | Completion signalling — stop-hook marker plus the per-window bell flag, latched by the poller |
-| "Can this go near production?" | Deployment — per-run log of user, target, version and result |
-
+| "Is this secured properly?" | Authentication — bind against AD over LDAPS, certificate validated, no unauthenticated route to a shell |
+| "Is being in AD enough to get in?" | Authentication — the bind is necessary, but the account also has to be in the local access record |
+| "What if that server dies?" | Workspaces — each one is backed by its own GitHub repository, so nothing exists only inside the tool |
+| "Is the completion signal reliable?" | Completion — it comes from the CLI reporting the end of its turn, not from watching the screen |
+| "Could this go near production?" | Deployment — every run records who, which target, which version, and the result |
+| "Who is this for?" | Close — an individual developer or a small team |
 
 ---
 
 ## Recording notes
 
 **Set up before you record**
-- `PW_LOGIN_ORG` must be set on the container, or the sign-in page still reads *"your directory account"* while
-  you are saying "GOA Active Directory" over the top of it. Script for that is in the outbox.
-- Five to eight projects in the rail. Fan-out is the premise of the whole argument; a thin rail contradicts it.
-- One window already **finished** (amber) and one still **running** (green), so both signal states are visible.
+- `PW_LOGIN_ORG` has to be set on the container, or the page still says *"your directory account"* while you're
+  saying "GOA Active Directory" over the top of it. `set-login-org.sh` in the outbox does it.
+- Five to eight projects in the rail with recognisable names. A thin rail contradicts the premise.
+- One session already **finished** (amber) and one still **running** (green), so both states are on screen.
 - At least one project with real deployment history. An empty History tab undercuts the audit claim.
-- Preview server already warm, so it isn't cold-booting on camera.
-- Second client already attached to the shared session.
-- Sign in with your own AD account. Do not demo the local-password fallback while describing directory auth.
+- Preview server already warm so it isn't cold-booting on camera.
+- Second viewer attached to the shared session, ready to switch to.
+- Sign in with your own AD account. Don't demo the local-password fallback while describing directory auth.
 
 **Pacing**
-- Weight the three sections this audience is actually assessing: authentication, completion signalling, and
-  deployment history. Move briskly through the rest.
-- Don't narrate the clicking. Name the mechanism and let the screen show the behaviour.
+- Slow down on authentication, completion notices, and deployment history. Move faster through the rest.
+- Don't narrate the clicking. Say what the feature is for and let the screen show the mechanic.
 
 **If you're running long, cut in this order**
-1. Preview — reduce to one clause.
-2. The live cross-project prompt — keep the sentence, don't run it on camera.
-3. The tmux sidecar detail — keep "the sessions survive an app redeploy," drop the reason.
+1. Preview — reduce to "and it previews the running app live."
+2. The cross-project lookup — keep the sentence, don't run the prompt on camera.
+3. The session-naming examples — keep "as many as I want, and they stay running."
 
 **Claims to keep precise**
 - "Stores no passwords" is true in directory mode, which is what this instance runs. A local-password mode
-  exists; don't say "cannot".
-- Say the bind is "necessary but not sufficient". The local record is an allowlist, not a mirror of the directory.
-- Sessions survive a *dashboard* restart because the tmux server is in a sidecar. They do not survive a host
-  reboot; don't imply they do.
+  exists in the code; don't say "cannot".
+- The bind is necessary but not sufficient. The local record is an allowlist, not a mirror of the directory.
+- Sessions survive closing the browser and restarting the app. They don't survive a host reboot — don't imply
+  they do.
