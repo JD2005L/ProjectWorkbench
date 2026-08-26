@@ -56,6 +56,21 @@ for HOME_DIR in /home/admin /root; do
   ' "$CFG/settings.json" "$HOOK"
 done
 
+# --- Codex CLI: NOT wired, deliberately -------------------------------------
+# Codex is not in enabledClis on this instance and its binary is not installed, so
+# there is nothing to wire yet. When it is enabled, it needs the same treatment as
+# Copilot -- verified against Codex's config reference (developers.openai.com/codex/
+# config-reference), not assumed:
+#   * lifecycle hooks must be turned on: features.hooks = true
+#   * events include Stop (also SessionEnd, UserPromptSubmit, PreToolUse, ...), in
+#     hooks.json or an inline [hooks] table in config.toml
+#   * or notify = ["<command>"], which receives a JSON payload -- user-level config
+#     only, since a project-local .codex/config.toml has notify ignored
+# Either route can call pw-agent-done.sh unchanged; the bell is what matters.
+# Install note: @openai/codex-linux-x64 404s on registry.npmjs.org (only the JS
+# wrapper is published there), so `npm i -g @openai/codex` yields a CLI that cannot
+# find its binary. Use the vendor installer instead.
+
 # --- Copilot CLI: agentStop hook (its only turn-end signal) ------------------
 DONE_HOOK=/opt/project-workbench/scripts/pw-agent-done.sh
 
