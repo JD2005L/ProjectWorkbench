@@ -7,7 +7,10 @@ set -e
 DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 case "$DIR" in
   /opt/project-workbench/workspaces/*)
-    NAME=$(basename "$DIR")
+    # First segment under the workspaces root: a nested cwd (…/Project/app) must
+    # still resolve to "Project", where basename would have marked "app".
+    REST=${DIR#/opt/project-workbench/workspaces/}
+    NAME=${REST%%/*}
     mkdir -p /var/lib/project-workbench/pending 2>/dev/null || true
     date -u +%FT%TZ > "/var/lib/project-workbench/pending/$NAME" 2>/dev/null || true
     ;;
