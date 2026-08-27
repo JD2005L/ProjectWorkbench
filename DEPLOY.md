@@ -97,6 +97,7 @@ previous config on failure before reloading.
 | `PW_LOGIN_ORG` | `your directory account` (ldap mode) | noun phrase in the login page's "Sign in with &hellip;" line, e.g. `your GOA account`. Read once at boot |
 | `PW_SSO_USER_HEADER` | `''` | emit the signed-in user from `/api/auth/check` for sibling-app SSO |
 | `PW_DEPLOY_CENTRE` | `false` | enable the Windows (WinRM/SMB) Deploy Centre |
+| `PW_SCHEDULED_TASKS` | `<registry dir>/scheduled-tasks.json` | where scheduled task definitions live. Managed from Settings → Scheduled tasks; the file is plain JSON and safe to edit by hand (it is re-read every tick, no restart). The scheduler is in-process, not a systemd timer, so it behaves the same in host and container mode; it does not arm in an isolated instance |
 | `PW_EXTRA_NGINX` | `/etc/project-workbench/extra-nginx.conf` | inject env-specific sibling-app nginx locations (see `docs/consolidation/extra-nginx.example.conf`) |
 | `PW_CANONICAL_REGISTRY` | `/opt/project-workbench/projects.json` | where THIS deployment's real registry lives. Any `PW_REGISTRY_PATH` other than this runs the instance isolated (no host tmux/ttyd/nginx writes). Deployments that keep the real registry elsewhere (e.g. GOA under `/etc/project-workbench/`) set this to that path to opt into host mode — host mode is never inferred from the path's shape |
 | `PW_ISOLATED` | unset | `1` forces isolation even on the canonical registry (belt-and-braces for test instances) |

@@ -20,6 +20,7 @@ import { resolveProjectCredentialOwner } from './project-owner.js';
 import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv } from './workspace-file.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
+import { normalizeTask, evaluateDue, resolveTargets, preserveBookkeeping, guardedGitCommand, SCHEDULE_LIMITS } from './scheduled-tasks.js';
 import { withLifecycleLock } from './lifecycle-lock.js';
 import { makeCredentialLockDomain } from './credential-domain-lock.js';
 import { assertTmuxOwner } from './tmux-owner-gate.js';
@@ -146,6 +147,100 @@ app.use(attachUser);
 
 async function loadProjects(){ const raw = await fs.readFile(registryPath,'utf8').catch(()=> '[]'); return JSON.parse(raw); }
 async function saveProjects(projects){ await writeFileAtomic(registryPath, JSON.stringify(projects, null, 2)+'\n', { mode: 0o644 }); }
+
+// ---------------------------------------------------------------- scheduled tasks
+//
+// Definitions live beside the registry, in a file that is bind-mounted 1:1 into
+// the containers, so editing it needs no restart and the file is visible from the
+// same place on a host install.
+const scheduledTasksPath = process.env.PW_SCHEDULED_TASKS || path.join(path.dirname(registryPath), 'scheduled-tasks.json');
+async function loadScheduledTasks(){
+ let raw;
+ try { raw = JSON.parse(await fs.readFile(scheduledTasksPath,'utf8')); }
+ catch { return []; }
+ if(!Array.isArray(raw)) return [];
+ const tz = await displayTimeZone();
+ const out = [];
+ for(const item of raw){
+  // One malformed task must not silence the rest: it is dropped with a reason
+  // rather than taking the whole schedule down.
+  try { out.push(normalizeTask(item, { defaultTimeZone: tz })); }
+  catch(e){ console.error(`[tasks] ignoring invalid task ${JSON.stringify(item?.id ?? '?')}: ${e.message}`); }
+ }
+ return out;
+}
+async function saveScheduledTasks(tasks){
+ await writeFileAtomic(scheduledTasksPath, JSON.stringify(tasks, null, 2)+'\n', { mode: 0o644 });
+}
+
+// A task that is mid-run must not be started again by the next tick. Keyed by id,
+// in memory only: a restart clears it, which is correct — nothing is running then.
+const tasksInFlight = new Set();
+
+// Run one task now. The command is injected as a tmux window per project, so it
+// executes as the pane account (never as this root process) and its output stays
+// readable in a tab afterwards, which is the whole reason to prefer this over a
+// headless exec for work an operator wants to inspect.
+async function runScheduledTask(task, { trigger = 'schedule', dueAt = Date.now(), actor = null } = {}){
+ if(tasksInFlight.has(task.id)) return { skipped:'already running' };
+ tasksInFlight.add(task.id);
+ try {
+  const projects = await loadProjects();
+  const { matched, missing } = resolveTargets(task, projects);
+  const results = [];
+  for(const name of matched){
+   const p = projects.find(x => x.name === name);
+   try {
+    // Create the session if the project has none, then add the window: a task
+    // firing after hours must not depend on someone having opened the project.
+    await ensureTmuxSession(p);
+    await newTmuxWindow(p, task.window, task.command);
+    results.push({ project:name, ok:true });
+   } catch(e){ results.push({ project:name, ok:false, error: e?.message || String(e) }); }
+  }
+  const failed = results.filter(r => !r.ok);
+  const status = !results.length ? 'failed' : failed.length === 0 ? 'ok' : failed.length === results.length ? 'failed' : 'partial';
+  const detail = [
+   `${results.length - failed.length}/${results.length} project(s)`,
+   ...(missing.length ? [`unknown: ${missing.join(', ')}`] : []),
+   ...failed.slice(0,5).map(f => `${f.project}: ${f.error}`),
+  ].join(' · ');
+
+  // Record the SCHEDULED instant, not the finish time, so a late run does not
+  // push tomorrow's deadline later.
+  const all = await loadScheduledTasks();
+  const next = all.map(t => t.id === task.id
+   ? { ...t, lastRun: new Date(dueAt).toISOString(), lastStatus: status, lastDetail: detail }
+   : t);
+  await saveScheduledTasks(next);
+  await audit('task_run', { task: task.id, trigger, status, projects: results.length, failed: failed.length, actor }, null);
+  console.log(`[tasks] ${task.id} (${trigger}): ${status} — ${detail}`);
+  return { status, detail, results, missing };
+ } finally { tasksInFlight.delete(task.id); }
+}
+
+// The ticker. 30s is fine for minute-resolution schedules and cheap: one small
+// file read per tick, and evaluateDue() is pure arithmetic.
+let taskTickTimer = null;
+function startTaskScheduler(){
+ if(taskTickTimer) return;
+ const tick = async () => {
+  try {
+   const tasks = await loadScheduledTasks();
+   const now = Date.now();
+   for(const t of tasks){
+    const verdict = evaluateDue(t, now);
+    if(verdict.due) await runScheduledTask(t, { trigger:'schedule', dueAt: verdict.dueAt });
+   }
+  } catch(e){ console.error('[tasks] tick failed:', e?.message || e); }
+ };
+ taskTickTimer = setInterval(tick, 30_000);
+ taskTickTimer.unref?.();
+ // Not on the boot tick: a restart during the minute a daily task is due would
+ // otherwise fire it before projects have their sessions back.
+ setTimeout(tick, 45_000);
+ console.log('[tasks] scheduler armed');
+}
 
 // Configure a project's workspace-local git credentials.
 //
@@ -3013,6 +3108,54 @@ app.get(BASE + '/api/setup/state', requireAdmin, async (_req,res)=>{ try {
  res.json({ ok:true, settings, clis, updateStamp });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
+// ---- scheduled tasks -------------------------------------------------------
+app.get(BASE + '/api/tasks', requireAdmin, async (_req,res)=>{ try {
+ const [tasks, projects] = await Promise.all([loadScheduledTasks(), loadProjects()]);
+ const tz = await displayTimeZone();
+ res.json({ ok:true, timeZone: tz, limits: SCHEDULE_LIMITS,
+  projects: projects.map(p => p.name),
+  // A template rather than a hidden default: the operator sees exactly what
+  // would run and can edit it before saving.
+  gitTemplate: guardedGitCommand(),
+  tasks: tasks.map(t => ({ ...t, running: tasksInFlight.has(t.id),
+   lastRunDisplay: t.lastRun ? (fmtUpdateStamp(t.lastRun, tz) || t.lastRun) : 'never' })) });
+} catch(e){ res.status(500).json({ok:false,error:e.message}); }});
+
+app.post(BASE + '/api/tasks', requireAdmin, async (req,res)=>{ try {
+ const tz = await displayTimeZone();
+ let incoming;
+ try { incoming = normalizeTask(req.body, { defaultTimeZone: tz }); }
+ catch(e){ return res.status(400).json({ok:false,error:e.message}); }
+ const tasks = await loadScheduledTasks();
+ const existing = tasks.find(t => t.id === incoming.id);
+ // The submitter owns the definition; the scheduler owns the history.
+ const merged = preserveBookkeeping(incoming, existing);
+ const next = existing ? tasks.map(t => t.id === merged.id ? merged : t) : [...tasks, merged];
+ await saveScheduledTasks(next);
+ await audit(existing ? 'task_update' : 'task_create', { task: merged.id, enabled: merged.enabled }, req);
+ res.json({ ok:true, task: merged });
+} catch(e){ res.status(500).json({ok:false,error:e.message}); }});
+
+app.delete(BASE + '/api/tasks/:id', requireAdmin, async (req,res)=>{ try {
+ const tasks = await loadScheduledTasks();
+ const id = String(req.params.id);
+ if(!tasks.some(t => t.id === id)) return res.status(404).json({ok:false,error:'No such task'});
+ await saveScheduledTasks(tasks.filter(t => t.id !== id));
+ await audit('task_delete', { task: id }, req);
+ res.json({ ok:true });
+} catch(e){ res.status(500).json({ok:false,error:e.message}); }});
+
+app.post(BASE + '/api/tasks/:id/run', requireAdmin, async (req,res)=>{ try {
+ const tasks = await loadScheduledTasks();
+ const task = tasks.find(t => t.id === String(req.params.id));
+ if(!task) return res.status(404).json({ok:false,error:'No such task'});
+ // Run now ignores `enabled` and the clock deliberately — it is the operator
+ // asking, not the schedule. It still records lastRun, so the schedule does not
+ // fire the same work again an hour later.
+ const out = await runScheduledTask(task, { trigger:'manual', dueAt: Date.now(), actor: req.user?.username || null });
+ res.json({ ok:true, ...out });
+} catch(e){ res.status(500).json({ok:false,error:e.message}); }});
+
 app.post(BASE + '/api/setup/state', requireAdmin, async (req,res)=>{ try {
  const s = await loadWorkbenchSettings();
  const body = req.body || {};
@@ -3099,7 +3242,7 @@ const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fi
 // Settings page (admin-only). Tabbed surface — primary settings destination.
 // Setup Wizard still exists as a focused guided modal launched from here.
 // ============================================================================
-const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
+const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
 .um-form{display:flex;flex-direction:column;gap:.9rem}.um-form label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.um-form label.inline{flex-direction:row;align-items:center;gap:.45rem}.um-form label.inline input[type=checkbox]{width:auto;margin:0}.proj-picker{border:1px solid #1f2937;border-radius:8px;padding:.5rem .65rem;background:#0b1220}.proj-picker .star{display:flex;align-items:center;gap:.45rem;color:#fde68a;font-size:.85rem;padding-bottom:.45rem;border-bottom:1px solid #1f2937;margin-bottom:.45rem}.proj-picker .star input{width:auto;margin:0}.proj-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.3rem .85rem;max-height:240px;overflow-y:auto}.proj-list.disabled{opacity:.45;pointer-events:none}.proj-list label{flex-direction:row;align-items:center;gap:.4rem;font-size:.82rem;color:#cbd5e1;padding:.2rem 0;cursor:pointer}.proj-list label input{width:auto;margin:0}.proj-list .empty{color:#94a3b8;font-style:italic;font-size:.82rem}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}`;
 
 const settingsScript = `<script>(function(){const tabs=document.querySelectorAll('.s-tabs button');const sections=document.querySelectorAll('.s-main section');function activate(id){tabs.forEach(b=>b.classList.toggle('active',b.dataset.tab===id));sections.forEach(s=>s.classList.toggle('active',s.id==='tab-'+id));try{history.replaceState(null,'','#'+id)}catch{}}tabs.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));const init=(location.hash||'#users').slice(1);activate(['users','clis','env','system','firstrun'].includes(init)?init:'users');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(el,t,err){if(!el)return;el.textContent=t||'';el.classList.toggle('err',!!err)}
@@ -3126,6 +3269,73 @@ umSave.addEventListener('click',async()=>{const username=umUsername.value.trim()
 loadProjectList();loadUsers();
 // --- CLIs + Environment + System tabs (reuse existing /api/setup/* endpoints) ---
 const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('${BASE}/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in">Signed in</span>':'')+'<span class="cli-checked'+(c.lastUpdateOk===false?' bad':'')+'" title="When the auto-updater last checked this CLI">'+(c.lastUpdate==='never'?'never checked':(c.lastUpdateOk===false?'check failed \u00b7 ':'checked ')+esc(c.lastUpdate))+'</span>'+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);loadState();loadSystem();
+/* ---- scheduled tasks ---- */
+const tRows=document.getElementById('taskRows'),tStatus=document.getElementById('taskStatus');
+const tF={id:'tId',name:'tName',window:'tWindow',kind:'tKind',at:'tAt',every:'tEvery',tz:'tTz',weekdays:'tWeekdays',enabled:'tEnabled',target:'tTarget',pick:'tPick',cmd:'tCmd'};
+const el=k=>document.getElementById(tF[k]);
+let taskState={tasks:[],projects:[],gitTemplate:''};
+function tSay(m,bad){tStatus.textContent=m||'';tStatus.style.color=bad?'#fca5a5':'#bbf7d0'}
+function syncKind(){const daily=el('kind').value==='daily';document.getElementById('tAtWrap').hidden=!daily;document.getElementById('tEveryWrap').hidden=daily;document.getElementById('tPickWrap').hidden=el('target').value!=='some'}
+el('kind').addEventListener('change',syncKind);el('target').addEventListener('change',syncKind);
+function fillTaskForm(t){
+ el('id').value=t?t.id:'';el('name').value=t?t.name:'';el('window').value=t?t.window:'';
+ el('kind').value=t?t.schedule.kind:'daily';el('at').value=t&&t.schedule.at?t.schedule.at:'17:00';
+ el('every').value=t&&t.schedule.everyMinutes?t.schedule.everyMinutes:30;
+ el('tz').value=t?t.timeZone:'';el('weekdays').checked=!!(t&&t.schedule.weekdaysOnly);
+ el('enabled').checked=t?t.enabled!==false:true;el('cmd').value=t?t.command:'';
+ el('target').value=t&&t.target!=='all'?'some':'all';
+ [...el('pick').options].forEach(o=>{o.selected=!!(t&&Array.isArray(t.target)&&t.target.includes(o.value))});
+ document.getElementById('taskFormTitle').textContent=t?('Edit '+t.id):'Add a task';syncKind();
+}
+function renderTasks(){
+ el('pick').innerHTML=taskState.projects.map(n=>'<option value="'+esc(n)+'">'+esc(n)+'</option>').join('');
+ if(!taskState.tasks.length){tRows.innerHTML='<p class="muted">No scheduled tasks yet.</p>';return}
+ tRows.innerHTML=taskState.tasks.map(t=>{
+  const when=t.schedule.kind==='daily'?('daily '+t.schedule.at+(t.schedule.weekdaysOnly?' (weekdays)':'')+' '+esc(t.timeZone)):('every '+t.schedule.everyMinutes+'m');
+  const who=t.target==='all'?'all projects':(t.target.length+' project'+(t.target.length===1?'':'s'));
+  const cls=t.lastStatus==='ok'?'ok':(t.lastStatus?'bad':'');
+  return '<div class="task-row" data-id="'+esc(t.id)+'"><div class="tr-main"><span class="tr-name">'+esc(t.name)+'</span>'
+   +(t.enabled?'':'<span class="tr-off">disabled</span>')+(t.running?'<span class="tr-run">running…</span>':'')
+   +'<span class="tr-when">'+when+' · '+who+'</span>'
+   +'<span class="tr-last '+cls+'">last: '+esc(t.lastRunDisplay)+(t.lastStatus?(' · '+esc(t.lastStatus)):'')+(t.lastDetail?(' — '+esc(t.lastDetail)):'')+'</span></div>'
+   +'<div class="tr-acts"><button class="button secondary tiny t-edit" type="button">Edit</button><button class="button secondary tiny t-run" type="button">Run now</button><button class="button secondary tiny t-del" type="button">Delete</button></div></div>';
+ }).join('');
+}
+async function loadTasks(){
+ try{const r=await fetch('${BASE}/api/tasks',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');
+  taskState={tasks:j.tasks||[],projects:j.projects||[],gitTemplate:j.gitTemplate||''};renderTasks();
+  if(!el('tz').placeholder)el('tz').placeholder=j.timeZone||'';
+ }catch(e){tRows.innerHTML='<p class="muted">'+esc(e.message)+'</p>'}
+}
+tRows.addEventListener('click',async e=>{
+ const row=e.target.closest('.task-row');if(!row)return;const id=row.dataset.id;
+ const t=taskState.tasks.find(x=>x.id===id);
+ if(e.target.classList.contains('t-edit')){fillTaskForm(t);document.getElementById('tId').focus();return}
+ if(e.target.classList.contains('t-del')){
+  if(!confirm('Delete task "'+id+'"? This does not undo anything it already did.'))return;
+  const r=await fetch('${BASE}/api/tasks/'+encodeURIComponent(id),{method:'DELETE'});const j=await r.json();
+  tSay(j.ok?('Deleted '+id):('Error: '+j.error),!j.ok);loadTasks();return}
+ if(e.target.classList.contains('t-run')){
+  if(!confirm('Run "'+id+'" now in '+(t&&t.target==='all'?'every project':'its projects')+'?'))return;
+  e.target.disabled=true;tSay('Running '+id+'…');
+  try{const r=await fetch('${BASE}/api/tasks/'+encodeURIComponent(id)+'/run',{method:'POST'});const j=await r.json();
+   tSay(j.ok?(id+': '+(j.status||'done')+' — '+(j.detail||'')):('Error: '+j.error),!j.ok||j.status==='failed');
+  }catch(err){tSay(err.message,true)}finally{e.target.disabled=false;loadTasks()}}
+});
+document.getElementById('tGit').onclick=()=>{el('cmd').value=taskState.gitTemplate;if(!el('name').value)el('name').value='End-of-day commit & push';if(!el('id').value)el('id').value='eod-commit';if(!el('window').value)el('window').value='eod'};
+document.getElementById('tReset').onclick=()=>fillTaskForm(null);
+document.getElementById('tSave').onclick=async()=>{
+ const kind=el('kind').value;
+ const body={id:el('id').value.trim().toLowerCase(),name:el('name').value.trim(),window:el('window').value.trim(),
+  enabled:el('enabled').checked,timeZone:el('tz').value.trim(),command:el('cmd').value,
+  schedule:kind==='daily'?{kind:'daily',at:el('at').value.trim(),weekdaysOnly:el('weekdays').checked}:{kind:'interval',everyMinutes:Number(el('every').value)},
+  target:el('target').value==='all'?'all':[...el('pick').selectedOptions].map(o=>o.value)};
+ try{const r=await fetch('${BASE}/api/tasks',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+  const j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');
+  tSay('Saved '+j.task.id);fillTaskForm(null);loadTasks();
+ }catch(e){tSay(e.message,true)}
+};
+fillTaskForm(null);loadTasks();
 // --- First Run tab: launch wizard modal ---
 document.getElementById('rerunWizardBtn')?.addEventListener('click',()=>{document.getElementById('setupBackdrop')?.classList.remove('hidden')});})();</script>`;
 
@@ -3133,11 +3343,30 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
 <section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed. When per-user Claude is enabled (<code>PW_PER_USER_CLAUDE</code>), the <b>Claude</b> column shows whether a user has completed their own Claude login — used automatically for the projects they own (their <code>primaryUser</code> assignment).</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
 <section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead">Install or update each assistant, then sign in. Tokens land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Sign-in terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
-<section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
+<section id="tab-tasks"><h2>Scheduled tasks</h2><p class="lead">Run a command in your projects on a clock. Each run opens a named tab in the project's terminal, so you can read what it did afterwards.</p>
+<div class="s-card"><h3>Tasks</h3><div id="taskRows"><p class="muted">loading…</p></div><div id="taskStatus" class="muted"></div></div>
+<div class="s-card"><h3 id="taskFormTitle">Add a task</h3>
+<div class="t-grid">
+<label>Id<input id="tId" type="text" placeholder="eod-commit" autocomplete="off"><span class="pmHelp">Lowercase letters, digits and dashes. Reusing an id edits that task.</span></label>
+<label>Name<input id="tName" type="text" placeholder="End-of-day commit &amp; push" autocomplete="off"></label>
+<label>Tab name<input id="tWindow" type="text" placeholder="eod" autocomplete="off"><span class="pmHelp">The tmux window each run opens.</span></label>
+<label>When<select id="tKind"><option value="daily">Daily at a time</option><option value="interval">Every N minutes</option></select></label>
+<label id="tAtWrap">Time<input id="tAt" type="text" placeholder="17:00" autocomplete="off"><span class="pmHelp">24-hour, in the timezone below.</span></label>
+<label id="tEveryWrap" hidden>Minutes<input id="tEvery" type="number" min="5" step="5" placeholder="30"></label>
+<label>Timezone<input id="tTz" type="text" placeholder="America/Edmonton" autocomplete="off"><span class="pmHelp">Blank uses the dashboard timezone.</span></label>
+<label class="t-check"><input id="tWeekdays" type="checkbox">Weekdays only</label>
+<label class="t-check"><input id="tEnabled" type="checkbox" checked>Enabled</label>
+<label>Projects<select id="tTarget"><option value="all">All projects</option><option value="some">Only the ones I pick</option></select></label>
+<label id="tPickWrap" hidden>Pick projects<select id="tPick" multiple size="6"></select></label>
+</div>
+<label class="t-cmd">Command<textarea id="tCmd" rows="10" spellcheck="false" placeholder="Runs in each project's workspace."></textarea></label>
+<div class="t-actions"><button class="button" id="tSave" type="button">Save task</button><button class="button secondary" id="tReset" type="button">Clear form</button><button class="button secondary" id="tGit" type="button">Use the guarded git template</button></div>
+<p class="muted">The git template skips clean repos, skips detached HEAD, commits locally when there is no upstream, and never force-pushes.</p>
+</div></section><section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
 <div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
@@ -3902,6 +4131,11 @@ const srv = app.listen(PORT,'127.0.0.1',()=>{
    .then(r => { if(r.removed?.length) console.log(`[per-user-claude] pruned ${r.removed.length} orphaned credential tree(s)`); })
    .catch(e => console.warn(`[per-user-claude] boot credential prune failed: ${e?.message || e}`));
  }
+ // Armed for BOTH modes and before the host-mode return: a scheduled task runs
+ // through newTmuxWindow(), which works in host mode too, so gating it on
+ // container mode would silently give host installs a UI that never fires.
+ // Never in an isolated instance — those point at real projects.
+ if(!ISOLATED) startTaskScheduler();
  if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
  if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
  sweepOrphanTmuxSessions();
