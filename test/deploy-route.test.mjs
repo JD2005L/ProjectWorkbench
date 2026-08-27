@@ -164,3 +164,74 @@ test('REGRESSION: a saved deploy password is reused without prompting, and never
     assert.match(body.output, /deployed-ok/);
   });
 });
+
+
+// The badge used to be emitted only when true, so after a successful deploy the
+// client rewrote the version text and left the badge behind — a card claiming the
+// working copy was newer than a build that had just superseded it. It is now
+// always rendered and hidden when it does not apply, so the client can correct it
+// in place, and the deploy response carries the recomputed answer.
+//
+// withServer() removes the instance directory on teardown, so each case gets its
+// own instance rather than reusing one across two server lifetimes.
+// Both target cards render a badge, so an assertion has to be scoped to one of
+// them: an unscoped regex matches prod's legitimately-hidden badge and reads as
+// dev's being wrong.
+function targetSection(html, target) {
+  const seg = html.split('data-target="').find((part) => part.startsWith(`${target}"`));
+  assert.ok(seg, `no ${target} target card in the rendered modal`);
+  return seg;
+}
+
+async function withDeployCard(port, versionCmd, fn) {
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(path.join(proj, 'a.txt'), 'x');   // gives getLocalVersion a today-stamp to read
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7821 }], null, 2));
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({
+    demo: { dev: { script: 'echo deployed-ok', versionCmd } },
+  }));
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-boss', username: 'boss', role: 'admin', projects: '*', passwordHash },
+  ] }, null, 2));
+  await withServer(inst, port, async (base) => {
+    const r = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'boss', password }),
+    });
+    assert.equal((await r.json()).ok, true, 'sanity: login must succeed');
+    const cookie = r.headers.get('set-cookie').split(';')[0];
+    const card = await (await fetch(`${base}/api/deploy/demo/card`, { headers: { Cookie: cookie } })).json();
+    assert.equal(card.ok, true, `card must render: ${JSON.stringify(card).slice(0, 200)}`);
+    await fn({ base, cookie, card });
+  });
+}
+
+test('REGRESSION: the source-newer badge is always rendered so a deploy can clear it', { timeout: 30000 }, async () => {
+  // Deployed build FAR in the future: the target is newer, so the badge must be
+  // present-but-hidden rather than absent — the state the card got wrong before.
+  await withDeployCard(3906, 'echo V1.99.0101.0000', async ({ base, cookie, card }) => {
+    const dev = targetSection(card.html, 'dev');
+    assert.match(dev, /class="src-newer-badge"/, 'badge must be in the DOM even when it does not apply');
+    assert.match(dev, /class="src-newer-badge"[^>]*\shidden/, 'and must be hidden when the target is newer');
+
+    // The deploy response has to carry the recomputed comparison, because that is
+    // what the client toggles on.
+    const dep = await (await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    })).json();
+    assert.equal(dep.ok, true, `deploy must succeed: ${JSON.stringify(dep).slice(0, 200)}`);
+    assert.equal(typeof dep.sourceNewer, 'boolean', 'response must state whether source is still newer');
+    assert.equal(dep.sourceNewer, false, 'a future-dated build is not older than the working copy');
+  });
+
+  // The converse: an ancient deployed build IS older, so the badge shows.
+  await withDeployCard(3907, 'echo V1.00.0101.0000', async ({ card }) => {
+    const dev = targetSection(card.html, 'dev');
+    assert.match(dev, /class="src-newer-badge"/, 'badge present');
+    assert.doesNotMatch(dev, /class="src-newer-badge"[^>]*\shidden/, 'and visible when the source really is newer');
+  });
+});
