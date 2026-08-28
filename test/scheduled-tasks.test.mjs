@@ -10,6 +10,7 @@ import assert from 'node:assert/strict';
 import {
   zonedParts, instantForLocal, normalizeTask, evaluateDue,
   resolveTargets, guardedGitCommand, preserveBookkeeping, SCHEDULE_LIMITS, NORTH_AMERICAN_TIMEZONES,
+  buildTaskCommand, shellSingleQuote, AGENT_BINS,
 } from '../app/scheduled-tasks.js';
 
 const MT = 'America/Edmonton';
@@ -85,7 +86,8 @@ test('bad definitions are rejected at the boundary, not at run time', () => {
   const cases = [
     ['missing id', { name: 'n', command: 'c', schedule: { kind: 'daily', at: '17:00' } }],
     ['id with edge dashes', { id: '-x-', name: 'n', command: 'c', schedule: { kind: 'daily', at: '17:00' } }],
-    ['blank command', { id: 'ab', name: 'n', command: '   ', schedule: { kind: 'daily', at: '17:00' } }],
+    ['neither box filled', { id: 'ab', name: 'n', command: '   ', prompt: '  ', schedule: { kind: 'daily', at: '17:00' } }],
+    ['unknown agent', { id: 'ab', name: 'n', prompt: 'do it', agent: 'rm', schedule: { kind: 'daily', at: '17:00' } }],
     ['hour out of range', { id: 'ab', name: 'n', command: 'c', schedule: { kind: 'daily', at: '25:00' } }],
     ['unknown kind', { id: 'ab', name: 'n', command: 'c', schedule: { kind: 'hourly' } }],
     ['interval too small', { id: 'ab', name: 'n', command: 'c', schedule: { kind: 'interval', everyMinutes: 1 } }],
@@ -150,4 +152,37 @@ test('the offered timezones are a convenience, not a constraint', () => {
   assert.equal(normalizeTask({
     id: 'ab', name: 'n', command: 'c', schedule: { kind: 'daily', at: '17:00' }, timeZone: 'Europe/London',
   }).timeZone, 'Europe/London');
+});
+
+test('a task composes shell first, then the wrapped agent call', () => {
+  const t = normalizeTask({
+    id: 'eod', name: 'EOD', schedule: { kind: 'daily', at: '17:00' }, timeZone: MT,
+    command: 'git fetch --all\ngit status --short',
+    prompt: 'Commit and push anything outstanding.\nIf there is no upstream, do nothing.',
+  });
+  const lines = buildTaskCommand(t).split('\n');
+  assert.deepEqual(lines.slice(0, 2), ['git fetch --all', 'git status --short'], 'shell runs first, newlines intact');
+  // The prompt's own newline is collapsed: send-keys turns a newline into Enter,
+  // which would run half the sentence as a command.
+  assert.equal(lines[2], "claude -p 'Commit and push anything outstanding. If there is no upstream, do nothing.'");
+  assert.equal(lines.length, 3);
+
+  // Either box alone is a complete task.
+  assert.equal(buildTaskCommand(normalizeTask({ id: 'ab', name: 'n', command: 'echo hi', schedule: { kind: 'daily', at: '1:00' } })), 'echo hi');
+  assert.match(buildTaskCommand(normalizeTask({ id: 'ab', name: 'n', prompt: 'do it', schedule: { kind: 'daily', at: '1:00' } })), /^claude -p 'do it'$/);
+});
+
+test('operator prose cannot escape its quotes into the shell', () => {
+  // The prompt is untrusted text going into a command line. Anything that would
+  // let it become a second command has to stay inert.
+  for (const nasty of ["it's fine", 'a`whoami`b', 'x$(id -u)y', 'a; echo PWNED', "''", 'back\\slash']) {
+    const cmd = buildTaskCommand({ agent: 'claude', prompt: nasty });
+    assert.match(cmd, /^claude -p '/, 'always single-quoted');
+    // Reconstruct what a POSIX shell would parse back out of the quoted form.
+    const quoted = cmd.slice("claude -p ".length);
+    const unquoted = quoted.slice(1, -1).split("'\\''").join("'");
+    assert.equal(unquoted, nasty.replace(/\s+/g, ' ').trim(), `must round-trip: ${nasty}`);
+  }
+  assert.equal(shellSingleQuote("a'b"), "'a'\\''b'");
+  assert.ok(AGENT_BINS.includes('claude'));
 });

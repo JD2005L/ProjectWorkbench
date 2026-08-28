@@ -27,6 +27,10 @@ const TARGET_ALL = 'all';
 const MAX_NAME = 80;
 const MAX_COMMAND = 4000;
 const MIN_INTERVAL_MINUTES = 5;
+/** Agent CLIs a task may invoke. Mirrors SUPPORTED_CLIS' bins; overridable by the
+ *  caller so this module stays standalone and testable. */
+export const AGENT_BINS = Object.freeze(['claude', 'copilot', 'codex']);
+const MAX_PROMPT = 4000;
 
 const ID_RE = /^[a-z0-9][a-z0-9-]{0,48}[a-z0-9]$/;
 const TIME_RE = /^([01]?\d|2[0-3]):([0-5]\d)$/;
@@ -72,7 +76,7 @@ export function instantForLocal(timeZone, year, month, day, hour, minute) {
 }
 
 /** Validate and canonicalise a task from disk or from the API. Throws on bad input. */
-export function normalizeTask(raw, { defaultTimeZone = 'UTC' } = {}) {
+export function normalizeTask(raw, { defaultTimeZone = 'UTC', agentBins = AGENT_BINS } = {}) {
   if (!isPlainObject(raw)) throw new Error('task must be an object');
 
   const id = String(raw.id ?? '').trim().toLowerCase();
@@ -81,9 +85,17 @@ export function normalizeTask(raw, { defaultTimeZone = 'UTC' } = {}) {
   const name = String(raw.name ?? '').trim().slice(0, MAX_NAME);
   if (!name) throw new Error('task name is required');
 
+  // Either box is enough, and both together is the point: shell prepares, agent
+  // finishes. Requiring one of them is what stops a task that does nothing at all.
   const command = String(raw.command ?? '').replace(/\r/g, '');
-  if (!command.trim()) throw new Error('task command is required');
+  const prompt = String(raw.prompt ?? '').replace(/\r/g, '');
+  if (!command.trim() && !prompt.trim()) throw new Error('a task needs a shell command, an agent prompt, or both');
   if (command.length > MAX_COMMAND) throw new Error(`task command must be under ${MAX_COMMAND} characters`);
+  if (prompt.length > MAX_PROMPT) throw new Error(`agent prompt must be under ${MAX_PROMPT} characters`);
+  const agent = String(raw.agent ?? 'claude').trim();
+  if (prompt.trim() && !agentBins.includes(agent)) {
+    throw new Error(`agent must be one of: ${agentBins.join(', ')}`);
+  }
 
   const kind = String(raw.schedule?.kind ?? '').trim();
   if (!SCHEDULE_KINDS.includes(kind)) throw new Error(`schedule.kind must be one of: ${SCHEDULE_KINDS.join(', ')}`);
@@ -125,6 +137,8 @@ export function normalizeTask(raw, { defaultTimeZone = 'UTC' } = {}) {
     target,
     window: String(raw.window ?? '').trim().slice(0, MAX_NAME) || name.slice(0, 24),
     command,
+    prompt,
+    agent,
     // Carried through because this same function loads tasks from disk, where the
     // bookkeeping is the scheduler's own record. It is NOT safe to accept from an
     // API caller — a submitted lastRun would let them suppress the next run or
@@ -237,6 +251,41 @@ export function preserveBookkeeping(incoming, existing) {
     lastStatus: existing?.lastStatus ?? null,
     lastDetail: existing?.lastDetail ?? null,
   };
+}
+
+/**
+ * Wrap a string so a POSIX shell sees it as one literal argument.
+ *
+ * The standard idiom: close the quote, emit an escaped quote, reopen. Anything
+ * else — backticks, $(), backslashes, semicolons — is inert inside single quotes,
+ * which is the point. Operator prose is not a trusted shell fragment.
+ */
+export function shellSingleQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * What actually gets typed into the tab: the shell part, then the agent call.
+ *
+ * Both halves are optional and a task may carry either or both, which is the
+ * useful shape — prepare something with shell, then hand the result to an agent.
+ * They are joined by a newline rather than `&&`, so the agent still runs if the
+ * preparation reports a non-zero status; a task that wants the stricter behaviour
+ * writes its own `&&` inside the shell box, where the operator can see it.
+ *
+ * The prompt's whitespace collapses to single spaces, and that is not cosmetic:
+ * newTmuxWindow() delivers this through `tmux send-keys … C-m`, i.e. as keystrokes
+ * followed by Enter. An embedded newline is therefore an Enter, which would run a
+ * fragment of the prose as a command and leave the rest at a continuation prompt.
+ * The shell box keeps its newlines, because there they are the sequencing.
+ */
+export function buildTaskCommand(task) {
+  const parts = [];
+  const shell = String(task.command ?? '').trim();
+  if (shell) parts.push(shell);
+  const prompt = String(task.prompt ?? '').replace(/\s+/g, ' ').trim();
+  if (prompt) parts.push(`${task.agent || 'claude'} -p ${shellSingleQuote(prompt)}`);
+  return parts.join('\n');
 }
 
 /**
