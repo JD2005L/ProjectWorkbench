@@ -35,6 +35,10 @@ function makeInstance(port) {
   // Seeded, as test/deploy-route.test.mjs does: session signing needs it, and
   // without it the login handler answers with an HTML error page rather than JSON.
   fs.writeFileSync(path.join(dir, '.secret-key'), crypto.randomBytes(32).toString('hex') + '\n');
+  // enabledClis is empty on purpose: the agent picker must then be empty whatever
+  // is installed on this machine, which makes the assertion about the gate rather
+  // than about the test host.
+  fs.writeFileSync(path.join(dir, 'workbench.json'), JSON.stringify({ enabledClis: [], updateClis: [] }, null, 2));
   const env = {
     PATH: process.env.PATH, HOME: process.env.HOME, LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port), PW_ISOLATED: '1',
@@ -44,6 +48,7 @@ function makeInstance(port) {
     PW_WORKSPACES: path.join(dir, 'workspaces'),
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'),
     PW_SCHEDULED_TASKS: path.join(dir, 'scheduled-tasks.json'),
+    PW_WORKBENCH_SETTINGS: path.join(dir, 'workbench.json'),
     PW_TIMEZONE: 'America/Edmonton',
   };
   fs.writeFileSync(env.PW_REGISTRY_PATH, JSON.stringify([
@@ -124,6 +129,12 @@ test('tasks round-trip through the API and are listed with a display time', { ti
     }
     assert.equal(j.timeZone, 'America/Edmonton', 'and the dashboard zone, which the form preselects');
 
+    // Only agents that could actually run are offered. This instance enables none
+    // in its settings file, so the picker must be empty rather than listing three
+    // CLIs that would fail at 17:00 unattended.
+    assert.ok(Array.isArray(j.agents), 'ships the agent list');
+    assert.deepEqual(j.agents, [], 'nothing enabled in settings means nothing offered, however much is installed');
+
     assert.equal((await (await post(validTask)).json()).ok, true);
     j = await list();
     assert.equal(j.tasks.length, 1);
@@ -131,6 +142,15 @@ test('tasks round-trip through the API and are listed with a display time', { ti
     assert.equal(j.tasks[0].schedule.weekdaysOnly, true);
     assert.equal(j.tasks[0].timeZone, 'America/Edmonton', 'inherits the dashboard timezone when none is given');
     assert.equal(j.tasks[0].lastRunDisplay, 'never', 'a task that has not run says so');
+
+    // A definition naming a currently-unusable agent stays loadable — dropping it
+    // would remove a scheduled job the operator believes exists — but is flagged.
+    assert.equal((await (await post({ ...validTask, id: 'agent-task', prompt: 'do it', agent: 'claude' })).json()).ok, true);
+    const withAgent = (await list()).tasks.find((t) => t.id === 'agent-task');
+    assert.equal(withAgent.agent, 'claude', 'the definition is preserved');
+    assert.equal(withAgent.agentUnavailable, true, 'and flagged as not runnable right now');
+    assert.match(withAgent.effectiveCommand, /claude -p 'do it'/, 'the composed command is still shown');
+    await fetch(`${base}/api/tasks/agent-task`, { method: 'DELETE', headers: { Cookie: cookie } });
 
     // Editing by the same id replaces rather than duplicating.
     assert.equal((await (await post({ ...validTask, name: 'Renamed' })).json()).ok, true);

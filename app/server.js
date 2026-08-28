@@ -58,7 +58,12 @@ const DEPLOY_MODE = (process.env.PW_DEPLOY_MODE || 'host').toLowerCase() === 'co
 const TMUX_SOCKET = process.env.PW_TMUX_SOCKET || (ISOLATED ? 'pwprev-' + process.pid : '');
 const nginxTestCmd = process.env.PW_NGINX_TEST_CMD || '';
 const nginxReloadCmd = process.env.PW_NGINX_RELOAD_CMD || '';
-const workbenchSettingsPath = '/etc/project-workbench/workbench.json';
+// Overridable like every other state path (registry, users, sessions, deploy
+// config, scheduled tasks). Without it an isolated instance read the real
+// /etc/project-workbench/workbench.json, so a test's behaviour — which CLIs are
+// enabled, which timezone is displayed — depended on production settings, and a
+// settings write from an isolated instance would have landed on the live file.
+const workbenchSettingsPath = process.env.PW_WORKBENCH_SETTINGS || '/etc/project-workbench/workbench.json';
 const wrapperEnvPath = '/etc/project-workbench/claude-wrapper.env';
 const emptyMcpPath = '/etc/project-workbench/empty-mcp.json';
 // Per-user CLI credentials: when ON, a project's terminal runs on its assigned
@@ -164,7 +169,7 @@ async function loadScheduledTasks(){
  for(const item of raw){
   // One malformed task must not silence the rest: it is dropped with a reason
   // rather than taking the whole schedule down.
-  try { out.push(normalizeTask(item, { defaultTimeZone: tz, agentBins: taskAgentBins })); }
+  try { out.push(normalizeTask(item, { defaultTimeZone: tz, agentBins: taskKnownAgentBins })); }
   catch(e){ console.error(`[tasks] ignoring invalid task ${JSON.stringify(item?.id ?? '?')}: ${e.message}`); }
  }
  return out;
@@ -176,9 +181,25 @@ async function saveScheduledTasks(tasks){
 // A task that is mid-run must not be started again by the next tick. Keyed by id,
 // in memory only: a restart clears it, which is correct — nothing is running then.
 const tasksInFlight = new Set();
-// Drawn from SUPPORTED_CLIS so the form, the validator and the installed CLIs are
-// one list rather than three.
-const taskAgentBins = Object.values(SUPPORTED_CLIS).map(c => c.bin);
+
+// Two different questions, deliberately not one list.
+//
+// VALIDATION asks "is this a known agent" — every CLI this build supports. A task
+// must not become unloadable because a CLI was temporarily uninstalled or switched
+// off: the definition is still valid, it just cannot run right now, and silently
+// dropping it would remove a scheduled job an operator believes exists.
+const taskKnownAgentBins = Object.values(SUPPORTED_CLIS).map(c => c.bin);
+
+// THE PICKER asks "which can actually run tonight" — enabled in settings AND
+// present on disk. Offering a CLI that is switched off, or enabled but not
+// installed, is offering a task that fails at 17:00 with nobody watching.
+async function activeAgentBins(){
+ const settings = await loadWorkbenchSettings();
+ const enabled = new Set(settings.enabledClis || []);
+ const pairs = await Promise.all(Object.entries(SUPPORTED_CLIS).map(async ([key,cfg]) =>
+  [cfg.bin, enabled.has(key) && !!(await getCliVersion(cfg.bin))]));
+ return pairs.filter(([,ok]) => ok).map(([bin]) => bin);
+}
 
 // Run one task now. The command is injected as a tmux window per project, so it
 // executes as the pane account (never as this root process) and its output stays
@@ -3113,9 +3134,9 @@ app.get(BASE + '/api/setup/state', requireAdmin, async (_req,res)=>{ try {
 
 // ---- scheduled tasks -------------------------------------------------------
 app.get(BASE + '/api/tasks', requireAdmin, async (_req,res)=>{ try {
- const [tasks, projects] = await Promise.all([loadScheduledTasks(), loadProjects()]);
+ const [tasks, projects, agents] = await Promise.all([loadScheduledTasks(), loadProjects(), activeAgentBins()]);
  const tz = await displayTimeZone();
- res.json({ ok:true, timeZone: tz, limits: SCHEDULE_LIMITS, timeZones: NORTH_AMERICAN_TIMEZONES, agents: taskAgentBins,
+ res.json({ ok:true, timeZone: tz, limits: SCHEDULE_LIMITS, timeZones: NORTH_AMERICAN_TIMEZONES, agents,
   projects: projects.map(p => p.name),
   // A template rather than a hidden default: the operator sees exactly what
   // would run and can edit it before saving.
@@ -3124,13 +3145,16 @@ app.get(BASE + '/api/tasks', requireAdmin, async (_req,res)=>{ try {
    lastRunDisplay: t.lastRun ? (fmtUpdateStamp(t.lastRun, tz) || t.lastRun) : 'never',
    // What will actually be typed into the tab, agent wrapper included, so the
    // operator sees the composition rather than inferring it.
-   effectiveCommand: buildTaskCommand(t) })) });
+   effectiveCommand: buildTaskCommand(t),
+   // A task can outlive the CLI it names. Say so in the list rather than letting
+   // it fail unattended.
+   agentUnavailable: !!(t.prompt && t.prompt.trim() && !agents.includes(t.agent)) })) });
 } catch(e){ res.status(500).json({ok:false,error:e.message}); }});
 
 app.post(BASE + '/api/tasks', requireAdmin, async (req,res)=>{ try {
  const tz = await displayTimeZone();
  let incoming;
- try { incoming = normalizeTask(req.body, { defaultTimeZone: tz, agentBins: taskAgentBins }); }
+ try { incoming = normalizeTask(req.body, { defaultTimeZone: tz, agentBins: taskKnownAgentBins }); }
  catch(e){ return res.status(400).json({ok:false,error:e.message}); }
  const tasks = await loadScheduledTasks();
  const existing = tasks.find(t => t.id === incoming.id);
@@ -3283,9 +3307,14 @@ let taskState={tasks:[],projects:[],gitTemplate:'',timeZone:'',timeZones:[]};
 let wantTz='';
 function tSay(m,bad){tStatus.textContent=m||'';tStatus.style.color=bad?'#fca5a5':'#bbf7d0'}
 function renderAgentOptions(){
- const sel=el('agent'),want=sel.value||'claude';
- sel.innerHTML=(taskState.agents||['claude']).map(a=>'<option value="'+esc(a)+'">'+esc(a)+'</option>').join('');
+ const sel=el('agent'),want=sel.value||'claude',list=taskState.agents||[];
+ sel.innerHTML=list.map(a=>'<option value="'+esc(a)+'">'+esc(a)+'</option>').join('');
+ // An agent that is no longer active must stay selectable while editing that task,
+ // or saving would quietly repoint it at a different CLI.
+ if(want&&!list.includes(want))sel.insertAdjacentHTML('afterbegin','<option value="'+esc(want)+'">'+esc(want)+' (not currently available)</option>');
  if([...sel.options].some(o=>o.value===want))sel.value=want;
+ // With no usable agent, say so instead of showing an empty control.
+ if(!sel.options.length)sel.innerHTML='<option value="">no agent enabled &amp; installed</option>';
 }
 function renderTzOptions(){
  const sel=el('tz');
@@ -3302,7 +3331,7 @@ function fillTaskForm(t){
  el('every').value=t&&t.schedule.everyMinutes?t.schedule.everyMinutes:30;
  wantTz=t?t.timeZone:'';renderTzOptions();el('weekdays').checked=!!(t&&t.schedule.weekdaysOnly);
  el('enabled').checked=t?t.enabled!==false:true;el('cmd').value=t?(t.command||''):'';el('prompt').value=t?(t.prompt||''):'';
- el('agent').value=(t&&t.agent)||'claude';
+ el('agent').value=(t&&t.agent)||'claude';renderAgentOptions();
  el('target').value=t&&t.target!=='all'?'some':'all';
  [...el('pick').options].forEach(o=>{o.selected=!!(t&&Array.isArray(t.target)&&t.target.includes(o.value))});
  document.getElementById('taskFormTitle').textContent=t?('Edit '+t.id):'Add a task';syncKind();
@@ -3316,6 +3345,7 @@ function renderTasks(){
   const cls=t.lastStatus==='ok'?'ok':(t.lastStatus?'bad':'');
   return '<div class="task-row" data-id="'+esc(t.id)+'"><div class="tr-main"><span class="tr-name">'+esc(t.name)+'</span>'
    +(t.enabled?'':'<span class="tr-off">disabled</span>')+(t.running?'<span class="tr-run">running…</span>':'')
+   +(t.agentUnavailable?'<span class="tr-off" title="This task names an agent that is not enabled or not installed, so its prompt will fail">agent unavailable: '+esc(t.agent)+'</span>':'')
    +'<span class="tr-when">'+when+' · '+who+'</span>'
    +'<span class="tr-last '+cls+'">last: '+esc(t.lastRunDisplay)+(t.lastStatus?(' · '+esc(t.lastStatus)):'')+(t.lastDetail?(' — '+esc(t.lastDetail)):'')+'</span></div>'
    +'<div class="tr-acts"><button class="button secondary tiny t-edit" type="button">Edit</button><button class="button secondary tiny t-run" type="button">Run now</button><button class="button secondary tiny t-del" type="button">Delete</button></div></div>';
