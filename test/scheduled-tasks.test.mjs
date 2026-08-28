@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 
 import {
   zonedParts, instantForLocal, normalizeTask, evaluateDue,
-  resolveTargets, guardedGitCommand, preserveBookkeeping, SCHEDULE_LIMITS,
+  resolveTargets, guardedGitCommand, preserveBookkeeping, SCHEDULE_LIMITS, NORTH_AMERICAN_TIMEZONES,
 } from '../app/scheduled-tasks.js';
 
 const MT = 'America/Edmonton';
@@ -136,4 +136,18 @@ test('the guarded git command refuses every surprising case', () => {
 test('limits are exported so the UI and the API agree on them', () => {
   assert.equal(typeof SCHEDULE_LIMITS.MIN_INTERVAL_MINUTES, 'number');
   assert.equal(SCHEDULE_LIMITS.TARGET_ALL, 'all');
+});
+
+test('the offered timezones are a convenience, not a constraint', () => {
+  // Every offered zone must resolve, or the picker hands the operator a value the
+  // validator will reject.
+  for (const z of NORTH_AMERICAN_TIMEZONES) {
+    assert.doesNotThrow(() => new Intl.DateTimeFormat('en-CA', { timeZone: z.id }), `bad zone: ${z.id}`);
+  }
+  assert.ok(NORTH_AMERICAN_TIMEZONES.some((z) => z.id === 'America/Edmonton'));
+  // A zone outside the list must still be accepted: the JSON is editable by hand
+  // and a picker is not a whitelist.
+  assert.equal(normalizeTask({
+    id: 'ab', name: 'n', command: 'c', schedule: { kind: 'daily', at: '17:00' }, timeZone: 'Europe/London',
+  }).timeZone, 'Europe/London');
 });

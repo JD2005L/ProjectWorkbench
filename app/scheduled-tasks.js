@@ -239,4 +239,37 @@ export function preserveBookkeeping(incoming, existing) {
   };
 }
 
+/**
+ * North American zones, for the picker.
+ *
+ * A convenience list, NOT a constraint: normalizeTask() accepts any zone Intl can
+ * resolve, so a task hand-edited in the JSON to Europe/London keeps working and the
+ * UI adds it to the dropdown rather than silently rewriting it. Ordered
+ * east-to-west because that is how someone scans for their own.
+ *
+ * Regina and Phoenix are listed separately from their neighbours on purpose: they
+ * do not observe DST, so "Central" and "Mountain" are the wrong label for them
+ * half the year.
+ */
+export const NORTH_AMERICAN_TIMEZONES = Object.freeze([
+  { id: 'America/St_Johns',    label: 'Newfoundland — St. John’s' },
+  { id: 'America/Halifax',     label: 'Atlantic — Halifax' },
+  { id: 'America/Toronto',     label: 'Eastern — Toronto' },
+  { id: 'America/New_York',    label: 'Eastern — New York' },
+  { id: 'America/Iqaluit',     label: 'Eastern — Iqaluit' },
+  { id: 'America/Winnipeg',    label: 'Central — Winnipeg' },
+  { id: 'America/Chicago',     label: 'Central — Chicago' },
+  { id: 'America/Mexico_City', label: 'Central — Mexico City' },
+  { id: 'America/Regina',      label: 'Saskatchewan — Regina (no DST)' },
+  { id: 'America/Edmonton',    label: 'Mountain — Edmonton' },
+  { id: 'America/Denver',      label: 'Mountain — Denver' },
+  { id: 'America/Phoenix',     label: 'Arizona — Phoenix (no DST)' },
+  { id: 'America/Vancouver',   label: 'Pacific — Vancouver' },
+  { id: 'America/Los_Angeles', label: 'Pacific — Los Angeles' },
+  { id: 'America/Tijuana',     label: 'Pacific — Tijuana' },
+  { id: 'America/Whitehorse',  label: 'Yukon — Whitehorse' },
+  { id: 'America/Anchorage',   label: 'Alaska — Anchorage' },
+  { id: 'Pacific/Honolulu',    label: 'Hawaii — Honolulu (no DST)' },
+]);
+
 export const SCHEDULE_LIMITS = Object.freeze({ MIN_INTERVAL_MINUTES, MAX_COMMAND, MAX_NAME, TARGET_ALL });

@@ -114,6 +114,16 @@ test('tasks round-trip through the API and are listed with a display time', { ti
     assert.deepEqual(j.projects, ['alpha', 'beta'], 'offers the live registry to pick from');
     assert.match(j.gitTemplate, /@\{upstream\}/, 'ships the guarded git template for the UI to offer');
 
+    // The picker is served from the same module that validates, so the two cannot
+    // disagree about which zones exist, and every entry must actually resolve.
+    assert.ok(Array.isArray(j.timeZones) && j.timeZones.length > 5, 'ships a timezone list for the picker');
+    assert.ok(j.timeZones.some((z) => z.id === 'America/Edmonton'), 'includes Mountain');
+    for (const z of j.timeZones) {
+      assert.doesNotThrow(() => new Intl.DateTimeFormat('en-CA', { timeZone: z.id }), `unresolvable zone offered: ${z.id}`);
+      assert.ok(z.label && z.label !== z.id, `zone ${z.id} needs a human label`);
+    }
+    assert.equal(j.timeZone, 'America/Edmonton', 'and the dashboard zone, which the form preselects');
+
     assert.equal((await (await post(validTask)).json()).ok, true);
     j = await list();
     assert.equal(j.tasks.length, 1);
