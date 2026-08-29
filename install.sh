@@ -274,6 +274,12 @@ install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux
 install -d -m 0755 "$PW_INSTALL_DIR/scripts"
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-assert-owner"   "$PW_INSTALL_DIR/scripts/pw-tmux-assert-owner"
 ln -sfn "$PW_INSTALL_DIR/scripts/pw-tmux-assert-owner"    /usr/local/bin/pw-tmux-assert-owner
+# Same shape, same reason: pw-box-remediate imports ../app/workspace-box-owner.js
+# relative to itself, so it goes BESIDE app/ and reaches PATH through a symlink.
+# Installed flat it would resolve /usr/local/app/… and die ERR_MODULE_NOT_FOUND —
+# the Round 12 defect, which is why that is now the pattern rather than a habit.
+install -m 0755 "$SRC_DIR/scripts/pw-box-remediate"       "$PW_INSTALL_DIR/scripts/pw-box-remediate"
+ln -sfn "$PW_INSTALL_DIR/scripts/pw-box-remediate"        /usr/local/sbin/pw-box-remediate
 # The owner unit's ExecStart. It has to be installed BEFORE the unit is enabled at
 # the end of this script, and it has to be installed at all: a controlled host
 # deployment failed here with 203/EXEC because the host unit named the CONTAINER

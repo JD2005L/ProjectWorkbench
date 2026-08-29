@@ -18,6 +18,7 @@ import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credential
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
 import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv } from './workspace-file.js';
+import { repairWorkspaceBoxes } from './workspace-box-owner.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { normalizeTask, evaluateDue, resolveTargets, preserveBookkeeping, guardedGitCommand, SCHEDULE_LIMITS, NORTH_AMERICAN_TIMEZONES, buildTaskCommand } from './scheduled-tasks.js';
@@ -497,6 +498,32 @@ async function pruneUserCredentialTrees(users){
   fsp: fs, base: USER_CRED_BASE, keep: list.map(u => u.username).filter(Boolean),
   owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
  });
+}
+// Hand back any box the SUPERSEDED root upload path created, once at boot.
+//
+// Every box operation now runs as the terminal owner (see workspace-file.js),
+// but the directories the old root path had already made are `root:root`, and
+// the worker cannot create its O_EXCL temp file in one:
+//
+//   Paste failed: EACCES ... open '<project>/_inbox/.pw-inbox-<pid>-<rand>.part'
+//
+// So on every instance that predates the boundary, uploads into an ALREADY-USED
+// box fail and nothing repairs them. Same shape as pruneUserCredentialTrees:
+// state that went stale while the old code was in charge, repaired once on the
+// way up rather than discovered by a user.
+//
+// Only when this process is actually root — nothing to hand over when the
+// dashboard and the panes already share an account, and a non-root chown would
+// only ever be EPERM. The handover itself is race-proof by construction
+// (open O_NOFOLLOW|O_DIRECTORY, then fchown the handle); see
+// app/workspace-box-owner.js for why that is not the vulnerability round 17
+// removed.
+async function repairLegacyBoxOwnership(){
+ if(ISOLATED) return { repaired: [], refused: [] };
+ if((process.getuid?.() ?? null) !== 0) return { repaired: [], refused: [] };
+ const owner = await terminalOwner();
+ if(!Number.isInteger(owner?.uid) || !Number.isInteger(owner?.gid)) return { repaired: [], refused: [] };
+ return repairWorkspaceBoxes({ fsp: fs, projects: await loadProjects(), owner });
 }
 // What a project's tmux session should be launched with. `tokens` are extra
 // non-secret `env` KEY=VALUE entries; `shellArgs` is the pane shell's argv tail;
@@ -4181,6 +4208,15 @@ const srv = app.listen(PORT,'127.0.0.1',()=>{
    .then(r => { if(r.removed?.length) console.log(`[per-user-claude] pruned ${r.removed.length} orphaned credential tree(s)`); })
    .catch(e => console.warn(`[per-user-claude] boot credential prune failed: ${e?.message || e}`));
  }
+ // Before the host-mode return, because a host install is exactly where the
+ // pre-boundary boxes are. Failure is logged, never fatal: a dashboard that
+ // cannot repair an old box must still serve every project whose box is fine.
+ repairLegacyBoxOwnership()
+  .then(r => {
+   for(const b of r.repaired) console.log(`[boxes] handed ${b.dir} back to the terminal owner`);
+   for(const b of r.refused) console.warn(`[boxes] NOT repaired: ${b.dir} — ${b.reason}`);
+  })
+  .catch(e => console.warn(`[boxes] boot ownership repair failed: ${e?.message || e}`));
  // Armed for BOTH modes and before the host-mode return: a scheduled task runs
  // through newTmuxWindow(), which works in host mode too, so gating it on
  // container mode would silently give host installs a UI that never fires.

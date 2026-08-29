@@ -1,0 +1,100 @@
+#!/usr/bin/env node
+// pw-box-remediate — hand pre-boundary `_inbox` / `_outbox` directories back to
+// the terminal owner.
+//
+// WHY YOU WOULD RUN THIS. Every workspace box operation now runs as the terminal
+// owner (app/workspace-file.js). The boxes the SUPERSEDED root path had already
+// created are still `root:root`, and the worker cannot create its O_EXCL temp
+// file in a directory it does not own, so uploads into an already-used box fail:
+//
+//   Paste failed: EACCES: permission denied, open
+//   '<project>/_inbox/.pw-inbox-<pid>-<rand>.part'
+//
+// The dashboard repairs this once at boot. This CLI is the same code with the
+// same guarantees, for repairing an instance without restarting it, and for
+// seeing what a repair WOULD do first.
+//
+// Usage:
+//   pw-box-remediate [--dry-run] [--registry <projects.json>]
+//
+// Must be run as root: chown is the one box operation that cannot be delegated
+// to the owner. It converts only a directory it opened O_NOFOLLOW|O_DIRECTORY
+// itself, only when root still holds it, and never descends — see
+// app/workspace-box-owner.js for why each of those is load-bearing.
+
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
+import { repairBox, REPAIRABLE_BOXES } from '../app/workspace-box-owner.js';
+import { resolveIsolation } from '../app/isolation.js';
+import { resolveTerminalOwner, makePasswdLookup } from '../app/terminal-owner.js';
+
+const argv = process.argv.slice(2);
+const dryRun = argv.includes('--dry-run') || argv.includes('-n');
+if (argv.includes('--help') || argv.includes('-h')) {
+  console.log('usage: pw-box-remediate [--dry-run] [--registry <projects.json>]');
+  process.exit(0);
+}
+const registryFlag = argv.indexOf('--registry');
+const registryPath = registryFlag >= 0
+  ? argv[registryFlag + 1]
+  : resolveIsolation(process.env).registryPath;
+
+if (!registryPath) {
+  console.error('pw-box-remediate: no project registry resolved');
+  process.exit(2);
+}
+
+// A dry run only ever stats, so it is useful unprivileged; a real one cannot
+// work at all without root, and saying so beats a pile of EPERM.
+if (!dryRun && (process.getuid?.() ?? 0) !== 0) {
+  console.error('pw-box-remediate: must run as root (try: sudo pw-box-remediate)');
+  process.exit(2);
+}
+
+// getent first, /etc/passwd as the fallback — the same lookup the dashboard
+// builds, so the CLI can never disagree with it about whose files these are.
+const owner = await resolveTerminalOwner(
+  process.env,
+  makePasswdLookup({ execFile: promisify(execFile), readFile: fs.readFile }),
+);
+if (!owner || !Number.isInteger(owner.uid) || !Number.isInteger(owner.gid)) {
+  console.error('pw-box-remediate: the terminal owner did not resolve to a numeric uid/gid; refusing to guess');
+  process.exit(2);
+}
+
+let projects;
+try { projects = JSON.parse(await fs.readFile(registryPath, 'utf8')); }
+catch (e) {
+  console.error(`pw-box-remediate: cannot read ${registryPath}: ${e.message}`);
+  process.exit(2);
+}
+if (!Array.isArray(projects)) {
+  console.error(`pw-box-remediate: ${registryPath} is not a project array`);
+  process.exit(2);
+}
+
+console.log(`owner: ${owner.user} (${owner.uid}:${owner.gid}) — registry: ${registryPath}${dryRun ? ' — DRY RUN' : ''}`);
+
+// In a dry run the same module decides, and only the chown is withheld — so what
+// it prints is what a real run would do, not a second opinion about it.
+const fsp = dryRun ? { ...fs, open: async (p, f) => { const h = await fs.open(p, f); return { stat: () => h.stat(), chown: async () => {}, close: () => h.close() }; } } : fs;
+
+let repaired = 0;
+let refused = 0;
+for (const project of projects) {
+  if (!project?.path) continue;
+  for (const box of REPAIRABLE_BOXES) {
+    let r;
+    try { r = await repairBox({ fsp, projectPath: project.path, box, owner }); }
+    catch (e) { r = { state: 'refused', dir: path.join(project.path, box), reason: e.message }; }
+    if (r.state === 'repaired') { repaired++; console.log(`${dryRun ? 'would repair' : 'repaired'}: ${r.dir} (was ${r.from.uid}:${r.from.gid})`); }
+    else if (r.state === 'refused') { refused++; console.warn(`REFUSED: ${r.dir} — ${r.reason}`); }
+  }
+}
+
+console.log(`${dryRun ? 'would repair' : 'repaired'} ${repaired} box(es); ${refused} refused`);
+// A refusal is something an operator has to look at — something that is not a
+// directory is sitting where a box belongs — so it must not exit 0 into a script.
+process.exit(refused ? 1 : 0);
