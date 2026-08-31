@@ -163,6 +163,27 @@ if [[ "$had_server" == 0 ]]; then
 fi
 
 tmux_ set-option -s exit-empty off 2>/dev/null || true
+# Set HERE, not only in a tmux.conf, because this is the one place that runs in
+# both deployments and is not baked into the container image — the sidecar
+# bind-mounts this script from the host, so a recreated container picks the
+# setting up without an image rebuild.
+#
+# WHY: every browser tab that opens a project terminal is its own ttyd child
+# running `tmux attach-session`, so it is its own tmux client carrying its own
+# browser-derived size. A window has exactly ONE size. tmux's `latest` default
+# re-picks it from whichever client last had activity, which with two clients
+# attached means a resize PER KEYSTROKE — measured 7 in 8 with an 80x24 and a
+# 160x48 client. Each one SIGWINCHes the pane, so a full-screen agent TUI
+# repaints its whole frame, and tmux redraws the `·` U+00B7 padding it fills an
+# oversized client's uncovered area with: reported as the screen shaking with
+# dots everywhere, and only ever visible while two clients are attached at once.
+#
+# `smallest` pads the larger client with a STATIC margin and costs nobody any
+# content. `largest` is the other stable choice and is worse: it clips the
+# smaller client to the top-left of the window, so part of the TUI is off-screen
+# and a tmux client cannot be panned. tmux recomputes on detach as well as
+# attach, so a client left alone returns to its own full size.
+tmux_ set-option -g window-size smallest 2>/dev/null || true
 # The marker goes on the SERVER, so it cannot be inherited by a client.
 tmux_ set-option -s "$OWNER_MARKER_OPTION" "$OWNER_MARKER_VALUE" 2>/dev/null || true
 
