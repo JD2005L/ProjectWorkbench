@@ -252,6 +252,10 @@ install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+# Flat is correct here, unlike the two helpers below: plain bash, no relative
+# import to break. Repairs a workspace tree that a root process wrote into before
+# the writers were dropped to the pane account.
+install -m 0755 "$SRC_DIR/scripts/pw-fix-workspace-ownership" /usr/local/sbin/pw-fix-workspace-ownership
 
 # The ownership gate is installed BESIDE app/, then symlinked onto PATH.
 #
