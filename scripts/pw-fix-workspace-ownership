@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+# Give a workspace back to the account that works in it.
+#
+# WHY THIS EXISTS. Agent panes run as an unprivileged account (PW_TERMINAL_UID,
+# `admin` here); the dashboard runs as root. Any root process that writes below a
+# workspace leaves files the pane account cannot modify, and the agent working in
+# that pane then hits "Permission denied" on files that are nominally its own —
+# `dotnet build` cannot overwrite bin/obj, `git` cannot add an object whose
+# 2-char fanout directory is root-owned (an intermittent ~3%-of-writes failure),
+# the app cannot open its own SQLite db, and a mode 0600 root file is not even
+# readable. See app/workspace-file.js for the rule this violates.
+#
+# The known writers are fixed at the source (container-mode preview spawn drops to
+# the pane account; _inbox/_outbox uploads go through app/workspace-writer.mjs).
+# This script repairs trees that drifted BEFORE those fixes, and is safe to re-run.
+#
+# RUN IT AS ROOT, INSIDE THE DASHBOARD CONTAINER (or on the host in host mode):
+#   sudo podman exec -u root project-workbench /opt/project-workbench/scripts/pw-fix-workspace-ownership
+#   sudo podman exec -u root project-workbench /opt/project-workbench/scripts/pw-fix-workspace-ownership --apply
+#
+# Dry-run by default; --apply is what actually chowns. Stop a running preview for
+# the project first (Manage -> Preview -> Stop), or it will recreate what you fixed.
+#
+# WHAT IT REFUSES TO DO, and why:
+#   * `workspaces/canonical` is PRUNED. Its root:root 0700 is a real boundary --
+#     that is the LIVE DEPLOYED APP, and handing it to the pane uid would let any
+#     agent rewrite the running dashboard.
+#   * A regular file with a link count above 1 is SKIPPED and reported. The tree is
+#     writable by the pane account, so a hard link planted there could point at a
+#     root-owned file elsewhere on the same filesystem; chowning it would hand that
+#     file over. Nothing in a normal workspace needs this, so a hit is worth a look.
+#   * Only root-owned (uid 0 or gid 0) paths are touched. A path owned by some
+#     OTHER account is reported, never reassigned -- that is somebody's decision.
+#   * `_inbox` / `_outbox` are PRUNED and left to `scripts/pw-box-remediate` (which
+#     the dashboard also runs at boot). Those two have a narrower, better handover:
+#     fchown on a handle opened O_NOFOLLOW|O_DIRECTORY, no descent. Legacy files
+#     inside a box work fine root-owned -- delete and overwrite are governed by
+#     write permission on the directory -- so there is nothing here to add, and two
+#     mechanisms converting the same paths is one too many.
+#   * `-xdev` keeps the walk on the workspaces filesystem, and every chown is `-h`
+#     so a symlink is never followed (plain chown dereferences).
+set -euo pipefail
+
+WS_ROOT="${PW_WORKSPACES:-/opt/project-workbench/workspaces}"
+OWNER_USER="${PW_TERMINAL_USER:-admin}"
+PRUNE_NAME="canonical"
+# Delegated to scripts/pw-box-remediate, per the note in the header.
+PRUNE_BOXES=( -name _inbox -o -name _outbox )
+APPLY=0
+declare -a PROJECTS=()
+
+for arg in "$@"; do
+  case "$arg" in
+    --apply) APPLY=1 ;;
+    -h|--help) sed -n '2,41p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -*) echo "unknown option: $arg" >&2; exit 2 ;;
+    *) PROJECTS+=("$arg") ;;
+  esac
+done
+
+# Only --apply needs root. The dry run is a diagnosis an agent in a pane can run
+# on itself, which is the whole point of reporting before repairing.
+[[ $APPLY -eq 0 || $EUID -eq 0 ]] || { echo "pw-fix-workspace-ownership: --apply must run as root (chown to another user needs it); omit it for a dry run" >&2; exit 1; }
+[[ -d $WS_ROOT ]] || { echo "pw-fix-workspace-ownership: $WS_ROOT is not a directory" >&2; exit 1; }
+id -u "$OWNER_USER" >/dev/null 2>&1 || { echo "pw-fix-workspace-ownership: no such user '$OWNER_USER'" >&2; exit 1; }
+OWNER_UID=$(id -u "$OWNER_USER"); OWNER_GID=$(id -g "$OWNER_USER")
+
+if [[ ${#PROJECTS[@]} -eq 0 ]]; then
+  while IFS= read -r d; do PROJECTS+=("$(basename "$d")"); done < <(find "$WS_ROOT" -mindepth 1 -maxdepth 1 -type d ! -name "$PRUNE_NAME" | sort)
+fi
+
+total_fixed=0 total_skipped=0 total_foreign=0
+
+for name in "${PROJECTS[@]}"; do
+  if [[ $name == "$PRUNE_NAME" ]]; then
+    echo "== $name: SKIPPED (live deployed app; its root ownership is a boundary, not drift)"
+    continue
+  fi
+  dir="$WS_ROOT/$name"
+  if [[ -L $dir || ! -d $dir ]]; then
+    echo "== $name: SKIPPED (not a real directory under $WS_ROOT)"
+    continue
+  fi
+
+  # One walk, classified. Directories cannot be hard-linked, so only regular
+  # files need the link-count guard.
+  mapfile -d '' -t fixable  < <(find "$dir" -xdev \( "${PRUNE_BOXES[@]}" \) -prune -o -xdev \( -type d -o -type l -o \( -type f -links 1 \) -o \( ! -type d ! -type l ! -type f \) \) \( -uid 0 -o -gid 0 \) -print0)
+  mapfile -d '' -t hardlink < <(find "$dir" -xdev \( "${PRUNE_BOXES[@]}" \) -prune -o -xdev -type f -links +1 \( -uid 0 -o -gid 0 \) -print0)
+  mapfile -d '' -t foreign  < <(find "$dir" -xdev \( "${PRUNE_BOXES[@]}" \) -prune -o -xdev ! -uid 0 ! -uid "$OWNER_UID" -print0)
+
+  printf '== %-30s root-owned: %-6d hardlinked(skipped): %-4d other-owner: %d\n' \
+    "$name" "${#fixable[@]}" "${#hardlink[@]}" "${#foreign[@]}"
+
+  for f in "${hardlink[@]:-}"; do [[ -n $f ]] && echo "   ! hardlinked root file, NOT chowned: $f ($(stat -c '%h links, %U:%G' "$f"))"; done
+  for f in "${foreign[@]:-}"; do [[ -n $f ]] && echo "   ? owned by $(stat -c '%U:%G' "$f"), left alone: $f"; done
+
+  total_skipped=$(( total_skipped + ${#hardlink[@]} ))
+  total_foreign=$(( total_foreign + ${#foreign[@]} ))
+
+  if [[ ${#fixable[@]} -gt 0 ]]; then
+    if [[ $APPLY -eq 1 ]]; then
+      printf '%s\0' "${fixable[@]}" | xargs -0 --no-run-if-empty chown -h "$OWNER_UID:$OWNER_GID"
+      left=$(find "$dir" -xdev \( "${PRUNE_BOXES[@]}" \) -prune -o -xdev -type f -links 1 \( -uid 0 -o -gid 0 \) -print -o -xdev ! -type f \( -uid 0 -o -gid 0 \) -print | wc -l)
+      echo "   -> chowned ${#fixable[@]} to $OWNER_USER ($OWNER_UID:$OWNER_GID); root-owned remaining: $left"
+    else
+      # A sample, so a dry run is readable on a 3000-file NuGet cache.
+      for f in "${fixable[@]:0:12}"; do echo "   would chown: $f"; done
+      [[ ${#fixable[@]} -gt 12 ]] && echo "   ... and $(( ${#fixable[@]} - 12 )) more"
+    fi
+    total_fixed=$(( total_fixed + ${#fixable[@]} ))
+  fi
+done
+
+echo
+if [[ $APPLY -eq 1 ]]; then
+  echo "done: $total_fixed path(s) given to $OWNER_USER, $total_skipped hardlinked file(s) skipped, $total_foreign path(s) with another owner left alone."
+else
+  echo "DRY RUN: $total_fixed path(s) would be given to $OWNER_USER, $total_skipped hardlinked file(s) would be skipped, $total_foreign left alone. Re-run with --apply."
+fi

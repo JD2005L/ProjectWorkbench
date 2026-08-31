@@ -12,7 +12,7 @@ import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
 import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
-import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop } from './terminal-priv.js';
+import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
@@ -1255,7 +1255,22 @@ async function startPreviewUnit(p){
  const cwd = p.path || workspacePath(p.name);
  const userEnv = (p.preview && p.preview.env && typeof p.preview.env === 'object') ? p.preview.env : {};
  const env = { ...process.env, ...userEnv, PORT:String(port), BASEPATH:basepath, DOTNET_ENVIRONMENT:'Development', ASPNETCORE_ENVIRONMENT:'Development', DOTNET_CLI_HOME:path.join(cwd,'.dotnet'), HOME:cwd };
- const proc = spawn('bash',['-c',previewCommand(p)],{cwd,env,stdio:['ignore','pipe','pipe']});
+ // THE PREVIEW RUNS AS THE PANE ACCOUNT, NOT AS ROOT. Same rule app/workspace-file.js
+ // states for the boxes: the root dashboard performs no filesystem operation below a
+ // path the terminal account controls. This spawn is the strongest form of one — it
+ // runs the PROJECT's own code, in the project's workspace, with HOME and
+ // DOTNET_CLI_HOME pointed INTO that tree. Undropped it made everything the app and
+ // the SDK create root-owned inside a tree the agent owns: the whole
+ // `<ws>/.dotnet` NuGet cache, `bin/`, `obj/`, and the app's own `App_Data/`
+ // (SQLite db + DataProtection keys, the last of them mode 0600 and so unreadable
+ // to the account that has to run the app next). The agent in the pane then cannot
+ // build, and `dotnet` cannot rewrite its own cache. Host mode never had this: the
+ // unit runs the same command under `User=` (systemd/project-preview@.service).
+ // setpriv execs in place, so proc.pid below is still the shell stopPreviewUnit signals.
+ const drop = agentSpawnDrop(TERMINAL_PRIV);
+ if(drop.length){ env.USER = TERMINAL_PRIV.user; env.LOGNAME = TERMINAL_PRIV.user; }
+ const argv = [...drop,'bash','-c',previewCommand(p)];
+ const proc = spawn(argv[0],argv.slice(1),{cwd,env,stdio:['ignore','pipe','pipe']});
  const state = { proc, pid:proc.pid, since:new Date().toISOString(), exitCode:null, result:null, log:[], stopping:false };
  function appendLog(line){ state.log.push(line); if(state.log.length > PREVIEW_LOG_MAX) state.log.shift(); }
  proc.stdout.on('data', d => d.toString().split('\n').filter(Boolean).forEach(appendLog));

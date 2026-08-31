@@ -50,3 +50,14 @@ export function agentLoginDrop(priv) {
   if (!priv || !priv.enabled) return [];
   return ['/usr/bin/setpriv', '--reuid', String(priv.uid), '--regid', String(priv.gid), '--init-groups', '/usr/bin/env', `HOME=${priv.home}`, `USER=${priv.user}`, `LOGNAME=${priv.user}`];
 }
+
+// setpriv drop prefix for a long-running spawn that supplies its own {cwd, env}
+// rather than an `env` token list — the project preview server. setpriv execs in
+// place and passes the environment through untouched, so the caller's env object
+// still applies and the pid the caller holds is still the process it must signal
+// to stop. Returns [] when disabled (host mode already runs the preview
+// unprivileged: systemd/project-preview@.service sets User=).
+export function agentSpawnDrop(priv) {
+  if (!priv || !priv.enabled) return [];
+  return ['/usr/bin/setpriv', '--reuid', String(priv.uid), '--regid', String(priv.gid), '--init-groups'];
+}
