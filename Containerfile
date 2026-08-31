@@ -94,7 +94,24 @@ ENV NPM_CONFIG_PREFIX=/opt/npm-global
 RUN echo 'export PATH="/opt/npm-global/bin:$PATH"' > /etc/profile.d/npm-global.sh
 
 # tmux: unicode/truecolor; hide the status bar (the workbench has its own tab strip).
-RUN printf 'set -g default-terminal "xterm-256color"\nset -ga terminal-overrides ",xterm-256color:Tc"\nset -g mouse on\nset -gq allow-passthrough on\nset -g status off\n' > /etc/tmux.conf
+#
+# window-size smallest, NOT tmux's `latest` default. Every browser tab that opens a
+# project terminal is its own ttyd child running `tmux attach-session` (server.js),
+# so it is its own tmux client with its own browser-derived size — two people, or
+# one person with two tabs, means two clients on one window. A window has exactly
+# ONE size, so tmux has to choose, and under `latest` it re-chooses on every
+# keystroke: measured 7 resizes in 8 keystrokes with an 80x24 and a 160x48 client
+# attached. Each one SIGWINCHes the pane, a full-screen TUI (copilot, claude)
+# repaints its whole frame, and tmux redraws the `·` U+00B7 padding it fills the
+# oversized client's uncovered area with — the reported "screen shaking, dots
+# everywhere", visible only while two clients are attached at once.
+#
+# `smallest` pads the larger client with a STATIC margin instead of thrashing, and
+# nobody loses content. `largest` is the other stable choice and was rejected: it
+# clips the smaller client to the top-left of the window, so part of the TUI is
+# simply off-screen and a tmux client cannot be panned. Either way tmux recomputes
+# on attach AND detach, so a client left alone goes back to its own full size.
+RUN printf 'set -g default-terminal "xterm-256color"\nset -ga terminal-overrides ",xterm-256color:Tc"\nset -g mouse on\nset -gq allow-passthrough on\nset -g status off\nset -g window-size smallest\n' > /etc/tmux.conf
 
 WORKDIR /opt/project-workbench/app
 
