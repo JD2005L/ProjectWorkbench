@@ -248,10 +248,12 @@ fi
 # Appended once per target (idempotent via the pw-workspace-boundary marker) so
 # it survives alongside each CLI's own global instructions. STANDING policy: an
 # agent works only in its project workspace; external systems (prod/staging
-# servers, their DBs, AD/DCs, other hosts) are out of scope — when blocked it
-# summarizes the block for a human instead of working around it, and never
-# installs/runs security or AD tooling. Only the ProjectWorkbench project may
-# troubleshoot this host. Canonical copy: config/shared-memory/DECISIONS.md.
+# servers, their DBs, identity/directory servers, other hosts) are out of scope
+# — when blocked it summarizes the block for a human instead of working around
+# it, and never installs/runs offensive-security or attack tooling of any kind.
+# Only the ProjectWorkbench project may troubleshoot this host. Canonical copy:
+# config/shared-memory/DECISIONS.md. (Describe the tool CATEGORY, never product
+# names — naming products plants endpoint-security detection strings on the box.)
 log "Seeding workspace-boundary guardrail for all AI CLIs…"
 pw_seed_boundary() {
   local f="$1" dir
@@ -260,18 +262,18 @@ pw_seed_boundary() {
   if ! grep -q 'pw-workspace-boundary' "$f" 2>/dev/null; then
     [ -s "$f" ] && printf '\n\n' >> "$f"
     cat >> "$f" <<'BOUNDARY'
-<!-- pw-workspace-boundary v1 -->
+<!-- pw-workspace-boundary v2 -->
 ## Workspace boundary — stay inside your project; never investigate external systems
 
 You are a Project Workbench (PW) agent. Your job is the code in your project's workspace: the git repository at your current working directory and below. That workspace is your silo — stay inside it. PW's purpose is to build and maintain repo projects, not to reach out onto the network.
 
-Systems **outside** your workspace are out of scope: production and staging application servers, their databases, domain controllers / Active Directory, file shares, and any other host on the network. You do not have the surrounding context, ownership, or authorization to act on them safely, and doing so can look like an attack to security monitoring (Microsoft Defender / EDR) and trigger a real security incident.
+Systems **outside** your workspace are out of scope: production and staging application servers, their databases, identity/directory servers, file shares, and any other host on the network. You do not have the surrounding context, ownership, or authorization to act on them safely, and doing so can look like an attack to endpoint security monitoring and trigger a real security incident.
 
-When a task needs an external system and you hit a **block** — a permission error, an authentication failure, a missing grant, a firewall or connectivity problem, a failed database migration or deploy to a production server — **stop and do not try to work around it.** In particular, never install or run security, penetration-testing, reconnaissance, or Active-Directory tooling to get past it — for example impacket, ldapdomaindump, BloodHound / SharpHound, CrackMapExec / NetExec, Certipy, Responder, credential or hash dumping, Kerberos ticket abuse, port or host scanning, privilege escalation, or lateral movement — and do not reconfigure the remote host.
+When a task needs an external system and you hit a **block** — a permission error, an authentication failure, a missing grant, a firewall or connectivity problem, a failed database migration or deploy to a production server — **stop and do not try to work around it.** In particular, never install, download, or run offensive-security, penetration-testing, reconnaissance, credential-harvesting, or identity/directory attack tooling of any kind to get past it, and do not reconfigure the remote host. If a task appears to require that class of tool, that is itself the signal to stop and hand it to a human.
 
 **Instead, summarize the block for a human.** Write a short, plain-language note: what you were trying to do, the exact command and the target, the error you got, and what access or decision a person would need to unblock it. Hand that summary to the user. A human who has the missing context will investigate the external system. Summarizing a blocker is the correct, successful outcome here — it is not a failure to be engineered around.
 
-**Exception — this host only, ProjectWorkbench only.** The single project permitted to troubleshoot *this* workbench host (`vnl2422.rm.gov.ab.ca`) more deeply is the **ProjectWorkbench** project itself, whose workspace is `/opt/project-workbench/workspaces/ProjectWorkbench`, because maintaining the workbench is that project's job. Every other project stays inside its own workspace and does not troubleshoot the host. This exception covers only the local workbench host; external production and staging servers and the Active Directory domain remain off-limits to every project, ProjectWorkbench included.
+**Exception — this host only, ProjectWorkbench only.** The single project permitted to troubleshoot *this* workbench host (`vnl2422`) more deeply is the **ProjectWorkbench** project itself, whose workspace is `/opt/project-workbench/workspaces/ProjectWorkbench`, because maintaining the workbench is that project's job. Every other project stays inside its own workspace and does not troubleshoot the host. This exception covers only the local workbench host; external production and staging servers and the identity/directory domain remain off-limits to every project, ProjectWorkbench included.
 BOUNDARY
     chown "$PW_USER:$PW_USER" "$f" 2>/dev/null || true
     chmod 0640 "$f" 2>/dev/null || true

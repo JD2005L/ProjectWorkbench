@@ -20,31 +20,29 @@ its project's workspace (the git repo at its cwd and below). That workspace is
 the silo — stay inside it.
 
 Systems **outside** the workspace are out of scope: production and staging
-servers, their databases, domain controllers / Active Directory, file shares,
-and any other host on the network. Agents lack the surrounding context,
-ownership, and authorization to act on them, and doing so looks like an attack
-to security monitoring (Microsoft Defender / EDR) and triggers real incidents.
+servers, their databases, identity/directory servers, file shares, and any
+other host on the network. Agents lack the surrounding context, ownership, and
+authorization to act on them, and doing so looks like an attack to endpoint
+security monitoring and triggers real incidents.
 
 When a task needs an external system and hits a **block** — permission denied,
 auth failure, missing grant, a firewall/connectivity problem, a failed prod
-migration or deploy — **stop.** Do not work around it. Never install or run
-security / penetration-testing / Active-Directory tooling to get past it
-(impacket, ldapdomaindump, BloodHound/SharpHound, CrackMapExec/NetExec,
-Certipy, Responder, credential/hash dumping, Kerberos ticket abuse, port/host
-scanning, privilege escalation, lateral movement), and never reconfigure a
-remote host. **Instead, summarize the block for a human** — what you were doing,
-the exact command and target, the error, and what access/decision would unblock
-it — and hand it over. Summarizing a blocker is the successful outcome.
+migration or deploy — **stop.** Do not work around it. Never install, download,
+or run offensive-security, penetration-testing, reconnaissance,
+credential-harvesting, or identity/directory attack tooling of any kind to get
+past it, and never reconfigure a remote host. **Instead, summarize the block for
+a human** — what you were doing, the exact command and target, the error, and
+what access/decision would unblock it — and hand it over. Summarizing a blocker
+is the successful outcome.
 
 **Exception — this host only, ProjectWorkbench only:** the one project allowed
-to troubleshoot *this* workbench host (`vnl2422.rm.gov.ab.ca`) more deeply is
-the **ProjectWorkbench** project itself
+to troubleshoot *this* workbench host (`vnl2422`) more deeply is the
+**ProjectWorkbench** project itself
 (`/opt/project-workbench/workspaces/ProjectWorkbench`). Every other project
-stays in its workspace. External prod/staging servers and the AD domain stay
-off-limits to every project, ProjectWorkbench included.
+stays in its workspace. External prod/staging servers and the identity/directory
+domain stay off-limits to every project, ProjectWorkbench included.
 
 ---
-
 ## The mental model
 
 A Project Workbench instance hosts one or more **projects**. Each project is:
