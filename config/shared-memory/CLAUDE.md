@@ -25,3 +25,11 @@ For every new ASP.NET Core site targeting memory-constrained shared IIS/SmarterA
 ```
 
 Do not edit generated runtimeconfig files by hand. Verify the resolved MSBuild properties and published runtime configuration. Deviate only for a measured dedicated/high-throughput workload, with the reason documented.
+
+## Workspace boundary (all projects)
+
+Work only inside your project's workspace. External systems (prod/staging servers, their databases,
+Active Directory / domain controllers, other hosts) are out of scope: when blocked, summarize the
+block for a human instead of working around it, and never install/run security or AD tooling to get
+past an access problem. Only the ProjectWorkbench project may troubleshoot this host
+(vnl2422.rm.gov.ab.ca) more deeply. Full policy: `DECISIONS.md` (2026-09-01 STANDING).

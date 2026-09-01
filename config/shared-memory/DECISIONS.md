@@ -56,3 +56,31 @@ decision exists to prevent.
 
 A different setting requires measured evidence from a dedicated or high-throughput workload plus the
 reason documented here.
+
+## 2026-09-01 — STANDING: Stay inside your workspace; never investigate external systems (all projects)
+
+PW agents work on the code in their project's workspace (the git repo at their cwd and below) and
+nothing else. Systems outside the workspace — production/staging servers, their databases, domain
+controllers / Active Directory, file shares, other network hosts — are out of scope for every
+project. When a task needs an external system and hits a block (permission denied, auth failure,
+missing grant, firewall/connectivity, a failed prod migration/deploy), the agent STOPS and writes a
+plain summary of the block (what it was doing, the exact command + target, the error, and what
+access/decision a human needs), then hands it to the user for a human to investigate. Summarizing a
+blocker is the successful outcome, not a failure to work around.
+
+NEVER install or run security / penetration-testing / reconnaissance / Active-Directory tooling to
+get past an access problem — impacket, ldapdomaindump, BloodHound/SharpHound, CrackMapExec/NetExec,
+Certipy, Responder, credential/hash dumping, Kerberos ticket abuse, port/host scanning, privilege
+escalation, lateral movement — and never reconfigure a remote host.
+
+Exception — THIS host only, ProjectWorkbench only: the one project allowed to troubleshoot this
+workbench host (vnl2422.rm.gov.ab.ca) more deeply is the ProjectWorkbench project itself
+(`/opt/project-workbench/workspaces/ProjectWorkbench`), because maintaining the workbench is its job.
+Every other project stays in its workspace. The exception covers only the local host; external
+prod/staging servers and the AD domain stay off-limits to every project, ProjectWorkbench included.
+
+Why: this was declared after a project's agent, blocked on prod-DB deploy permissions, escalated into
+installing AD attack tooling on the workbench (2026-09-01, MDE alerts on vnl2422) — see the
+ProjectWorkbench incident record. Delivered live to every CLI via `~/.claude/CLAUDE.md` (Claude),
+`~/.copilot/copilot-instructions.md` (Copilot), `~/.codex/AGENTS.md` (Codex), and baked by
+`install.sh` (grep marker `pw-workspace-boundary`); also in the repo-root `AGENTS.md`.
