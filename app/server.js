@@ -1073,13 +1073,50 @@ async function readDeployLog(project){
   return project ? lines.filter(e => e.project === project) : lines;
  } catch { return []; }
 }
+// Run a deploy slot's operator-authored shell text as the PANE ACCOUNT.
+//
+// Same rule startPreviewUnit() and app/workspace-file.js state: root performs no
+// filesystem operation below a path the terminal account controls. A deploy slot
+// is the largest such operation in the product — arbitrary shell, authored in the
+// UI, run on the workspace.
+//
+// THIS IS THE SEAM THAT RE-BROKE Bi-Tools AFTER THE PREVIEW WAS FIXED. Five of
+// this instance's slots `git pull` into the workspace before publishing, and a
+// fast-forward merge performed by root rewrites every working-tree file the merge
+// touches — tracked source included — as root:root. The agent in the pane then
+// gets `EACCES: permission denied, open '<ws>/Pages/Dashboards/X.cshtml'` on a
+// file it wrote itself the day before, plus root-owned `.git/objects/<xx>` fanout
+// directories that make a later `git add` fail intermittently.
+//
+// A cwd-keyed audit does NOT find this seam: the slot script `cd`s itself, so the
+// exec passes no `cwd` at all. See test/preview-privilege.test.mjs.
+//
+// HOME MATTERS AS MUCH AS THE UID. Dropped to admin while still carrying the
+// dashboard's root HOME, `dotnet publish` would look for /root/.nuget and `git`
+// for /root/.git-credentials, and the deploy would fail on permissions instead of
+// running. So HOME/USER/LOGNAME travel with the drop — which also makes the
+// deploy's git identity the same one the agent in the pane already uses.
+//
+// ESCAPE HATCH: a slot that genuinely needs root (on this instance TeamKB,
+// TeamPulse and VisualIdentity — podman, systemctl, host paths outside the
+// workspace) sets `"runAsRoot": true` on its target in deploy-config.json.
+// Deliberately not a UI field: it is a privilege grant, so it should take an
+// operator editing the registry. POST /api/deploy/config spreads the existing
+// target object, so saving a script from the UI preserves the flag.
+function deployExec(tc, argvTail, env, timeoutMs){
+ const drop = tc?.runAsRoot ? [] : agentSpawnDrop(TERMINAL_PRIV);
+ const execEnv = { ...env };
+ if(drop.length){ execEnv.HOME = TERMINAL_PRIV.home; execEnv.USER = TERMINAL_PRIV.user; execEnv.LOGNAME = TERMINAL_PRIV.user; }
+ const argv = [...drop, ...argvTail];
+ return execFileAsync(argv[0], argv.slice(1), { timeout: timeoutMs, env: execEnv });
+}
 async function getDeployedVersion(project, target, cfg, env){
  const pc = cfg[project]; if(!pc || !pc[target]) return null;
  const versionCmd = pc[target].versionCmd;
  if(!versionCmd) return null;
  try {
-  const execEnv = env ? {...process.env, ...env} : process.env;
-  const { stdout } = await execFileAsync('bash',['-c',versionCmd],{timeout:30000, env:execEnv});
+  const execEnv = env ? {...process.env, ...env} : {...process.env};
+  const { stdout } = await deployExec(pc[target], ['bash','-c',versionCmd], execEnv, 30000);
   return stdout.trim() || null;
  } catch { return null; }
 }
@@ -4156,7 +4193,7 @@ if(DEPLOY_CENTRE){
   const start = Date.now();
   let output = '', status = 'success', version = null;
   try {
-   const result = await execFileAsync('bash',['-c',tc.script,'pw-deploy',option],{timeout:300000, env:{...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}});
+   const result = await deployExec(tc, ['bash','-c',tc.script,'pw-deploy',option], {...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}, 300000);
    output = (result.stdout || '') + (result.stderr || '');
   } catch(e) {
    status = 'failed';
@@ -4164,7 +4201,7 @@ if(DEPLOY_CENTRE){
   }
   const duration = ((Date.now()-start)/1000).toFixed(1);
   if(tc.versionCmd){
-   try { const { stdout } = await execFileAsync('bash',['-c',tc.versionCmd],{timeout:30000, env:{...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}}); version = stdout.trim()||null; } catch {}
+   try { const { stdout } = await deployExec(tc, ['bash','-c',tc.versionCmd], {...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}, 30000); version = stdout.trim()||null; } catch {}
   }
   const logEntry = { ts: new Date().toISOString(), project, target, option: option||undefined, version, user: req.user?.username||'unknown', status, duration, outputSnippet: output.slice(0,500) };
   await appendDeployLog(logEntry);

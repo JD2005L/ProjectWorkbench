@@ -57,6 +57,41 @@ test('startPreviewUnit drops to the terminal account before running project code
   assert.match(body, /env\.USER = TERMINAL_PRIV\.user/, 'the dropped preview still advertises USER=root');
 });
 
+// THIS TEST EXISTS BECAUSE THE SWEEP BELOW MISSED A SEAM. The cwd-keyed audit
+// declared the preview the only workspace-rooted spawn and passed — while the
+// deploy runner was writing to workspaces as root the whole time, because a slot
+// script `cd`s itself and its exec carries no `cwd` for a sweep to key on. It
+// re-broke Bi-Tools two days later: `git pull` under root rewrote tracked source
+// as root:root and the agent hit EACCES on its own files. So operator-authored
+// deploy text gets its own contract, keyed on the TEXT rather than on the cwd.
+test('NO DRIFT: operator-authored deploy shell text never reaches execFileAsync undropped', () => {
+  const src = read('app/server.js');
+  for (const m of src.matchAll(/execFileAsync\(\s*'bash'\s*,\s*\[\s*'-c'\s*,\s*([A-Za-z_$][\w.$]*)/g)) {
+    assert.ok(
+      !/^(tc\.script|tc\.versionCmd|versionCmd)$/.test(m[1]),
+      `deploy slot text \`${m[1]}\` is executed without the privilege drop — route it through deployExec()`,
+    );
+  }
+  // The definition plus all three call sites: the deploy script, the post-deploy
+  // version probe, and getDeployedVersion's status probe.
+  assert.equal([...src.matchAll(/deployExec\(/g)].length, 4, 'deployExec() is no longer the single deploy exec seam');
+  const body = functionSource(src, 'getDeployedVersion');
+  assert.match(body, /deployExec\(pc\[target\]/, 'the deploy status probe bypasses deployExec()');
+});
+
+test('deployExec keeps the root escape hatch explicit and carries the pane HOME', () => {
+  const src = read('app/server.js');
+  const start = src.indexOf('function deployExec(');
+  assert.notEqual(start, -1, 'app/server.js no longer defines deployExec()');
+  const body = src.slice(start, src.indexOf('\nasync function', start));
+  assert.match(body, /tc\?\.runAsRoot \? \[\] : agentSpawnDrop\(TERMINAL_PRIV\)/, 'the runAsRoot opt-out is gone or no longer gates the drop');
+  // Dropping the uid without the HOME makes `dotnet publish` and `git` look in
+  // /root and fail on permissions — a different outage, not a fix.
+  for (const v of ['HOME', 'USER', 'LOGNAME']) {
+    assert.ok(body.includes(`execEnv.${v} = TERMINAL_PRIV.`), `the dropped deploy no longer sets ${v}`);
+  }
+});
+
 test('NO DRIFT: the preview is the only thing the dashboard spawns INTO a workspace', () => {
   const src = read('app/server.js');
   // Root running with a workspace as cwd is only safe while it cannot write there.
