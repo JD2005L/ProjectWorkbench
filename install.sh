@@ -323,6 +323,13 @@ ln -sfn "$PW_INSTALL_DIR/scripts/pw-tmux-assert-owner"    /usr/local/bin/pw-tmux
 # the Round 12 defect, which is why that is now the pattern rather than a habit.
 install -m 0755 "$SRC_DIR/scripts/pw-box-remediate"       "$PW_INSTALL_DIR/scripts/pw-box-remediate"
 ln -sfn "$PW_INSTALL_DIR/scripts/pw-box-remediate"        /usr/local/sbin/pw-box-remediate
+# Same shape, same reason a third time: pw-tmux-pane-drop imports
+# ../app/terminal-priv.js relative to ITSELF so the shell restore path and the
+# dashboard share one privilege resolver. Flat on PATH it would resolve
+# /usr/local/app/terminal-priv.js and die ERR_MODULE_NOT_FOUND; pw-tmux-restore
+# finds it next to its own realpath, which the symlink preserves.
+install -m 0755 "$SRC_DIR/scripts/pw-tmux-pane-drop"      "$PW_INSTALL_DIR/scripts/pw-tmux-pane-drop"
+ln -sfn "$PW_INSTALL_DIR/scripts/pw-tmux-pane-drop"       /usr/local/bin/pw-tmux-pane-drop
 # The owner unit's ExecStart. It has to be installed BEFORE the unit is enabled at
 # the end of this script, and it has to be installed at all: a controlled host
 # deployment failed here with 203/EXEC because the host unit named the CONTAINER

@@ -1,0 +1,39 @@
+#!/usr/bin/env node
+// The pane privilege drop, for the SHELL restore path.
+//
+// pw-tmux-restore recreates every saved session at boot. In container mode it
+// runs as the sidecar's root uid, so without a drop each restored pane is a ROOT
+// shell sitting in a workspace the agent account owns — which is precisely the
+// defect class app/workspace-file.js, startPreviewUnit() and deployExec() were
+// each fixed for. A restore that reintroduces it at every boot would be the
+// worst-placed instance of the three, because nobody is watching a boot.
+//
+// This deliberately does NOT re-implement the drop in bash. app/terminal-priv.js
+// is the single resolver the dashboard's panes, the _setup ttyd and the preview
+// all go through; a second copy in shell is exactly the drift that
+// pw-tmux-assert-owner exists to avoid (it imports ../app/tmux-owner.js so the
+// shell gate and the JS gate cannot disagree). Same reasoning, same shape.
+//
+// INSTALLED BESIDE app/, NOT FLAT ON PATH: the import below is relative to this
+// file's realpath. Installed into /usr/local/bin it would resolve
+// /usr/local/app/terminal-priv.js, which no deployment has, and die
+// ERR_MODULE_NOT_FOUND — the Round 12 defect. install.sh therefore puts it in
+// $PW_INSTALL_DIR/scripts and symlinks it onto PATH; node resolves an ES
+// module's imports against the REALPATH, so reaching it through the link lands
+// on the correct app/ directory.
+//
+// Output: three newline-terminated fields, always exactly three lines, so the
+// caller can read them without jq and cannot mistake a partial read for a
+// disabled drop:
+//   line 1  the setpriv prefix, or EMPTY when the drop is off (host mode, or no
+//           PW_TERMINAL_UID) — an empty first line means "do not drop"
+//   line 2  the pane account name, or empty
+//   line 3  the pane account HOME, or empty
+import { resolveTerminalPriv, agentSpawnDrop } from '../app/terminal-priv.js';
+
+const priv = resolveTerminalPriv(process.env);
+// agentSpawnDrop, not agentLoginDrop: the caller supplies its own
+// `env KEY=VAL... bash ...` token list, so a prefix that re-execs through env(1)
+// with its own HOME would clobber it. See app/terminal-priv.js.
+const drop = agentSpawnDrop(priv);
+process.stdout.write(`${drop.join(' ')}\n${priv.enabled ? priv.user : ''}\n${priv.enabled ? priv.home : ''}\n`);

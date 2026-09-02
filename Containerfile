@@ -158,6 +158,22 @@ COPY scripts/ /opt/project-workbench/scripts/
 COPY bin/ /opt/project-workbench/bin/
 RUN chmod +x /opt/project-workbench/scripts/* 2>/dev/null || true
 
+# Put the tmux owner/persistence helpers on PATH in the sidecar.
+#
+# Not cosmetic: pw-tmux-restore's ownership gate does `command -v
+# pw-tmux-assert-owner` and treats a MISSING helper as a REFUSAL, and this
+# script's own remediation message tells an operator to run
+# `pw-tmux-save && tmux kill-server && systemctl restart pw-tmux.service` —
+# advice that could not work in a container where nothing was on PATH.
+#
+# Symlinks, not copies: /opt/project-workbench/scripts is a BIND MOUNT at
+# runtime, so a copy baked here would be the stale image version. The link
+# resolves to the mounted file, and node resolves an ES module's imports against
+# its realpath, so pw-tmux-pane-drop still finds ../app/terminal-priv.js.
+RUN for h in pw-tmux-save pw-tmux-restore pw-tmux-assert-owner pw-tmux-pane-drop; do \
+      ln -sfn "/opt/project-workbench/scripts/$h" "/usr/local/bin/$h"; \
+    done
+
 RUN mkdir -p /opt/project-workbench/workspaces /opt/project-workbench/memory \
     /etc/project-workbench /etc/nginx/conf.d /opt/npm-global/bin /opt/npm-global/lib
 

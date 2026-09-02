@@ -16,12 +16,29 @@ ExecStartPre=-/usr/bin/podman rm -f pw-tmux
 # Same image + same mounts as the app container so shells/agents in the panes see
 # identical workspaces, agent homes, npm-global CLIs and CA trust. The extra
 # -v .../run/tmux mount is the shared tmux socket dir; TMUX_TMPDIR points at it.
+#
+# PW_TERMINAL_* and the four persistence paths are supplied HERE, not defaulted in
+# scripts/pw-tmux-keepalive.sh, because that script is shared with deployments
+# whose layout differs and must name no site-specific path (pinned by
+# test/tmux-owner-dispositions.test.mjs). PW_TERMINAL_* lets the replay drop each
+# restored pane to the pane account instead of leaving it as this sidecar's root.
+# The tmux-persist bind mount is load-bearing: the snapshot's whole job is to
+# outlive a container recreate, and the default state dir is INSIDE the container.
 ExecStart=/usr/bin/podman run --name pw-tmux \
   --network=host --pid=host --privileged --cgroupns=host --cgroup-parent=pw-tmux.slice \
   -e TMUX_TMPDIR=/opt/project-workbench/run/tmux \
   -e PW_DEPLOY_MODE=container \
   -e PW_TMUX_OWNER_CGROUP=pw-tmux.slice \
   -e PW_TMUX_REQUIRE_CGROUP=1 \
+  -e PW_TERMINAL_UID=1001 \
+  -e PW_TERMINAL_GID=1001 \
+  -e PW_TERMINAL_USER=admin \
+  -e PW_TERMINAL_HOME=/home/admin \
+  -e PW_TMUX_STATE_DIR=/var/lib/project-workbench/tmux-persist \
+  -e PW_CLAUDE_SESSIONS_DIR=/home/admin/.claude/sessions \
+  -e PW_CLAUDE_PROJECTS_DIR=/home/admin/.claude/projects \
+  -e PW_REGISTRY_PATH=/etc/project-workbench/projects.json \
+  -e PW_APP_DIR=/opt/project-workbench/app \
   -e NPM_CONFIG_PREFIX=/opt/npm-global \
   -e PATH=/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -e "NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection" \
@@ -36,6 +53,7 @@ ExecStart=/usr/bin/podman run --name pw-tmux \
   -v /opt/project-workbench/persistent/root-home:/root \
   -v /opt/project-workbench/persistent/admin-home:/home/admin \
   -v /opt/project-workbench/run/tmux:/opt/project-workbench/run/tmux \
+  -v /opt/project-workbench/persistent/tmux-persist:/var/lib/project-workbench/tmux-persist \
   project-workbench:latest \
   /opt/project-workbench/scripts/pw-tmux-keepalive.sh
 ExecStop=/usr/bin/podman stop -t 10 pw-tmux

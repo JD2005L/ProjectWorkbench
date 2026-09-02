@@ -36,9 +36,14 @@
 # therefore conditional and its absence is tolerated; it is never on an exit path
 # that would stop supervision.
 #
-# GOA-2 disposition: container supervision is retained as it was. No replay and no
-# opt-in restore-on-start is added here; container mid-uptime replay remains a
-# separate feature.
+# CONTAINER SESSION PERSISTENCE (added 2026-09-02, superseding the GOA-2
+# disposition that deliberately left it out): the sidecar now snapshots sessions
+# periodically and on SIGTERM, and replays the manifest once at start, because a
+# container recreate — which a plain image rebuild requires — otherwise destroyed
+# every session with nothing saved and nothing to replay. Host mode is untouched;
+# there pw-tmux-persist.service and pw-tmux-save.timer already do this. See the
+# `session persistence` block near the bottom for why the state dir and the
+# Claude dirs both have to be redirected.
 # ============================================================================
 set -u
 
@@ -233,10 +238,131 @@ fi
 # a systemd unit. Never set in production.
 [[ "${PW_TMUX_EXIT_AFTER_READY:-0}" == 1 ]] && exit 0
 
+# --- session persistence (CONTAINER MODE ONLY) --------------------------------
+#
+# Host mode already has this: pw-tmux-persist.service runs pw-tmux-restore on
+# ExecStart and pw-tmux-save on ExecStop, and pw-tmux-save.timer snapshots every
+# two minutes. The container sidecar has NO systemd, so none of that machinery
+# ran here — a `podman rm`/recreate destroyed every session with nothing saved
+# and nothing to replay. This block is the sidecar's stand-in for those units.
+#
+# WHERE THE SNAPSHOT LIVES IS THE WHOLE BALL GAME. The default state dir,
+# /var/lib/project-workbench/tmux-persist, is on the container's OVERLAY — it is
+# destroyed by the very recreate the snapshot exists to survive, so wiring this up
+# without moving it produces a feature that looks like it works and silently
+# loses everything. /root IS a bind mount (persistent/root-home in
+# pw-tmux.service) and this script runs as root, so the state goes there. If a
+# deployment overrides PW_TMUX_STATE_DIR, that wins and we only warn.
+#
+# The Claude dirs must ALSO be redirected: panes run as `admin` with
+# HOME=/home/admin, so the sessionIds pw-tmux-save records (and pw-tmux-restore
+# resumes via `claude --resume`) live under /home/admin/.claude — while this
+# script's own HOME is /root, which has no .claude at all. Left at the default,
+# restore would bring back window layout but silently no conversations.
+#
+# And PW_REGISTRY_PATH is the documented cause of the container-mode
+# fail-close: restore resolves the HOST default (/opt/project-workbench/projects.json),
+# finds nothing, refuses EVERY session and still exits 0 — a total refusal that
+# reads as a clean no-op. Exporting the real path is the fix.
+PERSIST_ENABLED=0
+# Read by the supervise loop in BOTH modes — must not live in the branch below,
+# or `set -u` aborts host mode on the first tick.
+: "${PW_TMUX_SAVE_INTERVAL:=120}"
+#
+# NO ENVIRONMENT-SPECIFIC PATH OR IDENTITY IS NAMED HERE. This file is shared with
+# deployments that look nothing like the one it was written on, and
+# test/tmux-owner-dispositions.test.mjs pins that: a hardcoded `/home/admin`,
+# `/root/...` or `/etc/project-workbench/...` default would make the shared owner
+# script carry one site's layout. So persistence engages ONLY when the DEPLOYMENT
+# supplies the four paths, and declines (loudly, harmlessly) when it does not.
+# The deployment-specific file is the unit — systemd/pw-tmux.service — which
+# already carries TMUX_TMPDIR, PW_DEPLOY_MODE and the owner cgroup for the same
+# reason.
+#
+# WHY THE STATE DIR MUST BE SUPPLIED AND NOT DEFAULTED. The scripts' own default,
+# /var/lib/project-workbench/tmux-persist, is inside the container in container
+# mode — destroyed by the very recreate the snapshot exists to survive. A default
+# would therefore produce a feature that looks like it works and silently loses
+# everything, which is worse than declining. The unit must point it at a mount
+# that outlives the container.
+#
+# The Claude dirs must be the PANE ACCOUNT's, not this script's: panes run as the
+# unprivileged terminal user, so the sessionIds pw-tmux-save records (and
+# pw-tmux-restore resumes via `claude --resume`) live under that account's home,
+# while this script's own HOME is root's. Left to default, restore would bring
+# back window layout and silently no conversations.
+if [[ "$HOST_MODE" != 1 ]]; then
+	persist_missing=()
+	for v in PW_TMUX_STATE_DIR PW_CLAUDE_SESSIONS_DIR PW_CLAUDE_PROJECTS_DIR PW_REGISTRY_PATH PW_APP_DIR; do
+		[[ -n "${!v:-}" ]] || persist_missing+=("$v")
+	done
+	if (( ${#persist_missing[@]} > 0 )); then
+		echo "[pw-tmux-owner] session persistence OFF: the deployment did not supply ${persist_missing[*]}" >&2
+		echo "[pw-tmux-owner]   set them in the unit (see systemd/pw-tmux.service) to enable snapshot/replay" >&2
+	else
+		PERSIST_ENABLED=1
+		SCRIPT_DIR="$(cd -- "$(dirname -- "$(realpath -- "${BASH_SOURCE[0]}")")" && pwd)"
+		# pw-tmux-restore's ownership gate does `command -v pw-tmux-assert-owner`
+		# and treats a MISSING helper as a refusal — and nothing need put these on
+		# PATH. Without this prefix the replay below would decline every time.
+		export PATH="$SCRIPT_DIR:$PATH"
+		export PW_TMUX_STATE_DIR PW_CLAUDE_SESSIONS_DIR PW_CLAUDE_PROJECTS_DIR PW_REGISTRY_PATH PW_APP_DIR
+		mkdir -p "$PW_TMUX_STATE_DIR" 2>/dev/null || true
+		chmod 0700 "$PW_TMUX_STATE_DIR" 2>/dev/null || true
+		# Loud, because a snapshot on a container-local filesystem is
+		# indistinguishable from a working one until the recreate you counted on.
+		if [[ "$(findmnt -no FSTYPE -T "$PW_TMUX_STATE_DIR" 2>/dev/null)" == overlay ]]; then
+			echo "[pw-tmux-owner] WARNING: PW_TMUX_STATE_DIR=$PW_TMUX_STATE_DIR is on the container overlay;" >&2
+			echo "[pw-tmux-owner]          snapshots there will NOT survive a container recreate." >&2
+		fi
+	fi
+fi
+
+pw_snapshot() {
+	[[ "$PERSIST_ENABLED" == 1 ]] || return 0
+	local why="$1" out
+	if out=$("$SCRIPT_DIR/pw-tmux-save" 2>&1); then
+		echo "[pw-tmux-owner] snapshot ($why) ok" >&2
+	else
+		echo "[pw-tmux-owner] snapshot ($why) failed: ${out##*$'\n'}" >&2
+	fi
+}
+
+if [[ "$PERSIST_ENABLED" == 1 ]]; then
+	# Restore BEFORE we signal readiness / start idling. project-workbench.service
+	# is ordered After=/Requires= this unit, so the dashboard has not yet booted and
+	# cannot have created the sessions itself — restore is idempotent and leaves an
+	# existing session alone, so losing that race would mean silently restoring
+	# nothing. This window is the only time it is safe.
+	if [[ -f "$PW_TMUX_STATE_DIR/manifest.tsv" ]]; then
+		if restore_out=$("$SCRIPT_DIR/pw-tmux-restore" 2>&1); then
+			echo "[pw-tmux-owner] session restore completed" >&2
+		else
+			rc=$?
+			# 78 is EX_CONFIG from pw-tmux-restore: a manifest was present but the
+			# configuration was unusable, so it restored NOTHING. Never fatal here —
+			# a restore failure must not tear down the server that owns every live
+			# session — but it must not be silent either.
+			echo "[pw-tmux-owner] session restore exited $rc (78=misconfigured, restored nothing); continuing" >&2
+			[[ -n "$restore_out" ]] && echo "[pw-tmux-owner]   ${restore_out##*$'\n'}" >&2
+		fi
+	else
+		echo "[pw-tmux-owner] no session manifest yet; nothing to restore (first boot with persistence on)" >&2
+	fi
+fi
+
 # --- supervise ----------------------------------------------------------------
 # Idle in the foreground so the owner (and the server's cgroup) stay up; on
-# SIGTERM/SIGINT exit cleanly.
-term() { exit 0; }
+# SIGTERM/SIGINT snapshot once more, then exit cleanly. The final snapshot is the
+# container-mode equivalent of pw-tmux-persist.service's ExecStop, and it is what
+# makes a PLANNED rebuild lose nothing: `podman stop` sends SIGTERM here first.
+term() { pw_snapshot shutdown; exit 0; }
 trap term TERM INT
-tail -f /dev/null &
-wait $!
+while :; do
+	# `sleep & wait` rather than a bare sleep: bash only runs a trap once the
+	# current foreground command finishes, so a bare `sleep 120` would delay
+	# shutdown — and the final snapshot — by up to the whole interval.
+	sleep "$PW_TMUX_SAVE_INTERVAL" &
+	wait $! || true
+	pw_snapshot periodic
+done
