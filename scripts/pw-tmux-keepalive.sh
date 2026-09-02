@@ -226,18 +226,6 @@ if [[ -r "$PROC_ROOT/$server_pid/cgroup" ]]; then
 	fi
 fi
 
-# --- readiness ----------------------------------------------------------------
-# Host mode only, and tolerated-absent: never an exit path (GOA constraint).
-if [[ "$HOST_MODE" == 1 ]]; then
-	if command -v systemd-notify >/dev/null 2>&1; then
-		systemd-notify --ready --status="tmux server pid $server_pid owned by $expected_owner" 2>/dev/null || true
-	fi
-fi
-
-# Test-only: supervise-and-return, so the readiness contract is testable without
-# a systemd unit. Never set in production.
-[[ "${PW_TMUX_EXIT_AFTER_READY:-0}" == 1 ]] && exit 0
-
 # --- session persistence (CONTAINER MODE ONLY) --------------------------------
 #
 # Host mode already has this: pw-tmux-persist.service runs pw-tmux-restore on
@@ -318,6 +306,20 @@ if [[ "$HOST_MODE" != 1 ]]; then
 	fi
 fi
 
+RESTORE_STATE_OPTION='@pw_restore_state'
+
+# Publish the replay outcome as a tmux SERVER option so the app container can fence
+# on it. Round 19 review found the previous barrier was `_keepalive` — which this
+# script creates BEFORE replay — so the dashboard could boot first, create a blank
+# pw_* session, and pw-tmux-restore would then skip it as "already exists". That
+# defeated the whole feature. A server option is the right medium: it lives and
+# dies with the server, so unlike a marker file it can never be stale, and both
+# containers reach the same socket.
+publish_restore_state() {
+	tmux_ set-option -s "$RESTORE_STATE_OPTION" "$1" 2>/dev/null || true
+	echo "[pw-tmux-owner] restore state: $1" >&2
+}
+
 pw_snapshot() {
 	[[ "$PERSIST_ENABLED" == 1 ]] || return 0
 	local why="$1" out
@@ -329,27 +331,42 @@ pw_snapshot() {
 }
 
 if [[ "$PERSIST_ENABLED" == 1 ]]; then
-	# Restore BEFORE we signal readiness / start idling. project-workbench.service
-	# is ordered After=/Requires= this unit, so the dashboard has not yet booted and
-	# cannot have created the sessions itself — restore is idempotent and leaves an
-	# existing session alone, so losing that race would mean silently restoring
-	# nothing. This window is the only time it is safe.
+	# Replay BEFORE publishing the barrier state, so the app cannot boot first.
 	if [[ -f "$PW_TMUX_STATE_DIR/manifest.tsv" ]]; then
 		if restore_out=$("$SCRIPT_DIR/pw-tmux-restore" 2>&1); then
-			echo "[pw-tmux-owner] session restore completed" >&2
+			publish_restore_state complete
 		else
 			rc=$?
 			# 78 is EX_CONFIG from pw-tmux-restore: a manifest was present but the
-			# configuration was unusable, so it restored NOTHING. Never fatal here —
-			# a restore failure must not tear down the server that owns every live
-			# session — but it must not be silent either.
-			echo "[pw-tmux-owner] session restore exited $rc (78=misconfigured, restored nothing); continuing" >&2
+			# configuration was unusable, or it refused on identity/privilege
+			# grounds, so it restored NOTHING. Never fatal here — a replay failure
+			# must not tear down the server that owns every live session — but it
+			# must not be silent, and the barrier must still release or the app
+			# would never start.
+			publish_restore_state "failed-$rc"
 			[[ -n "$restore_out" ]] && echo "[pw-tmux-owner]   ${restore_out##*$'\n'}" >&2
 		fi
 	else
-		echo "[pw-tmux-owner] no session manifest yet; nothing to restore (first boot with persistence on)" >&2
+		publish_restore_state no-manifest
+	fi
+else
+	# Persistence off (host mode, or the deployment supplied no paths). Publish
+	# immediately so a container fencing on this never waits for a replay that is
+	# not coming.
+	publish_restore_state off
+fi
+
+# --- readiness ----------------------------------------------------------------
+# Host mode only, and tolerated-absent: never an exit path (GOA constraint).
+if [[ "$HOST_MODE" == 1 ]]; then
+	if command -v systemd-notify >/dev/null 2>&1; then
+		systemd-notify --ready --status="tmux server pid $server_pid owned by $expected_owner" 2>/dev/null || true
 	fi
 fi
+
+# Test-only: supervise-and-return, so the readiness contract is testable without
+# a systemd unit. Never set in production.
+[[ "${PW_TMUX_EXIT_AFTER_READY:-0}" == 1 ]] && exit 0
 
 # --- supervise ----------------------------------------------------------------
 # Idle in the foreground so the owner (and the server's cgroup) stay up; on

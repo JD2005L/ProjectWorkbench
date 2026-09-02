@@ -123,3 +123,118 @@ test('the helper is installed BESIDE app/ in both deployments, never flat', () =
   // Container: symlinked from the bind-mounted scripts dir, which sits beside app/.
   assert.match(read('Containerfile'), /pw-tmux-assert-owner pw-tmux-pane-drop/);
 });
+
+// ---------------------------------------------------------------------------
+// Round 19 review blockers. Each of these fails on the pre-review branch.
+// ---------------------------------------------------------------------------
+
+test('RACE REGRESSION: the barrier is not published until replay has finished', async () => {
+  // The pre-review branch fenced the app on `_keepalive`, which the owner creates
+  // BEFORE replaying — so the dashboard booted first, created blank pw_* sessions,
+  // and restore skipped every one as "already exists". Driven with a real tmux
+  // server and a deliberately slow replay, so it is a timing proof, not a grep.
+  const os = await import('node:os');
+  const cp = await import('node:child_process');
+  const tmp = fs.mkdtempSync(path.join('/tmp', 'pwbar-'));
+  const dir = path.join(tmp, 'scripts');
+  fs.mkdirSync(dir);
+  fs.copyFileSync(path.join(REPO, 'scripts', 'pw-tmux-keepalive.sh'), path.join(dir, 'pw-tmux-keepalive.sh'));
+  // Stubs beside it, so SCRIPT_DIR resolution finds these rather than the real ones.
+  fs.writeFileSync(path.join(dir, 'pw-tmux-restore'), '#!/bin/sh\nsleep 3\nexit 0\n');
+  fs.writeFileSync(path.join(dir, 'pw-tmux-save'), '#!/bin/sh\nexit 0\n');
+  for (const f of ['pw-tmux-keepalive.sh', 'pw-tmux-restore', 'pw-tmux-save']) fs.chmodSync(path.join(dir, f), 0o755);
+  const state = path.join(tmp, 'state');
+  fs.mkdirSync(state);
+  fs.writeFileSync(path.join(state, 'manifest.tsv'), 'x\n');   // non-empty => replay runs
+  const sock = `pwbar${process.pid}`;
+  const env = {
+    ...process.env, TMUX_TMPDIR: tmp, PW_TMUX_SOCKET: sock, PW_DEPLOY_MODE: 'container',
+    PW_TMUX_HOST_MODE: '0', PW_TMUX_REQUIRE_CGROUP: '0', PW_TMUX_EXIT_AFTER_READY: '1',
+    PW_TMUX_STATE_DIR: state, PW_CLAUDE_SESSIONS_DIR: path.join(tmp, 'sess'),
+    PW_CLAUDE_PROJECTS_DIR: path.join(tmp, 'proj'), PW_REGISTRY_PATH: path.join(tmp, 'projects.json'),
+    PW_APP_DIR: path.join(REPO, 'app'), PW_TMUX_OWNER_CGROUP: 'x',
+  };
+  fs.writeFileSync(env.PW_REGISTRY_PATH, '[]');
+  delete env.TMUX;
+  const opt = () => {
+    try { return cp.execFileSync('tmux', ['-L', sock, 'show-options', '-sv', '@pw_restore_state'], { env, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim(); }
+    catch { return ''; }
+  };
+  const child = cp.spawn('bash', [path.join(dir, 'pw-tmux-keepalive.sh')], { env, stdio: 'ignore' });
+  try {
+    // Wait for the server to exist (that is the OLD, insufficient barrier).
+    const t0 = Date.now();
+    while (Date.now() - t0 < 8000) {
+      try { cp.execFileSync('tmux', ['-L', sock, 'has-session', '-t', '_keepalive'], { env, stdio: 'ignore' }); break; } catch { /* retry */ }
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    // THE ASSERTION: the server is up and _keepalive exists, yet the barrier is
+    // still unset because the (slow) replay has not finished.
+    assert.equal(opt(), '', 'the barrier was published while replay was still running — the app could pre-empt it');
+    // ...and it does eventually release, or the app would hang forever.
+    let final = '';
+    const t1 = Date.now();
+    while (Date.now() - t1 < 15000) {
+      final = opt();
+      if (final) break;
+      await new Promise((r) => setTimeout(r, 200));
+    }
+    assert.equal(final, 'complete', `barrier never released (got ${JSON.stringify(final)})`);
+  } finally {
+    try { child.kill('SIGKILL'); } catch { /* already gone */ }
+    try { cp.execFileSync('tmux', ['-L', sock, 'kill-server'], { env, stdio: 'ignore' }); } catch { /* none */ }
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('the app fences on replay completion, never on _keepalive alone', () => {
+  const src = read('scripts/entrypoint.sh');
+  assert.match(src, /show-options -sv @pw_restore_state/, 'the entrypoint no longer waits for the replay outcome');
+  // Ordering: the _keepalive wait must come FIRST and must not be the last word.
+  assert.ok(src.indexOf('has-session -t _keepalive') < src.indexOf('@pw_restore_state'),
+    'the restore barrier must come after the server-exists wait, not replace it');
+  // Bounded and non-fatal, like the wait it follows.
+  assert.match(src, /PW_RESTORE_BARRIER_TICKS/, 'the barrier is unbounded — a wedged replay would block the dashboard forever');
+  assert.match(src, /starting anyway/, 'the barrier is fatal on timeout; it must warn and proceed');
+});
+
+test('the owner publishes a terminal barrier state on EVERY path', () => {
+  const src = read('scripts/pw-tmux-keepalive.sh');
+  for (const st of ['complete', '"failed-$rc"', 'no-manifest', 'off']) {
+    assert.ok(src.includes(`publish_restore_state ${st}`), `no barrier state published for: ${st}`);
+  }
+  // A server option, not a file: it dies with the server and so can never be stale.
+  assert.match(src, /set-option -s "\$RESTORE_STATE_OPTION"/, 'the barrier is no longer a server-scoped tmux option');
+  // Never published before the replay it is supposed to gate.
+  assert.ok(src.indexOf('pw-tmux-restore"') < src.indexOf('publish_restore_state complete'),
+    'the barrier is published before replay runs');
+  // And readiness must follow replay, not precede it.
+  assert.ok(src.indexOf('--- session persistence') < src.indexOf('--- readiness'),
+    'readiness is signalled before replay finishes — the host After= barrier would release too early');
+});
+
+test('restore refuses rather than mis-attributing when the credential contract is absent', () => {
+  const src = read('scripts/pw-tmux-restore');
+  const i = src.indexOf('REFUSING TO RESTORE: PW_PER_USER_CLAUDE');
+  assert.notEqual(i, -1, 'the per-user credential-mode guard is gone');
+  const block = src.slice(i - 900, i + 600);
+  assert.match(block, /primaryUser/, 'the guard no longer consults the registry for owned projects');
+  assert.match(block, /exit "\$CONFIG_ERROR_EXIT"/, 'the guard no longer fails closed');
+});
+
+test('the unit passes the SAME credential contract the app and host restore path get', () => {
+  const unit = read('systemd/pw-tmux.service');
+  for (const v of ['PW_PER_USER_CLAUDE', 'PW_USERS_PATH', 'PW_USER_CRED_BASE', 'PW_SECRET_KEY_PATH']) {
+    assert.match(unit, new RegExp(`-e ${v}=`), `the sidecar unit does not pass ${v}; replay would answer "shared" on a per-user deployment`);
+  }
+});
+
+test('restored panes carry the CONFIGURED home and extra PATH, not a baked-in one', () => {
+  const src = read('scripts/pw-tmux-restore');
+  // One env head, built from the resolved account, used by every variant — the
+  // literal was previously spelled three times, so a non-default home was ignored.
+  assert.match(src, /PANE_ENV_HEAD="env HOME=\$PANE_HOME \$\{PANE_IDENT\}/, 'the pane env head no longer carries the configured HOME');
+  assert.match(src, /PANE_PATH="\$PANE_PATH:\$PANE_EXTRA_PATH"/, 'the configured extra PATH is not applied to restored panes');
+  assert.equal((src.match(/cred_env_prefix="\$PANE_ENV_HEAD/g) || []).length, 2, 'a per-user variant still spells its own env head');
+  assert.equal((src.match(/env HOME=\/home\/admin LANG=/g) || []).length, 0, 'a hardcoded pane env head is back');
+});

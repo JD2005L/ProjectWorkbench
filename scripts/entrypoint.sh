@@ -24,6 +24,34 @@ if [ -n "${TMUX_TMPDIR:-}" ]; then
     tmux -u has-session -t _keepalive 2>/dev/null && break
     sleep 0.2
   done
+  # THEN wait for the owner to finish replaying saved sessions.
+  #
+  # `_keepalive` is NOT a sufficient barrier and using it as one silently defeated
+  # rebuild restoration: the owner creates _keepalive to bring the server into
+  # existence BEFORE it replays, so this loop released immediately, node booted,
+  # its boot auto-start created blank pw_* sessions, and pw-tmux-restore then
+  # skipped every one of them as "already exists". Fence on the owner's published
+  # outcome instead (@pw_restore_state: complete / no-manifest / failed-N / off).
+  #
+  # Bounded and non-fatal, exactly like the loop above: an owner too old to
+  # publish the option, or a wedged replay, must never stop the dashboard from
+  # starting. It warns and proceeds.
+  _rs=""
+  _rs_max="${PW_RESTORE_BARRIER_TICKS:-300}"   # x0.2s => ~60s default
+  _i=0
+  while [ "$_i" -lt "$_rs_max" ]; do
+    _rs=$(tmux -u show-options -sv @pw_restore_state 2>/dev/null || true)
+    [ -n "$_rs" ] && break
+    _i=$((_i + 1))
+    sleep 0.2
+  done
+  if [ -n "$_rs" ]; then
+    echo "[entrypoint] tmux owner reports restore state: $_rs"
+  else
+    echo "[entrypoint] WARNING: no @pw_restore_state after $((_rs_max / 5))s;" >&2
+    echo "[entrypoint]          starting anyway. If the owner supports replay, a blank" >&2
+    echo "[entrypoint]          session created now may pre-empt it." >&2
+  fi
 fi
 
 cd /opt/project-workbench/app

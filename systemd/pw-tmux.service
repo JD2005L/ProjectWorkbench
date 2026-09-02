@@ -24,6 +24,16 @@ ExecStartPre=-/usr/bin/podman rm -f pw-tmux
 # restored pane to the pane account instead of leaving it as this sidecar's root.
 # The tmux-persist bind mount is load-bearing: the snapshot's whole job is to
 # outlive a container recreate, and the default state dir is INSIDE the container.
+#
+# THE CREDENTIAL FOUR ARE NOT OPTIONAL. Round 19 review: this unit passed the
+# persistence and terminal variables but not PW_PER_USER_CLAUDE / PW_USERS_PATH /
+# PW_USER_CRED_BASE / PW_SECRET_KEY_PATH, so on a per-user deployment the replay's
+# credential helper answered {"ok":true,"shared":true} and a project with a
+# primaryUser was rebuilt under the SHARED login and stamped `off` — a silent
+# identity swap. The replay must see the same credential contract the app and the
+# host restore path see. pw-tmux-restore additionally refuses outright if it is
+# told nothing while the registry shows a primaryUser, so a unit that misses this
+# fails closed rather than mis-attributing.
 ExecStart=/usr/bin/podman run --name pw-tmux \
   --network=host --pid=host --privileged --cgroupns=host --cgroup-parent=pw-tmux.slice \
   -e TMUX_TMPDIR=/opt/project-workbench/run/tmux \
@@ -39,6 +49,10 @@ ExecStart=/usr/bin/podman run --name pw-tmux \
   -e PW_CLAUDE_PROJECTS_DIR=/home/admin/.claude/projects \
   -e PW_REGISTRY_PATH=/etc/project-workbench/projects.json \
   -e PW_APP_DIR=/opt/project-workbench/app \
+  -e PW_PER_USER_CLAUDE=${PW_PER_USER_CLAUDE:-} \
+  -e PW_USERS_PATH=/etc/project-workbench/users.json \
+  -e PW_USER_CRED_BASE=/home/admin/pw-users \
+  -e PW_SECRET_KEY_PATH=/etc/project-workbench/.secret-key \
   -e NPM_CONFIG_PREFIX=/opt/npm-global \
   -e PATH=/opt/npm-global/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
   -e "NODE_OPTIONS=--dns-result-order=ipv4first --no-network-family-autoselection" \

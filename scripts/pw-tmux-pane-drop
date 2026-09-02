@@ -29,6 +29,7 @@
 //           PW_TERMINAL_UID) — an empty first line means "do not drop"
 //   line 2  the pane account name, or empty
 //   line 3  the pane account HOME, or empty
+//   line 4  the pane account's extra PATH entry, or empty
 import { resolveTerminalPriv, agentSpawnDrop } from '../app/terminal-priv.js';
 
 const priv = resolveTerminalPriv(process.env);
@@ -36,4 +37,7 @@ const priv = resolveTerminalPriv(process.env);
 // `env KEY=VAL... bash ...` token list, so a prefix that re-execs through env(1)
 // with its own HOME would clobber it. See app/terminal-priv.js.
 const drop = agentSpawnDrop(priv);
-process.stdout.write(`${drop.join(' ')}\n${priv.enabled ? priv.user : ''}\n${priv.enabled ? priv.home : ''}\n`);
+const on = priv.enabled;
+process.stdout.write(
+  `${drop.join(' ')}\n${on ? priv.user : ''}\n${on ? priv.home : ''}\n${on ? priv.extraPath : ''}\n`,
+);

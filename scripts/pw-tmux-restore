@@ -53,7 +53,9 @@ NODE_BIN=$(command -v node || echo /usr/bin/node)
 # resolution failure.
 # DISABLE_AUTOUPDATER: identical to the token app/server.js and scripts/project-terminal-start put
 # in every pane they create — a session restored after a reboot must not be the one that nags.
-ENVBASH='env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin bash --noprofile --norc'
+# Built in the `pane identity` block below, once the configured terminal account is
+# resolved — it must carry that account's HOME and extra PATH, not a baked-in one.
+ENVBASH=''
 
 log() { printf '%s restore: %s\n' "$(date -Iseconds)" "$*" >>"$LOG" 2>/dev/null || true; }
 
@@ -165,26 +167,51 @@ if (( ${#config_failures[@]} > 0 )); then
 fi
 # ------------------------------------------------------------------------------
 
-# ---- pane privilege drop ------------------------------------------------------
-# Every pane this script creates must run as the account THE PANES BELONG TO, not
-# as whatever uid the restore itself runs as. In container mode that uid is the
-# sidecar's root (pw-tmux-keepalive.sh is the tmux owner), so an undropped restore
-# would hand every recreated session a ROOT shell inside a workspace the agent
-# account owns — the same defect already fixed for the boxes
+# ---- pane identity + privilege drop -----------------------------------------
+# Every pane this script creates must run as, and LOOK LIKE, the account the panes
+# belong to — not the uid this script happens to run as. In container mode that
+# uid is the sidecar's root (pw-tmux-keepalive.sh is the tmux owner), so an
+# undropped restore would hand every recreated session a ROOT shell inside a
+# workspace the agent account owns: the defect already fixed for the boxes
 # (app/workspace-file.js), the preview (startPreviewUnit) and the deploy slots
 # (deployExec), reintroduced at every boot with nobody watching.
 #
-# Resolved by scripts/pw-tmux-pane-drop, which calls app/terminal-priv.js — the
-# one resolver the dashboard's own panes go through — rather than re-deriving
-# setpriv argv in shell. An EMPTY prefix means the drop is legitimately off: host
-# mode, where this script already runs unprivileged, or no PW_TERMINAL_UID.
-PANE_DROP=""; PANE_USER=""; PANE_HOME=""
+# Resolved by scripts/pw-tmux-pane-drop, which calls app/terminal-priv.js — the one
+# resolver the dashboard's own panes go through — rather than re-deriving setpriv
+# argv in shell. An EMPTY prefix means the drop is legitimately off: host mode,
+# where this script already runs unprivileged, or no PW_TERMINAL_UID.
+#
+# HOME AND PATH, NOT JUST THE UID. Round 19 review: a real-process probe with a
+# non-default terminal home dropped the pane to the right uid/gid but still
+# reported HOME=/home/admin, because the pane command spelled that literal three
+# times. A restored pane that does not match a freshly created one is a latent
+# bug, so the env head is now built ONCE, here, from the configured account, and
+# every variant below is built from it.
+PANE_DROP=""; PANE_USER=""; PANE_HOME=""; PANE_EXTRA_PATH=""
 _drop_helper="$(dirname -- "$(realpath -- "$0")")/pw-tmux-pane-drop"
 if [[ -x "$_drop_helper" ]]; then
-	{ read -r PANE_DROP; read -r PANE_USER; read -r PANE_HOME; } < <("$NODE_BIN" "$_drop_helper" 2>>"$LOG") || true
+	{ read -r PANE_DROP; read -r PANE_USER; read -r PANE_HOME; read -r PANE_EXTRA_PATH; } \
+		< <("$NODE_BIN" "$_drop_helper" 2>>"$LOG") || true
 else
 	log "pane privilege-drop helper not found or not executable: $_drop_helper"
 fi
+
+# Historical default, and ONLY reached when the drop is off (host mode / no
+# PW_TERMINAL_UID) — there the pane command is byte-identical to before this block.
+PANE_HOME="${PANE_HOME:-/home/admin}"
+PANE_PATH="/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+[[ -n "$PANE_EXTRA_PATH" ]] && PANE_PATH="$PANE_PATH:$PANE_EXTRA_PATH"
+# USER/LOGNAME: setpriv changes the uid but not what the shell reports itself as,
+# and the dashboard's panes set them (app/terminal-priv.js), so omitting them
+# would make a restored pane differ from a fresh one.
+# Appended AFTER HOME, not before it: env(1) is order-insensitive, and
+# test/autoupdater-env.test.mjs locates every pane command in this file by a
+# literal `env HOME=`, so interpolating anything between `env` and `HOME` hides
+# the seam from the guard that checks each one carries DISABLE_AUTOUPDATER.
+PANE_IDENT=""
+[[ -n "$PANE_USER" ]] && PANE_IDENT="USER=$PANE_USER LOGNAME=$PANE_USER "
+PANE_ENV_HEAD="env HOME=$PANE_HOME ${PANE_IDENT}LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=$PANE_PATH"
+ENVBASH="$PANE_ENV_HEAD bash --noprofile --norc"
 
 # FAIL SAFE, and it fails toward NOT RESTORING. Root in container mode with no
 # drop leaves exactly two options: create root panes, or restore nothing.
@@ -196,6 +223,31 @@ if [[ "$(printf '%s' "${PW_DEPLOY_MODE:-host}" | tr '[:upper:]' '[:lower:]')" ==
 	log "  helper=$_drop_helper (present and executable? is PW_TERMINAL_UID exported?)"
 	log "  restoring now would create ROOT shells inside agent-owned workspaces; declining instead"
 	exit "$CONFIG_ERROR_EXIT"
+fi
+
+# ---- credential-mode sanity --------------------------------------------------
+# Round 19 review, and this one is an attribution blocker rather than a crash.
+# resolve_session_credentials() below trusts PW_PER_USER_CLAUDE to decide whether
+# "shared" is a legitimate answer. If the per-user feature is ON for the instance
+# but this process was never told — the sidecar unit passed the persistence and
+# terminal variables but not the credential ones — the helper answers
+# {"ok":true,"shared":true} and a project with a primaryUser is rebuilt under the
+# SHARED login and stamped `off`. Silent identity swap, exactly what the Round 6
+# regression above exists to prevent, reached from the environment instead.
+#
+# So: if we were told nothing, but the registry says at least one project has a
+# primaryUser, this process cannot be trusted to attribute sessions. Refuse.
+if [[ "${PW_PER_USER_CLAUDE:-}" != "true" ]] && command -v jq >/dev/null 2>&1; then
+	_primary=$(jq -r 'if type=="object" and has("projects") then .projects else . end
+	                  | map(select(.primaryUser != null and .primaryUser != "")) | length' \
+	                  "$REGISTRY_JSON" 2>/dev/null || echo 0)
+	if [[ "$_primary" =~ ^[0-9]+$ ]] && (( _primary > 0 )); then
+		log "REFUSING TO RESTORE: PW_PER_USER_CLAUDE is not 'true' in this process, but $_primary project(s)"
+		log "  in $REGISTRY_JSON carry a primaryUser. Restoring now would rebuild owned sessions under the"
+		log "  SHARED login and stamp them 'off'. Export the credential contract (PW_PER_USER_CLAUDE,"
+		log "  PW_USERS_PATH, PW_USER_CRED_BASE, PW_SECRET_KEY_PATH) to this process, or clear primaryUser."
+		exit "$CONFIG_ERROR_EXIT"
+	fi
 fi
 
 # ---- tmux ownership gate ------------------------------------------------------
@@ -380,9 +432,9 @@ resolve_session_credentials() {
 		printf -v quoted_cfg '%q' "CLAUDE_CONFIG_DIR=$cred_config_dir"
 		if [[ -n "$cred_env_file" ]]; then
 			printf -v quoted_rcfile '%q' "$cred_env_file"
-			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --rcfile $quoted_rcfile"
+			cred_env_prefix="$PANE_ENV_HEAD $quoted_cfg bash --noprofile --rcfile $quoted_rcfile"
 		else
-			cred_env_prefix="env HOME=/home/admin LANG=C.UTF-8 LC_ALL=C.UTF-8 TERM=screen-256color COLORTERM=truecolor DISABLE_AUTOUPDATER=1 PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin $quoted_cfg bash --noprofile --norc"
+			cred_env_prefix="$PANE_ENV_HEAD $quoted_cfg bash --noprofile --norc"
 		fi
 	else
 		cred_env_prefix="$ENVBASH"
@@ -391,14 +443,9 @@ resolve_session_credentials() {
 	# every `new-window` (via SESSENV) both launch exactly this string, so the
 	# drop is applied once here instead of at each call site where a later
 	# addition could forget it.
-	if [[ -n "$PANE_DROP" ]]; then
-		# USER/LOGNAME as well: setpriv changes the uid but not what the shell
-		# reports itself as, and the dashboard's own panes set them
-		# (app/terminal-priv.js), so a restored pane omitting them would not match
-		# a freshly created one. Every variant above starts with a literal `env `.
-		cred_env_prefix="${cred_env_prefix/#env /env USER=$PANE_USER LOGNAME=$PANE_USER }"
-		cred_env_prefix="$PANE_DROP $cred_env_prefix"
-	fi
+	# Identity (HOME/USER/LOGNAME/PATH) is already in PANE_ENV_HEAD, which every
+	# variant above is built from, so all that remains here is the uid drop.
+	[[ -n "$PANE_DROP" ]] && cred_env_prefix="$PANE_DROP $cred_env_prefix"
 	cred_ok=1
 	return 0
 }

@@ -1,10 +1,14 @@
 // Candidate C — the dispositions it must NOT quietly overturn, and portability.
 //
-// GOA-2 was accepted with a specific bounded shape: keep exit-on-dead-server /
-// self-restore host-mode-only and preserve existing container behaviour; full
-// container mid-uptime replay stays a separate feature. GOA-5 was DISPUTED and
-// withdrawn: the documented host default is retained, and no new refusal on
-// ambiguous deploy mode may be introduced.
+// GOA-2 originally deferred container replay: keep exit-on-dead-server /
+// self-restore host-mode-only and preserve existing container behaviour. That
+// half was REVISED on 2026-09-02 — PVI accepted the revision in principle
+// ("container rebuild persistence is required") because container mode had no
+// snapshot/replay at all, so an image rebuild destroyed every session. The two
+// assertions that pinned the deferral are therefore replaced below by the
+// contract the accepted feature must meet; everything else in GOA-2 stands.
+// GOA-5 was DISPUTED and withdrawn: the documented host default is retained, and
+// no new refusal on ambiguous deploy mode may be introduced.
 //
 // A candidate that "improves" either of those is out of contract, so both are
 // pinned here rather than left to reviewer memory.
@@ -21,20 +25,27 @@ const NEW_SOURCES = ['app/tmux-owner.js', 'app/tmux-owner-gate.js', 'scripts/pw-
 
 // --- GOA-2: supervision retained, replay deferred ---------------------------
 
-test('GOA-2: the owner adds no restore/replay invocation of its own', () => {
+test('GOA-2 (revised): the owner UNIT still adds no restore, and replay is container-only', () => {
+  // Unchanged half: the host owner unit must not gain restore. Host mode already
+  // has pw-tmux-persist.service for that, and ExecStartPost is how the superseded
+  // candidate smuggled replay into the owner.
   const unit = read('systemd/pw-tmux-server.service');
-  assert.equal(/pw-tmux-restore/.test(unit), false,
-    'the owner unit must not invoke restore — replay stays a separate, deferred feature');
-  assert.equal(/ExecStartPost/.test(unit), false,
-    'ExecStartPost is how the superseded candidate smuggled restore into the owner');
+  assert.equal(/pw-tmux-restore/.test(unit), false, 'the host owner unit must not invoke restore');
+  assert.equal(/ExecStartPost/.test(unit), false, 'ExecStartPost must not reintroduce restore into the owner unit');
+  // Revised half: the sidecar MAY replay, but only in container mode, because the
+  // sidecar has no systemd and nothing else can do it there.
   const keepalive = read('scripts/pw-tmux-keepalive.sh');
-  assert.equal(/pw-tmux-restore/.test(keepalive), false, 'the keepalive must not replay sessions');
+  assert.match(keepalive, /pw-tmux-restore/, 'container replay is now required (GOA-2 revised 2026-09-02)');
+  assert.match(keepalive, /if \[\[ "\$HOST_MODE" != 1 \]\]; then/, 'replay must stay gated to container mode');
 });
 
 test('GOA-2: container supervision is retained, not converted to host-only behaviour', () => {
   const keepalive = read('scripts/pw-tmux-keepalive.sh');
-  // The sidecar path must still supervise in the foreground exactly as before.
-  assert.match(keepalive, /tail -f \/dev\/null/, 'the container foreground supervision must remain');
+  // The sidecar must still supervise in the FOREGROUND and never exit on its own;
+  // the snapshot loop replaced `tail -f /dev/null` but must keep that property,
+  // because the server's cgroup lives and dies with this process.
+  assert.match(keepalive, /^while :; do$/m, 'the container foreground supervision must remain');
+  assert.match(keepalive, /trap term TERM INT/, 'the sidecar must still exit cleanly on signal, not abort');
   // And readiness must never be an exit path in container mode.
   assert.match(keepalive, /PW_TMUX_HOST_MODE/, 'readiness must be gated on host mode');
   // Only actual INVOCATIONS matter; a `command -v systemd-notify` guard is the
