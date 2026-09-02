@@ -11,10 +11,46 @@
 FROM node:20-slim
 
 # Runtime dependencies. ldap-utils is only needed for PW_AUTH_MODE=ldap.
+#
+# krb5-user is the MIT Kerberos client (kinit/klist/kdestroy/ktutil/kvno). It is
+# baked in DELIBERATELY, for every project, because the alternative is worse:
+# without a sanctioned way to obtain a Kerberos TGT, agents investigating a
+# Windows-auth SQL Server or AD from these non-root panes reach for Impacket's
+# getTGT.py — an offensive-security toolkit whose on-disk signatures trip GOA's
+# EDR and generate a security incident every time. kinit is the legitimate,
+# EDR-neutral equivalent: it produces the identical MIT ccache (which the .NET
+# SqlClient `Integrated Security=true` path already consumes) using standard AD
+# client traffic. The GSSAPI libraries it drives (libgssapi_krb5, libkrb5) are
+# already present via the base image. See TeamKB "Kerberos Authentication to GOA
+# SQL Server from a Non-Root Linux Workbench" for the full, Impacket-free recipe.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
-      git sudo curl ca-certificates bash tmux jq ldap-utils procps python3 locales && \
+      git sudo curl ca-certificates bash tmux jq ldap-utils procps python3 locales \
+      krb5-user bzip2 && \
     rm -rf /var/lib/apt/lists/*
+
+# go-sqlcmd: a single static SQL Server client so any project can run an ad-hoc
+# query against an external DB without hand-rolling a throwaway .NET harness. The
+# Go rewrite (not the ODBC mssql-tools) is chosen precisely because it is one
+# binary with no EULA and no repo, and it authenticates with the Kerberos ccache
+# kinit produces (`KRB5CCNAME=… sqlcmd -S host.fqdn -d DB -E -Q "…"`). Pinned;
+# the layer fails loudly rather than shipping a half-download.
+RUN set -eux; \
+    url="https://github.com/microsoft/go-sqlcmd/releases/download/v1.10.0/sqlcmd-linux-amd64.tar.bz2"; \
+    curl -fsSL "$url" -o /tmp/sqlcmd.tar.bz2; \
+    tar -xjf /tmp/sqlcmd.tar.bz2 -C /usr/local/bin sqlcmd; \
+    rm -f /tmp/sqlcmd.tar.bz2; \
+    chmod 0755 /usr/local/bin/sqlcmd; \
+    /usr/local/bin/sqlcmd --version
+
+# --- OPTIONAL: site Kerberos realm (for kinit against your AD) ------------------
+# krb5-user above is generic; the realm/KDC mapping is site-specific, so it is NOT
+# hardcoded in this shared image (same reasoning as the CA block below). Either
+# bake a site /etc/krb5.conf here, or have callers point KRB5_CONFIG at their own.
+# With `dns_lookup_kdc = true` the KDCs are discovered from SRV records, so the
+# file is tiny. Example (GOA):
+# RUN printf '[libdefaults]\n    default_realm = GOA.DS.GOV.AB.CA\n    dns_lookup_kdc = true\n    rdns = false\n    udp_preference_limit = 1\n[domain_realm]\n    .goa.ds.gov.ab.ca = GOA.DS.GOV.AB.CA\n    goa.ds.gov.ab.ca = GOA.DS.GOV.AB.CA\n' > /etc/krb5.conf
+# -------------------------------------------------------------------------------
 
 # --- OPTIONAL: trust an internal / AD CA for LDAPS (PW_AUTH_MODE=ldap) ----------
 # LDAPS binds validate the DC certificate against the system CA store. If your
