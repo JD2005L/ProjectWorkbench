@@ -322,3 +322,47 @@ export const NORTH_AMERICAN_TIMEZONES = Object.freeze([
 ]);
 
 export const SCHEDULE_LIMITS = Object.freeze({ MIN_INTERVAL_MINUTES, MAX_COMMAND, MAX_NAME, TARGET_ALL });
+
+/**
+ * A pane running nothing but its login shell is IDLE and safe to reuse. Anything
+ * else means a previous run's agent (Claude Code shows up as `node`, see the
+ * pane_current_command notes in app/server.js), a build, or a human — and must
+ * not be typed into.
+ *
+ * The leading `-` of a login shell (`-bash`) is stripped before the comparison.
+ */
+export const TASK_WINDOW_IDLE_COMMANDS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish']);
+
+export function taskWindowIsIdle(command) {
+  const cmd = String(command || '').trim().replace(/^-/, '');
+  return cmd === '' || TASK_WINDOW_IDLE_COMMANDS.has(cmd);
+}
+
+/**
+ * What to do about a task's named window when the task fires.
+ *
+ * WHY THIS EXISTS. tmux permits duplicate window NAMES, and the runner used to
+ * call `new-window -n <task.window>` unconditionally — so every firing stacked
+ * another `eod-commit` tab onto every project, forever. Worse, the follow-up
+ * `send-keys -t <session>:<name>` then resolves that name against whichever
+ * duplicate tmux picks, so a later run's prompt could be typed into an EARLIER
+ * window that is still busy.
+ *
+ * `existing` is every window in the project whose name matches the task's.
+ *   - none                  -> create it (unchanged behaviour)
+ *   - one or more, any idle  -> REUSE the idle one, by INDEX, never by name
+ *   - one or more, all busy  -> SKIP; a task must never interrupt work in flight
+ */
+export function taskWindowDisposition({ existing = [] } = {}) {
+  const windows = Array.isArray(existing) ? existing.filter(Boolean) : [existing].filter(Boolean);
+  if (!windows.length) return { action: 'create', duplicates: 0 };
+  const idle = windows.find((w) => taskWindowIsIdle(w.command));
+  if (idle) return { action: 'reuse', index: idle.index, duplicates: windows.length };
+  const busy = windows[0];
+  return {
+    action: 'skip',
+    index: busy.index,
+    duplicates: windows.length,
+    reason: `window "${busy.name}" still busy (${String(busy.command || 'unknown')}) from an earlier run`,
+  };
+}

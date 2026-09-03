@@ -220,3 +220,55 @@ test('the task routes require admin, and the Settings page exposes the tab', { t
     assert.match(settings, /id="tab-tasks"/, 'and its section is rendered');
   });
 });
+
+// --- the runner must reuse a task window, not stack another one -------------
+
+test('runScheduledTask consults the window disposition instead of always creating', () => {
+  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
+  const start = src.indexOf('async function runScheduledTask(');
+  assert.notEqual(start, -1, 'app/server.js no longer defines runScheduledTask()');
+  const body = src.slice(start, src.indexOf('\n// The ticker.', start));
+  assert.match(body, /taskWindowDisposition\(\{ existing: sameName \}\)/, 'the runner no longer asks whether the window already exists');
+  assert.match(body, /w\.name === task\.window/, 'the runner no longer matches existing windows by the task window name');
+  // Reuse must target the index. A name target resolves to the FIRST duplicate
+  // (proved against real tmux below), i.e. a previous, possibly busy, run.
+  assert.match(body, /send-keys','-t',`\$\{tmuxSession\(name\)\}:\$\{d\.index\}`/, 'reuse no longer sends by window index');
+  // And a busy window is skipped, never interrupted.
+  assert.match(body, /d\.action === 'skip'/, 'the runner no longer honours a skip disposition');
+  assert.match(body, /skipped \(busy\)/, 'a skipped project is not surfaced in the task detail');
+});
+
+test('newTmuxWindow sends its command to the index it just created, not to a name', () => {
+  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
+  const start = src.indexOf('async function newTmuxWindow(');
+  const body = src.slice(start, src.indexOf('\nasync function requireProject(', start));
+  assert.match(body, /'-P','-F','#\{window_index\}'/, 'new-window no longer reports the created index');
+  assert.match(body, /send-keys','-t',`\$\{sess\}:\$\{idx \|\| safeName\}`/, 'the command is still targeted by name, which is ambiguous once duplicated');
+});
+
+test('REAL TMUX: a duplicated window name resolves to the FIRST match', async () => {
+  // This is the behaviour that made the bug sharp rather than merely untidy, so
+  // it is pinned against the real binary instead of assumed.
+  const cp = await import('node:child_process');
+  const os = await import('node:os');
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/pwdup-`);
+  const sock = `pwdup${process.pid}`;
+  const env = { ...process.env, TMUX_TMPDIR: dir };
+  delete env.TMUX;
+  const tm = (...a) => cp.execFileSync('tmux', ['-L', sock, ...a], { env, encoding: 'utf8' }).trim();
+  try {
+    tm('new-session', '-d', '-s', 't');
+    const first = tm('new-window', '-t', 't', '-n', 'dup', '-P', '-F', '#{window_index}');
+    const second = tm('new-window', '-t', 't', '-n', 'dup', '-P', '-F', '#{window_index}');
+    assert.notEqual(first, second, 'tmux gave the same index twice');
+    // Both exist under one name — tmux does not enforce uniqueness.
+    const named = tm('list-windows', '-t', 't', '-F', '#{window_name}').split('\n').filter((n) => n === 'dup');
+    assert.equal(named.length, 2, 'tmux started enforcing unique window names; the reuse logic can be simplified');
+    // And the name target picks the FIRST, i.e. the older window.
+    assert.equal(tm('display-message', '-p', '-t', 't:dup', '#{window_index}'), first,
+      'a name target no longer resolves to the first duplicate — re-check newTmuxWindow/reuse targeting');
+  } finally {
+    try { cp.execFileSync('tmux', ['-L', sock, 'kill-server'], { env, stdio: 'ignore' }); } catch { /* already gone */ }
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

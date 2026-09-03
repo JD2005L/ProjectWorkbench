@@ -21,7 +21,7 @@ import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceW
 import { repairWorkspaceBoxes } from './workspace-box-owner.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
-import { normalizeTask, evaluateDue, resolveTargets, preserveBookkeeping, guardedGitCommand, SCHEDULE_LIMITS, NORTH_AMERICAN_TIMEZONES, buildTaskCommand } from './scheduled-tasks.js';
+import { normalizeTask, evaluateDue, resolveTargets, preserveBookkeeping, guardedGitCommand, SCHEDULE_LIMITS, NORTH_AMERICAN_TIMEZONES, buildTaskCommand, taskWindowDisposition } from './scheduled-tasks.js';
 import { withLifecycleLock } from './lifecycle-lock.js';
 import { makeCredentialLockDomain } from './credential-domain-lock.js';
 import { assertTmuxOwner } from './tmux-owner-gate.js';
@@ -219,14 +219,42 @@ async function runScheduledTask(task, { trigger = 'schedule', dueAt = Date.now()
     // Create the session if the project has none, then add the window: a task
     // firing after hours must not depend on someone having opened the project.
     await ensureTmuxSession(p);
-    await newTmuxWindow(p, task.window, buildTaskCommand(task));
-    results.push({ project:name, ok:true });
+    // REUSE BEFORE CREATE. tmux allows duplicate window names, so calling
+    // new-window unconditionally stacked another `<task.window>` tab onto every
+    // project on every firing. See taskWindowDisposition() for the rules.
+    const sameName = (await tmuxWindowDetails(name).catch(()=>[])).filter(w => w.name === task.window);
+    const d = taskWindowDisposition({ existing: sameName });
+    if(d.action === 'skip'){
+     results.push({ project:name, ok:true, skipped:true, detail:d.reason, duplicates:d.duplicates });
+    } else if(d.action === 'reuse'){
+     const cmd = buildTaskCommand(task);
+     // By INDEX, never by name: with duplicates present a name target can land
+     // in the wrong window, which is the sharper half of this bug.
+     if(cmd) await tmux(['send-keys','-t',`${tmuxSession(name)}:${d.index}`,cmd,'C-m']);
+     results.push({ project:name, ok:true, reused:true, duplicates:d.duplicates });
+    } else {
+     await newTmuxWindow(p, task.window, buildTaskCommand(task));
+     results.push({ project:name, ok:true, created:true });
+    }
    } catch(e){ results.push({ project:name, ok:false, error: e?.message || String(e) }); }
   }
   const failed = results.filter(r => !r.ok);
-  const status = !results.length ? 'failed' : failed.length === 0 ? 'ok' : failed.length === results.length ? 'failed' : 'partial';
+  const skipped = results.filter(r => r.skipped);
+  const reused = results.filter(r => r.reused);
+  const dupes = results.filter(r => (r.duplicates || 0) > 1);
+  // A skip is deliberate, not an error — but it does mean the task did not run
+  // there, so it must not read as a clean 'ok'. Constrained to the three values
+  // normalizeTask() accepts, or it would be dropped to null on the next read.
+  const status = !results.length ? 'failed'
+   : failed.length === results.length ? 'failed'
+   : failed.length ? 'partial'
+   : skipped.length ? 'partial'
+   : 'ok';
   const detail = [
-   `${results.length - failed.length}/${results.length} project(s)`,
+   `${results.length - failed.length - skipped.length}/${results.length} project(s)`,
+   ...(reused.length ? [`reused: ${reused.map(r=>r.project).join(', ')}`] : []),
+   ...(skipped.length ? [`skipped (busy): ${skipped.map(r=>r.project).join(', ')}`] : []),
+   ...(dupes.length ? [`duplicate windows to clean up: ${dupes.map(r=>`${r.project}x${r.duplicates}`).join(', ')}`] : []),
    ...(missing.length ? [`unknown: ${missing.join(', ')}`] : []),
    ...failed.slice(0,5).map(f => `${f.project}: ${f.error}`),
   ].join(' · ');
@@ -1674,12 +1702,21 @@ async function newTmuxWindow(p,name='new task',cmd=''){
  }
  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
  const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
- await tmux(['new-window','-t',sess,'-c',p.path,'-n',safeName,...winEnv,'bash',...cred.shellArgs]);
+ // -P -F gives back the index of the window we just made. Send by INDEX, not by
+ // name: tmux permits duplicate window names, so a `session:name` target resolves
+ // against whichever duplicate tmux picks — which meant a command could be typed
+ // into an OLDER window of the same name (a scheduled task's previous, possibly
+ // still-busy, run) instead of the one just created.
+ const { stdout: newIdx } = await tmux(['new-window','-t',sess,'-c',p.path,'-n',safeName,'-P','-F','#{window_index}',...winEnv,'bash',...cred.shellArgs]);
+ const idx = String(newIdx || '').trim();
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
   await new Promise(r=>setTimeout(r,80));
-  await tmux(['send-keys','-t',`${tmuxSession(p.name)}:${safeName}`,trimmedCmd,'C-m']);
+  // Fall back to the name only if tmux somehow gave us no index, so this can
+  // never become a silent no-op.
+  await tmux(['send-keys','-t',`${sess}:${idx || safeName}`,trimmedCmd,'C-m']);
  }
+ return idx;
 }
 async function requireProject(req,res){ const p = await projectByName(req.params.project); if(!p){ res.status(404).json({ok:false,error:'Unknown project'}); return null; } return p; }
 async function sweepOrphanTmuxSessions(){

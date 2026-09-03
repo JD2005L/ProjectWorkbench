@@ -11,6 +11,7 @@ import {
   zonedParts, instantForLocal, normalizeTask, evaluateDue,
   resolveTargets, guardedGitCommand, preserveBookkeeping, SCHEDULE_LIMITS, NORTH_AMERICAN_TIMEZONES,
   buildTaskCommand, shellSingleQuote, AGENT_BINS,
+  taskWindowDisposition, taskWindowIsIdle,
 } from '../app/scheduled-tasks.js';
 
 const MT = 'America/Edmonton';
@@ -185,4 +186,70 @@ test('operator prose cannot escape its quotes into the shell', () => {
   }
   assert.equal(shellSingleQuote("a'b"), "'a'\\''b'");
   assert.ok(AGENT_BINS.includes('claude'));
+});
+
+// --- the task's named window: reuse before create ---------------------------
+//
+// tmux permits duplicate window NAMES, and the runner called `new-window -n
+// <task.window>` unconditionally — so every firing stacked another `eod-commit`
+// tab onto every project. The sharper half: `send-keys -t <session>:<name>`
+// resolves a duplicated name to the FIRST match, verified against real tmux
+// 3.3a, so from the second run onward the prompt was typed into the PREVIOUS
+// run's window (possibly still busy) while the new tab sat empty.
+
+test('taskWindowIsIdle: only a bare login shell counts as reusable', () => {
+  for (const idle of ['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', '-bash', '', '  ', undefined, null]) {
+    assert.equal(taskWindowIsIdle(idle), true, `expected idle: ${JSON.stringify(idle)}`);
+  }
+  // Claude Code appears as `node`; anything not a shell is somebody's work.
+  for (const busy of ['node', 'claude', 'copilot', 'vim', 'dotnet', 'git', 'python3', 'ssh']) {
+    assert.equal(taskWindowIsIdle(busy), false, `expected busy: ${busy}`);
+  }
+});
+
+test('disposition: no window of that name yet => create (unchanged behaviour)', () => {
+  assert.deepEqual(taskWindowDisposition({ existing: [] }), { action: 'create', duplicates: 0 });
+  assert.deepEqual(taskWindowDisposition({}), { action: 'create', duplicates: 0 });
+});
+
+test('disposition: an idle window is REUSED by index, never re-created', () => {
+  const d = taskWindowDisposition({ existing: [{ index: 4, name: 'eod-commit', command: 'bash' }] });
+  assert.equal(d.action, 'reuse');
+  assert.equal(d.index, 4, 'reuse must carry the INDEX — a name target is ambiguous once duplicated');
+  assert.equal(d.duplicates, 1);
+});
+
+test('disposition: a busy window is SKIPPED, never typed into', () => {
+  const d = taskWindowDisposition({ existing: [{ index: 2, name: 'eod-commit', command: 'node' }] });
+  assert.equal(d.action, 'skip');
+  assert.equal(d.index, 2);
+  assert.match(d.reason, /still busy \(node\)/);
+  assert.match(d.reason, /eod-commit/);
+});
+
+test('disposition: with duplicates already present, reuse the idle one and report the mess', () => {
+  // This is the state an instance is already in after N unchecked firings.
+  const d = taskWindowDisposition({ existing: [
+    { index: 3, name: 'eod-commit', command: 'node' },
+    { index: 7, name: 'eod-commit', command: 'bash' },
+    { index: 9, name: 'eod-commit', command: 'bash' },
+  ] });
+  assert.equal(d.action, 'reuse');
+  assert.equal(d.index, 7, 'must pick an idle duplicate, not the busy first one');
+  assert.equal(d.duplicates, 3, 'the operator needs to know how many stacked up');
+});
+
+test('disposition: every duplicate busy => skip, and still report the count', () => {
+  const d = taskWindowDisposition({ existing: [
+    { index: 3, name: 'eod-commit', command: 'node' },
+    { index: 8, name: 'eod-commit', command: 'claude' },
+  ] });
+  assert.equal(d.action, 'skip');
+  assert.equal(d.duplicates, 2);
+});
+
+test('disposition: a single object is accepted as well as an array', () => {
+  const d = taskWindowDisposition({ existing: { index: 1, name: 'eod-commit', command: 'bash' } });
+  assert.equal(d.action, 'reuse');
+  assert.equal(d.index, 1);
 });
