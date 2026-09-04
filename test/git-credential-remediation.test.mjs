@@ -303,3 +303,59 @@ test('an artifact owned by someone else is handed back for authoritative resync,
   assert.equal(row.action, 'refused');
   assert.equal(fs.lstatSync(artifact(p)).uid, ME, 'nothing may be converted in place');
 });
+
+// --- boot-time repair of a root-owned credential artifact --------------------
+//
+// A root-run git operation in a workspace (an operator in a `podman exec -u root`
+// shell, a deploy slot from before deployExec dropped, a root clone) makes git's
+// `store` helper rewrite `<project>/.git/.pw-credentials` as root. The file is
+// 0600, so the pane account can no longer read it and EVERY git command in that
+// project fails with "could not read Username" — the project silently loses all
+// git access while the repo itself looks perfectly fine.
+//
+// scripts/pw-git-credential-audit.mjs is the deliberate operator repair. This
+// pins the unattended half, and in particular the rule that keeps it safe.
+test('boot repair: inventories first, and NEVER revokes on a failed lookup', () => {
+  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
+  const start = src.indexOf('async function repairGitCredentialOwnership(){');
+  assert.notEqual(start, -1, 'the boot credential-ownership repair is gone');
+  const body = src.slice(start, src.indexOf("\n// What a project's tmux session", start));
+
+  // Inventory must be a DRY RUN: the planner refuses to convert a foreign-owned
+  // artifact and reports resyncRequired, so apply:true here would repair nothing
+  // while looking like it had.
+  assert.match(body, /apply: false/, 'the inventory pass must not claim to apply');
+  assert.match(body, /r\.resyncRequired/, 'the repair no longer selects the wrong-owner rows');
+
+  // THE SAFETY RULE. syncProjectCredentials() treats an empty token as REVOKE, so
+  // every path that cannot positively resolve a token must fall through to
+  // `blocked` and leave the artifact alone. Turning "cannot read the token" into
+  // "the token is gone" would be a worse outcome than the bug.
+  for (const guard of ['no longer in the registry', 'no primaryUser', 'does not resolve to a user record', 'left untouched rather than revoked']) {
+    assert.ok(body.includes(guard), `missing the guard that reports instead of revoking: ${guard}`);
+  }
+  const syncAt = body.indexOf('syncProjectCredentials(project)');
+  assert.notEqual(syncAt, -1, 'the repair no longer rewrites from the authoritative state');
+  assert.ok(body.indexOf('if(!token)') < syncAt, 'the empty-token guard must precede the rewrite');
+
+  // Only ever root->owner, and only when a drop is actually configured.
+  assert.match(body, /currentUid !== 0/, 'the repair must be a no-op unless this process is root');
+  assert.match(body, /if\(!plan\.drop\)/, 'the repair must be a no-op when dashboard and panes share an account');
+  assert.match(body, /if\(ISOLATED\)/, 'an isolated instance must never touch real projects');
+
+  // Locks for the inventory only: syncProjectCredentials takes the same domain
+  // itself, and this domain refuses a nested/out-of-order acquisition.
+  assert.ok(body.indexOf("withLocks(['lifecycle','projects','credential']") < syncAt,
+    'the inventory must hold the domain, and must have released it before the rewrite');
+  assert.equal((body.match(/withLocks\(/g) || []).length, 1, 'the repair must not take the domain twice');
+});
+
+test('boot repair is wired in beside the other two boot repairs, and is never fatal', () => {
+  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
+  assert.match(src, /repairGitCredentialOwnership\(\)\n\s*\.then/, 'the boot repair is defined but never called');
+  const call = src.slice(src.indexOf('repairGitCredentialOwnership()\n'));
+  assert.match(call.slice(0, 700), /\.catch\(/, 'a failed credential repair must not stop the dashboard booting');
+  // Ordered with the precedents it copies.
+  assert.ok(src.indexOf('pruneUserCredentialTrees()') < src.indexOf('repairGitCredentialOwnership()'));
+  assert.ok(src.indexOf('repairLegacyBoxOwnership()') < src.indexOf('repairGitCredentialOwnership()'));
+});

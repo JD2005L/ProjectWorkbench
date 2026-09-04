@@ -556,6 +556,92 @@ async function repairLegacyBoxOwnership(){
  if(!Number.isInteger(owner?.uid) || !Number.isInteger(owner?.gid)) return { repaired: [], refused: [] };
  return repairWorkspaceBoxes({ fsp: fs, projects: await loadProjects(), owner });
 }
+// Hand back any project's git credential artifact that has become root-owned.
+//
+// `<project>/.git/.pw-credentials` is mode 0600 and lives inside a tree the pane
+// account owns, and `.git/config` points `credential.helper = store --file=` at
+// it. Git's `store` helper REWRITES that file whenever an authenticated fetch or
+// push is approved — as whatever uid ran git. So one root-run git operation in a
+// workspace (an operator in a `podman exec -u root` shell, a deploy slot from
+// before deployExec dropped, a root clone) leaves the file readable only by root,
+// and every later git command in the pane fails with "could not read Username".
+// The repo looks fine; the agent simply has no credentials — which is what
+// "projects should have complete git access to their repos" is really about.
+//
+// So repair it on the way up, the same way and for the same reason as
+// pruneUserCredentialTrees() and repairLegacyBoxOwnership(): state that went
+// wrong while something else was in charge, corrected before a user meets it
+// rather than after. scripts/pw-git-credential-audit.mjs stays the deliberate
+// operator path for a live instance; this is the unattended half.
+//
+// It performs NO filesystem operation itself. The work is the same remediation
+// planner the audit CLI drives, run through the same privilege drop, so the
+// rewrite happens as the workspace owner and root never writes through a
+// pathname into a pane-controlled tree. It takes the credential serialization
+// domain first, so it cannot overlap a live rotation, revocation or rename.
+async function repairGitCredentialOwnership(){
+ if(ISOLATED) return { repaired: [], blocked: [] };
+ // Nothing to hand over when the dashboard and the panes already share an
+ // account, and a non-root process could only ever get EPERM trying.
+ const currentUid = process.getuid?.() ?? null;
+ if(currentUid !== 0) return { repaired: [], blocked: [] };
+ const terminal = await terminalOwner();
+ if(!Number.isInteger(terminal?.uid)) return { repaired: [], blocked: [] };
+ const plan = credentialExecutionPlan({ owner: terminal, currentUid });
+ if(!plan.drop) return { repaired: [], blocked: [] };
+ const projects = await loadProjects();
+ if(!projects.length) return { repaired: [], blocked: [] };
+
+ // INVENTORY ONLY (apply:false). The remediation planner deliberately refuses to
+ // convert an artifact owned by somebody else — it reports `resyncRequired`
+ // instead — because the old bytes are not authoritative. Rewriting the pair from
+ // the authoritative state is the only correct repair, and that is
+ // syncProjectCredentials() below. Locks are held for the inventory ONLY: that
+ // function takes the same domain itself, and this domain refuses an
+ // out-of-order/nested acquisition rather than deadlocking.
+ let rows = [];
+ try {
+  const report = await credentialDomain.withLocks(['lifecycle','projects','credential'], async () => (
+   runCredentialJob({
+    action: 'git-credential-audit',
+    workspaceRoot,
+    projects: projects.map(p => ({ name: p?.name, path: p?.path })).filter(p => p.path),
+    expectedUid: Number(terminal.uid),
+    apply: false,
+   }, plan)
+  ));
+  rows = Array.isArray(report?.projects) ? report.projects : [];
+ } catch(e){ return { repaired: [], blocked: [{ name: '(inventory)', detail: e?.message || String(e) }] }; }
+
+ const wrongOwner = rows.filter(r => r && r.resyncRequired);
+ if(!wrongOwner.length) return { repaired: [], blocked: [] };
+
+ // REVOCATION MUST BE A POSITIVE DECISION, never the residue of a failed lookup.
+ // syncProjectCredentials() treats an empty token as REVOKE, so calling it for a
+ // project whose owner cannot be resolved would destroy a credential that is
+ // merely mis-owned — turning "the agent cannot read its token" into "the token
+ // is gone". Same rule scripts/pw-git-credential-audit.mjs applies; anything
+ // unresolved is reported and left exactly as it is.
+ const users = await loadUsers();
+ const byPath = new Map(projects.filter(p => p?.path).map(p => [p.path, p]));
+ const repaired = [], blocked = [];
+ for(const row of wrongOwner){
+  const project = byPath.get(row.path);
+  const label = row.project || project?.name || row.path;
+  if(!project){ blocked.push({ name: label, detail: 'no longer in the registry' }); continue; }
+  if(!project.primaryUser){ blocked.push({ name: label, detail: 'no primaryUser, so no authoritative token to rewrite from' }); continue; }
+  const record = users.find(u => u.username === project.primaryUser);
+  if(!record){ blocked.push({ name: label, detail: `primaryUser "${project.primaryUser}" does not resolve to a user record` }); continue; }
+  let token = '';
+  try { token = record.ghToken ? (decrypt(record.ghToken) || '') : ''; } catch { token = ''; }
+  if(!token){ blocked.push({ name: label, detail: `no usable stored credential for "${project.primaryUser}" — left untouched rather than revoked` }); continue; }
+  try {
+   await syncProjectCredentials(project);
+   repaired.push({ name: label, detail: `rewritten as ${terminal.user || terminal.uid}` });
+  } catch(e){ blocked.push({ name: label, detail: e?.message || String(e) }); }
+ }
+ return { repaired, blocked };
+}
 // What a project's tmux session should be launched with. `tokens` are extra
 // non-secret `env` KEY=VALUE entries; `shellArgs` is the pane shell's argv tail;
 // `key` is the credential fingerprint stamped on the session (see CRED_KEY_OPTION).
@@ -4310,6 +4396,16 @@ const srv = app.listen(PORT,'127.0.0.1',()=>{
    for(const b of r.refused) console.warn(`[boxes] NOT repaired: ${b.dir} — ${b.reason}`);
   })
   .catch(e => console.warn(`[boxes] boot ownership repair failed: ${e?.message || e}`));
+ // Same shape, same reason: a root-owned `.git/.pw-credentials` silently costs a
+ // project ALL git access from its pane, and nothing in the running system
+ // noticed. Logged, never fatal — a credential that cannot be handed back must
+ // not stop the dashboard serving every other project.
+ repairGitCredentialOwnership()
+  .then(r => {
+   for(const c of r.repaired) console.log(`[git-cred] handed ${c.name || c.path} back to the workspace owner`);
+   for(const c of r.blocked) console.warn(`[git-cred] NOT repaired: ${c.name || c.path} — ${c.detail || c.reason || 'blocked'}`);
+  })
+  .catch(e => console.warn(`[git-cred] boot credential ownership repair failed: ${e?.message || e}`));
  // Armed for BOTH modes and before the host-mode return: a scheduled task runs
  // through newTmuxWindow(), which works in host mode too, so gating it on
  // container mode would silently give host installs a UI that never fires.
