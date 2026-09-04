@@ -246,9 +246,10 @@ test('newTmuxWindow sends its command to the index it just created, not to a nam
   assert.match(body, /send-keys','-t',`\$\{sess\}:\$\{idx \|\| safeName\}`/, 'the command is still targeted by name, which is ambiguous once duplicated');
 });
 
-test('REAL TMUX: a duplicated window name resolves to the FIRST match', async () => {
-  // This is the behaviour that made the bug sharp rather than merely untidy, so
-  // it is pinned against the real binary instead of assumed.
+test('REAL TMUX: send-keys REFUSES a duplicated window name (the root cause)', async () => {
+  // Reproduced 2026-09-04 against the live symptom: the eod-commit task failed on
+  // every project that already had an eod-commit window from an earlier run, and
+  // succeeded only on the two that did not. Pinned against the real binary.
   const cp = await import('node:child_process');
   const os = await import('node:os');
   const dir = fs.mkdtempSync(`${os.tmpdir()}/pwdup-`);
@@ -264,9 +265,20 @@ test('REAL TMUX: a duplicated window name resolves to the FIRST match', async ()
     // Both exist under one name — tmux does not enforce uniqueness.
     const named = tm('list-windows', '-t', 't', '-F', '#{window_name}').split('\n').filter((n) => n === 'dup');
     assert.equal(named.length, 2, 'tmux started enforcing unique window names; the reuse logic can be simplified');
-    // And the name target picks the FIRST, i.e. the older window.
-    assert.equal(tm('display-message', '-p', '-t', 't:dup', '#{window_index}'), first,
-      'a name target no longer resolves to the first duplicate — re-check newTmuxWindow/reuse targeting');
+    // THE OPERATIVE BEHAVIOUR: send-keys REFUSES an ambiguous name target. This is
+    // the actual bug — not misdirection to the wrong window, but no delivery at
+    // all, which is why the stacked eod-commit tabs sat empty while the task
+    // reported `can't find window: eod-commit`.
+    let refused = null;
+    try { tm('send-keys', '-t', 't:dup', 'echo hi', 'C-m'); }
+    catch (e) { refused = String(e.stderr || e.message || e); }
+    assert.ok(refused, 'send-keys accepted an ambiguous window name; the index targeting may no longer be required');
+    assert.match(refused, /can't find window/, `unexpected refusal text: ${refused}`);
+    // ...while targeting the same window by INDEX works, which is the fix.
+    tm('send-keys', '-t', `t:${second}`, 'echo hi', 'C-m');
+    // (display-message is lenient and resolves to the first match — noted so the
+    // difference between tmux target types is not rediscovered the hard way.)
+    assert.equal(tm('display-message', '-p', '-t', 't:dup', '#{window_index}'), first);
   } finally {
     try { cp.execFileSync('tmux', ['-L', sock, 'kill-server'], { env, stdio: 'ignore' }); } catch { /* already gone */ }
     fs.rmSync(dir, { recursive: true, force: true });

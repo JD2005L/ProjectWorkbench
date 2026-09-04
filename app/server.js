@@ -228,8 +228,11 @@ async function runScheduledTask(task, { trigger = 'schedule', dueAt = Date.now()
      results.push({ project:name, ok:true, skipped:true, detail:d.reason, duplicates:d.duplicates });
     } else if(d.action === 'reuse'){
      const cmd = buildTaskCommand(task);
-     // By INDEX, never by name: with duplicates present a name target can land
-     // in the wrong window, which is the sharper half of this bug.
+     // By INDEX, never by name. With two windows sharing a name, `send-keys -t
+     // <session>:<name>` does not pick one — tmux 3.3a REFUSES the ambiguous
+     // target with "can't find window: <name>", so the prompt was never
+     // delivered at all and the stacked tabs sat empty. Reproduced in
+     // test/scheduled-tasks-api.test.mjs.
      if(cmd) await tmux(['send-keys','-t',`${tmuxSession(name)}:${d.index}`,cmd,'C-m']);
      results.push({ project:name, ok:true, reused:true, duplicates:d.duplicates });
     } else {
@@ -1703,10 +1706,11 @@ async function newTmuxWindow(p,name='new task',cmd=''){
  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
  const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  // -P -F gives back the index of the window we just made. Send by INDEX, not by
- // name: tmux permits duplicate window names, so a `session:name` target resolves
- // against whichever duplicate tmux picks — which meant a command could be typed
- // into an OLDER window of the same name (a scheduled task's previous, possibly
- // still-busy, run) instead of the one just created.
+ // name: tmux permits duplicate window names, and `send-keys -t <session>:<name>`
+ // then REFUSES the ambiguous target ("can't find window: <name>") rather than
+ // choosing — so once a second window of the same name existed, the command was
+ // silently never delivered. That is what broke the eod-commit task on every run
+ // after its first. Verified against tmux 3.3a.
  const { stdout: newIdx } = await tmux(['new-window','-t',sess,'-c',p.path,'-n',safeName,'-P','-F','#{window_index}',...winEnv,'bash',...cred.shellArgs]);
  const idx = String(newIdx || '').trim();
  const trimmedCmd = String(cmd || '').trim();
