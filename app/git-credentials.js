@@ -978,6 +978,82 @@ function refusalRow(project, projectPath, e) {
   return { project, path: projectPath, status: 'error', detail: e?.message || String(e), eligible: false };
 }
 
+/**
+ * Git matches a stored credential on protocol + host + USERNAME. So a credential
+ * can be perfectly owned, perfectly moded, with a perfectly matching helper pair
+ * — and still be unusable, because the remote URL names a username no stored line
+ * provides. Git then prompts, and with no tty that is:
+ *
+ *     fatal: could not read Password for 'https://<user>@github.com': No such device or address
+ *
+ * Found in the field on a project whose remote had been hand-written as
+ * `https://<account>@github.com/<org>/<repo>.git` while PW writes the credential
+ * with the TOKEN in the username field. The inventory reported `ok` while git was
+ * unusable, which is the worst combination — hence this check.
+ *
+ * Pure and exported so the rule is tested directly rather than inferred from a
+ * fixture. REPORTS ONLY: rewriting somebody's remote URL is well outside this
+ * boundary's remit, and which remote is correct is a judgement call.
+ */
+export function credentialSatisfiesRemote({ remoteUrl, lines = [] }) {
+  const m = /^(https?):\/\/(?:([^:@/]+)(?::[^@]*)?@)?([^/]+)/.exec(String(remoteUrl || ''));
+  // Only http(s) consults a credential helper at all; ssh/git/file need none, so
+  // "no credential" is not a finding for them.
+  if (!m) return { applicable: false };
+  const [, protocol, rawUser, host] = m;
+  let user = '';
+  if (rawUser) { try { user = decodeURIComponent(rawUser); } catch { user = rawUser; } }
+  const forHost = lines.filter((l) => l && l.protocol === protocol && l.host === host);
+  if (!forHost.length) {
+    return { applicable: true, satisfied: false, reason: `no stored credential line for ${protocol}://${host}` };
+  }
+  // No username in the URL: any line for the host is offered. This is the shape PW
+  // itself writes, and the shape every working project here uses.
+  if (!user) return { applicable: true, satisfied: true };
+  if (forHost.some((l) => l.username === user)) return { applicable: true, satisfied: true };
+  // The URL's username is NOT a secret — it is sitting in .git/config. The stored
+  // usernames deliberately are not named: PW puts the token there.
+  return {
+    applicable: true,
+    satisfied: false,
+    urlUsername: user,
+    reason: `the remote URL requests username "${user}", which no stored credential line provides`,
+  };
+}
+
+// The remote this project would actually authenticate to. A missing or unreadable
+// remote is not a credential finding, so it degrades to "no opinion".
+async function readRemoteOriginUrl({ deps, pin, runGit }) {
+  await anchorProcessToPin({ deps, pin });
+  const result = await runGit(['config', '--file', GIT_CONFIG_NAME, '--get', 'remote.origin.url']);
+  if (result.code !== 0) return '';
+  return result.stdout.split('\n')[0].trim();
+}
+
+// The USERNAME FIELD of each stored line, and nothing else.
+//
+// This is the one place the inventory opens the credential itself. It runs as the
+// workspace owner — the same account git runs as, which already owns and reads
+// this file — and keeps only the username. The secret is never returned, never
+// compared, never logged. Read through the pinned descriptor with O_NOFOLLOW,
+// like every other access in this module.
+async function credentialLineIdentities({ deps, pin }) {
+  const fh = await deps.open(pinnedPath(pin, CREDENTIAL_BASENAME), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let text = '';
+  try { text = await fh.readFile('utf8'); } finally { await fh.close().catch(() => {}); }
+  const out = [];
+  for (const raw of String(text).split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const mm = /^(https?):\/\/([^:@/]+)(?::[^@]*)?@([^/]+)\/?$/.exec(line);
+    if (!mm) continue;
+    let username = mm[2];
+    try { username = decodeURIComponent(mm[2]); } catch { /* keep raw */ }
+    out.push({ protocol: mm[1], username, host: mm[3] });
+  }
+  return out;
+}
+
 async function inspectOneProject({ deps, runGit, workspaceRoot, registeredPaths, project, expectedUid }) {
   const name = project?.name || project?.path || '(unnamed)';
   const projectPath = project?.path || '';
@@ -1024,6 +1100,25 @@ async function inspectOneProject({ deps, runGit, workspaceRoot, registeredPaths,
       // reading a secret we must not read. It needs the authoritative current
       // credential re-applied over it instead.
       return { ...base, status: 'needs-repair', detail: reasons.join('; '), eligible: true, resyncRequired: wrongOwner };
+    }
+    // Ownership, mode and helper pair are all correct. That is still not the same
+    // as USABLE — see credentialSatisfiesRemote(). Any failure to form an opinion
+    // here leaves the row `ok`, exactly as before.
+    let usable = { applicable: false };
+    try {
+      usable = credentialSatisfiesRemote({
+        remoteUrl: await readRemoteOriginUrl({ deps, pin, runGit }),
+        lines: await credentialLineIdentities({ deps, pin }),
+      });
+    } catch { usable = { applicable: false }; }
+    if (usable.applicable && usable.satisfied === false) {
+      return {
+        ...base,
+        status: 'unusable-credential',
+        detail: `${usable.reason} — git will prompt and fail with no tty`,
+        eligible: false,
+        remoteMismatch: true,
+      };
     }
     return { ...base, status: 'ok', detail: 'owner-owned 0600 credential with a matching helper pair', eligible: false };
   } catch (e) {
@@ -1080,7 +1175,10 @@ async function repairOwnedArtifactMode({ deps, pin }) {
 
 export async function remediateGitCredentials({ deps, runGit, workspaceRoot, projects, expectedUid, apply = false }) {
   const report = await inEachProject({ deps, runGit, workspaceRoot, projects, expectedUid }, async (row, { registeredPaths, project }) => {
-    if (row.status === 'ok' || row.status === 'absent') return { ...row, action: 'none' };
+    // `unusable-credential` is a REPORT, not a refusal: the artifact is correct and
+    // there is nothing to convert. The remote URL is what needs a human decision,
+    // so it must not land in refused/unserviceable.
+    if (row.status === 'ok' || row.status === 'absent' || row.status === 'unusable-credential') return { ...row, action: 'none' };
     if (!row.eligible) return { ...row, action: 'refused' };
     if (!apply) return { ...row, action: 'would-repair' };
 

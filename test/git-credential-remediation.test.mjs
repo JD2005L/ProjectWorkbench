@@ -20,6 +20,7 @@ import {
   remediateGitCredentials,
   nodeJobDeps,
   nodeRunGit,
+  credentialSatisfiesRemote,
 } from '../app/git-credentials.js';
 
 const SENTINEL = 'ghp_SYNTHETIC_REMEDIATION_SENTINEL';
@@ -358,4 +359,70 @@ test('boot repair is wired in beside the other two boot repairs, and is never fa
   // Ordered with the precedents it copies.
   assert.ok(src.indexOf('pruneUserCredentialTrees()') < src.indexOf('repairGitCredentialOwnership()'));
   assert.ok(src.indexOf('repairLegacyBoxOwnership()') < src.indexOf('repairGitCredentialOwnership()'));
+});
+
+// --- a correct credential can still be UNUSABLE ------------------------------
+//
+// Git matches a stored credential on protocol + host + USERNAME. So ownership,
+// mode and the helper pair can all be right while git still cannot authenticate,
+// because the remote URL names a username no stored line provides:
+//
+//   fatal: could not read Password for 'https://<user>@github.com': No such device or address
+//
+// Found in the field: a project's remote had been hand-written as
+// https://<account>@github.com/... while PW writes the credential with the TOKEN
+// in the username field. The inventory said `ok` and git was unusable.
+test('credentialSatisfiesRemote: a URL username that no stored line provides is NOT satisfied', () => {
+  const lines = [{ protocol: 'https', username: 'gho_TOKEN', host: 'github.com' }];
+  const r = credentialSatisfiesRemote({ remoteUrl: 'https://someone@github.com/o/r.git', lines });
+  assert.equal(r.applicable, true);
+  assert.equal(r.satisfied, false);
+  assert.equal(r.urlUsername, 'someone');
+  assert.match(r.reason, /requests username "someone"/);
+  // THE SECRET MUST NOT LEAK. PW puts the token in the username field, so the
+  // stored usernames must never appear in a reason an operator will paste around.
+  assert.ok(!JSON.stringify(r).includes('gho_TOKEN'), 'the stored username (a token) leaked into the finding');
+});
+
+test('credentialSatisfiesRemote: PW’s own shape — no username in the URL — is satisfied', () => {
+  const lines = [{ protocol: 'https', username: 'gho_TOKEN', host: 'github.com' }];
+  assert.deepEqual(credentialSatisfiesRemote({ remoteUrl: 'https://github.com/o/r.git', lines }), { applicable: true, satisfied: true });
+  // ...and so is an exact match, for a deployment that stores it that way.
+  assert.deepEqual(credentialSatisfiesRemote({ remoteUrl: 'https://gho_TOKEN@github.com/o/r.git', lines }), { applicable: true, satisfied: true });
+});
+
+test('credentialSatisfiesRemote: non-http remotes need no helper, so they are not a finding', () => {
+  for (const url of ['git@github.com:o/r.git', 'ssh://git@github.com/o/r.git', '/srv/mirror/r.git', '']) {
+    assert.deepEqual(credentialSatisfiesRemote({ remoteUrl: url, lines: [] }), { applicable: false }, url);
+  }
+});
+
+test('credentialSatisfiesRemote: a host with no stored line at all is reported', () => {
+  const r = credentialSatisfiesRemote({ remoteUrl: 'https://gitlab.com/o/r.git', lines: [{ protocol: 'https', username: 'x', host: 'github.com' }] });
+  assert.equal(r.satisfied, false);
+  assert.match(r.reason, /no stored credential line for https:\/\/gitlab\.com/);
+  // A port is part of the host key, so it must not be silently ignored.
+  const p = credentialSatisfiesRemote({ remoteUrl: 'https://github.com:8443/o/r.git', lines: [{ protocol: 'https', username: 'x', host: 'github.com' }] });
+  assert.equal(p.satisfied, false);
+});
+
+test('the inventory reports unusable-credential WITHOUT calling it repairable', () => {
+  const src = fs.readFileSync(new URL('../app/git-credentials.js', import.meta.url), 'utf8');
+  assert.match(src, /status: 'unusable-credential'/, 'the inventory no longer reports the mismatch');
+  assert.match(src, /eligible: false/, 'the mismatch must not be offered as repairable');
+  // It is a report, not a refusal: refused/unserviceable is for things the command
+  // tried and could not do.
+  assert.match(src, /row\.status === 'unusable-credential'\) return \{ \.\.\.row, action: 'none' \}/,
+    'unusable-credential must map to action `none`, not `refused`');
+  // Forming no opinion must leave the row exactly as it was before this check.
+  assert.match(src, /catch \{ usable = \{ applicable: false \}; \}/, 'a failure to evaluate must degrade to ok, not to a finding');
+  // The username read must never widen into reading the secret back out.
+  assert.match(src, /keeps only the username/, 'the minimal-disclosure contract on the credential read is gone');
+});
+
+test('the audit CLI names unusable in its summary and says what to do', () => {
+  const src = fs.readFileSync(new URL('../scripts/pw-git-credential-audit.mjs', import.meta.url), 'utf8');
+  assert.match(src, /unusable: \$\{unusable\}/, 'the summary no longer counts unusable rows');
+  assert.match(src, /remote set-url origin https:\/\/github\.com/, 'the CLI no longer tells the operator how to fix it');
+  assert.match(src, /which remote is right is your call/, 'the CLI implies it will fix the remote itself');
 });

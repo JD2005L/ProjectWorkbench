@@ -111,8 +111,22 @@ function renderTable(report) {
   const repaired = rows.filter((r) => r.action === 'repaired' || r.action === 'resynced' || r.action === 'revoked').length;
   const repairable = rows.filter((r) => r.status === 'needs-repair').length;
   const refused = rows.filter((r) => r.action === 'refused' || r.status === 'error').length;
-  lines.push('', `repairable: ${repairable}   repaired: ${repaired}   refused/unserviceable: ${refused}`);
+  // Counted separately and named in the summary because it is the one finding this
+  // command cannot fix: the artifact is correct and the REMOTE is wrong. Left out
+  // of the summary it would sit in the table under action `none` and read as fine,
+  // which is how it went unnoticed until git failed in a pane.
+  const unusable = rows.filter((r) => r.status === 'unusable-credential').length;
+  lines.push('', `repairable: ${repairable}   repaired: ${repaired}   refused/unserviceable: ${refused}   unusable: ${unusable}`);
   if (!report.applied && repairable) lines.push('Re-run with --apply to repair the repairable rows.');
+  if (unusable) {
+    lines.push(
+      '',
+      'UNUSABLE means the credential is correct but the remote URL asks for a username it cannot satisfy,',
+      'so git prompts and fails with no tty. Not repaired here: which remote is right is your call.',
+      'PW stores the token in the username field, so the remote must NOT carry one:',
+      '  git -C <workspace> remote set-url origin https://github.com/<org>/<repo>.git',
+    );
+  }
   return `${lines.join('\n')}\n`;
 }
 
