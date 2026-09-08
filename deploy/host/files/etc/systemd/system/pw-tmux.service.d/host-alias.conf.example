@@ -1,0 +1,40 @@
+# TEMPLATE — copy to host-alias.conf and put YOUR deployment's name here.
+#
+# This file ships as `.example` on purpose: the canonical tree must never carry a
+# real deployment's hostname, which is exactly the portability defect that made a
+# shared container artifact work at one site only. The name below is in the
+# reserved `.invalid` namespace and resolves nowhere; a test asserts that stays
+# true, so filling in a real one here rather than in the copy will fail the suite.
+#
+#     sudo cp host-alias.conf.example /etc/systemd/system/pw-tmux.service.d/host-alias.conf
+#     sudoedit /etc/systemd/system/pw-tmux.service.d/host-alias.conf
+#     sudo systemctl daemon-reload
+#
+# WHAT IT IS FOR. An MCP client resolves each configured server ONCE at session
+# start and never retries, so one transient NXDOMAIN silently disables every
+# name-configured MCP server for that whole session. The image's nsswitch is
+# `hosts: files dns`, so a hosts entry wins and DNS is never consulted for the
+# name. The value is repetitions of `--add-host` with a <host>:<literal-address>
+# value; the address must be a literal, because a name would be resolved by the
+# very resolver this exists to bypass.
+#
+# 127.0.0.1 is right ONLY because pw-tmux.service runs --network=host, so
+# loopback is the host. A deployment that does not share the host network
+# namespace must map its own reachable address, and the checker below refuses the
+# loopback form when PW_TMUX_NETWORK_MODE does not say host.
+#
+# THIS FILE CARRIES THE VALUE AND NOTHING ELSE. Validation is not a thing each
+# deployment has to remember to wire: pw-tmux.service runs pw-host-alias-check
+# itself, as a non-`-` ExecStartPre, out of the container image — so whichever
+# supported route sets the value (this drop-in, or /etc/project-workbench/pw.env),
+# it is checked before podman ever sees it. A malformed mapping, or the loopback
+# form on a sidecar without host networking, exits 78 (EX_CONFIG) and fails the
+# unit. Do not add an ExecStartPre here; a test refuses one, because a second
+# gate suggests the unit does not already have one.
+#
+# To check an edit BEFORE `systemctl restart` takes every terminal down with it:
+#
+#     sudo PW_TMUX_HOST_ALIAS_ARGS='--add-host your.host.here:127.0.0.1' \
+#          PW_TMUX_NETWORK_MODE=host /usr/local/sbin/pw-host-alias-check
+[Service]
+Environment=PW_TMUX_HOST_ALIAS_ARGS=--add-host workbench.example.invalid:127.0.0.1

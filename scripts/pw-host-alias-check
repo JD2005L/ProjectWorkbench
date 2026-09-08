@@ -1,0 +1,35 @@
+#!/usr/bin/env node
+// The gate a deployment puts in front of its own host-alias configuration.
+//
+// Wired as a non-`-` ExecStartPre on the sidecar unit by the drop-in that carries
+// the value (see deploy/host/files/etc/systemd/system/pw-tmux.service.d/
+// host-alias.conf.example), so a malformed mapping or an unmet precondition
+// fails the unit instead of starting a container whose MCP clients will fail one
+// at a time, later, for reasons nobody connects back to this file.
+//
+// It exits 78 (EX_CONFIG) rather than 1 so a supervisor and an operator can tell
+// a misconfigured instance from a crashed check.
+//
+// IT LIVES BESIDE app/, and reaches PATH through a symlink. It imports
+// ../app/host-alias.js RELATIVE TO ITSELF, deliberately, so the gate and the
+// product share one verdict function and cannot drift. Installed flat into
+// /usr/local/sbin that import would resolve /usr/local/app/host-alias.js, which
+// no deployment has, and the helper would die ERR_MODULE_NOT_FOUND on every
+// invocation — the same defect pw-tmux-assert-owner and pw-box-remediate already
+// carry install notes about. Node resolves an ES module's imports against its
+// REALPATH, so reaching it through the link lands on the same app/ directory.
+import { validateHostAliasConfig, CONFIG_ERROR_EXIT, HOST_ALIAS_ENV, NETWORK_MODE_ENV } from '../app/host-alias.js';
+
+const raw = process.env[HOST_ALIAS_ENV];
+const result = validateHostAliasConfig({ raw, networkMode: process.env[NETWORK_MODE_ENV] });
+
+if (!result.ok) {
+  process.stderr.write(`pw-host-alias-check: ${HOST_ALIAS_ENV} is not usable: ${result.error}\n`);
+  process.exit(CONFIG_ERROR_EXIT);
+}
+
+// Silent on the default path: an unconfigured instance is the normal case and
+// must not put a line in the journal on every start.
+if (result.aliases.length > 0) {
+  process.stdout.write(`pw-host-alias-check: ${result.aliases.map((a) => `${a.host} -> ${a.address}`).join(', ')}\n`);
+}
