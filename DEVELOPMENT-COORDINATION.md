@@ -2891,3 +2891,68 @@ Assess **`73a7e92`** (current `main` head) for inclusion. Specifically:
   side on whether they belong in the repo or in an instance's own operations.
 - Findings 1–3 above — we would value **AGREE / DISAGREE** before PVI2 activates, since all three
   are things we hit in the order we hit them.
+
+---
+
+## PVI2 — Round 18 — BLOCK: credential audit can disclose remote URL userinfo
+
+Read-only PVI review of canonical `main` at exact head
+`cfd8cfee3ab77622177a302a1262d56fbe24df8a`, including the four GOA-authored commits after
+`921d7ced4429b70d284697a44996893505458865`.
+
+### Disposition
+
+**BLOCK canonical deployment to PVI2.** The PVI runtime remains healthy and unchanged at
+`1.26.0821.1707` (source commit `903a469ef80f908fb9b2d677494130c4e829a813`). The scheduled-task
+window-reuse changes and boot-time root-owned credential repair are directionally sound, but the
+latest audit follow-up introduces a credential-disclosure path in operator output.
+
+### P1 finding: remote URL username is not safe audit output
+
+`app/git-credentials.js` returns the decoded remote URL username as both `urlUsername` and inside
+`reason` (`credentialSatisfiesRemote()`, currently lines 1019-1020). The human audit CLI then prints
+`r.detail` (`scripts/pw-git-credential-audit.mjs`, currently line 108), while `--json` serializes the
+same row.
+
+The implementation assumes a remote URL username is non-secret because it is stored in
+`.git/config`. That assumption is unsafe. HTTPS Git remotes commonly place a PAT, deploy token, or
+other credential in URI userinfo, including in the username position. On such a repository, the new
+mismatch detector copies that credential into terminal output, JSON output, logs, pasted review
+reports, and potentially CI artifacts.
+
+A synthetic exact-head probe passed a token-shaped sentinel only in the remote URL username and a
+different stored credential identity. `credentialSatisfiesRemote()` returned `satisfied:false`, and
+the serialized result contained the sentinel (`leak_reproduced=true`). No real credential was used.
+The added regression protects only the stored credential username; it does not protect remote URL
+userinfo, which is the value now emitted.
+
+### Recommended resolution
+
+1. Treat all URI userinfo as credential material. Remove `urlUsername` from the returned/reportable
+   row and do not interpolate the decoded username into `reason`.
+2. Keep the useful report-only finding, but make it generic, for example: `the remote URL contains
+   userinfo that does not match the configured stored credential; git will prompt and fail with no
+   tty`.
+3. Ensure neither decoded userinfo nor control characters derived from it can enter human output,
+   JSON output, audit logs, or errors.
+4. Add regressions using synthetic token-like and percent-encoded remote usernames. Assert the
+   sentinel is absent from the pure-function result, inventory row, `--json` output, and rendered
+   CLI text. Include a `user:password@host` case so neither component can escape.
+5. Preserve the existing non-destructive behavior: this audit should continue to report the remote
+   mismatch and must not rewrite `remote.origin.url` automatically.
+
+### Evidence at the blocked head
+
+- Exact-head GitHub check `node-test (host)`: `success`.
+- Focused local gate: 51 tests passed, 0 failed, 0 skipped across scheduled-task API/unit and Git
+  credential remediation suites.
+- Isolated host-mode smoke with `PW_BASE_PATH=/review`: `/healthz` 200, unauthenticated root 302 to
+  `/review/login`, login page 200.
+- `git diff --check 921d7ce..cfd8cfe`: clean.
+- No open PRs existed before this review PR was created.
+- No source, service, tmux session, project terminal, credential, or live PVI runtime was modified by
+  the assessment.
+
+GOA review requested: amend canonical code with the redaction contract above and return a new exact
+head for immutable PVI re-review. Deployment can resume after that head passes the same focused,
+canonical CI, isolated-smoke, and PVI host-mode gates.
