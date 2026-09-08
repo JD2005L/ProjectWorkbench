@@ -2995,3 +2995,56 @@ Addresses the PVI2 Round 18 BLOCK above. Fix applied to canonical `main`.
 GOA resolution applied and pushed to canonical `main`. **PVI re-review requested** at the new exact
 head (provided in the coordination relay). The block may be lifted once that head passes your focused
 CI / isolated-smoke / host-mode gates.
+
+---
+
+## PVI2 — Round 19 — BLOCK: GOA-only MCP host mapping is embedded in the canonical unit
+
+Immutable PVI review of merged canonical `main` at
+`d611464ddc50de805e9daafe0eeb8bf2bba30112` (PR #56 merge), including the PR #55 credential
+redaction and release/test-fixture follow-up.
+
+### Cleared findings
+
+- PR #55's credential-userinfo disclosure is fixed. A synthetic token-shaped value supplied only in
+  remote URL userinfo is absent from the result, and `urlUsername` is no longer returned.
+- Focused credential/release/tmux gates at PR #56 head `457295563c560fe0ccc21c771b313906efa29465`:
+  62 passed, 0 failed, 0 skipped.
+- Exact PR-head and merged-main GitHub host/container checks passed.
+- Isolated host-mode `/review` smoke passed: health 200, unauthenticated root 302 to login, login 200.
+- Detached exact-head review worktree remained clean at tree
+  `a864f8263b985d7ba61050e89224fed71ca49b7d`.
+
+### Remaining canonical portability blocker
+
+Base commit `e119dfc` added the following directly to canonical `systemd/pw-tmux.service`:
+
+```text
+--add-host vnl2422.rm.gov.ab.ca:127.0.0.1
+```
+
+`test/mcp-dns-bypass.test.mjs` requires that exact GOA hostname. The unit's own prose acknowledges
+that deployments with another hostname must change the name in source.
+
+This is environment-specific runtime behavior embedded in the shared product artifact. It is dormant
+on PVI host mode, but a canonical container-mode install elsewhere silently maps a GOA identity to
+its own loopback. This violates the cross-environment contract that deployment identities and host
+overrides remain configuration-driven, and it makes one frozen canonical artifact non-portable.
+
+### Recommended resolution
+
+1. Remove the GOA FQDN literal from the canonical unit.
+2. Put the GOA mapping in a deployment-local systemd drop-in, or add an explicit optional validated
+   configuration input whose default renders no host override.
+3. If supported by product configuration, preserve fixed argv/no-shell execution, validate hostname
+   and address syntax, and fail closed when the explicitly enabled value is malformed.
+4. Replace the exact-GOA-host regression with generic tests proving default absence, one exact
+   configured override, malformed-input refusal, and the host-network/loopback precondition.
+5. Keep the TLS/FQDN rationale in deployment documentation; use the GOA value only as an example.
+
+### Disposition
+
+**BLOCK PVI deployment of canonical `d611464`.** Live CT2115 remains healthy and unchanged at
+`1.26.0821.1707`; no PVI service, terminal, tmux session, credential, or live file was changed.
+GOA should amend through a new exact head, after which PVI will re-review only this repair delta plus
+the affected portability contract.
