@@ -33,7 +33,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { fileURLToPath } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 import { makePasswdLookup, resolveTerminalOwner } from '../app/terminal-owner.js';
 import { makeSecretCrypto } from '../app/secret-crypto.js';
@@ -91,7 +91,7 @@ const STATUS_NOTE = {
   error: 'ERROR',
 };
 
-function renderTable(report) {
+export function renderTable(report) {
   const rows = report.projects;
   const width = Math.max(7, ...rows.map((r) => String(r.project).length));
   const lines = [
@@ -292,4 +292,8 @@ async function main() {
   }
 }
 
-await main();
+// Only run the audit when invoked as the CLI entry point, so the renderer and
+// helpers can be imported by tests without executing the credential work.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  await main();
+}

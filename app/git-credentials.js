@@ -1011,13 +1011,15 @@ export function credentialSatisfiesRemote({ remoteUrl, lines = [] }) {
   // itself writes, and the shape every working project here uses.
   if (!user) return { applicable: true, satisfied: true };
   if (forHost.some((l) => l.username === user)) return { applicable: true, satisfied: true };
-  // The URL's username is NOT a secret — it is sitting in .git/config. The stored
-  // usernames deliberately are not named: PW puts the token there.
+  // The URL's userinfo is treated as SECRET-BEARING. PW writes the token into the
+  // username field, and a hand-written remote can carry a PAT or deploy token there
+  // too — so the decoded username is never returned, interpolated into a reason, or
+  // logged. The finding is generic; the stored usernames are withheld for the same
+  // reason. See the PVI review (DEVELOPMENT-COORDINATION.md, 2026-09-08 / PR #55).
   return {
     applicable: true,
     satisfied: false,
-    urlUsername: user,
-    reason: `the remote URL requests username "${user}", which no stored credential line provides`,
+    reason: 'the remote URL specifies a username that no stored credential line provides',
   };
 }
 

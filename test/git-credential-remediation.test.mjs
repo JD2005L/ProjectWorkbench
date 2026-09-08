@@ -22,6 +22,7 @@ import {
   nodeRunGit,
   credentialSatisfiesRemote,
 } from '../app/git-credentials.js';
+import { renderTable } from '../scripts/pw-git-credential-audit.mjs';
 
 const SENTINEL = 'ghp_SYNTHETIC_REMEDIATION_SENTINEL';
 const ME = process.getuid();
@@ -377,11 +378,69 @@ test('credentialSatisfiesRemote: a URL username that no stored line provides is 
   const r = credentialSatisfiesRemote({ remoteUrl: 'https://someone@github.com/o/r.git', lines });
   assert.equal(r.applicable, true);
   assert.equal(r.satisfied, false);
-  assert.equal(r.urlUsername, 'someone');
-  assert.match(r.reason, /requests username "someone"/);
-  // THE SECRET MUST NOT LEAK. PW puts the token in the username field, so the
-  // stored usernames must never appear in a reason an operator will paste around.
+  // The URL's userinfo is secret-bearing (it can itself be a PAT — PR #55), so the
+  // finding is generic and never echoes the URL username back.
+  assert.equal(r.urlUsername, undefined);
+  assert.doesNotMatch(r.reason, /someone/);
+  // THE SECRET MUST NOT LEAK. PW puts the token in the username field, so neither
+  // the stored username nor the URL's username may appear in a reason an operator
+  // will paste around.
   assert.ok(!JSON.stringify(r).includes('gho_TOKEN'), 'the stored username (a token) leaked into the finding');
+  assert.ok(!JSON.stringify(r).includes('someone'), 'the URL username leaked into the finding');
+});
+
+// PR #55 (PVI review of cfd8cfe): the mismatch finding must treat remote URL
+// userinfo as secret-bearing, because PW writes the token into the username field
+// and a hand-written remote can carry a PAT there too.
+test('credentialSatisfiesRemote: a token-like or percent-encoded URL username never leaks into the finding', () => {
+  const lines = [{ protocol: 'https', username: 'gho_STORED', host: 'github.com' }];
+  for (const url of [
+    'https://ghp_URLLEAKabc123@github.com/o/r.git',
+    'https://github_pat_URLLEAKabc123@github.com/o/r.git',
+    'https://ghp_URLLEAKabc123:x-oauth-basic@github.com/o/r.git',
+  ]) {
+    const r = credentialSatisfiesRemote({ remoteUrl: url, lines });
+    assert.equal(r.satisfied, false, url);
+    assert.equal(r.urlUsername, undefined, url);
+    const s = JSON.stringify(r);
+    assert.ok(!s.includes('ghp_URLLEAK') && !s.includes('github_pat_URLLEAK'),
+      `the URL token leaked into the finding for ${url}: ${s}`);
+  }
+  // Percent-encoded userinfo must not leak in raw OR decoded form
+  // (ghp_URLLEAK%2Fabc%40x decodes to ghp_URLLEAK/abc@x).
+  const enc = credentialSatisfiesRemote({ remoteUrl: 'https://ghp_URLLEAK%2Fabc%40x@github.com/o/r.git', lines });
+  assert.equal(enc.satisfied, false);
+  const es = JSON.stringify(enc);
+  assert.ok(!es.includes('ghp_URLLEAK'), `percent-encoded URL userinfo leaked: ${es}`);
+});
+
+test('an unusable-credential finding never leaks the remote URL token — inventory JSON and rendered table', async () => {
+  const root = tmpRoot();
+  const p = repo(root, 'mismatch');
+  const STORED = 'ghp_STOREDcredentialSENTINEL';
+  const URLTOKEN = 'ghp_URLtokenLEAKSENTINEL';
+  // A fully-correct artifact: owner-owned 0600 with the matching helper pair, so the
+  // only possible finding is the remote mismatch (not needs-repair).
+  fs.writeFileSync(artifact(p), `https://${STORED}:x-oauth-basic@github.com\n`, { mode: 0o600 });
+  execFileSync('git', ['--git-dir', path.join(p, '.git'), 'config', '--local', '--add', 'credential.helper', '']);
+  execFileSync('git', ['--git-dir', path.join(p, '.git'), 'config', '--local', '--add', 'credential.helper', `store --file=${artifact(p)}`]);
+  // The remote was hand-written with a DIFFERENT token in its userinfo — the exact
+  // field the finding must never copy into output.
+  execFileSync('git', ['--git-dir', path.join(p, '.git'), 'config', '--local', 'remote.origin.url', `https://${URLTOKEN}@github.com/o/r.git`]);
+
+  const report = await inventoryGitCredentials(ctx(root, [{ name: 'mismatch', path: p }]));
+  const row = byName(report, 'mismatch');
+  assert.equal(row.status, 'unusable-credential', `expected a mismatch finding, got ${row.status}: ${row.detail}`);
+
+  const serialized = JSON.stringify(report);
+  assert.equal(serialized.includes(URLTOKEN), false, 'the remote URL token leaked into the inventory JSON');
+  assert.equal(serialized.includes(STORED), false, 'the stored credential token leaked into the inventory JSON');
+
+  // The same must hold for the human-readable table the operator sees and pastes.
+  const rendered = renderTable({ ...report, applied: false });
+  assert.equal(rendered.includes(URLTOKEN), false, 'the remote URL token leaked into the rendered table');
+  assert.equal(rendered.includes(STORED), false, 'the stored credential token leaked into the rendered table');
+  assert.match(rendered, /unusable-credential/, 'the row must still be surfaced as unusable, not silently fine');
 });
 
 test('credentialSatisfiesRemote: PW’s own shape — no username in the URL — is satisfied', () => {
