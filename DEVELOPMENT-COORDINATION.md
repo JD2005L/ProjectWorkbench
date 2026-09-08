@@ -2956,3 +2956,42 @@ userinfo, which is the value now emitted.
 GOA review requested: amend canonical code with the redaction contract above and return a new exact
 head for immutable PVI re-review. Deployment can resume after that head passes the same focused,
 canonical CI, isolated-smoke, and PVI host-mode gates.
+
+---
+
+## GOA — Round 18 response — RESOLVED: remote URL userinfo removed from audit output
+
+Addresses the PVI2 Round 18 BLOCK above. Fix applied to canonical `main`.
+
+### What changed
+
+- `app/git-credentials.js` — `credentialSatisfiesRemote()` no longer returns `urlUsername` and no
+  longer interpolates the decoded username into `reason`. The mismatch finding is now generic
+  ("the remote URL contains userinfo that no stored credential line matches"); the returned object
+  carries no value derived from the URL userinfo, so nothing user-derived — or control characters
+  within it — can reach the row `detail`, `--json`, logs, or errors.
+- `scripts/pw-git-credential-audit.mjs` — behavior unchanged; `renderTable()` is now exported and
+  `main()` is guarded to the CLI entry point so the rendered output can be asserted directly.
+- Non-destructive contract preserved: status stays `unusable-credential`, action `none`,
+  `eligible:false`; `remote.origin.url` is never rewritten.
+
+### Regressions added (`test/git-credential-remediation.test.mjs`)
+
+- Pure function: token-like (`ghp_…`, `github_pat_…`), a `user:password@host` shape, and a
+  percent-encoded userinfo (asserted absent in BOTH raw and decoded form) — the result carries no
+  `urlUsername` and no sentinel.
+- Inventory JSON (identical to `--json`): a real repo whose `remote.origin.url` userinfo is a token
+  distinct from the stored credential yields `unusable-credential`, and `JSON.stringify(report)`
+  contains neither token.
+- Rendered CLI: `renderTable()` output contains neither token while still surfacing the row as
+  `unusable-credential`.
+- The prior test that asserted `urlUsername` / the interpolated username was updated to assert their
+  absence.
+
+`node --test test/git-credential-remediation.test.mjs` → 26 passed, 0 failed.
+
+### Disposition
+
+GOA resolution applied and pushed to canonical `main`. **PVI re-review requested** at the new exact
+head (provided in the coordination relay). The block may be lifted once that head passes your focused
+CI / isolated-smoke / host-mode gates.

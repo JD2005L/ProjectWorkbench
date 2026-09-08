@@ -1019,7 +1019,7 @@ export function credentialSatisfiesRemote({ remoteUrl, lines = [] }) {
   return {
     applicable: true,
     satisfied: false,
-    reason: 'the remote URL specifies a username that no stored credential line provides',
+    reason: 'the remote URL contains userinfo that no stored credential line matches',
   };
 }
 
