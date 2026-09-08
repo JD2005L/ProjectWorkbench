@@ -20,6 +20,8 @@ import fsp from 'node:fs/promises';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
+import { registerFixtureTmuxServer } from './tmux-owner-fixture.mjs';
+
 const execFileAsync = promisify(execFile);
 
 // The pane-environment names these regressions are ABOUT. Scrubbed from the server so that a pane
@@ -45,6 +47,9 @@ export function startCleanTmuxServer(socket) {
     execFileSync('tmux', ['-L', socket, 'new-session', '-d', '-s', BASELINE_SESSION, 'sleep 86400'], {
       env: scrubbedEnv(), timeout: 20000,
     });
+    // This is a real, detached server, and creating it here means markOwnedServer()
+    // adopts rather than creates — so it is THIS call that owes the teardown.
+    registerFixtureTmuxServer(socket);
   }
 }
 

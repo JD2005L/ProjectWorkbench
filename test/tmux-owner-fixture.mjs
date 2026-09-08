@@ -31,6 +31,52 @@ import { OWNER_MARKER_OPTION, OWNER_MARKER_VALUE, expectedOwnerCgroup } from '..
 
 const REAL_HELPER = fileURLToPath(new URL('../scripts/pw-tmux-assert-owner', import.meta.url));
 
+// A FIXTURE THAT STANDS A REAL SERVER UP OWNS TAKING IT DOWN.
+//
+// markOwnedServer() below brings up a detached tmux server running `sleep 86400`.
+// The obligation to stop it used to sit with each caller, and several suites
+// simply never did — so every focused or full run left live servers behind, each
+// holding a socket and a sleeping child for 24 hours. That is a verification
+// defect rather than untidiness: they accumulate across runs until tmux can no
+// longer fork ("fork failed: No space left on device"), which takes the suite
+// that proves the product works out of service entirely.
+//
+// Registering at the point of CREATION and releasing on process exit keeps the
+// obligation with the code that incurs it, so a caller added later cannot forget
+// it. `process.on('exit')` admits only synchronous work, hence execFileSync.
+const FIXTURE_SERVERS = new Set();
+
+// A fixture must never be able to take down a server it did not create. These
+// helpers are only ever handed a freshly generated private socket name, so the
+// shared server — and whatever this run was pointed at — is refused outright.
+const NOT_A_FIXTURE_SOCKET = new Set(['default', process.env.PW_TMUX_SOCKET].filter(Boolean));
+
+/** Where tmux keeps its sockets, so a killed server leaves no socket file either. */
+function tmuxSocketDir() {
+  return path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${process.getuid()}`);
+}
+
+/** Record a private server THIS process brought up, to be killed when it exits. */
+export function registerFixtureTmuxServer(socket) {
+  if (socket && !NOT_A_FIXTURE_SOCKET.has(socket)) FIXTURE_SERVERS.add(socket);
+  return socket;
+}
+
+/** Kill every server this process registered. Idempotent; safe to call early. */
+export function killFixtureTmuxServers() {
+  for (const socket of FIXTURE_SERVERS) {
+    try {
+      execFileSync('tmux', ['-L', socket, 'kill-server'], { stdio: 'ignore', timeout: 20000 });
+    } catch { /* already gone */ }
+    // kill-server does not remove its own socket file on this system, so without
+    // this a run still leaks an (empty, but accumulating) socket special file.
+    try { fs.rmSync(path.join(tmuxSocketDir(), socket), { force: true }); } catch { /* fine */ }
+  }
+  FIXTURE_SERVERS.clear();
+}
+
+process.on('exit', killFixtureTmuxServers);
+
 // Put the REAL helper on PATH — not a stub. A fixture that stubbed it would stop
 // testing the thing the seams actually call.
 export function installOwnerHelper(dir) {
@@ -59,7 +105,10 @@ export function markOwnedServer({ socket, dir, env = {} }) {
   try {
     tmuxOn(socket, ['has-session', '-t', '_keepalive']);
   } catch {
-    try { tmuxOn(socket, ['new-session', '-d', '-s', '_keepalive', 'sleep 86400']); } catch { /* raced */ }
+    try {
+      tmuxOn(socket, ['new-session', '-d', '-s', '_keepalive', 'sleep 86400']);
+      registerFixtureTmuxServer(socket);
+    } catch { /* raced */ }
   }
   try { tmuxOn(socket, ['set-option', '-s', OWNER_MARKER_OPTION, OWNER_MARKER_VALUE]); } catch { /* no server */ }
 

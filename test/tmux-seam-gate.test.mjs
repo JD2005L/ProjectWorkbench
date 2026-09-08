@@ -239,3 +239,63 @@ test('MUTATION: removing the real helper from PATH makes a seam refuse, naming t
   assert.match(r.stderr, /ownership helper|not installed/i, 'and must say the helper is missing');
   assert.equal(fs.existsSync(path.join(dir, 'created')), false, 'no server may be created');
 });
+
+// ---------------------------------------------------------------------------
+// A fixture that stands a REAL server up owns taking it down
+// ---------------------------------------------------------------------------
+//
+// markOwnedServer() (and startCleanTmuxServer(), which pre-creates the same
+// server so the pane environment is scrubbed) brings up a DETACHED tmux server
+// running `sleep 86400`. Nothing obliged the caller to stop it, and of the suites
+// that use these fixtures several never did — so every focused or full run left
+// live servers behind, each holding a socket and a sleeping child for 24 hours.
+//
+// That is a verification defect, not an untidiness: on this host 479 of them had
+// accumulated across runs until tmux could no longer fork ("fork failed: No space
+// left on device"), which takes the whole suite — the thing that proves the
+// product works — out of service. Leaving the obligation with each caller is what
+// failed; the fixture that creates the server now releases it.
+//
+// Proved END-TO-END through a child process, because the guarantee is about what
+// survives PROCESS EXIT, which an in-process assertion cannot observe. Both
+// creation orders are covered: the fixture creating the server itself, and the
+// fixture adopting one startCleanTmuxServer() already scrubbed.
+const OWNER_FIXTURE = new URL('./tmux-owner-fixture.mjs', import.meta.url).href;
+const PANE_FIXTURE = new URL('./pane-env-fixture.mjs', import.meta.url).href;
+
+function liveTmuxServer(socket) {
+  return spawnSync('tmux', ['-L', socket, 'list-sessions'], { encoding: 'utf8' }).status === 0;
+}
+
+for (const [order, body] of [
+  ['the fixture creates the server itself', `
+    const { ownedTmuxFixture } = await import(${JSON.stringify(OWNER_FIXTURE)});
+    ownedTmuxFixture({ socket: SOCKET, dir: DIR });
+  `],
+  ['the fixture adopts a pre-scrubbed server', `
+    const { startCleanTmuxServer } = await import(${JSON.stringify(PANE_FIXTURE)});
+    const { ownedTmuxFixture } = await import(${JSON.stringify(OWNER_FIXTURE)});
+    startCleanTmuxServer(SOCKET);
+    ownedTmuxFixture({ socket: SOCKET, dir: DIR });
+  `],
+]) {
+  test(`REGRESSION: a fixture tmux server does not outlive its test process (${order})`, () => {
+    const dir = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'pw-leak-')));
+    const socket = `pwleak-${process.pid}-${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const child = spawnSync(process.execPath, ['--input-type=module', '-e',
+        `const SOCKET = ${JSON.stringify(socket)}; const DIR = ${JSON.stringify(dir)};\n${body}`,
+      ], { encoding: 'utf8', timeout: 60000 });
+      assert.equal(child.status, 0, `the fixture child failed: ${child.stderr}`);
+      // It must have really stood one up, or this proves nothing.
+      assert.equal(child.stderr.includes('no server running'), false, child.stderr);
+      assert.equal(
+        liveTmuxServer(socket), false,
+        `the fixture left a live tmux server on ${socket} after its process exited`,
+      );
+    } finally {
+      spawnSync('tmux', ['-L', socket, 'kill-server']);
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
