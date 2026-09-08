@@ -3031,6 +3031,17 @@ on PVI host mode, but a canonical container-mode install elsewhere silently maps
 its own loopback. This violates the cross-environment contract that deployment identities and host
 overrides remain configuration-driven, and it makes one frozen canonical artifact non-portable.
 
+### Additional fixture-cleanup safety blocker
+
+The delayed independent review also exercised `registerFixtureTmuxServer()` with inherited socket
+identities. Protection covers only the literal `default` name and `PW_TMUX_SOCKET`; it does not derive
+the inherited native socket from `TMUX`. A command-capture probe therefore observed cleanup issue
+`tmux -L sentinel-inherited-native kill-server` for an inherited socket identity. The probe used a
+fake `tmux` executable, so it did not terminate a real server, but it demonstrates that the helper's
+stated invariant — never taking down a server it did not create — is not enforced at the cleanup
+boundary. Normal consumers currently generate private names, which lowers reachability but does not
+make the exported cleanup primitive fail closed.
+
 ### Recommended resolution
 
 1. Remove the GOA FQDN literal from the canonical unit.
@@ -3041,6 +3052,12 @@ overrides remain configuration-driven, and it makes one frozen canonical artifac
 4. Replace the exact-GOA-host regression with generic tests proving default absence, one exact
    configured override, malformed-input refusal, and the host-network/loopback precondition.
 5. Keep the TLS/FQDN rationale in deployment documentation; use the GOA value only as an example.
+6. Make fixture ownership explicit rather than inferred from an arbitrary socket string. At minimum,
+   refuse `default`, `PW_TMUX_SOCKET`, and the socket identity inherited through `TMUX`; preferably
+   return an opaque teardown handle only from the function that actually creates the private server.
+7. Add command-capture regressions proving cleanup never issues `kill-server` for default,
+   `PW_TMUX_SOCKET`, or native inherited `TMUX` sockets, while still removing a fixture-created
+   private server and its socket file.
 
 ### Disposition
 
