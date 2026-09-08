@@ -20,7 +20,7 @@ import fsp from 'node:fs/promises';
 import { execFile, execFileSync } from 'node:child_process';
 import { promisify } from 'node:util';
 
-import { registerFixtureTmuxServer } from './tmux-owner-fixture.mjs';
+import { FIXTURE_SESSION, createFixtureTmuxServer } from './tmux-owner-fixture.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -30,8 +30,9 @@ export const PANE_ENV_NAMES = Object.freeze(['DISABLE_AUTOUPDATER', 'IS_SANDBOX'
 
 // The session name test/tmux-owner-fixture.mjs uses for the server it stands up. Matching it is
 // deliberate: creating this session first means markOwnedServer() adopts our scrubbed server rather
-// than creating a second one from the ambient environment.
-const BASELINE_SESSION = '_keepalive';
+// than creating a second one from the ambient environment. Imported rather than repeated, because
+// the two drifting apart silently turns adoption back into a second, unscrubbed server.
+const BASELINE_SESSION = FIXTURE_SESSION;
 
 export function scrubbedEnv(base = process.env) {
   const env = { ...base };
@@ -44,12 +45,11 @@ export function startCleanTmuxServer(socket) {
   try {
     execFileSync('tmux', ['-L', socket, 'has-session', '-t', BASELINE_SESSION], { stdio: 'ignore', timeout: 20000 });
   } catch {
-    execFileSync('tmux', ['-L', socket, 'new-session', '-d', '-s', BASELINE_SESSION, 'sleep 86400'], {
-      env: scrubbedEnv(), timeout: 20000,
-    });
     // This is a real, detached server, and creating it here means markOwnedServer()
-    // adopts rather than creates — so it is THIS call that owes the teardown.
-    registerFixtureTmuxServer(socket);
+    // adopts rather than creates — so it is THIS call that owes the teardown. The
+    // creation seam takes that obligation on as it brings the server up, and
+    // refuses outright to stand one up on a socket the fixture does not own.
+    createFixtureTmuxServer({ socket, session: BASELINE_SESSION, env: scrubbedEnv() });
   }
 }
 
