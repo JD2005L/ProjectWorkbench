@@ -1302,8 +1302,14 @@ function deployOptionSelect(slot){
 }
 async function getLocalVersion(projectPath){
  try {
+  // "Source" is the newest working-copy file mtime. Prune the runtime upload
+  // boxes (_inbox/_outbox) alongside the build/vendor dirs: a clipboard paste or
+  // an upload lands there with mtime=now and would otherwise keep Source
+  // perpetually "newer" than the deployed build, so the "source newer" badge
+  // never cleared (a project's own inbox fills constantly). They are not source
+  // and sit outside this process's boundary anyway — see the _inbox/_outbox note.
   const { stdout } = await execFileAsync('bash',['-c',
-   "find . \\( -name .git -o -name node_modules -o -name bin -o -name obj -o -name .vs -o -name dist -o -name .publish-output \\) -prune -o -type f -printf '%T@\\n' 2>/dev/null | sort -nr | head -1"
+   "find . \\( -name .git -o -name node_modules -o -name bin -o -name obj -o -name .vs -o -name dist -o -name .publish-output -o -name _inbox -o -name _outbox \\) -prune -o -type f -printf '%T@\\n' 2>/dev/null | sort -nr | head -1"
   ],{timeout:15000, cwd:projectPath});
   const epoch = parseFloat(stdout.trim());
   if(!Number.isFinite(epoch) || epoch <= 0) return null;
