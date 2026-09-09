@@ -110,6 +110,23 @@ ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
 RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 \
     -o /usr/local/bin/ttyd && chmod +x /usr/local/bin/ttyd
 
+# GitHub CLI (gh) — available to EVERY project, so agents and operators can use
+# gh pr / gh issue / gh api without a per-repo install. Resolves the latest stable
+# release via the releases/latest redirect (the unauthenticated API is rate-limited
+# and would flake a build), with a pinned fallback, and installs the single binary
+# — same shape as the sqlcmd/ttyd downloads. `set -e` + the final `gh --version`
+# make the layer fail loudly rather than ship a half-download.
+# NOTE: this installs the TOOL only. gh still needs a token for private repos
+# (GH_TOKEN in the environment, or `gh auth login`); baking it here grants no access.
+RUN set -eux; \
+    ver="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest | sed -E 's#.*/tag/v?##')"; \
+    case "$ver" in ''|*/*) ver=2.63.2 ;; esac; \
+    curl -fsSL "https://github.com/cli/cli/releases/download/v${ver}/gh_${ver}_linux_amd64.tar.gz" -o /tmp/gh.tgz; \
+    tar -xzf /tmp/gh.tgz -C /tmp "gh_${ver}_linux_amd64/bin/gh"; \
+    install -m 0755 "/tmp/gh_${ver}_linux_amd64/bin/gh" /usr/local/bin/gh; \
+    rm -rf /tmp/gh.tgz "/tmp/gh_${ver}_linux_amd64"; \
+    gh --version
+
 # admin user for host-parity. Container terminals/agents run as this NON-root
 # user (the app drops to it via `sudo -u admin`). We intentionally grant NO
 # passwordless-root sudo here: nothing in PW needs admin-initiated sudo, and in a
