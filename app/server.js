@@ -17,7 +17,7 @@ import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './term
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner } from './project-owner.js';
-import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv } from './workspace-file.js';
+import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv, selectExpiredBoxFiles } from './workspace-file.js';
 import { repairWorkspaceBoxes } from './workspace-box-owner.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
@@ -296,6 +296,52 @@ function startTaskScheduler(){
  // otherwise fire it before projects have their sessions back.
  setTimeout(tick, 45_000);
  console.log('[tasks] scheduler armed');
+}
+
+// ---- Inbox expiry -----------------------------------------------------------
+// Uploads pile up in every project's `_inbox` and nothing else removes them, so
+// the bind-mounted workspace volume grows without bound. Expire files older than
+// PW_INBOX_EXPIRY_DAYS (default 30) so they self-delete and free the space.
+//
+// A node-side ticker, NOT a systemd timer: per scheduled-tasks.js, generated
+// timers do not reach container mode and have failed silently here before. The
+// DELETES go through the same owner-dropped, symlink-safe box worker the
+// dashboard UI uses (boxJob box-list/box-delete) — this root process never
+// touches a byte under a workspace itself. Idempotent: each sweep removes only
+// what is already due, so a restart neither loses nor double-runs work.
+const INBOX_EXPIRY_DAYS = Number(process.env.PW_INBOX_EXPIRY_DAYS ?? 30);
+const INBOX_EXPIRY_SWEEP_MS = Math.max(1, Number(process.env.PW_INBOX_EXPIRY_SWEEP_HOURS || 6)) * 60 * 60 * 1000;
+let inboxExpiryTimer = null;
+
+async function sweepInboxExpiry(){
+ if(!(INBOX_EXPIRY_DAYS > 0)) return;
+ let projects;
+ try { projects = await loadProjects(); }
+ catch(e){ console.error('[inbox-expiry] cannot read registry:', e?.message || e); return; }
+ const now = Date.now();
+ for(const p of projects){
+  if(!p?.path) continue;
+  let listing;
+  try { listing = await boxJob(p, INBOX_DIR, 'box-list'); }
+  catch(e){ console.error(`[inbox-expiry] ${p.name}: list failed: ${e?.message || e}`); continue; }
+  const expired = selectExpiredBoxFiles(listing?.files, { now, maxAgeDays: INBOX_EXPIRY_DAYS });
+  let removed = 0;
+  for(const name of expired){
+   try { await boxJob(p, INBOX_DIR, 'box-delete', name); removed++; }
+   catch(e){ console.error(`[inbox-expiry] ${p.name}: delete ${name} failed: ${e?.message || e}`); }
+  }
+  if(removed) console.log(`[inbox-expiry] ${p.name}: removed ${removed} file(s) older than ${INBOX_EXPIRY_DAYS}d`);
+ }
+}
+
+function startInboxExpiry(){
+ if(inboxExpiryTimer) return;
+ if(!(INBOX_EXPIRY_DAYS > 0)){ console.log('[inbox-expiry] disabled (PW_INBOX_EXPIRY_DAYS <= 0)'); return; }
+ inboxExpiryTimer = setInterval(() => { sweepInboxExpiry().catch(e => console.error('[inbox-expiry] sweep failed:', e?.message || e)); }, INBOX_EXPIRY_SWEEP_MS);
+ inboxExpiryTimer.unref?.();
+ // A short delay after boot mirrors the task scheduler: let projects settle first.
+ setTimeout(() => { sweepInboxExpiry().catch(()=>{}); }, 90_000);
+ console.log(`[inbox-expiry] armed — ${INBOX_EXPIRY_DAYS}d expiry, sweep every ${INBOX_EXPIRY_SWEEP_MS / 3600000}h`);
 }
 
 // Configure a project's workspace-local git credentials.
@@ -4411,6 +4457,7 @@ const srv = app.listen(PORT,'127.0.0.1',()=>{
  // container mode would silently give host installs a UI that never fires.
  // Never in an isolated instance — those point at real projects.
  if(!ISOLATED) startTaskScheduler();
+ if(!ISOLATED) startInboxExpiry();
  if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
  if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
  sweepOrphanTmuxSessions();

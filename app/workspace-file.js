@@ -455,6 +455,31 @@ export async function applyBoxDelete({ fsp, projectPath, box, name }) {
   return { name };
 }
 
+/**
+ * Names in a box listing that have aged past `maxAgeDays` and are safe to expire.
+ *
+ * PURE, like scheduled-tasks.js's due-evaluation: it decides *what* is expired and
+ * nothing else, so the rule is unit-testable without a workspace or a clock change.
+ * The caller (server.js's daily sweep) does the removal through the same
+ * owner-dropped `box-delete` the dashboard UI uses. Entries box-delete would refuse
+ * (dotfiles — see isSafeBoxName; this also spares an in-progress `.pw-inbox-*.part`
+ * upload temp) and entries with an unparseable mtime are left alone. maxAgeDays <= 0
+ * disables expiry (returns []). Input is the `files` array from applyBoxList.
+ */
+export function selectExpiredBoxFiles(files, { now = Date.now(), maxAgeDays } = {}) {
+  const days = Number(maxAgeDays);
+  if (!(days > 0)) return [];
+  const cutoff = now - days * 24 * 60 * 60 * 1000;
+  const expired = [];
+  for (const f of Array.isArray(files) ? files : []) {
+    if (!f || !isSafeBoxName(f.name)) continue;
+    const t = Date.parse(f.mtime);
+    if (!Number.isFinite(t)) continue;
+    if (t < cutoff) expired.push(f.name);
+  }
+  return expired;
+}
+
 /** Empty a box, subdirectories included — the behaviour clear-all has always had. */
 export async function applyBoxClear({ fsp, projectPath, box }) {
   const dir = await boxDir({ fsp, projectPath, box });
