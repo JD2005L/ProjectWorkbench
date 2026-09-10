@@ -27,6 +27,14 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .top-actions{display:flex;gap:.6rem;align-items:center}
 :is(.deploy-page,#deployBackdrop) #probe-all.probing{opacity:.7;cursor:progress}
 :is(.deploy-page,#deployBackdrop) .last-deploy{font-size:.8rem;color:#94a3b8;margin:.4rem 0}
+:is(.deploy-page,#deployBackdrop) .deploy-inputs{display:flex;flex-wrap:wrap;gap:.75rem;margin:.6rem 0}
+:is(.deploy-page,#deployBackdrop) .deploy-input-field{display:flex;flex:1 1 180px;flex-direction:column;gap:.35rem;font-size:.85rem;color:#cbd5e1}
+:is(.deploy-page,#deployBackdrop) .deploy-input{width:100%;box-sizing:border-box;background:#020617;color:#e5e7eb;border:1px solid #475569;border-radius:6px;padding:.45rem;font:inherit}
+:is(.deploy-page,#deployBackdrop) .deploy-input:focus-visible,:is(.deploy-page,#deployBackdrop) .button:focus-visible{outline:2px solid #93c5fd;outline-offset:3px}
+:is(.deploy-page,#deployBackdrop) .selection-version{font-size:.85rem;margin:.5rem 0}
+:is(.deploy-page,#deployBackdrop) .manifest-notice,:is(.deploy-page,#deployBackdrop) .repo-managed-note{font-size:.8rem;line-height:1.5;color:#cbd5e1}
+:is(.deploy-page,#deployBackdrop) .deploy-manifest-error{color:#fecaca;border:1px solid #991b1b;padding:.65rem;border-radius:6px;font-size:.85rem}
+:is(.deploy-page,#deployBackdrop) .deploy-script[readonly]{opacity:.85}
 :is(.deploy-page,#deployBackdrop) .config-section{margin-top:.8rem;border-top:1px solid #1f2937;padding-top:.8rem}
 :is(.deploy-page,#deployBackdrop) .config-section label{display:block;font-size:.8rem;font-weight:600;color:#cbd5e1;margin-bottom:.3rem}
 :is(.deploy-page,#deployBackdrop) .config-section textarea,:is(.deploy-page,#deployBackdrop) .config-section input{width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;padding:.4rem .5rem;border:1px solid #334155;border-radius:4px;resize:vertical;background:#020617;color:#e5e7eb}

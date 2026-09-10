@@ -12,6 +12,8 @@ import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
 import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth } from './deploy-reauth.js';
+import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
+import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserSignedIn } from './user-credentials.js';
@@ -1266,12 +1268,12 @@ async function readDeployLog(project){
 // Deliberately not a UI field: it is a privilege grant, so it should take an
 // operator editing the registry. POST /api/deploy/config spreads the existing
 // target object, so saving a script from the UI preserves the flag.
-function deployExec(tc, argvTail, env, timeoutMs){
+function deployExec(tc, argvTail, env, timeoutMs, cwd){
  const drop = tc?.runAsRoot ? [] : agentSpawnDrop(TERMINAL_PRIV);
  const execEnv = { ...env };
  if(drop.length){ execEnv.HOME = TERMINAL_PRIV.home; execEnv.USER = TERMINAL_PRIV.user; execEnv.LOGNAME = TERMINAL_PRIV.user; }
  const argv = [...drop, ...argvTail];
- return execFileAsync(argv[0], argv.slice(1), { timeout: timeoutMs, env: execEnv });
+ return execFileAsync(argv[0], argv.slice(1), { timeout: timeoutMs, env: execEnv, ...(cwd ? { cwd } : {}) });
 }
 async function getDeployedVersion(project, target, cfg, env){
  const pc = cfg[project]; if(!pc || !pc[target]) return null;
@@ -1299,6 +1301,38 @@ function deployOptionSelect(slot){
  if(!slot.options || !slot.options.length) return '';
  const opts = slot.options.map(o => `<option value="${esc(String(o.value))}">${esc(String(o.label||o.value))}</option>`).join('');
  return `<select class="deploy-option" title="Release level" style="background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:6px;padding:.25rem .4rem;font-size:.8rem;margin-right:.4rem">${opts}</select>`;
+}
+async function getDeploySlotState(project, target, cfg){
+ const saved = cfg[project.name]?.[target] || {};
+ const slot = deploySlot(project, target);
+ const workspace = project.path || workspacePath(project.name);
+ try {
+  const manifest = await resolveDeployManifest(workspace, target);
+  return manifest
+   ? { managed:true, manifest, slot:{ ...slot, label:manifest.label, options:[] }, config:{ ...saved, script:manifest.script, versionCmd:'' }, workspace }
+   : { managed:false, manifest:null, slot, config:saved, workspace };
+ } catch(error) {
+  if(!(error instanceof DeployManifestError)) throw error;
+  // A broken repo contract must never expose or execute a previously saved
+  // script. Keep the other slot available and make this slot's error visible.
+  return { managed:true, manifest:null, error, slot, config:{}, workspace };
+ }
+}
+async function getProjectDeployStates(project, cfg){
+ return Promise.all(['dev','prod'].map(target => getDeploySlotState(project, target, cfg)));
+}
+function deployManifestFailure(res, error){
+ return res.status(error.statusCode).json({ ok:false, error:error.message, staleManifest:error.staleManifest });
+}
+function validateManifestRequest(manifest, body){
+ if(!body || typeof body !== 'object' || Array.isArray(body)) throw new DeployManifestError('deployment body must be an object');
+ for(const key of Object.keys(body)){
+  if(!['inputs','manifestRevision','password','savePassword'].includes(key)) throw new DeployManifestError(`unknown deployment field ${key}`);
+ }
+ return validateDeployInputs(manifest, body.inputs, body.manifestRevision);
+}
+function usesIndependentVersions(states){
+ return states.some(state => state.managed) && !states.some(state => !state.managed && (state.config.script || state.config.versionCmd));
 }
 async function getLocalVersion(projectPath){
  try {
@@ -2364,11 +2398,86 @@ const designTokensCss = `:root{--bg:#070c18;--bg2:#0e1728;--panel:#141f38;--pane
 ::view-transition-old(root),::view-transition-new(root){animation-duration:.16s}\n@keyframes pwPulse{0%,100%{opacity:.55;transform:scale(1)}50%{opacity:1;transform:scale(1.15)}}`;
 // deployCss (fully scoped) is imported from app/deploy-css.js.
 
-const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
-const deployModalScript = `<script>(function(){const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;const title=document.getElementById('deployModalTitle');const body=document.getElementById('deployModalBody');const closeBtn=document.getElementById('deployCloseBtn');let project=null;function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function hide(){backdrop.classList.add('hidden');project=null}closeBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});async function show(name){backdrop.__pwRefresh=()=>show(name);project=name;title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');try{const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');body.innerHTML=j.html;bindDeployActions(body)}catch(e){body.innerHTML='<p style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}}function bindDeployActions(container){container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block'})});container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const output=card.querySelector('.deploy-output');const isProd=target==='prod';const opt=(card.querySelector('.deploy-option')||{}).value||'';if((isProd||(opt&&opt!=='draft'))&&!confirm('Confirm \"'+(card.dataset.label||'this slot')+'\"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';async function runDeploy(pw,save){const bd={option:opt};if(pw){bd.password=pw;if(save)bd.savePassword=true}const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});return r.json()}try{let j=await runDeploy('',false);if(!j.ok&&j.needPassword){const pw=prompt(j.error||'Enter your domain password for deployment:');if(!pw){output.textContent='Deployment cancelled.';return}const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');output.textContent='Running deployment script…';j=await runDeploy(pw,save)}output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');const vEl=card.querySelector('.current-version');if(vEl&&j.version)vEl.textContent=j.version;const nb=card.querySelector('.src-newer-badge');if(nb&&typeof j.sourceNewer==='boolean')nb.hidden=!j.sourceNewer;const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')}catch(e){output.textContent=e.message||String(e)}finally{btn.textContent='Deploy';btn.disabled=false}})});container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{const card=btn.closest('.target-card');const target=card.dataset.target;const script=card.querySelector('.deploy-script').value;const versionCmd=card.querySelector('.version-cmd').value;try{const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000)}catch(e){alert(e.message||String(e))}})})}window.pwDeploy={open:show,close:hide};document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)})})();</script>`;
+const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="deployModalTitle"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
+const deployModalScript = `<script>(function(){
+ ${deployInputsClientSrc}
+ const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;
+ const title=document.getElementById('deployModalTitle'),body=document.getElementById('deployModalBody'),closeBtn=document.getElementById('deployCloseBtn');
+ let loadGeneration=0,opener=null;
+ function escHtml(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+ function hide(){loadGeneration++;backdrop.classList.add('hidden');opener?.focus()}
+ closeBtn.onclick=hide;
+ backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});
+ backdrop.addEventListener('keydown',e=>{
+  if(e.key!=='Tab')return;
+  const focusable=[...backdrop.querySelectorAll('button,select,input,textarea,a[href]')].filter(el=>!el.disabled&&el.getClientRects().length);
+  const first=focusable[0],last=focusable[focusable.length-1];
+  if(e.shiftKey&&document.activeElement===first){e.preventDefault();last?.focus()}
+  else if(!e.shiftKey&&document.activeElement===last){e.preventDefault();first?.focus()}
+ });
+ async function show(name){
+  const generation=++loadGeneration;backdrop.__pwRefresh=()=>show(name);
+  if(backdrop.classList.contains('hidden'))opener=document.activeElement;
+  title.textContent='Deploy — '+name;body.innerHTML='<p class="muted">Loading…</p>';backdrop.classList.remove('hidden');closeBtn.focus();
+  try{
+   const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});
+   const j=await r.json();if(generation!==loadGeneration)return;
+   if(!j.ok)throw new Error(j.error||'load failed');
+   body.innerHTML=j.html;bindDeployActions(body);(body.querySelector('.deploy-input')||closeBtn).focus();
+  }catch(e){if(generation===loadGeneration)body.innerHTML='<p role="alert" style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}
+ }
+ function bindDeployActions(container){
+  deployInputs.bind(container);
+  container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{
+   container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');
+   container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');
+   const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block';
+  })});
+  container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{
+   const card=btn.closest('.target-card'),project=card.dataset.project,target=card.dataset.target,output=card.querySelector('.deploy-output');
+   const selected=deployInputs.collect(card);if(!selected)return;
+   const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
+   if((target==='prod'||selected.inputs||(opt&&opt!=='draft'))&&!confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
+   deployInputs.setBusy(card,true);btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   async function runDeploy(pw,save){
+    const bd={...selected};if(pw){bd.password=pw;if(save)bd.savePassword=true}
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
+    return r.json();
+   }
+   try{
+    let j=await runDeploy('',false);
+    if(!j.ok&&j.needPassword){
+     const pw=prompt(j.error||'Enter your domain password for deployment:');
+     if(!pw){output.textContent='Deployment cancelled.';return}
+     const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
+     output.textContent='Running deployment script…';j=await runDeploy(pw,save);
+    }
+    deployInputs.applyResult(card,j);
+    output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');
+    const vEl=card.querySelector('.current-version');if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
+    const nb=card.querySelector('.src-newer-badge');if(nb&&typeof j.sourceNewer==='boolean')nb.hidden=!j.sourceNewer;
+    const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')+(summary?' | '+summary:'');
+   }catch(e){output.textContent=e.message||String(e)}
+   finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
+  })});
+  container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{
+   const card=btn.closest('.target-card'),project=card.dataset.project,target=card.dataset.target;
+   const script=card.querySelector('.deploy-script').value,versionCmd=card.querySelector('.version-cmd').value;
+   try{
+    const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd})});
+    const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000);
+   }catch(e){alert(e.message||String(e))}
+  })});
+ }
+ window.pwDeploy={open:show,close:hide};
+ document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)});
+})();</script>`;
 
 const deployScript = `<script>
 (function(){
+ ${deployInputsClientSrc}
+ deployInputs.bind(document);
  function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]))}
  document.querySelectorAll('.save-config').forEach(btn=>{
   btn.onclick=async()=>{
@@ -2392,12 +2501,12 @@ const deployScript = `<script>
    const project=card.dataset.project;
    const target=card.dataset.target;
    const output=card.querySelector('.deploy-output');
-   const isProd=target==='prod';
-   const opt=(card.querySelector('.deploy-option')||{}).value||'';
-   if((isProd||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(opt?' ('+opt+')':'')+' for '+project+'? This action is logged.'))return;
-   btn.disabled=true;btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   const selected=deployInputs.collect(card);if(!selected)return;
+   const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
+   if((target==='prod'||selected.inputs||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
+   deployInputs.setBusy(card,true);btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
    async function runDeploy(pw,save){
-    const bd={option:opt};
+    const bd={...selected};
     if(pw){bd.password=pw;if(save)bd.savePassword=true}
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
     return r.json();
@@ -2415,17 +2524,18 @@ const deployScript = `<script>
      output.textContent='Running deployment script…';
      j=await runDeploy(pw,save);
     }
-    if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');throw new Error(j.error||'deploy failed')}
+    deployInputs.applyResult(card,j);
+    if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');return}
     output.textContent='✅ SUCCESS ('+j.duration+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
     const vEl=card.querySelector('.current-version');
-    if(vEl&&j.version)vEl.textContent=j.version;
+    if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
     // This page keeps its badge in .version-line via markSrcNewer, so reuse that
     // rather than introducing a second mechanism: a deploy changes the comparison
     // and the badge has to follow it here too.
     markSrcNewer(card, j.version||'');
     const ldEl=card.querySelector('.last-deploy-info');
-    if(ldEl)ldEl.textContent='Just now by '+j.user;
-   }catch(e){output.textContent=output.textContent||e.message}finally{btn.textContent='Deploy';btn.disabled=false}
+    if(ldEl)ldEl.textContent='Just now by '+j.user+(summary?' | '+summary:'');
+   }catch(e){output.textContent='❌ FAILED\\n'+e.message}finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
   };
  });
  document.querySelectorAll('.toggle-log').forEach(btn=>{
@@ -2438,13 +2548,14 @@ const deployScript = `<script>
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log');
     const j=await r.json();if(!j.ok)throw new Error(j.error);
     if(!j.log.length){logDiv.innerHTML='<p class="muted">No deployments yet.</p>'}
-    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td></tr>').join('')+'</tbody></table>'}
+    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td></tr>').join('')+'</tbody></table>'}
     logDiv.style.display='block';btn.textContent='Hide history';
    }catch(e){logDiv.innerHTML='<p class="muted">Error: '+esc(e.message)+'</p>';logDiv.style.display='block'}
   };
  });
  function srcCmp(src,dep){var re=/^V1\\.\\d{2}\\.\\d{4}\\.\\d{4}$/;return !!src&&!!dep&&re.test(src)&&re.test(dep)&&src>dep;}
  function markSrcNewer(card,dep){
+  if(card.dataset.managed==='1')return;
   var pc=card.closest('.project-card');var se=pc&&pc.querySelector('.version.source');
   var src=se?se.textContent.trim():'';var line=card.querySelector('.version-line');if(!line)return;
   var badge=line.querySelector('.src-newer');
@@ -3238,7 +3349,7 @@ app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ awai
  let deployConfigured = false;
  if(DEPLOY_CENTRE){
   const dCfg = await loadDeployConfig();
-  deployConfigured = hasDeployConfigFor(p.name, dCfg);
+  deployConfigured = hasDeployConfigFor(p.name, dCfg) || (await getProjectDeployStates(p, dCfg)).some(state => state.managed);
  }
  // No client-side "do we have a saved password?" hint: both deploy surfaces now
  // request first and let the server answer needPassword, so a hint could only
@@ -4186,22 +4297,49 @@ app.get(BASE + '/api/system/firstrun', async (_req,res) => {
 });
 
 if(DEPLOY_CENTRE){
- const fmtDeployLog = (entry) => entry ? `${entry.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')} by ${entry.user}` : 'Never deployed';
+ const fmtDeployLog = (entry) => {
+  if(!entry) return 'Never deployed';
+  const selection = describeDeploySelection(entry);
+  return `${entry.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')} by ${entry.user}${selection ? ' | '+selection : ''}`;
+ };
+
+ function managedDeployTarget(p, target, state, entry){
+  const { slot, config, manifest, error } = state;
+  const opening = `<div class="target-card ${target}" data-project="${esc(p.name)}" data-target="${target}" data-managed="1" data-probeable="0" data-label="${esc(slot.label)}"${config.reauth?' data-reauth="1"':''}${manifest ? ` data-manifest="${esc(JSON.stringify(manifest))}"` : ''}>
+   <h3>${slot.icon?esc(slot.icon)+' ':''}${esc(slot.label)}</h3>`;
+  if(error) return `${opening}<p class="deploy-manifest-error" role="alert">${esc(error.message)}</p><p class="repo-managed-note">Repository-managed slot. Fix .pw/deploy.json or its choice metadata; a saved deployment script will not be used.</p></div>`;
+  return `${opening}
+   <p class="repo-managed-note">Repository-managed by <code>.pw/deploy.json</code>. Script and inputs are read-only here.</p>
+   ${renderDeployInputs(manifest, 'deploy-'+p.name+'-'+target, esc)}
+   <p class="manifest-notice">${esc(deployInputNotice(manifest))}</p>
+   <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(entry))}</span></div>
+   <button class="button ${target==='prod'?'danger ':''}small deploy-btn" type="button"${manifest.inputs.length?' disabled':''}>Deploy</button>
+   <div class="deploy-output" role="status" aria-live="polite"></div>
+   <div class="config-section"><label>Repository-managed deploy script (bash, read-only)<textarea class="deploy-script" readonly>${esc(manifest.script)}</textarea></label></div>
+  </div>`;
+ }
+ function deploySourceSummary(localVersion, independent){
+  if(independent) return '<p class="muted">Version information comes from repository-managed slot metadata, not the application source stamp.</p>';
+  return `<div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>`;
+ }
 
  async function deployPageCard(p, cfg, isAdmin){
-  const devCfg = cfg[p.name]?.dev || {};
-  const prodCfg = cfg[p.name]?.prod || {};
-  const devSlot = deploySlot(p,'dev'); const prodSlot = deploySlot(p,'prod');
+  const states = await getProjectDeployStates(p, cfg);
+  const [devState, prodState] = states;
+  const devCfg = devState.config;
+  const prodCfg = prodState.config;
+  const devSlot = devState.slot; const prodSlot = prodState.slot;
   const devOptSel = deployOptionSelect(devSlot); const prodOptSel = deployOptionSelect(prodSlot);
-  const localVersion = await getLocalVersion(p.path || workspacePath(p.name));
+  const independent = usesIndependentVersions(states);
+  const localVersion = independent ? null : await getLocalVersion(p.path || workspacePath(p.name));
   const log = await readDeployLog(p.name);
   const devLog = log.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = log.filter(e=>e.target==='prod').slice(-1)[0];
   return `<div class="project-card" data-project="${esc(p.name)}">
    <h2>${esc(p.name)}</h2>
-   <div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>
+   ${deploySourceSummary(localVersion, independent)}
    <div class="targets">
-    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
+    ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
      <div class="version-line">Version: <span class="version current-version">—</span>${devCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
@@ -4214,8 +4352,8 @@ if(DEPLOY_CENTRE){
       <input class="version-cmd" placeholder="ssh devserver 'cat /app/package.json | jq -r .version'" value="${esc(devCfg.versionCmd||'')}">
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
-    </div>
-    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
+    </div>`}
+    ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
      <div class="version-line">Version: <span class="version current-version">—</span>${prodCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
@@ -4228,32 +4366,35 @@ if(DEPLOY_CENTRE){
       <input class="version-cmd" placeholder="ssh prodserver 'cat /app/package.json | jq -r .version'" value="${esc(prodCfg.versionCmd||'')}">
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
-    </div>
+    </div>`}
    </div>
    <button class="button secondary small toggle-log" type="button" style="margin-top:.8rem">Show history</button>
    <div class="deploy-log" style="display:none"></div>
   </div>`;
  }
 
- async function deployModalCard(p, cfg, isAdmin, deployEnv){
-  const devCfg = cfg[p.name]?.dev || {};
-  const prodCfg = cfg[p.name]?.prod || {};
-  const devSlot = deploySlot(p,'dev'); const prodSlot = deploySlot(p,'prod');
+ async function deployModalCard(p, cfg, isAdmin, deployEnv, states){
+  states ||= await getProjectDeployStates(p, cfg);
+  const [devState, prodState] = states;
+  const devCfg = devState.config;
+  const prodCfg = prodState.config;
+  const devSlot = devState.slot; const prodSlot = prodState.slot;
   const devOptSel = deployOptionSelect(devSlot); const prodOptSel = deployOptionSelect(prodSlot);
+  const independent = usesIndependentVersions(states);
   const [devVersion, prodVersion, localVersion, allLog] = await Promise.all([
-   getDeployedVersion(p.name,'dev',cfg,deployEnv),
-   getDeployedVersion(p.name,'prod',cfg,deployEnv),
-   getLocalVersion(p.path || workspacePath(p.name)),
+   devState.managed ? null : getDeployedVersion(p.name,'dev',cfg,deployEnv),
+   prodState.managed ? null : getDeployedVersion(p.name,'prod',cfg,deployEnv),
+   independent ? null : getLocalVersion(p.path || workspacePath(p.name)),
    readDeployLog(p.name)
   ]);
   const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
-  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td class="${e.status==='success'||e.ok?'ok':'fail'}">${e.status==='success'||e.ok?'✅ OK':'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
+  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':'fail'}">${e.status==='success'||e.ok?'✅ OK':'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
   return `<div class="deploy-tabs"><button class="deploy-tab active" data-tab="deploy-panel">Deploy</button><button class="deploy-tab" data-tab="history-panel">History</button></div>
    <div id="deploy-panel" class="deploy-tab-panel">
-   <div class="local-version">Source: <span class="version source"${localVersion?.hash?` title="newest source change in the working copy · HEAD ${esc(localVersion.hash)}"`:''}>${esc(localVersion?.version||'—')}</span></div>
+   ${deploySourceSummary(localVersion, independent)}
    <div class="targets">
-    <div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
+    ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
      <div>Version: <span class="version current-version">${esc(devVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, devVersion)}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
@@ -4266,8 +4407,8 @@ if(DEPLOY_CENTRE){
       <input class="version-cmd" value="${esc(devCfg.versionCmd||'')}">
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
-    </div>
-    <div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
+    </div>`}
+    ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
      <div>Version: <span class="version current-version">${esc(prodVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, prodVersion)}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
@@ -4280,11 +4421,11 @@ if(DEPLOY_CENTRE){
       <input class="version-cmd" value="${esc(prodCfg.versionCmd||'')}">
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
-    </div>
+    </div>`}
    </div>
    </div>
    <div id="history-panel" class="deploy-tab-panel" style="display:none">
-    ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th></tr></thead><tbody>${historyRows}</tbody></table>` : `<p class="muted">No deployment history yet.</p>`}
+    ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th></tr></thead><tbody>${historyRows}</tbody></table>` : `<p class="muted">No deployment history yet.</p>`}
    </div>`;
  }
 
@@ -4305,6 +4446,12 @@ if(DEPLOY_CENTRE){
    if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
    if(project === '__proto__' || project === 'constructor' || project === 'prototype') return res.status(400).json({ok:false,error:'Invalid project name'});
    const cfg = await loadDeployConfig();
+   const p = await projectByName(project);
+   if(p){
+    const state = await getDeploySlotState(p, target, cfg);
+    if(state.error) return deployManifestFailure(res, state.error);
+    if(state.managed) return res.status(409).json({ok:false,error:'This slot is repository-managed. Edit .pw/deploy.json in the project; its script and inputs cannot be saved here.'});
+   }
    if(!cfg[project]) cfg[project] = {};
    cfg[project][target] = { ...(cfg[project][target]||{}), script: String(script||'').trim(), versionCmd: String(versionCmd||'').trim() };
    await saveDeployConfig(cfg);
@@ -4317,14 +4464,21 @@ if(DEPLOY_CENTRE){
   try {
    const projects = filterProjectsForUser(await loadProjects(), req.user);
    const cfg = await loadDeployConfig();
-   const users = await loadUsers();
-   const currentUser = users.find(u => u.username === req.user?.username);
-   const deployEnv = getDeployEnv(users, currentUser);
-   const status = await Promise.all(projects.map(async p => ({
-    name: p.name,
-    dev: { version: await getDeployedVersion(p.name,'dev',cfg,deployEnv), configured: !!(cfg[p.name]?.dev?.script) },
-    prod: { version: await getDeployedVersion(p.name,'prod',cfg,deployEnv), configured: !!(cfg[p.name]?.prod?.script) },
-   })));
+   const states = await Promise.all(projects.map(p => getProjectDeployStates(p, cfg)));
+   let deployEnv = null;
+   if(states.some(slots => slots.some(state => !state.managed && state.config.versionCmd))){
+    const users = await loadUsers();
+    deployEnv = getDeployEnv(users, users.find(u => u.username === req.user?.username));
+   }
+   const status = await Promise.all(projects.map(async (p, index) => {
+    const targets = await Promise.all(['dev','prod'].map(async (target, i) => {
+     const state = states[index][i];
+     return state.managed
+      ? { version:null, configured:!!state.manifest, managed:true, manifest:state.manifest, error:state.error?.message }
+      : { version:await getDeployedVersion(p.name,target,cfg,deployEnv), configured:!!state.config.script };
+    }));
+    return { name:p.name, dev:targets[0], prod:targets[1] };
+   }));
    res.json({ok:true, projects: status});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
@@ -4336,7 +4490,16 @@ if(DEPLOY_CENTRE){
   const p = await projectByName(project);
   if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
   const cfg = await loadDeployConfig();
-  const tc = cfg[project]?.[target];
+  const state = await getDeploySlotState(p, target, cfg);
+  if(state.error) return deployManifestFailure(res, state.error);
+  let tc = state.config, manifest = state.manifest, selection = null;
+  if(!manifest && (Object.hasOwn(req.body||{}, 'inputs') || Object.hasOwn(req.body||{}, 'manifestRevision'))){
+   return deployManifestFailure(res, new DeployManifestError('the selected repository-managed slot is missing; reopen the deployment panel', 409));
+  }
+  if(manifest){
+   try { selection = validateManifestRequest(manifest, req.body); }
+   catch(error) { if(error instanceof DeployManifestError) return deployManifestFailure(res, error); throw error; }
+  }
   if(!tc || !tc.script) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
   const users = await loadUsers();
   const currentUser = users.find(u => u.username === req.user?.username);
@@ -4353,6 +4516,17 @@ if(DEPLOY_CENTRE){
    await audit('deploy_reauth_failed', { project, target, staleStored: decision.staleStored }, req);
    return res.status(401).json({ ok:false, needPassword:true, staleStored: decision.staleStored, error: decision.error });
   }
+  if(manifest){
+   // Directory reauthentication can take time. Check the same displayed contract
+   // again immediately before any password save or deployment execution.
+   const latest = await getDeploySlotState(p, target, cfg);
+   if(latest.error) return deployManifestFailure(res, latest.error);
+   if(!latest.manifest) return deployManifestFailure(res, new DeployManifestError('the repository-managed slot disappeared; reopen the deployment panel', 409));
+   try { selection = validateManifestRequest(latest.manifest, req.body); }
+   catch(error) { if(error instanceof DeployManifestError) return deployManifestFailure(res, error); throw error; }
+   manifest = latest.manifest;
+   tc = latest.config;
+  }
   const effectivePassword = decision.password;
   // Persist a freshly-entered password if the user opted in (encrypted at rest).
   // Re-resolve the record inside the store: `users` above was read before the
@@ -4363,34 +4537,59 @@ if(DEPLOY_CENTRE){
    }
    catch(e){ /* non-fatal: the deploy still proceeds if saving fails */ }
   }
-  const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
-  let option = String(req.body?.option || '').trim();
-  if(allowedOpts.length){ if(!option) option = allowedOpts[0]; if(!allowedOpts.includes(option)) return res.status(400).json({ok:false,error:'Invalid option for this slot'}); }
-  else option = '';
+  let option = '';
+  if(!manifest){
+   const allowedOpts = (deploySlot(p, target).options || []).map(o => String(o.value));
+   option = String(req.body?.option || '').trim();
+   if(allowedOpts.length){ if(!option) option = allowedOpts[0]; if(!allowedOpts.includes(option)) return res.status(400).json({ok:false,error:'Invalid option for this slot'}); }
+   else option = '';
+  }
   const deployPassword = effectivePassword || '';
   const deployUser = currentUser?.deployUser || currentUser?.username || req.user?.username || '';
+  const executionEnv = { ...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword,
+   ...(manifest ? selection.env : { DEPLOY_OPTION:option }) };
+  if(manifest) delete executionEnv.DEPLOY_OPTION;
   const start = Date.now();
-  let output = '', status = 'success', version = null;
+  let output = '', status = 'success', version = null, freshManifest = null, manifestError = '', staleManifest = false;
   try {
-   const result = await deployExec(tc, ['bash','-c',tc.script,'pw-deploy',option], {...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}, 300000);
+   const result = await deployExec(tc, ['bash','-c',tc.script,'pw-deploy',...(manifest ? [] : [option])], executionEnv, 300000, manifest ? state.workspace : undefined);
    output = (result.stdout || '') + (result.stderr || '');
   } catch(e) {
    status = 'failed';
    output = (e.stdout || '') + (e.stderr || '') + '\n' + (e.message || '');
   }
   const duration = ((Date.now()-start)/1000).toFixed(1);
-  if(tc.versionCmd){
+  if(manifest){
+   try {
+    freshManifest = await resolveDeployManifest(state.workspace, target);
+    if(!freshManifest) throw new DeployManifestError('the repository-managed slot disappeared during deployment', 409);
+    if(manifest.version){
+     const choice = freshManifest.inputs.find(input => input.name === manifest.version.input)?.choices.find(item => item.value === selection.inputs[manifest.version.input]);
+     if(!choice || choice.version === undefined) throw new DeployManifestError('selected version metadata disappeared during deployment', 409);
+     version = choice.version;
+     if(status === 'success' && version !== selection.targetVersion){
+      throw new DeployManifestError(`published version is ${version || 'unpublished'}, but ${selection.targetVersion} was anticipated; inspect the deployment output before retrying`, 409);
+     }
+    }
+   } catch(error) {
+    if(!(error instanceof DeployManifestError)) throw error;
+    status = 'failed'; manifestError = error.message; staleManifest = true;
+    output += '\n' + error.message;
+   }
+  } else if(tc.versionCmd){
    try { const { stdout } = await deployExec(tc, ['bash','-c',tc.versionCmd], {...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}, 30000); version = stdout.trim()||null; } catch {}
   }
-  const logEntry = { ts: new Date().toISOString(), project, target, option: option||undefined, version, user: req.user?.username||'unknown', status, duration, outputSnippet: output.slice(0,500) };
+  const selectionLog = manifest ? { inputs:selection.inputs, currentVersion:selection.currentVersion, targetVersion:selection.targetVersion, manifestRevision:manifest.revision } : {};
+  const logEntry = { ts: new Date().toISOString(), project, target, option: option||undefined, ...selectionLog, version, user: req.user?.username||'unknown', status, duration, outputSnippet: output.slice(0,500) };
   await appendDeployLog(logEntry);
-  await audit('deploy_execute', { project, target, option: option||undefined, status, version, duration }, req);
+  await audit('deploy_execute', { project, target, option: option||undefined, ...selectionLog, status, version, duration }, req);
   // Report the recomputed comparison rather than leaving the client to redo it:
   // the badge is now wrong the instant a deploy lands, and the server is the only
   // side that knows how a release stamp is ordered.
-  const srcNow = await getLocalVersion(p.path || workspacePath(p.name));
+  const srcNow = manifest ? null : await getLocalVersion(p.path || workspacePath(p.name));
   res.json({ ok: status==='success', status, output: output.slice(0,5000), version, duration, user: req.user?.username,
-   sourceNewer: sourceNewer(srcNow?.version, version), sourceVersion: srcNow?.version || null });
+   sourceNewer: !manifest && sourceNewer(srcNow?.version, version), sourceVersion: srcNow?.version || null,
+   ...(manifest ? { ...selectionLog, manifest:freshManifest, staleManifest, error:manifestError || undefined } : {}) });
  });
 
  app.get(BASE + '/api/deploy/:project/log', requireAuth, requireProjectAccess, async (req,res)=>{
@@ -4404,6 +4603,12 @@ if(DEPLOY_CENTRE){
    if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
    if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
    const cfg = await loadDeployConfig();
+   const p = await projectByName(project);
+   if(p){
+    const state = await getDeploySlotState(p, target, cfg);
+    if(state.error) return deployManifestFailure(res, state.error);
+    if(state.managed) return res.json({ok:true, version:null, configured:true, managed:true, manifest:state.manifest});
+   }
    const tc = cfg[project]?.[target];
    if(!tc?.versionCmd) return res.json({ok:true, version:null, configured:false});
    const users = await loadUsers();
@@ -4421,10 +4626,13 @@ if(DEPLOY_CENTRE){
    if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
    const isAdmin = req.user?.role === 'admin';
    const cfg = await loadDeployConfig();
-   const users = await loadUsers();
-   const currentUser = users.find(u => u.username === req.user?.username);
-   const deployEnv = getDeployEnv(users, currentUser);
-   res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, deployEnv)});
+   const states = await getProjectDeployStates(p, cfg);
+   let deployEnv = null;
+   if(states.some(state => !state.managed && state.config.versionCmd)){
+    const users = await loadUsers();
+    deployEnv = getDeployEnv(users, users.find(u => u.username === req.user?.username));
+   }
+   res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, deployEnv, states)});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
 }

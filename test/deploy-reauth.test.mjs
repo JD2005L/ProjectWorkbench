@@ -105,7 +105,7 @@ test('an empty candidate is never handed to the verifier', async () => {
 // ── Both client surfaces must implement the same contract ───────────────────
 
 function extractScript(name) {
-  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
+  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
   const m = src.match(new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\n'));
   assert.ok(m, `${name} not found in app/server.js`);
   return m[1];
