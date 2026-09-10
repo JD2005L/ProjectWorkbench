@@ -1764,7 +1764,7 @@ async function ensureTmuxSession(p){
  // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
  // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
  // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
- const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
+ const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','DISABLE_AUTOUPDATER=1','PATH=/opt/npm-global/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  const tabs = Array.isArray(p.tabs) ? p.tabs : [];
  const firstName = tabs[0]?.name || 'Base';
  await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash',...cred.shellArgs]);
@@ -1806,7 +1806,7 @@ async function ensureProjectTmuxSession(p){
  // scripts/pw-tmux-restore, newTmuxWindow, ensureTmuxSession): a pane's environment is fixed at
  // creation, so a seam that omits it produces panes Claude Code nags in — and may self-update
  // under — for the life of the session. See test/autoupdater-env.test.mjs.
- const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]).join(' ') + ' bash ' + cred.shellArgs.join(' ');
+ const cmd = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/opt/npm-global/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]).join(' ') + ' bash ' + cred.shellArgs.join(' ');
  await tmux(['new-session','-d','-s',sess,'-c',p.path,cmd]);
  await stampSessionCredKey(sess, cred.key);
  await tmux(['send-keys','-t',sess,`printf 'Project workspace: %s\nClaude: %s\nPersistent console: tmux session %s\nTip: run claude from here after auth is completed.\n\n' ${shellQuote(p.path)} ${shellQuote('/usr/local/bin/claude')} ${shellQuote(sess)}`,'C-m']);
@@ -1893,7 +1893,7 @@ async function newTmuxWindow(p,name='new task',cmd=''){
   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to create a mixed-attribution window — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
  }
  if(!stamped.key) await stampSessionCredKey(sess, cred.key);
- const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
+ const winEnv = agentEnvTokens(['env','HOME=/home/admin','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=screen-256color','COLORTERM=truecolor','DISABLE_AUTOUPDATER=1','PATH=/opt/npm-global/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
  // -P -F gives back the index of the window we just made. Send by INDEX, not by
  // name: tmux permits duplicate window names, and `send-keys -t <session>:<name>`
  // then REFUSES the ambiguous target ("can't find window: <name>") rather than
