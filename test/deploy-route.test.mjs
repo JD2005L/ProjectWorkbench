@@ -23,6 +23,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { addIdentity, manifestDocument, writeJson } from './deploy-manifest-fixtures.mjs';
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
@@ -149,7 +150,8 @@ test('REGRESSION: a saved deploy password is reused without prompting, and never
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: 'boss', password }),
     });
-    assert.equal((await login.json()).ok, true, 'sanity: login must succeed');
+    const loginBody = await login.json();
+    assert.equal(loginBody.ok, true, `sanity: login must succeed (HTTP ${login.status}: ${loginBody.error || ''})`);
     const cookie = login.headers.get('set-cookie').split(';')[0];
 
     const deploy = await fetch(`${base}/api/deploy/demo/dev`, {
@@ -202,7 +204,8 @@ async function withDeployCard(port, versionCmd, fn) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: 'boss', password }),
     });
-    assert.equal((await r.json()).ok, true, 'sanity: login must succeed');
+    const loginBody = await r.json();
+    assert.equal(loginBody.ok, true, `sanity: login must succeed (HTTP ${r.status}: ${loginBody.error || ''})`);
     const cookie = r.headers.get('set-cookie').split(';')[0];
     const card = await (await fetch(`${base}/api/deploy/demo/card`, { headers: { Cookie: cookie } })).json();
     assert.equal(card.ok, true, `card must render: ${JSON.stringify(card).slice(0, 200)}`);
@@ -233,5 +236,89 @@ test('REGRESSION: the source-newer badge is always rendered so a deploy can clea
     const dev = targetSection(card.html, 'dev');
     assert.match(dev, /class="src-newer-badge"/, 'badge present');
     assert.doesNotMatch(dev, /class="src-newer-badge"[^>]*\shidden/, 'and visible when the source really is newer');
+  });
+});
+
+test('managed deployment HTTP: data-only panels and fresh validated choices never use stale saved scripts', { timeout: 30000 }, async () => {
+  // No login/session mutation is needed for the existing trusted-local test
+  // operator. In particular, this scenario can run without Linux flock(1).
+  const port = 3904;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  const document = manifestDocument();
+  document.slots.prod = { label: 'Deploy MCP server', script: 'bash deploy/deploy-mcp.sh' };
+  writeJson(proj, ['.pw', 'deploy.json'], document);
+  addIdentity(proj, 'alpha', { published: '2.3.4' });
+  addIdentity(proj, 'bravo');
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7822 }]));
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({ demo: { dev: { script: 'echo obsolete-default', versionCmd: 'echo obsolete-version' } } }));
+  const registryBefore = fs.readFileSync(inst.env.PW_REGISTRY_PATH, 'utf8');
+  const configBefore = fs.readFileSync(inst.env.PW_DEPLOY_CONFIG, 'utf8');
+  await withServer(inst, port, async base => {
+    const page = await (await fetch(`${base}/deploy`)).text();
+    const card = await (await fetch(`${base}/api/deploy/demo/card`)).json();
+    assert.equal(card.ok, true, card.error);
+    for (const html of [page, card.html]) {
+      const dev = targetSection(html, 'dev');
+      assert.match(dev, /name="identity" required><option value="">/);
+      assert.match(dev, /name="bump" required><option value="">/);
+      assert.match(dev, /Repository-managed/);
+      assert.doesNotMatch(dev, /obsolete-default|obsolete-version|save-config|src-newer/);
+      const prod = targetSection(html, 'prod');
+      assert.match(prod, /Deploy MCP server/);
+      assert.match(prod, /No input selections required/);
+      assert.doesNotMatch(prod, /<select\b|<button[^>]*class="[^"]*deploy-btn"[^>]*\bdisabled/);
+    }
+    const version = await (await fetch(`${base}/api/deploy/demo/dev/version`)).json();
+    assert.equal(version.managed, true);
+    assert.equal(version.manifest.inputs[0].choices[0].version, '2.3.4');
+    const status = await (await fetch(`${base}/api/deploy/status`)).json();
+    assert.equal(status.projects[0].dev.managed, true);
+    assert.equal(status.projects[0].prod.managed, true);
+    assert.equal(status.projects[0].prod.configured, true);
+    assert.deepEqual(status.projects[0].prod.manifest.inputs, []);
+    assert.equal(status.projects[0].prod.manifest.version, null);
+    assert.equal(fs.readFileSync(inst.env.PW_REGISTRY_PATH, 'utf8'), registryBefore);
+    assert.equal(fs.readFileSync(inst.env.PW_DEPLOY_CONFIG, 'utf8'), configBefore, 'GET must not migrate or rewrite saved config');
+    const good = { inputs: { identity: 'alpha', bump: 'patch' }, manifestRevision: version.manifest.revision };
+    for (const body of [
+      {}, { option: 'patch' }, { ...good, inputs: { bump: 'patch' } },
+      { ...good, inputs: { identity: 'missing', bump: 'patch' } },
+      { ...good, inputs: { identity: 'alpha', bump: 'draft' } },
+      { ...good, inputs: { identity: 'alpha', bump: 'patch', extra: 'x' } },
+      { ...good, script: 'override' },
+    ]) {
+      const result = await fetch(`${base}/api/deploy/demo/dev`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      assert.ok([400, 409].includes(result.status));
+      assert.equal((await result.json()).ok, false);
+    }
+    const save = await fetch(`${base}/api/deploy/config`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ project: 'demo', target: 'dev', script: 'overwritten' }),
+    });
+    assert.equal(save.status, 409);
+    const prodInvalid = await fetch(`${base}/api/deploy/demo/prod`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ inputs: { identity: 'alpha' }, manifestRevision: status.projects[0].prod.manifest.revision }),
+    });
+    assert.equal(prodInvalid.status, 400, 'script-only managed slots still reject undeclared input values');
+    addIdentity(proj, 'future-style');
+    const reopened = await (await fetch(`${base}/api/deploy/demo/card`)).json();
+    assert.match(reopened.html, /<option value="future-style">/);
+    const stale = await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(good),
+    });
+    assert.equal(stale.status, 409);
+    assert.equal((await stale.json()).staleManifest, true);
+    fs.unlinkSync(path.join(proj, '.pw', 'deploy.json'));
+    const removed = await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(good),
+    });
+    assert.equal(removed.status, 409, 'missing manifest must not run the old default-identity script');
+    assert.equal(fs.existsSync(inst.env.PW_DEPLOY_LOG), false, 'no rejected request reaches execution/history');
+    assert.equal(fs.readFileSync(inst.env.PW_DEPLOY_CONFIG, 'utf8'), configBefore);
   });
 });

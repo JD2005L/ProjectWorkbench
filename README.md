@@ -378,6 +378,13 @@ curl http://127.0.0.1/healthz
 
 ---
 
+## GitHub authentication
+
+See [GitHub authentication and credential lifecycle](docs/git-authentication.md)
+for credential storage, PW's Git identity binding, access validation, rotation,
+and the shared-account security boundary. Repository authentication does not
+require an organization-specific knowledge service.
+
 ## License
 
 MIT — see `LICENSE` if present, otherwise treat this as MIT-licensed for now.

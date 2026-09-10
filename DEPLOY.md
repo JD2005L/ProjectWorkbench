@@ -107,6 +107,129 @@ previous config on failure before reloading.
 | `PW_TLS_SERVER_NAME` | — | this instance's hostname. Required with `PW_TLS_ENABLED`: it becomes `server_name` on both listeners and the target of the 80→443 redirect (`return 301 https://<name>$request_uri`), so the redirect never reflects the client-supplied `$host` |
 | `PW_TLS_DEFAULT_SERVER` | unset | `1` marks both the :80 and :443 blocks `default_server`. Only for hosts where PW is the sole site; never claimed implicitly |
 
+## Repository-managed deployment inputs
+
+With Deploy Centre enabled, a project can declare either existing target (`dev`
+or `prod`) in its local `.pw/deploy.json`. No registry edits, generated option
+lists, discovery scripts, or network providers are needed. The manifest is read
+again whenever the deployment page/panel opens and on every deployment request.
+An omitted target retains its ordinary saved configuration.
+
+For example, a repository with `identities/<slug>/tokens.json` and
+`releases/<slug>/index.json` can declare:
+
+```json
+{
+  "schemaVersion": 1,
+  "slots": {
+    "dev": {
+      "label": "Publish visual identity",
+      "script": "bash deploy/publish.sh \"$DEPLOY_IDENTITY\" \"$DEPLOY_BUMP\"",
+      "inputs": [
+        {
+          "name": "identity",
+          "type": "select",
+          "label": "Visual identity",
+          "env": "DEPLOY_IDENTITY",
+          "required": true,
+          "source": {
+            "directory": "identities",
+            "file": "tokens.json",
+            "labelPath": ["$meta", "name"],
+            "initialVersionPath": ["$meta", "version"],
+            "version": {
+              "directory": "releases",
+              "file": "index.json",
+              "valuePath": ["latest"]
+            }
+          }
+        },
+        {
+          "name": "bump",
+          "type": "select",
+          "label": "Version bump",
+          "env": "DEPLOY_BUMP",
+          "required": true,
+          "choices": [
+            { "value": "patch", "label": "Patch" },
+            { "value": "minor", "label": "Minor" },
+            { "value": "major", "label": "Major" }
+          ]
+        }
+      ],
+      "version": { "input": "identity", "bumpInput": "bump" }
+    },
+    "prod": {
+      "label": "Deploy MCP server",
+      "script": "bash deploy/deploy-mcp.sh"
+    }
+  }
+}
+```
+
+Each select must declare exactly one of `choices` or `source`; all selects are
+required and start with an empty placeholder. A source enumerates only immediate
+child directories, using the directory name as the value and a JSON property
+path as its label. New identities appear on the next panel opening. The source
+and metadata paths must remain inside the workspace, without symlinks, absolute
+paths, or traversal. Missing/broken metadata is an error, not a hidden option or
+a fallback to some other identity. Unknown manifest fields and duplicate names,
+environment names, or choices are rejected. The limits are eight inputs, 1,024
+choices per input, and 1 MiB per JSON file.
+
+A script-only slot, such as `prod` above, may omit `inputs` or use `inputs: []`
+and omit `version`. It is independently discoverable without a saved host script,
+shows no identity/bump controls, and still requires an explicit Deploy action.
+The example separates identity publication from rebuilding the MCP server;
+the publishing script retains its own CSS refresh step.
+Its managed POST body is `{ "inputs": {}, "manifestRevision": "..." }`; extra
+inputs and stale revisions are still rejected. Declaring `version` without its
+required source/bump inputs is invalid. This does not relax the publishing slot's
+required identity/bump selections or infer any root/reauthentication privilege.
+
+The optional slot `version` links the versioned source input to a
+patch/minor/major input. Versions must be numeric `major.minor.patch`. An absent
+matching release directory means the first release uses `initialVersionPath`
+**exactly**, regardless of the chosen bump. An existing release directory with a
+missing/invalid index is an error. Published and anticipated versions are shown
+for the selected identity; independent releases are never compared with the
+application's timestamp-based source version.
+
+For a declared slot, the valid manifest's script and inputs are authoritative,
+including when an older script is saved in `deploy-config.json`. The UI shows
+read-only repository-managed fields and refuses Save for that slot. A malformed
+manifest disables the affected slot rather than executing its saved script.
+Slots without a manifest retain their existing Save, URLs, `{ "option": ... }`
+request and `DEPLOY_OPTION` behavior.
+
+The existing deployment POST accepts
+`{ "inputs": { "identity": "alpha", "bump": "patch" }, "manifestRevision": "..." }`
+for managed slots. Obtain the resolved manifest/revision from the existing
+`GET /api/deploy/:project/:target/version` endpoint or the rendered card. Only
+declared values and the optional existing `password`/`savePassword` fields are
+accepted. The server re-reads the manifest and metadata, rejects stale revisions,
+and rechecks after reauthentication. A manifest removed after opening the panel
+cannot cause that request to fall back to a saved script. Reopen the panel or
+reload the page after a stale-choice error.
+
+Inputs travel as literal environment values, not substitutions into shell text;
+the declared script runs from the project workspace. Quote environment arguments
+in the script as shown above. No provider command runs for managed GET requests.
+Existing project access, admin-only configuration, CSRF, request-first
+reauthentication, and pane-account execution remain in force. A manifest cannot
+declare `runAsRoot`, disable `reauth`, or override credential/environment control
+fields: those privileges remain operator-controlled in the saved configuration.
+An explicit operator `runAsRoot` grant still applies to the slot, so review
+repository-managed scripts accordingly.
+
+History and audit entries retain selected `inputs`, `currentVersion`,
+`targetVersion`, and the manifest revision, as well as the observed version and
+existing deployment result. A successful versioned script must leave the selected
+published metadata at its anticipated version; a mismatch is reported as a
+failed deployment, not an inferred success. Publishing/deployment happens only
+after a human invokes Deploy (or runs the project's explicit publish command);
+opening a panel never publishes anything.
+
 ## Release version
 
 The canonical release identifier lives in `app/VERSION` and is shown in the shared footer on every primary UI, including the project cockpit. It must match `1.YY.MMDD.hhmm` (for example, `1.26.0721.2233`). Bump this file once for every release commit; because it is part of `app/`, both `install.sh` and container builds carry the same version to every environment.
