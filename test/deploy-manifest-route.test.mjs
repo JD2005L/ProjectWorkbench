@@ -420,6 +420,9 @@ test('managed routes: actual Bash receives literal named inputs and workspace cw
  const h = deployRouteHarness(root, { config: { demo: { dev: { script: 'stale', runAsRoot: true } } }, nativeExec: true });
  const result = await h.call('POST', deployRoute, { params, body: bodyFor(manifest, identity, 'major') });
  assert.equal(result.body.ok, true, result.body.output);
+ assert.equal(h.executions[0].options.env.HOME, root);
+ assert.deepEqual(h.executions[0].nativeArgs.slice(0, 2), ['--noprofile', '--norc']);
+ assert.equal(h.executions[0].result.stderr, '', 'native fixture must not emit startup diagnostics');
  const output = JSON.parse(result.body.output);
  assert.deepEqual(output.args, [identity, 'major']);
  assert.equal(path.resolve(output.cwd).toLowerCase(), path.resolve(root).toLowerCase());
@@ -438,6 +441,9 @@ test('script-only routes: actual Bash receives no implicit option or identity ar
  const h = deployRouteHarness(root, { config: { demo: { prod: { runAsRoot: true } } }, nativeExec: true });
  const result = await h.call('POST', deployRoute, { params: { project: 'demo', target: 'prod' }, body: { inputs: {}, manifestRevision: slot.revision } });
  assert.equal(result.body.ok, true, result.body.output);
+ assert.equal(h.executions[0].options.env.HOME, root);
+ assert.deepEqual(h.executions[0].nativeArgs.slice(0, 2), ['--noprofile', '--norc']);
+ assert.equal(h.executions[0].result.stderr, '', 'native fixture must not emit startup diagnostics');
  const output = JSON.parse(result.body.output);
  assert.deepEqual(output.args, []);
  assert.equal(output.option, null);

@@ -52,7 +52,7 @@ export function deployRouteHarness(root, options = {}) {
   DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth,
   deployInputNotice, describeDeploySelection, renderDeployInputs, agentSpawnDrop,
   TERMINAL_PRIV: resolveTerminalPriv({ PW_DEPLOY_MODE: 'container', PW_TERMINAL_UID: '1001', PW_TERMINAL_GID: '1001', PW_TERMINAL_USER: 'pane' }),
-  process: { env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP, HOME: '/root', USER: 'root', LOGNAME: 'root', DEPLOY_OPTION: 'must-not-leak' } },
+  process: { env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP, HOME: options.nativeExec ? root : '/root', USER: 'root', LOGNAME: 'root', DEPLOY_OPTION: 'must-not-leak' } },
   console,
   app: {
    get: (url, ...handlers) => routes.set(`GET ${url}`, handlers),
@@ -78,8 +78,16 @@ export function deployRouteHarness(root, options = {}) {
   audit: async (event, detail) => audit.push({ event, ...plain(detail) }),
   getLocalVersion: async () => { sourceReads++; return { version: 'V1.26.0909.1200', hash: 'abc123' }; },
   execFileAsync: async (file, args, execOptions) => {
-   executions.push({ file, args: [...args], options: { ...execOptions, env: { ...execOptions.env } } });
-   if (options.nativeExec) return nativeExec(file, args, execOptions);
+   const execution = { file, args: [...args], options: { ...execOptions, env: { ...execOptions.env } } };
+   executions.push(execution);
+   if (options.nativeExec) {
+    if (file !== 'bash') throw new Error('The native deployment harness only executes Bash fixtures.');
+    // Login profiles belong to the machine, not the fixture. Their stderr is
+    // combined with stdout by the real route and must not pollute its JSON probe.
+    execution.nativeArgs = ['--noprofile', '--norc', ...args];
+    execution.result = await nativeExec(file, execution.nativeArgs, execOptions);
+    return execution.result;
+   }
    return options.onExec ? options.onExec(executions.at(-1)) : { stdout: 'deployed-ok', stderr: '' };
   },
  };
