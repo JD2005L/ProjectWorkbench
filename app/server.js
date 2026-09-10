@@ -2856,8 +2856,8 @@ function railHtml(projects, currentName, user, deployConfigured=false){
  const adminActs = isAdmin
   ? `<a class="railAct" id="manageEntry" href="${BASE}/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="${BASE}/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
   : '';
- const deployAct = DEPLOY_CENTRE && deployConfigured
-  ? `<a class="railAct" id="deployEntry" href="${BASE}/deploy?project=${encodeURIComponent(currentName)}" data-deploy="${esc(currentName)}" title="Deploy this project"><span class="railActIco">🚀</span><span class="railActLabel">Deploy</span></a>`
+ const deployAct = DEPLOY_CENTRE && (deployConfigured || isAdmin)
+  ? `<a class="railAct" id="deployEntry" href="${BASE}/deploy?project=${encodeURIComponent(currentName)}" data-deploy="${esc(currentName)}" title="${deployConfigured ? 'Deploy this project' : 'Configure deployment for this project'}"><span class="railActIco">🚀</span><span class="railActLabel">Deploy</span></a>`
   : '';
  const who = user.implicit
   ? `<span class="railWho" title="PW_AUTH_ENFORCE off — anonymous admin"><span class="railWhoDot"></span><span class="railWhoName">anonymous</span></span>`
