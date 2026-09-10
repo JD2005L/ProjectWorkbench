@@ -7,7 +7,10 @@ attributed to — and billed against — that person's seat.
 
 ## Model
 
-A project is owned by its `primaryUser` (the "Primary user" field in the Manage
+For repository authentication, storage and rotation, see
+[GitHub authentication and credential lifecycle](git-authentication.md).
+
+A project is owned by its `primaryUser` (the "Git identity" field in the Manage
 Projects modal, already used for git-push auth). When the feature is enabled,
 that project's terminal launches with the owner's private credential context:
 
