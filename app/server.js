@@ -1704,7 +1704,20 @@ async function ensureTmuxSession(p){
   }
   const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
   if(state.stale){
-   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to attach a possibly-mismatched identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+   // GRANDFATHER — attach, do NOT 502. The owner RESOLVED fine (credentialContext
+   // above did not throw); this is simply an already-running session whose stamp
+   // predates the current desired key — e.g. every live session the instant
+   // PW_PER_USER_CLAUDE is switched on. Refusing here took ttyd, and with it the
+   // whole project, down (nginx 502) while protecting nothing: the same session is
+   // reachable by anyone with shell via `tmux attach`. So attach it on its existing
+   // (pre-migration) credentials and DO NOT re-stamp — leaving the drift visible so
+   // credentialsStale() keeps flagging it and the operator migrates it deliberately
+   // with POST /api/term/:project/recycle. This is NOT the AC1 silent-shared-fallback
+   // (that guards a NEW launch on a resolution FAILURE); the still-fail-closed cases —
+   // an unresolvable owner (credentialContext throws) and an unverifiable stamp
+   // (stamped.ok === false, above) — are "cannot tell", not "known grandfathered".
+   console.warn(`[per-user-claude] project "${p.name}": existing session credentials are stale (${state.reason}); attaching grandfathered — POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle to migrate it to the current owner.`);
+   return;
   }
   // Exact match (or nothing to be stale about): safe to attach. Adopt the
   // stamp on a legacy-unstamped session now that we've confirmed there is
@@ -1746,7 +1759,11 @@ async function ensureProjectTmuxSession(p){
   }
   const state = sessionCredentialState({ perUserEnabled: PER_USER_CLAUDE, desiredKey: cred.key, stampedKey: stamped.key });
   if(state.stale){
-   throw new Error(`[per-user-claude] project "${p.name}"'s existing session credentials are stale (${state.reason}) relative to the current owner. Refusing to attach a possibly-mismatched identity — recycle required: POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle.`);
+   // Grandfather, don't 502 — same policy as ensureTmuxSession (see its note):
+   // a RESOLVED owner whose live session merely predates the current desired key
+   // is attached as-is and left flagged for a deliberate recycle, never refused.
+   console.warn(`[per-user-claude] project "${p.name}": existing session credentials are stale (${state.reason}); attaching grandfathered — POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle to migrate it to the current owner.`);
+   return;
   }
   if(!stamped.key) await stampSessionCredKey(sess, cred.key);
   return;

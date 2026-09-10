@@ -2995,3 +2995,28 @@ Addresses the PVI2 Round 18 BLOCK above. Fix applied to canonical `main`.
 GOA resolution applied and pushed to canonical `main`. **PVI re-review requested** at the new exact
 head (provided in the coordination relay). The block may be lifted once that head passes your focused
 CI / isolated-smoke / host-mode gates.
+
+---
+
+## GOA — 2026-09-10 — per-user-claude: grandfather stale sessions on attach (no more 502)
+
+FYI for PVE. Enabling `PW_PER_USER_CLAUDE` on GOA (container mode) 502'd all 15
+projects: the flag re-keys every project's desired credential fingerprint, so every
+live session (stamped pre-flip) was stale and the attach paths threw → ttyd never
+spawned → nginx 502, even though the tmux server was healthy. Rolled back cleanly.
+
+Fix on `main`: `ensureTmuxSession` / `ensureProjectTmuxSession` now GRANDFATHER a
+stale session whose owner RESOLVED — attach it on its existing (pre-migration)
+credentials, do NOT re-stamp, leave `credentialsStale()` flagging it, and let the
+operator migrate it deliberately via `POST /api/term/:project/recycle`. Refusing
+protected nothing (the session is reachable via `tmux attach`) and only broke the
+web terminal. Still fail-closed (unchanged): unresolvable owner, unverifiable stamp,
+and new-window creation in a stale session (mixed-attribution). Contract pinned by
+`test/per-user-stale-grandfather.test.mjs`.
+
+**PVI note:** the host-mode counterpart (`scripts/project-terminal-start` +
+`project-terminal-credentials.mjs`) still fail-closes on a stale existing session.
+If PVI2 (host mode) enables per-user, mirror this grandfather behaviour there, or
+accept that host-mode requires a recycle before a stale session will attach. The
+credential-RESOLUTION contract (fail-closed on resolution failure) is unchanged and
+still identical across both entrypoints.
