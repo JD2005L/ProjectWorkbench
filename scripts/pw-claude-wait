@@ -19,7 +19,8 @@
 #
 # The id kept is the conversation the window was really in. /clear and an in-app /resume move a running
 # Claude to another id, and a Claude that was killed cannot remove its registry entry, so after it ends the
-# entry it left for this pane says which conversation that was.
+# entry it left says which conversation that was. Only an unambiguous entry counts: interactive, naming this
+# window and pane, started after this placeholder, and written during the attempt that just ended.
 #
 # pw-claude-hibernate stops the whole job when it hibernates a resumed conversation again, so this script
 # ends with Claude, the markers stay, and the hibernator arms a fresh placeholder.
@@ -40,7 +41,8 @@
 # While waiting it records "<pid>:<attempt>" on the window (@pw_claude_waiting), which is how pw-claude-wake
 # tells a waiting placeholder from a shell or a running Claude, and which attempt a wake is for. After
 # PW_CLAUDE_WAKE_RETRIES consecutive failures (default 3) it stops advertising itself, so opening the tab
-# no longer retries on its own; Enter still does.
+# no longer retries on its own; Enter still does. PW_CLAUDE_WAKE_SETTLE (seconds, default 1) is how long a
+# failure waits before offering the next attempt.
 set -u
 if [[ "${PW_CLAUDE_WAIT_NAMED:-}" != 1 ]]; then
 	PW_CLAUDE_WAIT_NAMED=1 exec -a claude-resume /bin/bash "$0" "$@"
@@ -53,9 +55,12 @@ PROJECTS_DIR="${PW_CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 CLAUDE_BIN="${PW_CLAUDE_BIN:-claude}"
 AUTO_RETRIES="${PW_CLAUDE_WAKE_RETRIES:-3}"
 [[ "$AUTO_RETRIES" =~ ^[0-9]+$ ]] || AUTO_RETRIES=3
+SETTLE="${PW_CLAUDE_WAKE_SETTLE:-1}"
+[[ "$SETTLE" =~ ^[0-9]+([.][0-9]+)?$ ]] || SETTLE=1
 pane="${TMUX_PANE:-}"
 sid=""
 attempt_started=0
+my_start=$(awk '{sub(/.*\) /, ""); print $20}' /proc/$$/stat 2>/dev/null)
 
 # $TMUX, inherited from the pane, names the server this window lives on.
 set_window_opt() {
@@ -102,24 +107,31 @@ running_elsewhere() {
 	done
 	return 1
 }
-# The conversation the Claude that just ended in this pane was in, from the registry entry it wrote during
-# this attempt (tmux "<session>:<window>.<pane>"), if it left one and that conversation has a transcript.
+# The conversation the Claude that just ended in this window was in, from the registry entry it wrote during
+# this attempt (tmux "<session>:<window>.<pane>"), if exactly one such entry exists and its conversation has a
+# transcript. Pane ids start again at %0 when the tmux server does, and a nested `claude -p` inherits the
+# pane, so an entry must also be interactive, name this window, and belong to a Claude started after this
+# placeholder.
 conversation_left_here() {
-	[[ -n "$pane" ]] || return 1
-	local jf m other best="" best_m=0
+	[[ -n "$pane" && "$my_start" =~ ^[0-9]+$ ]] || return 1
+	local wid jf pst other found="" n=0
+	wid=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null) || return 1
 	for jf in "$SESS_REG"/*.json; do
 		[[ -e "$jf" ]] || continue
-		m=$(stat -c %Y "$jf" 2>/dev/null) || continue
-		(( m >= attempt_started && m >= best_m )) || continue
-		[[ "$(field_of "$jf" tmux)" == *".$pane" ]] || continue
+		(( $(stat -c %Y "$jf" 2>/dev/null || echo 0) >= attempt_started )) || continue
+		[[ "$(field_of "$jf" kind)" == interactive ]] || continue
+		[[ "$(field_of "$jf" tmux)" == *":$wid.$pane" ]] || continue
+		pst=$(field_of "$jf" procStart)
+		[[ "$pst" =~ ^[0-9]+$ ]] && (( pst > my_start )) || continue
 		entry_running "$jf" && continue
 		other=$(field_of "$jf" sessionId)
 		[[ "$other" =~ $UUID_RE ]] || continue
 		compgen -G "$PROJECTS_DIR/*/$other.jsonl" >/dev/null || continue
-		best=$other
-		best_m=$m
+		[[ "$other" == "$found" ]] && continue
+		found=$other
+		n=$((n + 1))
 	done
-	[[ -n "$best" ]] && printf '%s\n' "$best"
+	(( n == 1 )) && printf '%s\n' "$found"
 }
 cancelled() {
 	# Say how to get the conversation back before the window stops remembering it.
@@ -141,6 +153,8 @@ main() {
 
 	trap 'unset_window_opts @pw_claude_waiting' EXIT
 	while :; do
+		# From here until Claude starts, Ctrl-C cancels, as the banner says; that includes the settle below.
+		trap cancelled INT
 		keep_markers
 		if (( failures == 0 )); then
 			printf '\n\033[1mClaude Code is hibernated in this window to free memory.\033[0m\n'
@@ -158,14 +172,13 @@ main() {
 		if (( failures < AUTO_RETRIES )); then
 			# One visit fires several hooks. Let the rest of the visit that caused a failure pass before offering the
 			# next attempt, so they cannot use up the retries; Enter pressed meanwhile is kept for the read below.
-			(( failures == 0 )) || sleep 1
+			(( failures == 0 )) || sleep "$SETTLE"
 			attempt=$((attempt + 1))
 			set_window_opt @pw_claude_waiting "$$:$attempt"
 		else
 			unset_window_opts @pw_claude_waiting
 		fi
 
-		trap cancelled INT
 		# Ctrl-D (end of input) cancels exactly like Ctrl-C, so no window is left marked with nothing waiting.
 		read -r _ || cancelled
 		trap - INT

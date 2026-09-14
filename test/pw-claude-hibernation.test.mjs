@@ -51,6 +51,23 @@ const reg = path.join(process.env.PW_CLAUDE_SESSIONS_DIR, process.pid + '.json')
 // Like Claude Code 2.1.270 on a conversation it cannot load: says so and exits 1 before registering.
 if (args.includes('--resume') && process.env.FAKE_FAIL_FILE && fs.existsSync(process.env.FAKE_FAIL_FILE)) {
   fs.appendFileSync(process.env.FAKE_LOG, 'failed-resume ' + sid + '\\n');
+  if (process.env.FAKE_FOREIGN === '1') {
+    // Dead registry entries that appear during the attempt but were never this window's conversation. Their pids
+    // are above pid_max, so no process can have them.
+    const nobody = Number(fs.readFileSync('/proc/sys/kernel/pid_max', 'utf8')) + 1000;
+    const [, windowPane] = tmuxRef.split(':');
+    const foreign = {
+      print: { kind: 'print', tmux: tmuxRef, procStart: String(procStart) },         // a nested claude -p in this pane
+      otherWindow: { kind: 'interactive', tmux: 'pw_elsewhere:@9999.' + windowPane.split('.')[1], procStart: String(procStart) }, // same pane id, another window
+      older: { kind: 'interactive', tmux: tmuxRef, procStart: '1' },                   // started before this placeholder
+    };
+    Object.entries(foreign).forEach(([name, e], i) => {
+      const id = crypto.randomUUID();
+      fs.writeFileSync(path.join(process.env.PW_CLAUDE_PROJECTS_DIR, 'proj', id + '.jsonl'), '{"type":"user"}\\n');
+      fs.writeFileSync(path.join(process.env.PW_CLAUDE_SESSIONS_DIR, (nobody + i) + '.json'), JSON.stringify({ pid: nobody + i, sessionId: id, ...e }));
+      fs.appendFileSync(process.env.FAKE_LOG, 'foreign ' + name + ' ' + id + '\\n');
+    });
+  }
   process.stdout.write('No conversation found with session ID: ' + sid + '\\r\\n');
   process.exit(1);
 }
@@ -488,11 +505,43 @@ test('after /clear, a crash keeps the conversation the window was really in, and
   } finally { await teardown(ctx); }
 });
 
+test('after a failure, a dead registry entry that was never this window\'s conversation is not adopted', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const failFlag = path.join(ctx.dir, 'resume-fails');
+    fs.writeFileSync(failFlag, '');
+    const c = await claudeWindow(ctx, { session: 'pw_foreign', fake: { FAKE_FAIL_FILE: failFlag, FAKE_FOREIGN: '1' } });
+    await hibernated(ctx, c);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(async () => /Resuming did not work: Claude Code exited with status 1/.test(await paneText(ctx, c))));
+    assert.equal(logLines(ctx).filter((l) => l.startsWith('foreign ')).length, 3, 'sanity: the foreign entries were written during the attempt');
+    assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0));
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid, 'a nested claude -p, another window with the same pane id, or an older Claude must not take the window over');
+    assert.match(await paneText(ctx, c), new RegExp(`This window still holds conversation ${c.sid}`));
+  } finally { await teardown(ctx); }
+});
+
+test('Ctrl-C right after a failure, while the next attempt is not yet offered, still cancels cleanly', { timeout: 40000 }, async () => {
+  const ctx = await setup();
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_settlecancel', fake: { PW_CLAUDE_WAKE_SETTLE: '5' } });
+    await hibernated(ctx, c);
+    fs.rmSync(path.join(ctx.projects, 'proj', `${c.sid}.jsonl`));
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(async () => /Resuming did not work: no transcript/.test(await paneText(ctx, c)), 10000, 20));
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'C-c']);
+    assert.ok(await until(async () => /Resume cancelled; this window is a plain shell again/.test(await paneText(ctx, c))), 'the cancel path runs');
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), '');
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_hib_win'), '');
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_waiting'), '');
+  } finally { await teardown(ctx); }
+});
+
 test('one visit makes at most one automatic attempt, however many hooks it fires; the next visit tries again', { timeout: 60000 }, async () => {
   const ctx = await setup();
   let client;
   try {
-    const c = await claudeWindow(ctx, { session: 'pw_burst' });
+    const c = await claudeWindow(ctx, { session: 'pw_burst', fake: { PW_CLAUDE_WAKE_SETTLE: '4' } });
     await hibernated(ctx, c);
     // The quickest failure there is: no transcript, so no Claude is even started.
     const file = path.join(ctx.projects, 'proj', `${c.sid}.jsonl`);
@@ -516,12 +565,13 @@ test('one visit makes at most one automatic attempt, however many hooks it fires
   }
 });
 
-test('a wake cannot use up a retry: not one arriving just after a failure, nor a slow one read before it', { timeout: 60000 }, async () => {
+test('a wake cannot use up a retry: not one arriving just after a failure, nor a slow one read before it', { timeout: 90000 }, async () => {
   const ctx = await setup();
   let client;
   let slow;
   try {
-    const c = await claudeWindow(ctx, { session: 'pw_stale' });
+    // A settle long enough for a loaded runner; the slow wake below acts well after it.
+    const c = await claudeWindow(ctx, { session: 'pw_stale', fake: { PW_CLAUDE_WAKE_SETTLE: '3' } });
     await hibernated(ctx, c);
     for (const [h, scope] of [['client-attached', '-gu'], ['client-session-changed', '-gu'], ['session-window-changed', '-gu'], ['pane-focus-in', '-gwu']]) await tmux(ctx.sock, ['set-hook', scope, h]);
     client = attachClient(ctx, 'pw_stale');
@@ -541,10 +591,11 @@ test('a wake cannot use up a retry: not one arriving just after a failure, nor a
     const shim = path.join(ctx.dir, 'slow-tmux');
     fs.mkdirSync(shim);
     const realTmux = execFileSync('bash', ['-c', 'command -v tmux'], { encoding: 'utf8' }).trim();
-    fs.writeFileSync(path.join(shim, 'tmux'), `#!/bin/bash\ncase " $* " in *" if-shell "*) sleep 2.5 ;; esac\nexec ${realTmux} "$@"\n`, { mode: 0o755 });
+    const shimLog = path.join(ctx.dir, 'slow-tmux.log');
+    fs.writeFileSync(path.join(shim, 'tmux'), `#!/bin/bash\necho "$*" >> ${shimLog}\ncase " $* " in *" if-shell "*) sleep 6 ;; esac\nexec ${realTmux} "$@"\n`, { mode: 0o755 });
     assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0));
     slow = spawn('bash', [WAKE, socketPath, c.windowId], { env: { ...process.env, PATH: `${shim}:${process.env.PATH}` }, stdio: 'ignore' });
-    await sleep(500);
+    assert.ok(await until(() => fs.existsSync(shimLog) && /if-shell/.test(fs.readFileSync(shimLog, 'utf8')), 10000, 20), 'sanity: the slow wake read the claim and is about to act on it');
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
     assert.ok(await until(async () => (await failures()) === 2, 10000, 20));
     await new Promise((resolve) => slow.on('exit', resolve));
