@@ -2909,6 +2909,7 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railFilterMenu[hidden]{display:none}
 .railFilterOpt{display:flex;align-items:center;gap:8px;padding:7px 9px;border-radius:8px;color:var(--text);font:600 12px var(--font);cursor:pointer;user-select:none}
 .railFilterOpt:hover{background:var(--panel2)}
+.railFilterOpt.pinnedOpt{border-bottom:1px solid var(--line);border-radius:8px 8px 0 0;padding-bottom:9px;margin-bottom:4px}
 .railFilterOpt input{accent-color:var(--cyan);margin:0;flex:0 0 auto;width:auto}
 .railFilterOpt .n{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .railFilterOpt .cnt{color:var(--faint);font:10.5px var(--mono)}
@@ -2960,19 +2961,18 @@ function railHtml(projects, currentName, user, deployConfigured=false){
   ? `<span class="railWho" title="PW_AUTH_ENFORCE off — anonymous admin"><span class="railWhoDot"></span><span class="railWhoName">anonymous</span></span>`
   : `<span class="railWho" title="${esc(user.username)} · ${esc(user.role)}"><span class="railWhoDot"></span><span class="railWhoName">${esc(user.username)} · ${esc(user.role)}</span></span><button id="railLogout" class="railAct" type="button" title="Sign out"><span class="railActIco">↪</span><span class="railActLabel">Sign out</span></button>`;
  const autoPinBtn = `<button id="autoPinBtn" class="railAct" type="button" role="switch" aria-pressed="true" title="Auto-pin projects when a session finishes"><span class="railActIco autoPinIco">📌</span><span class="railActLabel">Auto-pin on done · <b id="autoPinState">on</b></span></button>`;
- // Category filter: rendered only when at least one visible project carries a category, so the
- // rail is unchanged for setups that never use tags. Checkbox per category (multi-select), plus
- // "Uncategorized" when there is a mix. '|none' cannot collide with a real name: parseCategories
- // strips '|'.
+ // Rail filter: always rendered — "Pinned only" applies with or without category tags. Below it,
+ // a checkbox per category (multi-select) plus "Uncategorized" when tags exist and some project
+ // lacks one. '|pinned' and '|none' cannot collide with a real name: parseCategories strips '|'.
+ // Pinned state is per-browser, so that option carries no server-side count.
  const catCount = new Map();
  for(const p of projects) for(const c of projCats(p)){ const k=c.toLowerCase(); catCount.set(k,{ name:(catCount.get(k)?.name)||c, n:(catCount.get(k)?.n||0)+1 }); }
  const allCats = [...catCount.values()].sort((a,b)=>a.name.localeCompare(b.name,undefined,{sensitivity:'base'}));
  const uncatN = projects.filter(p=>projCats(p).length===0).length;
- const filterOpts = allCats.map(c=>`<label class="railFilterOpt"><input type="checkbox" data-cat="${esc(c.name)}"><span class="n">${esc(c.name)}</span><span class="cnt">${c.n}</span></label>`).join('')
-  + (uncatN ? `<label class="railFilterOpt"><input type="checkbox" data-cat="|none"><span class="n">Uncategorized</span><span class="cnt">${uncatN}</span></label>` : '');
- const railFilter = allCats.length
-  ? `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter projects by category"><span class="railFilterIco" aria-hidden="true">🗂</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><div id="railFilterMenu" class="railFilterMenu" hidden>${filterOpts}<button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div>`
-  : '';
+ const filterOpts = `<label class="railFilterOpt${allCats.length?' pinnedOpt':''}"><input type="checkbox" data-cat="|pinned"><span class="n">📌 Pinned only</span></label>`
+  + allCats.map(c=>`<label class="railFilterOpt"><input type="checkbox" data-cat="${esc(c.name)}"><span class="n">${esc(c.name)}</span><span class="cnt">${c.n}</span></label>`).join('')
+  + (allCats.length && uncatN ? `<label class="railFilterOpt"><input type="checkbox" data-cat="|none"><span class="n">Uncategorized</span><span class="cnt">${uncatN}</span></label>` : '');
+ const railFilter = `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter the project rail"><span class="railFilterIco" aria-hidden="true">🗂</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><div id="railFilterMenu" class="railFilterMenu" hidden>${filterOpts}<button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div>`;
  return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div>${railFilter}<nav id="railKeys" class="railKeys" aria-label="Projects"><ul class="railKeysList">${keys}</ul></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
 }
 
@@ -2997,16 +2997,18 @@ if(logout)logout.onclick=async()=>{try{await fetch('${BASE}/api/auth/logout',{me
 let pinned=new Set();try{pinned=new Set(JSON.parse(localStorage.getItem('pwPinned')||'[]'))}catch{}
 let autoPin=true;try{autoPin=(localStorage.getItem('pwAutoPin')||'1')==='1'}catch{}
 function savePins(){try{localStorage.setItem('pwPinned',JSON.stringify([...pinned]))}catch{}}
-function applyPins(){KEYS.classList.toggle('has-pins',pinned.size>0);KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const row=k.closest('.pkeyRow');if(row)row.classList.toggle('pinned',on);const pb=row&&row.querySelector('.pk-pin');if(pb){pb.title=on?'Unpin':'Pin — lean this project out while you work with it';pb.setAttribute('aria-pressed',on?'true':'false');pb.setAttribute('aria-label',(on?'Unpin ':'Pin ')+n)}})}
+function applyPins(){KEYS.classList.toggle('has-pins',pinned.size>0);KEYS.querySelectorAll('.pkey').forEach(k=>{const n=k.dataset.project;const on=pinned.has(n);k.classList.toggle('pinned',on);const row=k.closest('.pkeyRow');if(row)row.classList.toggle('pinned',on);const pb=row&&row.querySelector('.pk-pin');if(pb){pb.title=on?'Unpin':'Pin — lean this project out while you work with it';pb.setAttribute('aria-pressed',on?'true':'false');pb.setAttribute('aria-label',(on?'Unpin ':'Pin ')+n)}});applyCatFilter()}
 const autoBtn=document.getElementById('autoPinBtn');
 function renderAuto(){if(!autoBtn)return;autoBtn.setAttribute('aria-pressed',autoPin?'true':'false');autoBtn.classList.toggle('off',!autoPin);const st=document.getElementById('autoPinState');if(st)st.textContent=autoPin?'on':'off'}
 if(autoBtn)autoBtn.onclick=()=>{autoPin=!autoPin;try{localStorage.setItem('pwAutoPin',autoPin?'1':'0')}catch{}renderAuto()};
 KEYS.addEventListener('click',e=>{const pb=e.target.closest('.pk-pin');if(!pb)return;e.preventDefault();e.stopPropagation();const n=pb.dataset.project;if(!n)return;if(pinned.has(n))pinned.delete(n);else pinned.add(n);savePins();applyPins()});
-applyPins();renderAuto();
-// Category filter: multi-select checkboxes rendered server-side; selection persists per browser.
-// An empty selection means "show all". The current project stays visible whatever the filter, so
-// the rail can never hide the cockpit you are looking at. Saved names no longer on any project are
-// pruned at load, so a renamed or removed category cannot invisibly filter forever.
+// Rail filter: "Pinned only" plus multi-select category checkboxes, rendered server-side;
+// selection persists per browser. An empty selection means "show all". Pinned-only intersects
+// with the category selection (a category union). The current project stays visible whatever the
+// filter, so the rail can never hide the cockpit you are looking at. Saved names no longer
+// offered by the menu are pruned at load, so a renamed or removed category cannot invisibly
+// filter forever. Declared BEFORE the first applyPins() call: applyPins re-applies the filter,
+// because pinning and unpinning change what "Pinned only" shows.
 const filterWrap=document.getElementById('railFilter');
 const filterBtn=document.getElementById('railFilterBtn');
 const filterMenu=document.getElementById('railFilterMenu');
@@ -3017,14 +3019,17 @@ function applyCatFilter(){
 if(!filterWrap)return;
 const boxes=[...filterMenu.querySelectorAll('input[data-cat]')];
 boxes.forEach(b=>{b.checked=catFilter.has(b.dataset.cat)});
-const names=boxes.filter(b=>b.checked).map(b=>b.dataset.cat==='|none'?'Uncategorized':b.dataset.cat);
-filterLabel.textContent=names.length===0?'All projects':(names.length===1?names[0]:names.length+' categories');
+const names=boxes.filter(b=>b.checked).map(b=>b.dataset.cat==='|none'?'Uncategorized':(b.dataset.cat==='|pinned'?'Pinned only':b.dataset.cat));
+filterLabel.textContent=names.length===0?'All projects':(names.length===1?names[0]:names.length+' filters');
 filterBtn.classList.toggle('filtering',names.length>0);
+const pinnedOnly=catFilter.has('|pinned');
+const catSel=new Set([...catFilter].filter(c=>c!=='|pinned'));
 KEYS.querySelectorAll('.pkeyRow').forEach(row=>{
 const cats=(row.dataset.cats||'').split('|').filter(Boolean);
 const cur=!!row.querySelector('.pkey.current');
-const show=catFilter.size===0||cur||cats.some(c=>catFilter.has(c))||(cats.length===0&&catFilter.has('|none'));
-row.classList.toggle('catHidden',!show)})}
+const catHit=catSel.size===0||cats.some(c=>catSel.has(c))||(cats.length===0&&catSel.has('|none'));
+const pinHit=!pinnedOnly||row.classList.contains('pinned');
+row.classList.toggle('catHidden',!(cur||(catHit&&pinHit)))})}
 function setFilterOpen(open){if(!filterWrap)return;filterMenu.hidden=!open;filterBtn.setAttribute('aria-expanded',open?'true':'false')}
 if(filterWrap){
 const known=new Set([...filterMenu.querySelectorAll('input[data-cat]')].map(b=>b.dataset.cat));
@@ -3034,8 +3039,8 @@ filterMenu.addEventListener('change',e=>{const b=e.target.closest('input[data-ca
 document.getElementById('railFilterAll').onclick=()=>{catFilter.clear();saveCatFilter();applyCatFilter();setFilterOpen(false)};
 document.addEventListener('click',e=>{if(!filterMenu.hidden&&!filterWrap.contains(e.target))setFilterOpen(false)});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!filterMenu.hidden)setFilterOpen(false)});
-applyCatFilter();
 }
+applyPins();renderAuto();
 const baseTitle=(CUR?CUR+' — ':'')+'Workbench';
 document.title=baseTitle;
 let first=true;

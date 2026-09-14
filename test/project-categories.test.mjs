@@ -4,8 +4,8 @@
 // These pin the full round trip on a real dashboard process: the manage form stores sanitized
 // tags, /api/projects/config returns them, and the cockpit renders both halves the client filter
 // depends on — the rows' pipe-joined data attribute and the dropdown's checkbox per category.
-// Just as deliberately: a setup with no tags anywhere renders NO dropdown at all, so the rail is
-// byte-identical to what untagged installations have today.
+// The dropdown itself renders unconditionally — "Pinned only" applies with or without tags — but
+// a setup with no tags gets no category options, only that one.
 //
 // The compile-coverage for the filter's inline JS rides on test/cockpit-client-script.test.mjs,
 // which compiles every inline script of this same page; the user-visible click flow is
@@ -36,11 +36,15 @@ const cockpitHtml = async (base, name) => {
 
 test('categories round-trip: manage form → sanitized registry → config → rail markup', { timeout: 120000 }, async () => {
   await withCockpit(async ({ base, name }) => {
-    // Untagged baseline: config reports an empty list and the rail renders no filter at all.
+    // Untagged baseline: config reports an empty list, and the dropdown still renders — with
+    // exactly one option, "Pinned only", which applies whether or not any tags exist.
     const before = await configOf(base, name);
     assert.deepEqual(before.categories, [], 'a project starts with no categories');
     const htmlBefore = await cockpitHtml(base, name);
-    assert.doesNotMatch(htmlBefore, /id="railFilter"/, 'no dropdown when no project carries a tag');
+    assert.match(htmlBefore, /id="railFilter"/, 'the dropdown renders even with no tags');
+    assert.match(htmlBefore, /data-cat="\|pinned"/, 'Pinned only is offered');
+    assert.equal([...htmlBefore.matchAll(/data-cat="/g)].length, 1,
+      'no category or Uncategorized options without tags');
     assert.match(htmlBefore, /class="pkeyRow"[^>]*data-cats=""/, 'rows carry an empty data attribute');
 
     // Tagging through the same form the Manage modal posts. The raw value exercises every
@@ -60,7 +64,6 @@ test('categories round-trip: manage form → sanitized registry → config → r
     const html = await cockpitHtml(base, name);
     assert.match(html, /data-cats="Client Sites\|Internal Tools\|weird\|X{40}"/,
       'the rail row serializes the tags pipe-joined for the client filter');
-    assert.match(html, /id="railFilter"/, 'the dropdown appears once a tag exists');
     assert.match(html, /<input type="checkbox" data-cat="Client Sites">/, 'each category is a checkbox option');
     assert.doesNotMatch(html, /data-cat="\|none"/,
       'no Uncategorized option while every visible project is tagged');
@@ -73,15 +76,17 @@ test('categories round-trip: manage form → sanitized registry → config → r
     assert.match(mixed, /data-cat="\|none"><span class="n">Uncategorized<\/span><span class="cnt">1<\/span>/,
       'a mixed set offers Uncategorized, counting the untagged projects');
 
-    // Clearing the field removes the stored key entirely (config returns [] again) and, with no
-    // tag left anywhere, the dropdown disappears again.
+    // Clearing the field removes the stored key entirely (config returns [] again); the category
+    // options leave with the last tag, but the dropdown itself stays for Pinned only.
     const clear = await form(base, `/manage/update/${encodeURIComponent(name)}`, {
       name, repo: '', port: String(before.port), categories: '  ,  ',
     });
     assert.equal(clear.ok, true, `clearing must succeed: ${JSON.stringify(clear)}`);
     assert.deepEqual((await configOf(base, name)).categories, [], 'clearing the field clears the tags');
-    assert.doesNotMatch(await cockpitHtml(base, name), /id="railFilter"/,
-      'the dropdown leaves with the last tag');
+    const cleared = await cockpitHtml(base, name);
+    assert.doesNotMatch(cleared, /data-cat="Client Sites"/, 'category options leave with the last tag');
+    assert.doesNotMatch(cleared, /data-cat="\|none"/, 'Uncategorized leaves with them');
+    assert.match(cleared, /data-cat="\|pinned"/, 'Pinned only stays');
   });
 });
 

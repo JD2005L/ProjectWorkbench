@@ -72,6 +72,27 @@ test('BROWSER: the category dropdown filters the rail and the selection persists
       await page.reload({ waitUntil: 'domcontentloaded' });
       await page.waitForSelector('#railFilterBtn', { timeout: 20000 });
       assert.equal(await page.textContent('#railFilterLabel'), 'Uncategorized', 'the filter persists across reloads');
+
+      // Pinned only: pin the twin, reset the filter, enable Pinned only — the pinned twin and the
+      // current project show. Unpinning the twin then hides it LIVE, because applyPins re-applies
+      // the filter.
+      const pinSel = `.pkeyRow:has(.pkey[data-project="${twin}"]) .pk-pin`;
+      await page.click('#railToggle');
+      await page.click(pinSel);
+      await page.click('#railFilterBtn');
+      await page.click('#railFilterAll');
+      await page.click('#railFilterBtn');
+      await page.check('#railFilterMenu input[data-cat="|pinned"]');
+      assert.equal(await page.textContent('#railFilterLabel'), 'Pinned only', 'the button names the mode');
+      // Close the menu before touching the rows beneath it — the open popover covers them.
+      await page.keyboard.press('Escape');
+      assert.ok(await row(twin).isVisible(), 'a pinned project shows under Pinned only');
+      await page.click(pinSel);
+      await page.waitForFunction((t) => {
+        const r = document.querySelector(`.pkey[data-project="${t}"]`)?.closest('.pkeyRow');
+        return r && r.classList.contains('catHidden');
+      }, twin, { timeout: 10000 });
+      assert.ok(await row(name).isVisible(), 'the current project stays visible under Pinned only');
       assert.deepEqual(pageErrors, [], 'the cockpit page must raise no uncaught script error');
     });
   } finally {
