@@ -21,6 +21,10 @@
 //                       [--stop-timeout SECONDS] [--json]
 //   pw-claude-hibernate --backfill-from-manifest [--apply] [--json]
 //   pw-claude-hibernate --install-hooks
+//   pw-claude-hibernate --refresh-placeholders [--apply] [--session-id UUID] [--json]
+//
+// --refresh-placeholders replaces placeholders still running an older pw-claude-wait (bash keeps the script
+// it started with) by the current one, keeping each window's markers and exact conversation id.
 //
 // A session is hibernated only when ALL of these hold: its registry entry is interactive and idle; its pid
 // still carries the registry's procStart; it runs inside the single pane of a pw_* project window, under
@@ -63,6 +67,7 @@ function usage(message) {
   if (message) process.stderr.write(`pw-claude-hibernate: ${message}\n`);
   process.stderr.write('usage: pw-claude-hibernate [--apply] [--idle-days N | --idle-minutes N] [--session-id UUID] [--max N] [--stop-timeout S] [--json]\n'
     + '       pw-claude-hibernate --backfill-from-manifest [--apply] [--json]\n'
+    + '       pw-claude-hibernate --refresh-placeholders [--apply] [--session-id UUID] [--json]\n'
     + '       pw-claude-hibernate --install-hooks\n');
   process.exit(EXIT_USAGE);
 }
@@ -72,7 +77,7 @@ function number(flag, value, { min = 0 } = {}) {
   return n;
 }
 function parseArgs(argv) {
-  const o = { apply: false, idleMs: 7 * DAY, idleGiven: false, max: 10, stopTimeoutMs: 20000, sessionId: null, backfill: false, installHooks: false, json: false };
+  const o = { apply: false, idleMs: 7 * DAY, idleGiven: false, max: 10, stopTimeoutMs: 20000, sessionId: null, backfill: false, refresh: false, installHooks: false, json: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     switch (a) {
@@ -83,6 +88,7 @@ function parseArgs(argv) {
       case '--stop-timeout': o.stopTimeoutMs = number(a, argv[++i], { min: 1 }) * 1000; break;
       case '--session-id': o.sessionId = argv[++i]; if (!UUID.test(String(o.sessionId))) usage('--session-id needs a Claude session UUID'); break;
       case '--backfill-from-manifest': o.backfill = true; break;
+      case '--refresh-placeholders': o.refresh = true; break;
       case '--install-hooks': o.installHooks = true; break;
       case '--json': o.json = true; break;
       case '-h': case '--help': usage(); break;
@@ -270,6 +276,8 @@ function assess(entry, ctx) {
   if (d.kind !== 'interactive') return skip(`not an interactive session (kind=${d.kind})`, base);
   const st = procStat(pid);
   if (!st || st.state === 'Z') return skip('process is not running', base);
+  // A stopped process holds SIGTERM until it is continued, so it cannot be stopped cleanly.
+  if (st.state === 'T' || st.state === 't') return skip('Claude is suspended (Ctrl-Z)', base);
   if (d.procStart == null || !Number.isFinite(Number(d.procStart))) return skip('registry has no procStart proving the pid is still this session', base);
   if (st.starttime !== Number(d.procStart)) return skip('pid now belongs to another process (procStart mismatch)', base);
   if (d.status !== 'idle') return skip(`session is ${d.status || 'not reported idle'}`, base);
@@ -408,6 +416,82 @@ function backfillCandidates(ctx, quietMs) {
   return { results };
 }
 
+// ---- placeholder refresh ----------------------------------------------------------------------------
+// bash keeps executing the script file it started with, so a placeholder started before pw-claude-wait was
+// updated still runs the old code. Identity of the script is its inode: the running copy holds it open.
+function fileIdentity(file) { try { const s = fs.statSync(file); return `${s.dev}:${s.ino}`; } catch { return null; } }
+function heldScriptIdentity(pid) {
+  let fds = [];
+  try { fds = fs.readdirSync(`/proc/${pid}/fd`); } catch { return null; }
+  for (const fd of fds) {
+    let target = '';
+    try { target = fs.readlinkSync(`/proc/${pid}/fd/${fd}`); } catch { continue; }
+    if (/pw-claude-wait( \(deleted\))?$/.test(target)) return fileIdentity(`/proc/${pid}/fd/${fd}`);
+  }
+  return null;
+}
+function waitingPlaceholder(windowId, sid) {
+  const wp = windowOpt(windowId, '@pw_claude_waiting');
+  const pid = /^\d+$/.test(wp) ? Number(wp) : 0;
+  if (!pid) return null;
+  let argv = [];
+  try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return null; }
+  if (!argv.some((a) => /pw-claude-wait$/.test(a)) || !argv.includes(sid)) return null;
+  return { pid, starttime: procStat(pid)?.starttime };
+}
+
+function refreshCandidates(ctx) {
+  const current = fileIdentity(WAIT_BIN);
+  if (!current) return { error: `cannot read ${WAIT_BIN}` };
+  const results = [];
+  for (const p of ctx.panes.values()) {
+    const sid = windowOpt(p.windowId, '@pw_claude_sid');
+    if (!sid) continue;
+    if (ctx.onlySid && sid !== ctx.onlySid) continue;
+    const r = { sid, window: `${p.session}:${p.windowIndex}`, windowId: p.windowId, paneId: p.paneId, panePid: p.panePid };
+    const skip = (reason) => results.push({ ok: false, reason, ...r });
+    if (!UUID.test(sid) || windowOpt(p.windowId, '@pw_claude_hib_win') !== p.windowId) { skip('window markers do not name this window'); continue; }
+    const w = waitingPlaceholder(p.windowId, sid);
+    if (!w) { skip('no placeholder is waiting in this window'); continue; }
+    if (ctx.table.get(w.pid)?.ppid !== p.panePid) { skip("the placeholder is not a job of the window's own shell"); continue; }
+    if (heldScriptIdentity(w.pid) === current) { skip('placeholder already runs the current script'); continue; }
+    if (p.windowPanes !== 1) { skip('window is split into several panes'); continue; }
+    if (shellRunsCommand(p.panePid)) { skip("the pane's shell is not a plain interactive shell"); continue; }
+    const inUse = inUseReason(p, ctx.now, 0);
+    if (inUse) { skip(inUse); continue; }
+    results.push({ ok: true, ...r, waiterPid: w.pid, waiterStart: w.starttime });
+  }
+  return { results };
+}
+
+async function refreshPlaceholder(c) {
+  const leave = (reason) => ({ ...c, action: 'left-alone', reason });
+  // Re-check immediately before acting.
+  const p = listPanes().get(c.paneId);
+  if (!p || p.windowId !== c.windowId) return leave('window changed');
+  if (windowOpt(c.windowId, '@pw_claude_sid') !== c.sid || windowOpt(c.windowId, '@pw_claude_hib_win') !== c.windowId) return leave('markers changed');
+  const w = waitingPlaceholder(c.windowId, c.sid);
+  if (!w || w.pid !== c.waiterPid || w.starttime !== c.waiterStart) return leave('the placeholder is no longer waiting (it may be resuming)');
+  const inUse = inUseReason(p, Date.now(), 0);
+  if (inUse) return leave(inUse);
+  appendLog({ event: 'refresh-start', sid: c.sid, window: c.window, windowId: c.windowId, oldPlaceholder: c.waiterPid });
+  // Every pw-claude-wait leaves SIGTERM at its default, so the old one ends without running its cancel path,
+  // and the window keeps its markers.
+  try { process.kill(c.waiterPid, 'SIGTERM'); } catch { /* already gone */ }
+  if (!await until(() => !running(c.waiterPid, c.waiterStart), 5000)) return leave('the old placeholder did not stop');
+  tmux(['set-option', '-wu', '-t', c.windowId, '@pw_claude_waiting'], { allowFail: true });
+  if (windowOpt(c.windowId, '@pw_claude_sid') !== c.sid || windowOpt(c.windowId, '@pw_claude_hib_win') !== c.windowId) {
+    if (!mark(c.windowId, c.sid)) return { ...c, action: 'error', reason: 'markers were lost and could not be restored' };
+  }
+  const armed = await until(() => shellAwaitsInput(c.panePid), 5000) && await armWaiter(c.paneId, c.windowId, c.sid);
+  const fresh = armed ? waitingPlaceholder(c.windowId, c.sid) : null;
+  const current = !!fresh && heldScriptIdentity(fresh.pid) === fileIdentity(WAIT_BIN);
+  appendLog({ event: 'refreshed', sid: c.sid, window: c.window, windowId: c.windowId, waiter: armed, current });
+  return armed && current
+    ? { ...c, action: 'refreshed', waiter: true, newPlaceholder: fresh.pid }
+    : { ...c, action: 'error', waiter: armed, reason: armed ? 'the new placeholder does not run the current script' : 'the new placeholder did not start; markers are kept' };
+}
+
 // ---- main ---------------------------------------------------------------------------------------------
 async function main() {
   const o = parseArgs(process.argv.slice(2));
@@ -434,10 +518,15 @@ async function main() {
   // Backfill's windows have sat at a prompt for hours, not days: by default it only needs ten quiet minutes.
   const backfillQuietMs = o.idleGiven ? o.idleMs : 10 * 60000;
   const ctx = { now: Date.now(), idleMs: o.idleMs, onlySid: o.sessionId, table, panes: listPanes(), liveCount, self: new Set([process.pid, ...ancestorsOf(process.pid, table)]) };
-  const out = { mode: o.backfill ? 'backfill' : 'hibernate', apply: o.apply, idle: fmtAge(o.idleMs), acted: [], skipped: [] };
+  const out = { mode: o.refresh ? 'refresh' : o.backfill ? 'backfill' : 'hibernate', apply: o.apply, idle: fmtAge(o.idleMs), acted: [], skipped: [] };
 
   let candidates;
-  if (o.backfill) {
+  if (o.refresh) {
+    const f = refreshCandidates(ctx);
+    if (f.error) { process.stderr.write(`pw-claude-hibernate: ${f.error}\n`); return 1; }
+    candidates = f.results.filter((r) => r.ok);
+    out.skipped = f.results.filter((r) => !r.ok);
+  } else if (o.backfill) {
     const b = backfillCandidates(ctx, backfillQuietMs);
     if (b.error) { process.stderr.write(`pw-claude-hibernate: ${b.error}\n`); return 1; }
     candidates = b.results.filter((r) => r.ok);
@@ -454,13 +543,15 @@ async function main() {
 
   let failures = 0;
   if (!o.apply) {
-    out.acted = candidates.map((c) => ({ ...c, action: 'would-hibernate' }));
+    out.acted = candidates.map((c) => ({ ...c, action: o.refresh ? 'would-refresh' : 'would-hibernate' }));
   } else if (candidates.length) {
     installHooks();
     for (const c of candidates) {
       let r;
       try {
-        if (o.backfill) {
+        if (o.refresh) {
+          r = await refreshPlaceholder(c);
+        } else if (o.backfill) {
           // Re-check right before typing into the shell: someone may have started using it since.
           const p = listPanes().get(c.paneId);
           const why = !p ? 'window disappeared'
@@ -494,7 +585,7 @@ async function main() {
         r = { ...c, action: 'error', reason: err.message };
         appendLog({ event: 'error', sid: c.sid, window: c.window, reason: err.message });
       }
-      if (r.action !== 'hibernated' && r.action !== 'backfilled') failures++;
+      if (!['hibernated', 'backfilled', 'refreshed'].includes(r.action)) failures++;
       out.acted.push(r);
     }
   }
