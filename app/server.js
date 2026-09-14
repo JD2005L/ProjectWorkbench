@@ -1258,10 +1258,12 @@ async function audit(event, detail = {}, req = null){
   const entry = {
    ts: new Date().toISOString(),
    event,
-   user: req?.user?.username ?? (req?.apiToken ? `token:${req.apiToken.label || req.apiToken.id}` : null),
-   role: req?.user?.role ?? (req?.apiToken ? 'service-token' : null),
-   // Present only for machine-surface calls, so a project registered by a token is attributable
-   // to THAT token rather than logging an anonymous actor.
+   // A validated bearer token is the credential that authorized a machine-surface call, so it
+   // wins attribution over any user identity that happens to ride along — the implicit admin of
+   // non-enforce mode, or a browser cookie sent to a token route. Without this precedence the
+   // audit row claims a person did what a token did.
+   user: req?.apiToken ? `token:${req.apiToken.label || req.apiToken.id}` : (req?.user?.username ?? null),
+   role: req?.apiToken ? 'service-token' : (req?.user?.role ?? null),
    ...(req?.apiToken ? { apiTokenId: req.apiToken.id } : {}),
    ip: req ? (req.get('x-forwarded-for')?.split(',')[0]?.trim() || req.ip || '') : '',
    ...detail,

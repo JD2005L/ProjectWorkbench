@@ -32,8 +32,11 @@ test('a scoped token registers a project end to end', { timeout: 60000 }, async 
       },
       body: JSON.stringify({ name, port: String(21000 + crypto.randomInt(0, 8000)) }),
     });
-    assert.equal(res.status, 200, `a scoped token must register a project: ${await res.text()}`);
-    assert.equal((await res.json()).ok, true);
+    // One read: the template message would consume the body even on success, and the json() read
+    // after it then throws "Body is unusable" — which is exactly how this test arrived broken.
+    const body = await res.text();
+    assert.equal(res.status, 200, `a scoped token must register a project: ${body}`);
+    assert.equal(JSON.parse(body).ok, true);
 
     // It must really be in the registry, not merely accepted.
     const status = await fetch(`${base}/api/projects/status`).then((r) => r.json());
