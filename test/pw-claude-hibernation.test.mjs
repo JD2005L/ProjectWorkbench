@@ -254,13 +254,10 @@ async function hibernated(ctx, c) {
   await assertQuiet(ctx, c.windowId);
   return r;
 }
-// The dashboard lights a project amber ("turn done") from tmux's bell flag. Nothing hibernation does may set it,
-// and the window must be left monitoring bells exactly as before.
-async function assertQuiet(ctx, windowId, { bell = '0' } = {}) {
+// The dashboard lights a project amber ("turn done") from tmux's bell flag. Nothing hibernation does may set it.
+async function assertQuiet(ctx, windowId) {
   await sleep(300);
-  assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', windowId, '#{window_bell_flag}']), bell, `window ${windowId}: the turn-done bell flag`);
-  assert.equal(await tmux(ctx.sock, ['show-options', '-wqv', '-t', windowId, 'monitor-bell']), '', `window ${windowId}: bell monitoring is inherited again, not left muted`);
-  assert.equal(await opt(ctx, windowId, '@pw_claude_bell_muted'), '');
+  assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', windowId, '#{window_bell_flag}']), '0', `window ${windowId}: the turn-done bell flag`);
 }
 
 test('dry run: a dormant session is reported and nothing is touched', { timeout: 30000 }, async () => {
@@ -811,43 +808,44 @@ test('a waiting placeholder whose script is overwritten in place still resumes i
   } finally { await teardown(ctx); }
 });
 
-test('hibernation never lights a turn-done notice, and leaves one that is already lit exactly as it was', { timeout: 60000 }, async () => {
+test('hibernation never lights a turn-done notice, not even on the next visit, and leaves one already lit as it was', { timeout: 60000 }, async () => {
   const ctx = await setup();
+  let client;
   try {
-    // A project with its terminal on another window, as in the sidebar: the hibernated windows are in the background.
+    // A project whose terminal shows another window, as in the sidebar: the hibernated windows are in the background.
     await tmux(ctx.sock, ['new-session', '-d', '-s', 'pw_notice', '-n', 'front', '-c', ctx.work, `env HOME=${ctx.dir} HISTFILE=/dev/null bash --noprofile --norc`]);
     const control = await tmux(ctx.sock, ['new-window', '-d', '-P', '-F', '#{window_id}', '-t', 'pw_notice:', '-n', 'control', '-c', ctx.work, `env HOME=${ctx.dir} HISTFILE=/dev/null bash --noprofile --norc`]);
     await until(async () => /\$$/.test((await tmux(ctx.sock, ['capture-pane', '-p', '-t', control])).trimEnd()));
     await tmux(ctx.sock, ['send-keys', '-t', control, 'C-u']);
-    assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', control, '#{window_bell_flag}'])) === '1'), 'sanity: an unmuted C-u at an empty prompt rings the bell this suite watches for');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', control, '#{window_bell_flag}'])) === '1'), 'sanity: C-u at an empty prompt rings the bell this test watches for');
 
     const quiet = await claudeWindow(ctx, { session: 'pw_notice', name: 'quiet' });
     const lit = await claudeWindow(ctx, { session: 'pw_notice', name: 'lit' });
     // A genuine unviewed "turn done": the Stop hook writes BEL to the pane's tty.
     fs.writeFileSync(await tmux(ctx.sock, ['display-message', '-p', '-t', lit.paneId, '#{pane_tty}']), '\x07');
     assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', lit.windowId, '#{window_bell_flag}'])) === '1'));
-    // One window with a monitor-bell setting of its own, which must survive.
-    await tmux(ctx.sock, ['set-option', '-w', '-t', lit.windowId, 'monitor-bell', 'on']);
 
     for (const c of [quiet, lit]) {
       const r = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0']);
       assert.deepEqual([r.out.acted[0]?.action, r.out.acted[0]?.waiter], ['hibernated', true], JSON.stringify(r.out));
     }
-    await assertQuiet(ctx, quiet.windowId);
+    const flag = (w) => tmux(ctx.sock, ['display-message', '-p', '-t', w, '#{window_bell_flag}']);
     await sleep(300);
-    assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', lit.windowId, '#{window_bell_flag}']), '1', 'the notice that was already lit stays lit');
-    assert.equal(await tmux(ctx.sock, ['show-options', '-wqv', '-t', lit.windowId, 'monitor-bell']), 'on', "the window's own setting is put back");
-    assert.equal(await opt(ctx, lit.windowId, '@pw_claude_bell_muted'), '');
+    assert.equal(await flag(quiet.windowId), '0');
+    assert.equal(await flag(lit.windowId), '1', 'the notice that was already lit stays lit');
 
-    // A run that died between muting and restoring is repaired by the next run that acts.
-    await tmux(ctx.sock, ['set-option', '-w', '-t', control, 'monitor-bell', 'off']);
-    await tmux(ctx.sock, ['set-option', '-w', '-t', control, '@pw_claude_bell_muted', `inherit|${Date.now() - 120000}`]);
-    const again = await hibernate(ctx, ['--apply', '--idle-minutes', '0']);
-    assert.equal(again.code, 0, again.stderr);
-    assert.equal(await tmux(ctx.sock, ['show-options', '-wqv', '-t', control, 'monitor-bell']), '', 'the abandoned mute is lifted');
-    assert.equal(await opt(ctx, control, '@pw_claude_bell_muted'), '');
-    assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', control, '#{window_bell_flag}']), '1', 'and lifting it does not touch the flag');
-  } finally { await teardown(ctx); }
+    // Opening the project attaches a client, and tmux then reports any bell a window recorded while nobody
+    // watched, even one rung with bell monitoring off.
+    client = attachClient(ctx, 'pw_notice');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000), 'sanity: a client is attached');
+    await sleep(1000);
+    assert.equal(await flag(quiet.windowId), '0', 'nothing hibernation typed surfaces as a notice on the next visit');
+    assert.equal(await flag(lit.windowId), '1', 'and the genuine notice is still there');
+    assert.equal(await opt(ctx, quiet.windowId, '@pw_claude_sid'), quiet.sid, 'sanity: the visit did not wake a background window');
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
 });
 
 test('pressing Enter in the window resumes it even with no hook', { timeout: 40000 }, async () => {
