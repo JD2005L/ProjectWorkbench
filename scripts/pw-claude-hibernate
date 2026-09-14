@@ -162,21 +162,29 @@ function listPanes() {
   return panes;
 }
 
-// A shell started to run a command string exits when that command ends, and takes its window with it, even
-// with job control on: `bash -ic 'claude; echo after'` passes the foreground-job rule and still closes its
-// window when Claude stops. Reads the shell's own argv; an unreadable one counts as unsafe.
+// A shell started to run a command string, or a script, exits when that ends and takes its window with it,
+// even with job control on: `bash -ic 'claude; echo after'` passes the foreground-job rule and still closes its
+// window when Claude stops. Denying the shapes we can name left bypasses (`+x -ic`, `+c`, `-io vi -c`, an empty
+// --rcfile value, a script operand), so this ALLOWS only the shapes an interactive login or PW pane shell is
+// started with, and refuses everything else, including an unreadable or empty argv.
+const SHELL_LONG_FLAGS = new Set(['--noprofile', '--norc', '--login']);
 const SHELL_OPTS_WITH_VALUE = new Set(['--rcfile', '--init-file', '-o', '+o', '-O', '+O']);
 function shellRunsCommand(pid) {
   let argv;
-  try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean); } catch { return true; }
+  try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return true; }
+  if (argv.length && argv[argv.length - 1] === '') argv.pop(); // only the terminator; an empty VALUE stays
+  if (!argv.length || !argv[0]) return true;
   for (let i = 1; i < argv.length; i++) {
     const a = argv[i];
-    if (a === '--') break;
-    if (a === '--command' || a.startsWith('--command=')) return true; // fish
-    if (SHELL_OPTS_WITH_VALUE.has(a)) { i++; continue; }
-    if (/^-[A-Za-z]+$/.test(a)) { if (a.includes('c')) return true; continue; } // -c, -ic, -lc, ...
-    if (a.startsWith('--')) continue;
-    break; // the first operand ends the options
+    if (SHELL_LONG_FLAGS.has(a)) continue;
+    if (SHELL_OPTS_WITH_VALUE.has(a)) {
+      if (i + 1 >= argv.length) return true; // a missing value: the parse is not what the shell sees
+      i++;
+      continue;
+    }
+    // A cluster of single-letter flags, but never c (a command string) or o/O (which take a value inside a cluster).
+    if (/^[-+][A-Za-z]+$/.test(a) && !/[coO]/.test(a.slice(1))) continue;
+    return true; // any other option, `--`, or an operand (a script or command): not an interactive shell
   }
   return false;
 }
@@ -446,6 +454,7 @@ async function main() {
           // Re-check right before typing into the shell: someone may have started using it since.
           const p = listPanes().get(c.paneId);
           const why = !p ? 'window disappeared'
+            : shellRunsCommand(p.panePid) ? "the pane's shell was started to run a command (-c)"
             : !shellAwaitsInput(p.panePid) ? 'shell is no longer waiting for input'
               : inUseReason(p, Date.now(), backfillQuietMs);
           if (why) r = { ...c, action: 'left-alone', reason: `changed before it could be backfilled: ${why}` };
