@@ -340,7 +340,9 @@ async function armWaiter(paneId, windowId, sid) {
   // First discard anything on the line without running it: to its end, one space, then C-u. The space matters:
   // C-u at the start of a line (an empty prompt) rings the terminal bell, which tmux records on the window and the
   // dashboard shows as a "turn done" notice, even if bell monitoring was off at that moment (the next client to
-  // attach reports it). Nothing typed this way rings, in emacs or vi mode.
+  // attach reports it). Nothing typed this way rings at a fresh prompt, in emacs or vi insert mode (in vi insert
+  // mode C-e inserts ^E, which C-u then removes). A vi shell left in command mode still rings, as it always did;
+  // only backfill can meet one, and the placeholder does not start there.
   const typed = [['C-e'], ['-l', ' '], ['C-u'], ['-l', ` ${shq(WAIT_BIN)} ${sid}`], ['Enter']]
     .every((keys) => tmux(['send-keys', '-t', paneId, ...keys], { allowFail: true }) !== null);
   return typed && until(() => { const pid = waiterPidOf(windowOpt(windowId, '@pw_claude_waiting')); return !!pid && running(pid); }, 5000);

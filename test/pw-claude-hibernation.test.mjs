@@ -841,7 +841,8 @@ test('hibernation never lights a turn-done notice, not even on the next visit, a
     await sleep(1000);
     assert.equal(await flag(quiet.windowId), '0', 'nothing hibernation typed surfaces as a notice on the next visit');
     assert.equal(await flag(lit.windowId), '1', 'and the genuine notice is still there');
-    assert.equal(await opt(ctx, quiet.windowId, '@pw_claude_sid'), quiet.sid, 'sanity: the visit did not wake a background window');
+    assert.deepEqual(resumes(ctx), [], 'sanity: the visit woke no background window');
+    assert.ok(waiterPid(await opt(ctx, quiet.windowId, '@pw_claude_waiting')) > 0, 'and its placeholder is still waiting');
   } finally {
     client?.kill('SIGKILL');
     await teardown(ctx);
