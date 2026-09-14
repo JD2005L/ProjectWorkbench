@@ -24,7 +24,9 @@
 //   pw-claude-hibernate --refresh-placeholders [--apply] [--session-id UUID] [--json]
 //
 // --refresh-placeholders replaces placeholders still running an older pw-claude-wait (bash keeps the script
-// it started with) by the current one, keeping each window's markers and exact conversation id.
+// it started with) by the current one, keeping each window's markers and exact conversation id. An older
+// script is told apart by the file it holds open, so a deploy must replace the file (install(1), or a rename
+// over it, as install.sh does), never overwrite it in place.
 //
 // A session is hibernated only when ALL of these hold: its registry entry is interactive and idle; its pid
 // still carries the registry's procStart; it runs inside the single pane of a pw_* project window, under
@@ -338,7 +340,7 @@ async function armWaiter(paneId, windowId, sid) {
   // C-u first: discard anything on the line (readline, and the tty's own line kill) without running it.
   const typed = [['C-u'], ['-l', ` ${shq(WAIT_BIN)} ${sid}`], ['Enter']]
     .every((keys) => tmux(['send-keys', '-t', paneId, ...keys], { allowFail: true }) !== null);
-  return typed && until(() => { const w = windowOpt(windowId, '@pw_claude_waiting'); return /^\d+$/.test(w) && running(Number(w)); }, 5000);
+  return typed && until(() => { const pid = waiterPidOf(windowOpt(windowId, '@pw_claude_waiting')); return !!pid && running(pid); }, 5000);
 }
 
 function installHooks() {
@@ -419,6 +421,23 @@ function backfillCandidates(ctx, quietMs) {
 // ---- placeholder refresh ----------------------------------------------------------------------------
 // bash keeps executing the script file it started with, so a placeholder started before pw-claude-wait was
 // updated still runs the old code. Identity of the script is its inode: the running copy holds it open.
+// @pw_claude_waiting is "<pid>:<attempt>"; a placeholder from before attempts were numbered records the pid alone.
+function waiterPidOf(value) { const m = /^(\d+)(?::\d+)?$/.exec(value || ''); return m ? Number(m[1]) : 0; }
+// Replacing a placeholder is safe only while it sits at its prompt as the one thing its shell runs: the
+// terminal's foreground job, not stopped with Ctrl-Z, with no process of its own and nothing else beside it.
+// Otherwise the old one might be killed and no new one could be typed in.
+function placeholderBusyReason(p, w, table) {
+  const s = table.get(w.pid);
+  const shell = table.get(p.panePid);
+  if (!s || !shell) return 'the placeholder or its shell has exited';
+  if (s.ppid !== p.panePid) return "the placeholder is not a job of the window's own shell";
+  if (s.state === 'T' || s.state === 't') return 'the placeholder is stopped (Ctrl-Z)';
+  if (s.state === 'Z') return 'the placeholder has exited';
+  if (shell.tpgid !== s.pgrp) return 'the placeholder is not the foreground job of its shell';
+  const others = descendantsOf(p.panePid, table).filter((pid) => pid !== w.pid);
+  if (others.length) return 'the shell runs other processes beside the placeholder';
+  return null;
+}
 function fileIdentity(file) { try { const s = fs.statSync(file); return `${s.dev}:${s.ino}`; } catch { return null; } }
 function heldScriptIdentity(pid) {
   let fds = [];
@@ -431,8 +450,7 @@ function heldScriptIdentity(pid) {
   return null;
 }
 function waitingPlaceholder(windowId, sid) {
-  const wp = windowOpt(windowId, '@pw_claude_waiting');
-  const pid = /^\d+$/.test(wp) ? Number(wp) : 0;
+  const pid = waiterPidOf(windowOpt(windowId, '@pw_claude_waiting'));
   if (!pid) return null;
   let argv = [];
   try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return null; }
@@ -453,7 +471,8 @@ function refreshCandidates(ctx) {
     if (!UUID.test(sid) || windowOpt(p.windowId, '@pw_claude_hib_win') !== p.windowId) { skip('window markers do not name this window'); continue; }
     const w = waitingPlaceholder(p.windowId, sid);
     if (!w) { skip('no placeholder is waiting in this window'); continue; }
-    if (ctx.table.get(w.pid)?.ppid !== p.panePid) { skip("the placeholder is not a job of the window's own shell"); continue; }
+    const busy = placeholderBusyReason(p, w, ctx.table);
+    if (busy) { skip(busy); continue; }
     if (heldScriptIdentity(w.pid) === current) { skip('placeholder already runs the current script'); continue; }
     if (p.windowPanes !== 1) { skip('window is split into several panes'); continue; }
     if (shellRunsCommand(p.panePid)) { skip("the pane's shell is not a plain interactive shell"); continue; }
@@ -474,6 +493,11 @@ async function refreshPlaceholder(c) {
   if (!w || w.pid !== c.waiterPid || w.starttime !== c.waiterStart) return leave('the placeholder is no longer waiting (it may be resuming)');
   const inUse = inUseReason(p, Date.now(), 0);
   if (inUse) return leave(inUse);
+  const busy = placeholderBusyReason(p, w, processTable());
+  if (busy) return leave(busy);
+  // Last look, right before the signal: still the same waiting placeholder for this conversation.
+  const last = waitingPlaceholder(c.windowId, c.sid);
+  if (!last || last.pid !== c.waiterPid || last.starttime !== c.waiterStart) return leave('the placeholder is no longer waiting (it may be resuming)');
   appendLog({ event: 'refresh-start', sid: c.sid, window: c.window, windowId: c.windowId, oldPlaceholder: c.waiterPid });
   // Every pw-claude-wait leaves SIGTERM at its default, so the old one ends without running its cancel path,
   // and the window keeps its markers.

@@ -30,6 +30,8 @@ const HIBERNATE = path.join(REPO, 'scripts', 'pw-claude-hibernate');
 const SAVE = path.join(REPO, 'scripts', 'pw-tmux-save');
 const WAIT = path.join(REPO, 'scripts', 'pw-claude-wait');
 const WAKE = path.join(REPO, 'scripts', 'pw-claude-wake');
+// The placeholder the live windows were armed with before refresh existed (pw-claude-wait at c819d9a).
+const WAIT_C819D9A = path.join(REPO, 'test', 'fixtures', 'pw-claude-wait-c819d9a');
 const REFUSED = 75;
 const DAY = 86400000;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -39,6 +41,7 @@ const FAKE_CLAUDE = `#!/usr/bin/env node
 import fs from 'node:fs';
 import path from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import crypto from 'node:crypto';
 const args = process.argv.slice(2);
 const sid = args[args.indexOf('--resume') + 1 || args.indexOf('--session-id') + 1];
 const stat = fs.readFileSync('/proc/self/stat', 'utf8');
@@ -55,9 +58,17 @@ if (args.includes('--resume')) fs.appendFileSync(process.env.FAKE_LOG, 'resume '
 if (process.env.FAKE_CHILD === '1') spawn('sleep', ['300'], { stdio: 'ignore' });
 if (process.env.FAKE_CHATTER === '1') setInterval(() => process.stdout.write('.'), 300);
 // Anything typed into a resumed conversation is recorded: a stray Enter would show up here.
+// Like the real TUI: the terminal in raw mode, which a Claude killed outright cannot undo.
+if (args.includes('--resume') && process.env.FAKE_RAW === '1' && process.stdin.isTTY) process.stdin.setRawMode(true);
 if (args.includes('--resume')) process.stdin.on('data', (d) => {
   fs.appendFileSync(process.env.FAKE_LOG, 'input ' + JSON.stringify(String(d)) + '\\n');
   if (String(d).trim() === '/exit') { try { fs.rmSync(reg); } catch {} process.exit(0); } // ended on purpose
+  if (String(d).trim() === '/clear') { // like Claude Code 2.1.270: a new conversation, and the registry entry follows it
+    entry.sessionId = crypto.randomUUID();
+    fs.writeFileSync(path.join(process.env.PW_CLAUDE_PROJECTS_DIR, 'proj', entry.sessionId + '.jsonl'), '{"type":"user","message":{"content":"/clear"}}\\n');
+    fs.writeFileSync(reg, JSON.stringify(entry));
+    fs.appendFileSync(process.env.FAKE_LOG, 'clear ' + entry.sessionId + '\\n');
+  }
 });
 const entry = { pid: process.pid, sessionId: sid, procStart, status: process.env.FAKE_STATUS || 'idle', kind: 'interactive', tmux: tmuxRef };
 if (process.env.FAKE_PROCSTART_OFFSET) entry.procStart += Number(process.env.FAKE_PROCSTART_OFFSET);
@@ -188,6 +199,9 @@ const resumes = (ctx) => logLines(ctx).filter((l) => l.startsWith('resume '));
 const inputs = (ctx) => logLines(ctx).filter((l) => l.startsWith('input '));
 const failedResumes = (ctx) => logLines(ctx).filter((l) => l.startsWith('failed-resume '));
 const paneText = (ctx, c) => tmux(ctx.sock, ['capture-pane', '-p', '-J', '-S', '-200', '-t', c.paneId]);
+const waiterPid = (value) => Number(/^(\d+)(?::\d+)?$/.exec(value || '')?.[1] || 0);
+const clears = (ctx) => logLines(ctx).filter((l) => l.startsWith('clear ')).map((l) => l.slice(6));
+const ttyOf = (pid) => fs.readlinkSync(`/proc/${pid}/fd/0`);
 const stateOf = (pid) => { try { const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8'); return s.slice(s.lastIndexOf(') ') + 2)[0]; } catch { return ''; } };
 async function resumedPid(ctx, c) {
   let pid = null;
@@ -219,7 +233,7 @@ async function hibernated(ctx, c) {
   const r = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0']);
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.out.acted[0]?.action, 'hibernated', JSON.stringify(r.out));
-  assert.ok(await until(async () => /^\d+$/.test(await opt(ctx, c.windowId, '@pw_claude_waiting'))), 'the placeholder must be waiting');
+  assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0), 'the placeholder must be waiting');
   return r;
 }
 
@@ -289,7 +303,7 @@ test('REGRESSION (real Claude proof): the placeholder is armed even when Claude\
     const r = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0']);
     assert.equal(r.code, 0, r.stderr);
     assert.deepEqual([r.out.acted[0]?.action, r.out.acted[0]?.waiter], ['hibernated', true], JSON.stringify(r.out.acted));
-    assert.ok(await until(async () => /^\d+$/.test(await opt(ctx, c.windowId, '@pw_claude_waiting'))));
+    assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0));
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
     assert.ok(await until(() => resumes(ctx).length === 1));
     assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
@@ -312,7 +326,7 @@ test('REGRESSION: a failed resume keeps the markers and the exact id, and openin
     assert.deepEqual(resumes(ctx), []);
     assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid, 'the window still holds the exact conversation id');
     assert.equal(await opt(ctx, c.windowId, '@pw_claude_hib_win'), c.windowId);
-    assert.ok(await until(async () => (await opt(ctx, c.windowId, '@pw_claude_waiting')) === waiter), 'the same placeholder is waiting again');
+    assert.ok(await until(async () => { const now = await opt(ctx, c.windowId, '@pw_claude_waiting'); return waiterPid(now) === waiterPid(waiter) && now !== waiter; }), 'the same placeholder is waiting again, for the next attempt');
     assert.match(await paneText(ctx, c), new RegExp(`This window still holds conversation ${c.sid}`));
 
     const save = await run(ctx, SAVE);
@@ -403,7 +417,7 @@ test('Ctrl-Z suspends a resumed conversation like any shell job, and fg continue
   try {
     const c = await claudeWindow(ctx, { session: 'pw_ctrlz' });
     await hibernated(ctx, c);
-    const waiter = Number(await opt(ctx, c.windowId, '@pw_claude_waiting'));
+    const waiter = waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting'));
     assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', c.paneId, '#{pane_current_command}']), 'claude-resume', 'a waiting placeholder is not an idle shell either');
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
     const pid = await resumedPid(ctx, c);
@@ -420,24 +434,159 @@ test('Ctrl-Z suspends a resumed conversation like any shell job, and fg continue
   } finally { await teardown(ctx); }
 });
 
-test('an OOM-style kill of the resumed Claude keeps the markers and re-arms the same placeholder', { timeout: 60000 }, async () => {
+test('an OOM-style kill of the resumed Claude keeps the markers, puts the terminal back, and Enter retries', { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
-    const c = await claudeWindow(ctx, { session: 'pw_oom' });
+    const c = await claudeWindow(ctx, { session: 'pw_oom', fake: { FAKE_RAW: '1' } });
     await hibernated(ctx, c);
     const waiter = await opt(ctx, c.windowId, '@pw_claude_waiting');
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
     const pid = await resumedPid(ctx, c);
     assert.ok(pid);
+    assert.ok(await until(() => /-icrnl/.test(execFileSync('stty', ['-a', '-F', ttyOf(pid)], { encoding: 'utf8' }))), 'sanity: the stand-in put the terminal in raw mode');
     process.kill(pid, 'SIGKILL');
     assert.ok(await until(async () => /Resuming did not work: Claude Code exited with status 137/.test(await paneText(ctx, c))));
-    assert.ok(await until(async () => (await opt(ctx, c.windowId, '@pw_claude_waiting')) === waiter), 'the same placeholder waits again');
+    assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) === waiterPid(waiter)), 'the same placeholder waits again');
     assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid);
     const save = await run(ctx, SAVE);
     assert.equal(save.code, 0, save.stderr);
     const row = fs.readFileSync(path.join(ctx.state, 'manifest.tsv'), 'utf8').split('\n').find((l) => l.startsWith('pw_oom\x1f'));
     assert.deepEqual(row.split('\x1f').slice(4, 6), ['2', c.sid]);
+    // Enter is a carriage return; only a terminal back in its normal mode turns it into the end of a line.
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => resumes(ctx).length === 2), 'Enter retries after Claude was killed in raw mode');
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`, `resume ${c.sid} pane=${c.paneId}`]);
   } finally { await teardown(ctx); }
+});
+
+test('after /clear, a crash keeps the conversation the window was really in, and retrying resumes that one', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_clear', fake: { FAKE_RAW: '1' } });
+    await hibernated(ctx, c);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    const pid = await resumedPid(ctx, c);
+    assert.ok(pid);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, '-l', '/clear']);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => clears(ctx).length === 1));
+    const cleared = clears(ctx)[0];
+    assert.notEqual(cleared, c.sid);
+    assert.ok(await until(() => registryFor(ctx, cleared)?.pid === pid), 'sanity: the registry entry follows /clear');
+    process.kill(pid, 'SIGKILL');
+    assert.ok(await until(async () => /Resuming did not work: Claude Code exited with status 137/.test(await paneText(ctx, c))));
+    assert.ok(await until(async () => (await opt(ctx, c.windowId, '@pw_claude_sid')) === cleared), 'the window now holds the conversation Claude was in when it died');
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_hib_win'), c.windowId);
+    assert.match(await paneText(ctx, c), new RegExp(`This window still holds conversation ${cleared}`));
+    const save = await run(ctx, SAVE);
+    assert.equal(save.code, 0, save.stderr);
+    const row = fs.readFileSync(path.join(ctx.state, 'manifest.tsv'), 'utf8').split('\n').find((l) => l.startsWith('pw_clear\x1f'));
+    assert.deepEqual(row.split('\x1f').slice(4, 6), ['2', cleared]);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => resumes(ctx).length === 2));
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`, `resume ${cleared} pane=${c.paneId}`]);
+  } finally { await teardown(ctx); }
+});
+
+test('one visit makes at most one automatic attempt, however many hooks it fires; the next visit tries again', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_burst' });
+    await hibernated(ctx, c);
+    // The quickest failure there is: no transcript, so no Claude is even started.
+    const file = path.join(ctx.projects, 'proj', `${c.sid}.jsonl`);
+    const saved = fs.readFileSync(file);
+    fs.rmSync(file);
+    const failures = async () => ((await paneText(ctx, c)).match(/Resuming did not work: no transcript/g) || []).length;
+    client = attachClient(ctx, 'pw_burst');
+    assert.ok(await until(async () => (await failures()) === 1, 15000), 'opening the tab tries once');
+    await sleep(3000);
+    assert.equal(await failures(), 1, 'the other hooks of the same visit must not try again');
+    assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0), 'still waiting for the next visit');
+    client.kill('SIGKILL');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim() === ''));
+    fs.writeFileSync(file, saved);
+    client = attachClient(ctx, 'pw_burst');
+    assert.ok(await until(() => resumes(ctx).length === 1, 15000), 'the next visit tries again');
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
+});
+
+test('a wake cannot use up a retry: not one arriving just after a failure, nor a slow one read before it', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  let client;
+  let slow;
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_stale' });
+    await hibernated(ctx, c);
+    for (const [h, scope] of [['client-attached', '-gu'], ['client-session-changed', '-gu'], ['session-window-changed', '-gu'], ['pane-focus-in', '-gwu']]) await tmux(ctx.sock, ['set-hook', scope, h]);
+    client = attachClient(ctx, 'pw_stale');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000));
+    fs.rmSync(path.join(ctx.projects, 'proj', `${c.sid}.jsonl`)); // fails at once, before any Claude starts
+    const failures = async () => ((await paneText(ctx, c)).match(/Resuming did not work: no transcript/g) || []).length;
+    const socketPath = await tmux(ctx.sock, ['display-message', '-p', '#{socket_path}']);
+
+    // Another hook of the same visit, landing right after the attempt failed.
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(async () => (await failures()) === 1, 10000, 20));
+    execFileSync('bash', [WAKE, socketPath, c.windowId]);
+    await sleep(2000);
+    assert.equal(await failures(), 1, 'a wake in the moment after a failure must not start another attempt');
+
+    // A wake that read the placeholder's claim before the attempt, and acts only after it failed.
+    const shim = path.join(ctx.dir, 'slow-tmux');
+    fs.mkdirSync(shim);
+    const realTmux = execFileSync('bash', ['-c', 'command -v tmux'], { encoding: 'utf8' }).trim();
+    fs.writeFileSync(path.join(shim, 'tmux'), `#!/bin/bash\ncase " $* " in *" if-shell "*) sleep 2.5 ;; esac\nexec ${realTmux} "$@"\n`, { mode: 0o755 });
+    assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0));
+    slow = spawn('bash', [WAKE, socketPath, c.windowId], { env: { ...process.env, PATH: `${shim}:${process.env.PATH}` }, stdio: 'ignore' });
+    await sleep(500);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(async () => (await failures()) === 2, 10000, 20));
+    await new Promise((resolve) => slow.on('exit', resolve));
+    await sleep(1500);
+    assert.equal(await failures(), 2, 'a wake for an attempt that already failed must not start the next one');
+    assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0), 'the next attempt is still offered');
+  } finally {
+    client?.kill('SIGKILL');
+    slow?.kill('SIGKILL');
+    await teardown(ctx);
+  }
+});
+
+test('the wake hook never presses Enter into a shell whose placeholder was stopped with Ctrl-Z', { timeout: 40000 }, async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_zwait' });
+    await hibernated(ctx, c);
+    const waiter = waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting'));
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'C-z']);
+    assert.ok(await until(() => stateOf(waiter) === 'T'));
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', c.paneId, '#{pane_current_command}'])) === 'bash'));
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, '-l', 'echo HALF-TYPED-$((6*7))']);
+    await tmux(ctx.sock, ['set-hook', '-gu', 'client-attached']); // this test drives the wake itself
+    client = attachClient(ctx, 'pw_zwait');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000));
+    const socketPath = await tmux(ctx.sock, ['display-message', '-p', '#{socket_path}']);
+    execFileSync('bash', [WAKE, socketPath, c.windowId]);
+    await sleep(1000);
+    assert.doesNotMatch(await paneText(ctx, c), /HALF-TYPED-42/, 'the half-typed line must not run');
+    assert.deepEqual(resumes(ctx), []);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'C-u']);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, '-l', 'fg']);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => stateOf(waiter) === 'S'), 'fg puts the placeholder back');
+    execFileSync('bash', [WAKE, socketPath, c.windowId]);
+    assert.ok(await until(() => resumes(ctx).length === 1), 'and the wake works again');
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
 });
 
 test('a Claude stopped from outside (SIGSTOP) is left running by the hibernator', { timeout: 40000 }, async () => {
@@ -455,13 +604,13 @@ test('a Claude stopped from outside (SIGSTOP) is left running by the hibernator'
   } finally { await teardown(ctx); }
 });
 
-test('refresh: a placeholder whose script was replaced on disk is swapped for the current one, keeping the id', { timeout: 60000 }, async () => {
+test('refresh: a placeholder still running the c819d9a script is swapped for the current one, keeping the id', { timeout: 60000 }, async () => {
   const ctx = await setup();
   try {
     const bin = path.join(ctx.dir, 'installed');
     fs.mkdirSync(bin);
     const installed = path.join(bin, 'pw-claude-wait');
-    fs.copyFileSync(WAIT, installed);
+    fs.copyFileSync(WAIT_C819D9A, installed);
     fs.chmodSync(installed, 0o755);
     const c = await claudeWindow(ctx, { session: 'pw_refresh' });
     const h = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0'], { PW_CLAUDE_WAIT_BIN: installed });
@@ -480,9 +629,10 @@ test('refresh: a placeholder whose script was replaced on disk is swapped for th
     const r = await hibernate(ctx, ['--refresh-placeholders', '--apply'], env);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(r.out.acted[0]?.action, 'refreshed', JSON.stringify(r.out.acted));
-    const newWaiter = await opt(ctx, c.windowId, '@pw_claude_waiting');
-    assert.ok(/^\d+$/.test(newWaiter) && newWaiter !== oldWaiter, 'a new placeholder is waiting');
+    const newWaiter = waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting'));
+    assert.ok(newWaiter > 0 && newWaiter !== Number(oldWaiter), 'a new placeholder is waiting');
     assert.equal(alive(Number(oldWaiter)), false);
+    assert.equal(fs.readFileSync(`/proc/${newWaiter}/cmdline`, 'utf8').split('\0')[0], 'claude-resume', 'it runs the current script');
     assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid);
     assert.equal(await opt(ctx, c.windowId, '@pw_claude_hib_win'), c.windowId);
     const again = await hibernate(ctx, ['--refresh-placeholders'], env);
@@ -492,6 +642,110 @@ test('refresh: a placeholder whose script was replaced on disk is swapped for th
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
     assert.ok(await until(() => resumes(ctx).length === 1));
     assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
+  } finally { await teardown(ctx); }
+});
+
+test('refresh leaves alone a placeholder it could not replace safely: resumed, stopped, beside other work, or in view', { timeout: 90000 }, async () => {
+  const ctx = await setup();
+  let client;
+  let besideShell = 0;
+  try {
+    const bin = path.join(ctx.dir, 'installed');
+    fs.mkdirSync(bin);
+    const installed = path.join(bin, 'pw-claude-wait');
+    fs.copyFileSync(WAIT_C819D9A, installed);
+    fs.chmodSync(installed, 0o755);
+    const old = { PW_CLAUDE_WAIT_BIN: installed };
+    const armOld = async (c) => {
+      const h = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0'], old);
+      assert.equal(h.out.acted[0]?.waiter, true, JSON.stringify(h.out));
+      return waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting'));
+    };
+
+    // Resumed under the current placeholder: markers set, nothing waiting.
+    const resumed = await claudeWindow(ctx, { session: 'pw_refkeep', name: 'resumed' });
+    await hibernated(ctx, resumed);
+    await tmux(ctx.sock, ['send-keys', '-t', resumed.paneId, 'Enter']);
+    const resumedClaude = await resumedPid(ctx, resumed);
+    assert.ok(resumedClaude);
+    // Stopped at its prompt.
+    const stopped = await claudeWindow(ctx, { session: 'pw_refkeep', name: 'stopped' });
+    const stoppedWaiter = await armOld(stopped);
+    process.kill(stoppedWaiter, 'SIGSTOP');
+    assert.ok(await until(() => stateOf(stoppedWaiter) === 'T'));
+    // Beside other work: the shell started a background job before the placeholder.
+    const beside = await claudeWindow(ctx, { session: 'pw_refkeep', name: 'beside' });
+    const besideWaiter = await armOld(beside);
+    process.kill(besideWaiter, 'SIGTERM'); // make room at the prompt, then arm it by hand next to a background job
+    assert.ok(await until(() => !alive(besideWaiter)));
+    besideShell = Number(await tmux(ctx.sock, ['display-message', '-p', '-t', beside.paneId, '#{pane_pid}']));
+    await tmux(ctx.sock, ['send-keys', '-t', beside.paneId, '-l', `sleep 600 & ${installed} ${beside.sid}`]);
+    await tmux(ctx.sock, ['send-keys', '-t', beside.paneId, 'Enter']);
+    let besideNow = 0;
+    assert.ok(await until(async () => { besideNow = waiterPid(await opt(ctx, beside.windowId, '@pw_claude_waiting')); return besideNow > 0 && besideNow !== besideWaiter; }));
+    // In view: a client is attached and it is the active window (the wake hooks are off, so nothing resumes).
+    const inView = await claudeWindow(ctx, { session: 'pw_refview' });
+    const inViewWaiter = await armOld(inView);
+    for (const [h, scope] of [['client-attached', '-gu'], ['client-session-changed', '-gu'], ['session-window-changed', '-gu'], ['pane-focus-in', '-gwu']]) await tmux(ctx.sock, ['set-hook', scope, h]);
+    client = attachClient(ctx, 'pw_refview');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000));
+
+    const staged = path.join(bin, '.pw-claude-wait.new');
+    fs.copyFileSync(WAIT, staged);
+    fs.chmodSync(staged, 0o755);
+    fs.renameSync(staged, installed);
+    const current = { PW_CLAUDE_WAIT_BIN: installed };
+    const expect = [[resumed, /no placeholder is waiting/], [stopped, /stopped/], [beside, /other processes beside the placeholder/], [inView, /someone is looking/]];
+    for (const args of [['--refresh-placeholders'], ['--refresh-placeholders', '--apply']]) {
+      const r = await hibernate(ctx, args, current);
+      assert.equal(r.code, 0, r.stderr);
+      assert.deepEqual(r.out.acted, [], JSON.stringify(r.out.acted));
+      for (const [c, reason] of expect) assert.match(r.out.skipped.find((s) => s.sid === c.sid)?.reason || '(not reported)', reason, c.windowId);
+    }
+    for (const [c, pid] of [[stopped, stoppedWaiter], [beside, besideNow], [inView, inViewWaiter]]) {
+      assert.ok(alive(pid), `${c.windowId}: the old placeholder is untouched`);
+      assert.equal(waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')), pid);
+    }
+    assert.ok(alive(resumedClaude), 'the resumed conversation is untouched');
+    for (const c of [resumed, stopped, beside, inView]) {
+      assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid);
+      assert.equal(await opt(ctx, c.windowId, '@pw_claude_hib_win'), c.windowId);
+    }
+    assert.doesNotMatch(fs.readFileSync(path.join(ctx.state, 'hibernation.log'), 'utf8'), /refresh-start/);
+    process.kill(stoppedWaiter, 'SIGCONT');
+  } finally {
+    client?.kill('SIGKILL');
+    for (const d of fs.readdirSync('/proc').filter((x) => /^\d+$/.test(x))) {
+      try {
+        const st = fs.readFileSync(`/proc/${d}/stat`, 'utf8');
+        if (besideShell && st.includes(' (sleep) ') && Number(st.slice(st.lastIndexOf(') ') + 2).split(' ')[1]) === besideShell) process.kill(Number(d), 'SIGKILL');
+      } catch { /* gone */ }
+    }
+    await teardown(ctx);
+  }
+});
+
+test('a waiting placeholder whose script is overwritten in place still resumes its conversation exactly once', { timeout: 40000 }, async () => {
+  const ctx = await setup();
+  try {
+    const bin = path.join(ctx.dir, 'installed');
+    fs.mkdirSync(bin);
+    const installed = path.join(bin, 'pw-claude-wait');
+    fs.copyFileSync(WAIT, installed);
+    fs.chmodSync(installed, 0o755);
+    const c = await claudeWindow(ctx, { session: 'pw_rewrite' });
+    const h = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0'], { PW_CLAUDE_WAIT_BIN: installed });
+    assert.equal(h.out.acted[0]?.waiter, true, JSON.stringify(h.out));
+    // bash reads a script as it goes: a copy rewritten under it (cp, an editor) shifts every later line.
+    const ino = fs.statSync(installed).ino;
+    fs.writeFileSync(installed, `#!/bin/bash\n${'# shifted\n'.repeat(40)}echo REWRITTEN-SCRIPT-RAN; exit 0\n`);
+    assert.equal(fs.statSync(installed).ino, ino, 'sanity: overwritten in place');
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => resumes(ctx).length === 1), 'the conversation is resumed');
+    await sleep(500);
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
+    assert.doesNotMatch(await paneText(ctx, c), /REWRITTEN-SCRIPT-RAN|syntax error|command not found/);
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid);
   } finally { await teardown(ctx); }
 });
 
@@ -517,7 +771,7 @@ test('nobody looking: the wake hook does nothing for a window whose session has 
     await tmux(ctx.sock, ['select-window', '-t', c.windowId]);
     await sleep(1500);
     assert.deepEqual(resumes(ctx), []);
-    assert.ok(/^\d+$/.test(await opt(ctx, c.windowId, '@pw_claude_waiting')), 'the placeholder is still waiting');
+    assert.ok(waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0, 'the placeholder is still waiting');
   } finally { await teardown(ctx); }
 });
 
