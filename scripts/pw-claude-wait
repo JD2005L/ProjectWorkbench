@@ -4,27 +4,81 @@
 # pw-claude-hibernate stops an idle Claude and types this into the window's own shell, so the window
 # keeps its cwd and the credential environment that shell was started with. It waits. When the window
 # is opened again (pw-claude-wake presses Enter from a tmux hook), or someone presses Enter, it resumes
-# the same conversation in place with `claude --resume <id>`. Ctrl-C gives the shell back instead.
+# the same conversation in place with `claude --resume <id>`. Ctrl-C or Ctrl-D gives the shell back.
 #
-# While waiting it records its pid on the window (@pw_claude_waiting), which is how pw-claude-wake tells
-# a waiting placeholder from a shell someone is typing into.
+# The window keeps its markers (@pw_claude_sid, @pw_claude_hib_win) for as long as this runs, including
+# while the resumed Claude does. They are cleared only when the conversation is ended on purpose. How
+# Claude ends decides what happens next (exit codes measured on Claude Code 2.1.270):
+#   0                     /exit, or Ctrl-C twice: ended on purpose. Markers cleared; a plain shell again.
+#   129 (HUP), 143 (TERM) Claude alone was stopped from outside, as when the window closes. Markers kept;
+#                         no retry here.
+#   anything else         the resume failed ("No conversation found" exits 1; a crash; an OOM kill). Markers
+#                         and the id are kept, and this waits again so the same conversation can be retried.
+# Until this was fixed the markers were cleared before `exec claude`, so a resume that failed at once left
+# the window without its conversation and the next snapshot dropped the id.
+#
+# The id kept is the conversation the window was really in. /clear and an in-app /resume move a running
+# Claude to another id, and a Claude that was killed cannot remove its registry entry, so after it ends the
+# entry it left says which conversation that was. Only an unambiguous entry counts: interactive, naming this
+# window and pane, started after this placeholder, and written during the attempt that just ended.
+#
+# pw-claude-hibernate stops the whole job when it hibernates a resumed conversation again, so this script
+# ends with Claude, the markers stay, and the hibernator arms a fresh placeholder.
+#
+# Claude runs as an ordinary child in this script's own job, with no job control here. Ctrl-Z therefore
+# stops the whole job and the pane's shell handles it like any other (Stopped, then fg), and the wait
+# simply continues. (With job control on here, a Claude stopped inside this retry loop makes bash abandon
+# the loop and exit, and the kernel then hangs up the orphaned, stopped Claude.)
+#
+# This script runs under the process name "claude-resume", because tmux reports a job's leader as the
+# pane's foreground command:
+#   - scheduled tasks type into a pane whose foreground command is a shell, so it must not look like one,
+#     neither while waiting nor while the resumed Claude runs;
+#   - the PVIKPBot handoff recycles a window whose command does not end in "claude" (a live Claude usually
+#     shows as node), so it must not look like Claude either, or the handoff prompt would be typed into
+#     this placeholder instead.
+#
+# While waiting it records "<pid>:<attempt>" on the window (@pw_claude_waiting), which is how pw-claude-wake
+# tells a waiting placeholder from a shell or a running Claude, and which attempt a wake is for. After
+# PW_CLAUDE_WAKE_RETRIES consecutive failures (default 3) it stops advertising itself, so opening the tab
+# no longer retries on its own; Enter still does. PW_CLAUDE_WAKE_SETTLE (seconds, default 1) is how long a
+# failure waits before offering the next attempt.
 set -u
-
-sid="${1:-}"
-if [[ ! "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
-	echo "usage: pw-claude-wait <claude-session-id>" >&2
-	exit 64
+if [[ "${PW_CLAUDE_WAIT_NAMED:-}" != 1 ]]; then
+	PW_CLAUDE_WAIT_NAMED=1 exec -a claude-resume /bin/bash "$0" "$@"
 fi
+unset PW_CLAUDE_WAIT_NAMED
+
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
 SESS_REG="${PW_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
 PROJECTS_DIR="${PW_CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 CLAUDE_BIN="${PW_CLAUDE_BIN:-claude}"
+AUTO_RETRIES="${PW_CLAUDE_WAKE_RETRIES:-3}"
+[[ "$AUTO_RETRIES" =~ ^[0-9]+$ ]] || AUTO_RETRIES=3
+SETTLE="${PW_CLAUDE_WAKE_SETTLE:-1}"
+[[ "$SETTLE" =~ ^[0-9]+([.][0-9]+)?$ ]] || SETTLE=1
 pane="${TMUX_PANE:-}"
+sid=""
+attempt_started=0
+my_start=$(awk '{sub(/.*\) /, ""); print $20}' /proc/$$/stat 2>/dev/null)
 
 # $TMUX, inherited from the pane, names the server this window lives on.
+set_window_opt() {
+	[[ -n "$pane" ]] && tmux set-option -w -t "$pane" "$1" "$2" 2>/dev/null
+}
 unset_window_opts() {
 	[[ -n "$pane" ]] || return 0
 	local o
 	for o in "$@"; do tmux set-option -wu -t "$pane" "$o" 2>/dev/null; done
+}
+# Before every wait, restate this window's claim on the conversation, so no failed attempt can leave the
+# window without its id.
+keep_markers() {
+	[[ -n "$pane" ]] || return 0
+	local wid
+	wid=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null) || return 0
+	set_window_opt @pw_claude_sid "$sid"
+	set_window_opt @pw_claude_hib_win "$wid"
 }
 starttime_of() {
 	local s
@@ -32,19 +86,52 @@ starttime_of() {
 	s=${s##*') '}
 	awk '{print $20}' <<<"$s"
 }
+field_of() {
+	grep -oE "\"$2\":\"?[^\",}]*" "$1" | head -1 | sed -E "s/^\"$2\":\"?//"
+}
+# Is the Claude that wrote this registry entry still running?
+entry_running() {
+	local pid pst
+	pid=$(field_of "$1" pid)
+	pst=$(field_of "$1" procStart)   # a JSON string in real registries
+	[[ "$pid" =~ ^[0-9]+$ && -d "/proc/$pid" ]] || return 1
+	[[ -z "$pst" || "$(starttime_of "$pid")" == "$pst" ]]
+}
 # Is this conversation already running somewhere? Resuming it twice would fork its transcript.
 running_elsewhere() {
-	local jf pid other pst
+	local jf
 	for jf in "$SESS_REG"/*.json; do
 		[[ -e "$jf" ]] || continue
-		other=$(grep -o '"sessionId":"[^"]*"' "$jf" | head -1 | cut -d'"' -f4)
-		[[ "$other" == "$sid" ]] || continue
-		pid=$(grep -o '"pid":[0-9]*' "$jf" | head -1 | cut -d: -f2)
-		pst=$(grep -oE '"procStart":"?[0-9]+' "$jf" | head -1 | grep -oE '[0-9]+$')   # a JSON string in real registries
-		[[ -n "$pid" && -d "/proc/$pid" ]] || continue
-		[[ -z "$pst" || "$(starttime_of "$pid")" == "$pst" ]] && return 0
+		[[ "$(field_of "$jf" sessionId)" == "$sid" ]] || continue
+		entry_running "$jf" && return 0
 	done
 	return 1
+}
+# The conversation the Claude that just ended in this window was in, from the registry entry it wrote during
+# this attempt (tmux "<session>:<window>.<pane>"), if exactly one such entry exists and its conversation has a
+# transcript. Pane ids start again at %0 when the tmux server does, and a nested `claude -p` inherits the
+# pane, so an entry must also be interactive, name this window, and belong to a Claude started after this
+# placeholder.
+conversation_left_here() {
+	[[ -n "$pane" && "$my_start" =~ ^[0-9]+$ ]] || return 1
+	local wid jf pst other found="" n=0
+	wid=$(tmux display-message -p -t "$pane" '#{window_id}' 2>/dev/null) || return 1
+	for jf in "$SESS_REG"/*.json; do
+		[[ -e "$jf" ]] || continue
+		(( $(stat -c %Y "$jf" 2>/dev/null || echo 0) >= attempt_started )) || continue
+		[[ "$(field_of "$jf" kind)" == interactive ]] || continue
+		[[ "$(field_of "$jf" tmux)" == *":$wid.$pane" ]] || continue
+		pst=$(field_of "$jf" procStart)
+		[[ "$pst" =~ ^[0-9]+$ ]] && (( pst > my_start )) || continue
+		entry_running "$jf" && continue
+		other=$(field_of "$jf" sessionId)
+		[[ "$other" =~ $UUID_RE ]] || continue
+		compgen -G "$PROJECTS_DIR/*/$other.jsonl" >/dev/null || continue
+		[[ "$other" == "$found" ]] && continue
+		found=$other
+		n=$((n + 1))
+	done
+	(( n == 1 )) && printf '%s\n' "$found"
 }
 cancelled() {
 	# Say how to get the conversation back before the window stops remembering it.
@@ -53,33 +140,93 @@ cancelled() {
 	exit 130
 }
 
-[[ -n "$pane" ]] && tmux set-option -w -t "$pane" @pw_claude_waiting "$$" 2>/dev/null
-trap 'unset_window_opts @pw_claude_waiting' EXIT
-trap cancelled INT
+main() {
+	sid="${1:-}"
+	if [[ ! "$sid" =~ $UUID_RE ]]; then
+		echo "usage: pw-claude-wait <claude-session-id>" >&2
+		exit 64
+	fi
+	# The terminal as the shell handed it over, put back after every attempt: a Claude killed outright (the OOM
+	# killer, a crash) leaves it in raw mode, where Enter no longer ends a line and Ctrl-C no longer interrupts.
+	local tty_state rc next failures=0 attempt=0 reason=""
+	tty_state=$(stty -g 2>/dev/null) || tty_state=""
 
-printf '\n\033[1mClaude Code is hibernated in this window to free memory.\033[0m\n'
-printf 'It resumes here when you open this tab, or press Enter now. Ctrl-C returns to the shell.\n'
-printf 'Conversation: %s\n' "$sid"
+	trap 'unset_window_opts @pw_claude_waiting' EXIT
+	while :; do
+		# From here until Claude starts, Ctrl-C cancels, as the banner says; that includes the settle below.
+		trap cancelled INT
+		keep_markers
+		if (( failures == 0 )); then
+			printf '\n\033[1mClaude Code is hibernated in this window to free memory.\033[0m\n'
+			printf 'It resumes here when you open this tab, or press Enter now. Ctrl-C returns to the shell.\n'
+			printf 'Conversation: %s\n' "$sid"
+		else
+			printf '\n\033[1mResuming did not work: %s.\033[0m\n' "$reason"
+			printf 'This window still holds conversation %s.\n' "$sid"
+			if (( failures < AUTO_RETRIES )); then
+				printf 'It tries again when you open this tab, or press Enter now. Ctrl-C returns to the shell.\n'
+			else
+				printf 'Automatic retries stopped after %d failures. Press Enter to try again; Ctrl-C returns to the shell.\n' "$failures"
+			fi
+		fi
+		if (( failures < AUTO_RETRIES )); then
+			# One visit fires several hooks. Let the rest of the visit that caused a failure pass before offering the
+			# next attempt, so they cannot use up the retries; Enter pressed meanwhile is kept for the read below.
+			(( failures == 0 )) || sleep "$SETTLE"
+			attempt=$((attempt + 1))
+			set_window_opt @pw_claude_waiting "$$:$attempt"
+		else
+			unset_window_opts @pw_claude_waiting
+		fi
 
-# Ctrl-D (end of input) cancels exactly like Ctrl-C, so no window is left marked with nothing waiting.
-read -r _ || cancelled
-trap - INT
+		# Ctrl-D (end of input) cancels exactly like Ctrl-C, so no window is left marked with nothing waiting.
+		read -r _ || cancelled
+		trap - INT
+		# Nothing may press Enter into the conversation while it runs.
+		unset_window_opts @pw_claude_waiting
 
-if running_elsewhere; then
-	unset_window_opts @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
-	printf 'This conversation is already open in another window, so it is not resumed here.\n'
-	exit 0
-fi
-if ! compgen -G "$PROJECTS_DIR/*/$sid.jsonl" >/dev/null; then
-	# Markers stay, so the id is still recorded by pw-tmux-save.
-	printf 'No transcript for %s was found; nothing to resume.\n' "$sid"
-	exit 1
-fi
-if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
-	printf '%s is not on PATH. Resume manually: claude --resume %s\n' "$CLAUDE_BIN" "$sid"
-	exit 1
-fi
+		if running_elsewhere; then
+			unset_window_opts @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
+			printf 'This conversation is already open in another window, so it is not resumed here.\n'
+			exit 0
+		fi
+		if ! compgen -G "$PROJECTS_DIR/*/$sid.jsonl" >/dev/null; then
+			failures=$((failures + 1)); reason="no transcript for this conversation was found"
+			continue
+		fi
+		if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+			failures=$((failures + 1)); reason="$CLAUDE_BIN is not on PATH"
+			continue
+		fi
 
-unset_window_opts @pw_claude_waiting @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
-trap - EXIT
-exec "$CLAUDE_BIN" --resume "$sid"
+		attempt_started=$(date +%s)
+		"$CLAUDE_BIN" --resume "$sid"
+		rc=$?
+		if [[ -n "$tty_state" ]]; then
+			stty "$tty_state" 2>/dev/null || stty sane 2>/dev/null
+		fi
+
+		if (( rc == 0 )); then
+			unset_window_opts @pw_claude_waiting @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
+			trap - EXIT
+			exit 0
+		fi
+		if next=$(conversation_left_here) && [[ "$next" != "$sid" ]]; then
+			sid=$next
+		fi
+		case "$rc" in
+			129|143)
+				keep_markers
+				trap - EXIT
+				exit 0
+				;;
+			*)
+				failures=$((failures + 1)); reason="Claude Code exited with status $rc"
+				;;
+		esac
+	done
+}
+
+# The whole file is read before any of it runs, so a copy rewritten in place while this waits cannot change
+# what it does next.
+main "$@"; exit
