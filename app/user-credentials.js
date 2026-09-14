@@ -106,20 +106,38 @@ export function userCredRoot(base, username) {
   return path.join(base, encodeUserName(username));
 }
 /**
- * Keys in settings.json that are PW INSTANCE INFRASTRUCTURE rather than user preference, and so
- * must exist in every per-user config dir:
+ * Keys in settings.json that are PW INSTANCE configuration rather than personal preference, and
+ * so must exist in every per-user config dir. The feature's contract is that enabling per-user
+ * credentials changes WHOSE identity a project runs as, not how the workbench behaves -- so
+ * anything that alters behaviour has to come across, or turning the flag on silently changes it.
  *
- *   hooks                 - hooks.Stop runs pw-stop-hook.sh, which writes the marker under
- *                           /var/lib/project-workbench/pending that the dashboard renders as a
- *                           project's amber "turn done" flag.
- *   preferredNotifChannel - 'terminal_bell' is what makes Claude ring the BEL that tmux records
- *                           as window_bell_flag, the second (live) half of that same flag.
+ *   hooks                             hooks.Stop runs pw-stop-hook.sh, which writes the marker
+ *                                     under /var/lib/project-workbench/pending that the rail
+ *                                     renders as a project's amber "turn done" flag.
+ *   preferredNotifChannel             'terminal_bell' makes Claude ring the BEL that tmux records
+ *                                     as window_bell_flag -- the live half of that same flag.
+ *   permissions                       the instance's tool-permission posture. Pre-migration EVERY
+ *                                     project terminal ran on the shared config, so this was
+ *                                     already in force for every owner; seeding it restores that
+ *                                     rather than widening anything. Carries both defaultMode and
+ *                                     an MCP allow-list, so review it when onboarding an owner.
+ *   skipDangerousModePermissionPrompt pairs with the above; without it a posture the operator has
+ *                                     already chosen re-prompts on every new session.
+ *   effortLevel                       the instance's reasoning-effort default.
  *
- * Deliberately NOT here: theme, model, effortLevel (personal), and permissions /
- * skipDangerousModePermissionPrompt (an authority grant, which must be a deliberate act per
- * account rather than something a credential job propagates).
+ * Deliberately NOT seeded: `model`, which the wrapper leaves unset ON PURPOSE so each user picks
+ * their own, plus `theme` and `enabledPlugins` -- personal, and Claude Code writes them itself.
+ *
+ * Merge is fill-only: a key the user has already set is never overwritten, so seeding a posture
+ * still leaves them free to choose a different one.
  */
-export const SEEDED_SETTINGS_KEYS = Object.freeze(['hooks', 'preferredNotifChannel']);
+export const SEEDED_SETTINGS_KEYS = Object.freeze([
+  'hooks',
+  'preferredNotifChannel',
+  'permissions',
+  'skipDangerousModePermissionPrompt',
+  'effortLevel',
+]);
 
 export function userClaudeConfigDir(base, username) {
   return path.join(userCredRoot(base, username), 'claude');

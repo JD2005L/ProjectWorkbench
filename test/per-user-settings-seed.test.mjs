@@ -31,8 +31,10 @@ const SHARED = {
     SessionStart: [{ hooks: [{ type: 'command', command: 'true' }] }],
   },
   preferredNotifChannel: 'terminal_bell',
-  permissions: { defaultMode: 'bypassPermissions' },
+  permissions: { allow: ['mcp__teamkb__reveal_secret'], defaultMode: 'bypassPermissions' },
   skipDangerousModePermissionPrompt: true,
+  effortLevel: 'xhigh',
+  enabledPlugins: { 'some-plugin@marketplace': true },
 };
 
 function scratch() {
@@ -98,20 +100,48 @@ test('an infrastructure key the user has deliberately set is left alone', async 
   }
 });
 
-test('authority and preference keys are deliberately NOT propagated', async () => {
-  // permissions/skipDangerousModePermissionPrompt are an authority grant: propagating the admin's
-  // bypassPermissions into every owner's config as a side effect of a credential job would widen
-  // authority silently. Personal preferences are equally not ours to copy.
+test('instance behaviour comes across, personal preference does not', async () => {
+  // The feature changes WHOSE identity a project runs as, not how the workbench behaves, so the
+  // permission posture and effort default have to follow -- pre-migration every terminal ran on
+  // the shared config, so this restores that rather than widening it. `model` stays out on
+  // purpose: the wrapper leaves it unset so each user chooses.
   const { dir, base, sharedSettings } = scratch();
   try {
     await applyCredentialJob({ fsp, base, username: 'narrow.user', sharedSettings });
     const got = readSettings(base, 'narrow.user');
-    assert.equal(got.permissions, undefined, 'bypassPermissions must not ride along');
-    assert.equal(got.skipDangerousModePermissionPrompt, undefined);
-    assert.equal(got.model, undefined, 'the admin\'s model preference is not the owner\'s');
-    assert.equal(got.theme, undefined);
-    assert.deepEqual(SEEDED_SETTINGS_KEYS.slice(), ['hooks', 'preferredNotifChannel'],
-      'if this list grows, it should be a deliberate argued change');
+
+    assert.deepEqual(got.permissions, SHARED.permissions, 'the permission posture must follow');
+    assert.equal(got.skipDangerousModePermissionPrompt, true);
+    assert.equal(got.effortLevel, 'xhigh');
+
+    assert.equal(got.model, undefined, 'model is left per-user by design');
+    assert.equal(got.theme, undefined, 'theme is personal');
+    assert.equal(got.enabledPlugins, undefined, 'plugins are personal');
+
+    assert.deepEqual(SEEDED_SETTINGS_KEYS.slice(),
+      ['hooks', 'preferredNotifChannel', 'permissions', 'skipDangerousModePermissionPrompt', 'effortLevel'],
+      'changing this list changes what a credential job propagates -- make it deliberate');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a permission posture the owner has already chosen is not overwritten', async () => {
+  // Fill-only matters most here: seeding must never silently re-widen an owner who has
+  // deliberately tightened their own posture.
+  const { dir, base, sharedSettings } = scratch();
+  try {
+    const cfgDir = userClaudeConfigDir(base, 'tightened');
+    fs.mkdirSync(cfgDir, { recursive: true });
+    fs.writeFileSync(path.join(cfgDir, 'settings.json'),
+      JSON.stringify({ permissions: { defaultMode: 'default' } }, null, 2));
+
+    await applyCredentialJob({ fsp, base, username: 'tightened', sharedSettings });
+
+    const got = readSettings(base, 'tightened');
+    assert.deepEqual(got.permissions, { defaultMode: 'default' },
+      'a stricter posture the owner set must survive seeding');
+    assert.deepEqual(got.hooks, SHARED.hooks, 'absent keys are still filled');
   } finally {
     fs.rmSync(dir, { recursive: true, force: true });
   }
