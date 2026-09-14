@@ -53,6 +53,8 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-' } = {}) {
     PW_WORKSPACES: path.join(dir, 'workspaces'),
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'),
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
+    PW_API_TOKENS_PATH: path.join(dir, 'api-tokens.json'),
+    PW_AUDIT_LOG: path.join(dir, 'audit.log'),
   };
   const logs = [];
   const child = spawn(process.execPath, [path.join(APP_DIR, 'server.js')], { cwd: APP_DIR, env, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -74,7 +76,7 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-' } = {}) {
       body: new URLSearchParams({ name, port: String(20000 + crypto.randomInt(0, 9000)) }),
     }).then((r) => r.json());
     assert.equal(created.ok, true, `project creation must succeed: ${JSON.stringify(created)}`);
-    await fn({ base, name, sock, logs });
+    await fn({ base, name, sock, logs, dir });
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 200));
