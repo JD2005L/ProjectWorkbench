@@ -62,8 +62,12 @@ test('the single default is claimed, released, and carried across a rename', () 
 
   assert.match(between("app.post(BASE + '/manage/update/:oldName'", "audit('project_update'"),
     /applyDefaultProjectFlag\(oldName, newName, req\.body\.defaultProject\)/);
-  assert.match(between("app.post(BASE + '/manage/add'", "audit('project_add'"),
+  // The add path became a handler shared by the form and the token API (1e12463); the flag work
+  // lives in the handler, and both mounts must still route through it.
+  assert.match(between('const addProjectHandler = async (req,res,next)', "audit('project_add'"),
     /applyDefaultProjectFlag\(null, name, req\.body\.defaultProject\)/);
+  assert.match(server, /app\.post\(BASE \+ '\/manage\/add', requireAdmin, addProjectHandler\)/,
+    'the dashboard form must still mount the shared add handler');
   assert.match(between("app.post(BASE + '/manage/delete/:name'", "audit('project_delete'"),
     /applyDefaultProjectFlag\(name, name, ''\)/,
     'deleting the default project must release it, or first logins strand');
