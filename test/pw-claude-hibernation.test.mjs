@@ -130,7 +130,7 @@ function transcript(ctx, sid, ageMs) {
 }
 
 /** A project window whose shell runs the stand-in Claude, exactly like a PW pane running `claude`. */
-async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.randomUUID(), idleMs = 10 * DAY, fake = {}, paneRoot = false, lane = false, wrapped = false, nonInteractive = false } = {}) {
+async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.randomUUID(), idleMs = 10 * DAY, fake = {}, paneRoot = false, lane = false, wrapped = false, nonInteractive = false, interactiveCommand = false } = {}) {
   transcript(ctx, sid, idleMs);
   const paneEnv = {
     PATH: process.env.PATH, HOME: ctx.dir, HISTFILE: '/dev/null',
@@ -140,6 +140,7 @@ async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.random
   const envArgs = Object.entries(paneEnv).map(([k, v]) => `${k}=${JSON.stringify(String(v))}`).join(' ');
   const command = paneRoot ? `env ${envArgs} ${ctx.fake} --session-id ${sid}`
     : nonInteractive ? `env ${envArgs} bash -c '${ctx.fake} --session-id ${sid}; echo after'`
+      : interactiveCommand ? `env ${envArgs} bash --norc -ic '${ctx.fake} --session-id ${sid}; echo after'`
       : `env ${envArgs} bash --noprofile --norc`;
   let exists = false;
   try { await tmux(ctx.sock, ['has-session', '-t', `=${session}`]); exists = true; } catch { /* new */ }
@@ -151,7 +152,7 @@ async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.random
     await tmux(ctx.sock, ['set-option', '-w', '-t', windowId, '@pw_role', 'lane']);
     await tmux(ctx.sock, ['set-option', '-w', '-t', windowId, '@pw_session_key', 'k']);
   }
-  if (!paneRoot && !nonInteractive) {
+  if (!paneRoot && !nonInteractive && !interactiveCommand) {
     await until(async () => /\$$/.test((await tmux(ctx.sock, ['capture-pane', '-p', '-t', paneId])).trimEnd()));
     // wrapped: a job leader that dies on the signal at once, with Claude as its child, like the real wrapper.
     const launch = wrapped ? `sh -c '${ctx.fake} --session-id ${sid} & wait'` : `${ctx.fake} --session-id ${sid}`;
@@ -377,6 +378,8 @@ test('REGRESSION (review P1): a window someone is using is left running, however
     const scrolling = await claudeWindow(ctx, { session: 'pw_scroll' });
     const chatty = await claudeWindow(ctx, { session: 'pw_chatty', fake: { FAKE_CHATTER: '1' } });
     const oneShot = await claudeWindow(ctx, { session: 'pw_oneshot', nonInteractive: true });
+    // Job control on, so it passes the foreground-job rule, but the shell still exits after its command.
+    const interactiveOneShot = await claudeWindow(ctx, { session: 'pw_ioneshot', interactiveCommand: true });
     client = attachClient(ctx, 'pw_look');
     assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000), 'sanity: a client is attached');
     await tmux(ctx.sock, ['copy-mode', '-t', scrolling.paneId]);
@@ -388,8 +391,10 @@ test('REGRESSION (review P1): a window someone is using is left running, however
     assert.match(reason(looking), /someone is looking at this window/);
     assert.match(reason(scrolling), /copy mode/);
     assert.match(reason(chatty), /showed output .* ago/);
-    assert.match(reason(oneShot), /not the foreground job of an interactive shell/);
-    for (const c of [looking, scrolling, chatty, oneShot]) {
+    assert.match(reason(oneShot), /started to run a command \(-c\)|not the foreground job of an interactive shell/);
+    assert.match(reason(interactiveOneShot), /started to run a command \(-c\)/);
+    assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', interactiveOneShot.windowId, '#{window_id}']), interactiveOneShot.windowId, 'its window must still exist');
+    for (const c of [looking, scrolling, chatty, oneShot, interactiveOneShot]) {
       assert.ok(alive(c.pid));
       assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), '');
     }

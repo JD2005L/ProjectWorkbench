@@ -162,6 +162,25 @@ function listPanes() {
   return panes;
 }
 
+// A shell started to run a command string exits when that command ends, and takes its window with it, even
+// with job control on: `bash -ic 'claude; echo after'` passes the foreground-job rule and still closes its
+// window when Claude stops. Reads the shell's own argv; an unreadable one counts as unsafe.
+const SHELL_OPTS_WITH_VALUE = new Set(['--rcfile', '--init-file', '-o', '+o', '-O', '+O']);
+function shellRunsCommand(pid) {
+  let argv;
+  try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0').filter(Boolean); } catch { return true; }
+  for (let i = 1; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--') break;
+    if (a === '--command' || a.startsWith('--command=')) return true; // fish
+    if (SHELL_OPTS_WITH_VALUE.has(a)) { i++; continue; }
+    if (/^-[A-Za-z]+$/.test(a)) { if (a.includes('c')) return true; continue; } // -c, -ic, -lc, ...
+    if (a.startsWith('--')) continue;
+    break; // the first operand ends the options
+  }
+  return false;
+}
+
 // The pane's shell is waiting for input: asleep, owning the terminal's foreground, running nothing.
 // Judged from /proc, not the screen. Claude Code's wrapper exits before Claude does, so bash prints its
 // prompt and Claude's last words land on top of it (seen in the real-Claude proof): a screen check
@@ -247,6 +266,7 @@ function assess(entry, ctx) {
   if (pane.panePid === pid) return skip("Claude is the pane's own process; stopping it would close the window", base);
   if (!ancestorsOf(pid, ctx.table).includes(pane.panePid)) return skip('process is not running inside the pane the registry names', base);
   if (!SHELLS.has(comm(pane.panePid))) return skip(`the pane runs ${comm(pane.panePid) || 'an unknown process'}, not a shell; stopping Claude would close the window`, base);
+  if (shellRunsCommand(pane.panePid)) return skip("the pane's shell was started to run a command (-c) and exits when it finishes; stopping Claude would close the window", base);
   // Job control proves an interactive shell that returns to its prompt. A `bash -c 'claude; ...'` pane shares
   // Claude's process group and exits when Claude does, which would close the window.
   const shell = procStat(pane.panePid);
@@ -359,6 +379,7 @@ function backfillCandidates(ctx, quietMs) {
     Object.assign(r, { windowId: p.windowId, paneId: p.paneId });
     if (p.windowName !== name || p.cwd !== cwd) { skip('window at that index is not the one the manifest recorded (name or cwd differs)'); continue; }
     if (p.windowPanes !== 1 || !SHELLS.has(p.cmd) || descendantsOf(p.panePid, ctx.table).length) { skip('window is not an idle shell'); continue; }
+    if (shellRunsCommand(p.panePid)) { skip("the pane's shell was started to run a command (-c)"); continue; }
     const inUse = inUseReason(p, ctx.now, quietMs);
     if (inUse) { skip(inUse); continue; }
     if (windowOpt(p.windowId, '@pw_claude_sid')) { skip('window already carries hibernation markers'); continue; }
