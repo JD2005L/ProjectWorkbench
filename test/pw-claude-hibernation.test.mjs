@@ -251,7 +251,13 @@ async function hibernated(ctx, c) {
   assert.equal(r.code, 0, r.stderr);
   assert.equal(r.out.acted[0]?.action, 'hibernated', JSON.stringify(r.out));
   assert.ok(await until(async () => waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting')) > 0), 'the placeholder must be waiting');
+  await assertQuiet(ctx, c.windowId);
   return r;
+}
+// The dashboard lights a project amber ("turn done") from tmux's bell flag. Nothing hibernation does may set it.
+async function assertQuiet(ctx, windowId) {
+  await sleep(300);
+  assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', windowId, '#{window_bell_flag}']), '0', `window ${windowId}: the turn-done bell flag`);
 }
 
 test('dry run: a dormant session is reported and nothing is touched', { timeout: 30000 }, async () => {
@@ -531,9 +537,10 @@ test('Ctrl-C right after a failure, while the next attempt is not yet offered, s
     assert.ok(await until(async () => /Resuming did not work: no transcript/.test(await paneText(ctx, c)), 10000, 20));
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'C-c']);
     assert.ok(await until(async () => /Resume cancelled; this window is a plain shell again/.test(await paneText(ctx, c))), 'the cancel path runs');
-    assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), '');
-    assert.equal(await opt(ctx, c.windowId, '@pw_claude_hib_win'), '');
-    assert.equal(await opt(ctx, c.windowId, '@pw_claude_waiting'), '');
+    // The message is printed first and the markers are unset right after it.
+    const markers = async () => [await opt(ctx, c.windowId, '@pw_claude_sid'), await opt(ctx, c.windowId, '@pw_claude_hib_win'), await opt(ctx, c.windowId, '@pw_claude_waiting')];
+    assert.ok(await until(async () => (await markers()).join('') === ''), 'the cancel path clears every marker');
+    assert.deepEqual(await markers(), ['', '', '']);
   } finally { await teardown(ctx); }
 });
 
@@ -680,6 +687,7 @@ test('refresh: a placeholder still running the c819d9a script is swapped for the
     const r = await hibernate(ctx, ['--refresh-placeholders', '--apply'], env);
     assert.equal(r.code, 0, r.stderr);
     assert.equal(r.out.acted[0]?.action, 'refreshed', JSON.stringify(r.out.acted));
+    await assertQuiet(ctx, c.windowId);
     const newWaiter = waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting'));
     assert.ok(newWaiter > 0 && newWaiter !== Number(oldWaiter), 'a new placeholder is waiting');
     assert.equal(alive(Number(oldWaiter)), false);
@@ -798,6 +806,47 @@ test('a waiting placeholder whose script is overwritten in place still resumes i
     assert.doesNotMatch(await paneText(ctx, c), /REWRITTEN-SCRIPT-RAN|syntax error|command not found/);
     assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid);
   } finally { await teardown(ctx); }
+});
+
+test('hibernation never lights a turn-done notice, not even on the next visit, and leaves one already lit as it was', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    // A project whose terminal shows another window, as in the sidebar: the hibernated windows are in the background.
+    await tmux(ctx.sock, ['new-session', '-d', '-s', 'pw_notice', '-n', 'front', '-c', ctx.work, `env HOME=${ctx.dir} HISTFILE=/dev/null bash --noprofile --norc`]);
+    const control = await tmux(ctx.sock, ['new-window', '-d', '-P', '-F', '#{window_id}', '-t', 'pw_notice:', '-n', 'control', '-c', ctx.work, `env HOME=${ctx.dir} HISTFILE=/dev/null bash --noprofile --norc`]);
+    await until(async () => /\$$/.test((await tmux(ctx.sock, ['capture-pane', '-p', '-t', control])).trimEnd()));
+    await tmux(ctx.sock, ['send-keys', '-t', control, 'C-u']);
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', control, '#{window_bell_flag}'])) === '1'), 'sanity: C-u at an empty prompt rings the bell this test watches for');
+
+    const quiet = await claudeWindow(ctx, { session: 'pw_notice', name: 'quiet' });
+    const lit = await claudeWindow(ctx, { session: 'pw_notice', name: 'lit' });
+    // A genuine unviewed "turn done": the Stop hook writes BEL to the pane's tty.
+    fs.writeFileSync(await tmux(ctx.sock, ['display-message', '-p', '-t', lit.paneId, '#{pane_tty}']), '\x07');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', lit.windowId, '#{window_bell_flag}'])) === '1'));
+
+    for (const c of [quiet, lit]) {
+      const r = await hibernate(ctx, ['--apply', '--session-id', c.sid, '--idle-minutes', '0']);
+      assert.deepEqual([r.out.acted[0]?.action, r.out.acted[0]?.waiter], ['hibernated', true], JSON.stringify(r.out));
+    }
+    const flag = (w) => tmux(ctx.sock, ['display-message', '-p', '-t', w, '#{window_bell_flag}']);
+    await sleep(300);
+    assert.equal(await flag(quiet.windowId), '0');
+    assert.equal(await flag(lit.windowId), '1', 'the notice that was already lit stays lit');
+
+    // Opening the project attaches a client, and tmux then reports any bell a window recorded while nobody
+    // watched, even one rung with bell monitoring off.
+    client = attachClient(ctx, 'pw_notice');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000), 'sanity: a client is attached');
+    await sleep(1000);
+    assert.equal(await flag(quiet.windowId), '0', 'nothing hibernation typed surfaces as a notice on the next visit');
+    assert.equal(await flag(lit.windowId), '1', 'and the genuine notice is still there');
+    assert.deepEqual(resumes(ctx), [], 'sanity: the visit woke no background window');
+    assert.ok(waiterPid(await opt(ctx, quiet.windowId, '@pw_claude_waiting')) > 0, 'and its placeholder is still waiting');
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
 });
 
 test('pressing Enter in the window resumes it even with no hook', { timeout: 40000 }, async () => {
@@ -1033,6 +1082,7 @@ test('backfill: a window hibernated by hand gets its markers and placeholder fro
     const wid1 = await tmux(ctx.sock, ['display-message', '-p', '-t', 'pw_hand:1', '#{window_id}']);
     assert.equal(await opt(ctx, wid0, '@pw_claude_sid'), sid);
     assert.equal(await opt(ctx, wid1, '@pw_claude_sid'), '');
+    await assertQuiet(ctx, wid0);
     await tmux(ctx.sock, ['send-keys', '-t', 'pw_hand:0', 'Enter']);
     assert.ok(await until(() => resumes(ctx).length === 1));
     assert.match(resumes(ctx)[0], new RegExp(`^resume ${sid} `));
