@@ -65,7 +65,10 @@ test('the project a token registers is attributable to that token in the audit l
       },
       body: JSON.stringify({ name, port: String(22000 + crypto.randomInt(0, 8000)) }),
     });
-    assert.equal(res.status, 200, await res.text());
+    // Read once, for the same reason as above: an assertion's message argument is evaluated
+    // eagerly, so a body-consuming await in it spends the body even when the assertion passes.
+    const registerBody = await res.text();
+    assert.equal(res.status, 200, registerBody);
 
     // The fixture isolates PW_AUDIT_LOG into its temp dir and exposes it, so this asserts for
     // real rather than skipping when the path is not writable.
