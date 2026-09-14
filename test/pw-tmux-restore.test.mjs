@@ -482,3 +482,39 @@ test('REGRESSION: a properly isolated restore run leaves the REAL default tmux s
   const after = await snapshotDefault();
   assert.equal(after, before, 'the real default tmux socket\'s session list must be byte-for-byte unchanged by an isolated restore run');
 });
+
+// A hibernated window (manifest hasc=2, see scripts/pw-claude-hibernate) must come back after a reboot as
+// what it was: a window whose conversation resumes when someone opens it. Relaunching it at boot, as a
+// hasc=1 row is, would start again every Claude that was stopped to free memory. Resuming nothing and
+// leaving no marker would lose its id at the next snapshot.
+test('a hibernated row is recreated with its markers and placeholder, and is not relaunched', { timeout: 20000 }, async () => {
+  const ctx = await setup({ enabled: false });
+  const sid = crypto.randomUUID();
+  const projects = ctx.env.PW_CLAUDE_PROJECTS_DIR;
+  await fsp.mkdir(path.join(projects, 'p'), { recursive: true });
+  await fsp.writeFile(path.join(projects, 'p', `${sid}.jsonl`), `{"timestamp":"${new Date(Date.now() - 864e6).toISOString()}"}\n`);
+  // A stand-in placeholder: records that it was started, with which id, then waits like the real one.
+  const ran = path.join(ctx.dir, 'waiter-ran');
+  const waiter = path.join(ctx.dir, 'pw-claude-wait-stub');
+  await fsp.writeFile(waiter, `#!/bin/bash\necho "$1" >> ${ran}\nexec sleep 300\n`, { mode: 0o755 });
+  writeManifest(path.join(ctx.stateDir, 'manifest.tsv'), [
+    { s: ctx.session, w: 0, wn: 'Base', cwd: ctx.projPath, hasc: 0 },
+    { s: ctx.session, w: 1, wn: 'research', cwd: ctx.projPath, hasc: 2, sid },
+  ]);
+  ctx.env.PW_CLAUDE_WAIT_BIN = waiter;
+  ctx.env.PW_CLAUDE_HIBERNATE_BIN = path.join(REPO, 'scripts', 'pw-claude-hibernate');
+  try {
+    await runScript(ctx);
+    const target = `${ctx.session}:research`;
+    const wid = (await tmux(ctx.sock, ['display-message', '-p', '-t', target, '#{window_id}'])).stdout.trim();
+    assert.equal((await tmux(ctx.sock, ['show-options', '-wqv', '-t', wid, '@pw_claude_sid'])).stdout.trim(), sid);
+    assert.equal((await tmux(ctx.sock, ['show-options', '-wqv', '-t', wid, '@pw_claude_hib_win'])).stdout.trim(), wid, 'the marker names the NEW window');
+    let started = '';
+    for (let i = 0; i < 50 && !started; i++) { try { started = fs.readFileSync(ran, 'utf8'); } catch { await new Promise((r) => setTimeout(r, 100)); } }
+    assert.equal(started.trim(), sid, 'the placeholder is started in the window with the exact id');
+    const log = fs.readFileSync(path.join(ctx.stateDir, 'persist.log'), 'utf8');
+    assert.match(log, /launched 0 Claude session\(s\); re-armed 1 hibernated/);
+    assert.doesNotMatch(log, new RegExp(`resumed claude ${sid}`));
+    assert.match((await tmux(ctx.sock, ['show-hooks', '-g', 'client-attached'])).stdout, /pw-claude-wake/, 'the wake hooks are back on the new server');
+  } finally { await teardown(ctx); }
+});

@@ -1,0 +1,85 @@
+#!/bin/bash
+# Project Workbench: the placeholder a hibernated Claude Code session leaves in its tmux window.
+#
+# pw-claude-hibernate stops an idle Claude and types this into the window's own shell, so the window
+# keeps its cwd and the credential environment that shell was started with. It waits. When the window
+# is opened again (pw-claude-wake presses Enter from a tmux hook), or someone presses Enter, it resumes
+# the same conversation in place with `claude --resume <id>`. Ctrl-C gives the shell back instead.
+#
+# While waiting it records its pid on the window (@pw_claude_waiting), which is how pw-claude-wake tells
+# a waiting placeholder from a shell someone is typing into.
+set -u
+
+sid="${1:-}"
+if [[ ! "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+	echo "usage: pw-claude-wait <claude-session-id>" >&2
+	exit 64
+fi
+SESS_REG="${PW_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
+PROJECTS_DIR="${PW_CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
+CLAUDE_BIN="${PW_CLAUDE_BIN:-claude}"
+pane="${TMUX_PANE:-}"
+
+# $TMUX, inherited from the pane, names the server this window lives on.
+unset_window_opts() {
+	[[ -n "$pane" ]] || return 0
+	local o
+	for o in "$@"; do tmux set-option -wu -t "$pane" "$o" 2>/dev/null; done
+}
+starttime_of() {
+	local s
+	s=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	s=${s##*') '}
+	awk '{print $20}' <<<"$s"
+}
+# Is this conversation already running somewhere? Resuming it twice would fork its transcript.
+running_elsewhere() {
+	local jf pid other pst
+	for jf in "$SESS_REG"/*.json; do
+		[[ -e "$jf" ]] || continue
+		other=$(grep -o '"sessionId":"[^"]*"' "$jf" | head -1 | cut -d'"' -f4)
+		[[ "$other" == "$sid" ]] || continue
+		pid=$(grep -o '"pid":[0-9]*' "$jf" | head -1 | cut -d: -f2)
+		pst=$(grep -oE '"procStart":"?[0-9]+' "$jf" | head -1 | grep -oE '[0-9]+$')   # a JSON string in real registries
+		[[ -n "$pid" && -d "/proc/$pid" ]] || continue
+		[[ -z "$pst" || "$(starttime_of "$pid")" == "$pst" ]] && return 0
+	done
+	return 1
+}
+cancelled() {
+	# Say how to get the conversation back before the window stops remembering it.
+	printf '\nResume cancelled; this window is a plain shell again.\nTo resume the conversation later, run:\n  claude --resume %s\n' "$sid"
+	unset_window_opts @pw_claude_waiting @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
+	exit 130
+}
+
+[[ -n "$pane" ]] && tmux set-option -w -t "$pane" @pw_claude_waiting "$$" 2>/dev/null
+trap 'unset_window_opts @pw_claude_waiting' EXIT
+trap cancelled INT
+
+printf '\n\033[1mClaude Code is hibernated in this window to free memory.\033[0m\n'
+printf 'It resumes here when you open this tab, or press Enter now. Ctrl-C returns to the shell.\n'
+printf 'Conversation: %s\n' "$sid"
+
+# Ctrl-D (end of input) cancels exactly like Ctrl-C, so no window is left marked with nothing waiting.
+read -r _ || cancelled
+trap - INT
+
+if running_elsewhere; then
+	unset_window_opts @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
+	printf 'This conversation is already open in another window, so it is not resumed here.\n'
+	exit 0
+fi
+if ! compgen -G "$PROJECTS_DIR/*/$sid.jsonl" >/dev/null; then
+	# Markers stay, so the id is still recorded by pw-tmux-save.
+	printf 'No transcript for %s was found; nothing to resume.\n' "$sid"
+	exit 1
+fi
+if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
+	printf '%s is not on PATH. Resume manually: claude --resume %s\n' "$CLAUDE_BIN" "$sid"
+	exit 1
+fi
+
+unset_window_opts @pw_claude_waiting @pw_claude_sid @pw_claude_hib_win @pw_claude_hib_at
+trap - EXIT
+exec "$CLAUDE_BIN" --resume "$sid"

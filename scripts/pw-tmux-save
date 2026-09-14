@@ -9,6 +9,32 @@
 #
 # Run periodically (systemd timer) and best-effort on shutdown. Safe anytime;
 # it only reads tmux/proc and writes under the state dir.
+#
+# Manifest row, US (0x1f) separated:
+#   session  window-index  window-name  cwd  hasc  sessionId  content-file
+# hasc: 0 plain window (content-file may hold its scrollback)
+#       1 live Claude Code session (resume it on boot)
+#       2 hibernated Claude Code session — no process, resume id kept on the
+#         window by pw-claude-hibernate; resumed when someone next opens it
+#
+# HARDENED after the 2026-09-14 incident. On a saturated host one save sat for
+# 8.5 minutes in capture-pane; the timer started the next one the moment it
+# returned; the shared tmux server then exited; and a save that ran against the
+# one-session server that came up in its place replaced the 60-row manifest with
+# that single blank session. Each rule below closes one step of that sequence:
+#
+#   * One run at a time (flock). A run that finds the lock held skips.
+#   * Every tmux call is time-bounded. Scrollback capture has a per-pane limit
+#     and a whole-run budget; a capture that stalls keeps the previous content.
+#   * The server must pass the same ownership gate every server-creation seam
+#     uses. A server the owner unit never stamped is not the workbench.
+#   * A snapshot materially smaller than the manifest it would replace is
+#     refused. PW_TMUX_ALLOW_SHRINK=1 accepts an intentional shrink.
+#   * The candidate is validated row by row, fsynced and renamed into place;
+#     the previous generation is kept as manifest.tsv.prev.
+#   * A hibernated window keeps its resume id (hasc=2). The pre-hardening code
+#     read ids only from live processes, so it recorded such a window as a plain
+#     shell and silently dropped the id.
 set -uo pipefail
 
 # tmux mangles literal tabs in an -F format to underscores under a non-UTF-8
@@ -18,15 +44,25 @@ export LANG=C.UTF-8 LC_ALL=C.UTF-8
 
 STATE_DIR="${PW_TMUX_STATE_DIR:-/var/lib/project-workbench/tmux-persist}"
 CONTENT_DIR="$STATE_DIR/content"
+MANIFEST="$STATE_DIR/manifest.tsv"
 SESS_REG="${PW_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
 SCROLLBACK_LINES="${PW_TMUX_SCROLLBACK_LINES:-2000}"
 LOG="${PW_TMUX_LOG:-$STATE_DIR/persist.log}"
+QUERY_TIMEOUT="${PW_TMUX_QUERY_TIMEOUT:-10}"      # seconds, any single tmux query
+CAPTURE_TIMEOUT="${PW_TMUX_CAPTURE_TIMEOUT:-5}"   # seconds, one pane's scrollback
+CAPTURE_BUDGET="${PW_TMUX_CAPTURE_BUDGET:-60}"    # seconds, all captures in a run
+SHRINK_PERCENT="${PW_TMUX_SHRINK_PERCENT:-25}"    # refuse a count that drops by more than this
+ALLOW_SHRINK="${PW_TMUX_ALLOW_SHRINK:-0}"
 # Sessions we never persist (space padded for substring match).
 EXCLUDE=" pw_setup "
 # Field separator for the manifest: US (0x1f). Must be non-whitespace so `read`
 # preserves empty fields (an empty sid or content file) instead of collapsing
 # adjacent separators the way it does with tab/space.
 SEP=$'\x1f'
+TAB=$'\t'
+UUID_RE='^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+CONFIG_ERROR_EXIT=78   # EX_CONFIG, the same distinct code pw-tmux-restore uses
+REFUSED_EXIT=75        # EX_TEMPFAIL: this run deliberately kept the existing manifest
 
 # Also to stderr. The log lives inside STATE_DIR, so on an install where that
 # directory does not exist yet every explanation of why nothing was saved was
@@ -37,11 +73,60 @@ log() {
 	printf 'pw-tmux-save: %s\n' "$*" >&2
 }
 
-# No tmux server → nothing to snapshot. Do NOT clobber an existing manifest, so
-# a save that fires after the server is already gone can't erase a good one.
-tmux list-sessions >/dev/null 2>&1 || { log "no tmux server; keeping existing manifest"; exit 0; }
+for v in SCROLLBACK_LINES QUERY_TIMEOUT CAPTURE_TIMEOUT CAPTURE_BUDGET SHRINK_PERCENT; do
+	[[ "${!v}" =~ ^[0-9]+$ ]] || { log "CONFIGURATION ERROR: $v=${!v} is not a whole number; saved nothing"; exit "$CONFIG_ERROR_EXIT"; }
+done
+(( QUERY_TIMEOUT > 0 && CAPTURE_TIMEOUT > 0 )) || { log "CONFIGURATION ERROR: tmux timeouts must be positive; saved nothing"; exit "$CONFIG_ERROR_EXIT"; }
+
+# Every tmux call goes to the socket this script was told to use — PW_TMUX_SOCKET,
+# exactly as pw-tmux-restore, project-terminal-start and app/server.js do — and
+# none may wait forever. `command timeout ... tmux` runs the tmux binary, not
+# this function.
+tmux_sock_args=()
+[[ -n "${PW_TMUX_SOCKET:-}" ]] && tmux_sock_args=(-L "$PW_TMUX_SOCKET")
+# fd 9 is the run lock; no child may inherit it, or a long-lived child would hold it.
+tmux() { command timeout -k 2 "$QUERY_TIMEOUT" tmux "${tmux_sock_args[@]}" "$@" 9>&-; }
 
 mkdir -p "$CONTENT_DIR" 2>/dev/null || true
+if [[ ! -d "$STATE_DIR" ]]; then
+	log "state directory $STATE_DIR does not exist and could not be created; saved nothing"
+	exit 0
+fi
+
+# One run at a time. The lock is held until this process exits.
+if ! { exec 9>>"$STATE_DIR/.save.lock"; } 2>/dev/null; then
+	log "REFUSED: cannot open $STATE_DIR/.save.lock; keeping existing manifest"
+	exit "$REFUSED_EXIT"
+fi
+if ! flock -n 9; then
+	log "another pw-tmux-save run still holds the lock; skipping this run"
+	exit 0
+fi
+
+# No tmux server → nothing to snapshot. Do NOT clobber an existing manifest, so
+# a save that fires after the server is already gone can't erase a good one.
+# A server that does not answer is different from no server: refuse, visibly.
+tmux list-sessions >/dev/null 2>&1
+rc=$?
+if (( rc == 124 || rc == 137 )); then
+	log "REFUSED: the tmux server did not answer within ${QUERY_TIMEOUT}s; keeping existing manifest"
+	exit "$REFUSED_EXIT"
+fi
+(( rc == 0 )) || { log "no tmux server; keeping existing manifest"; exit 0; }
+
+# The server must be the workbench's. The incident's foreign server answered
+# list-sessions perfectly well; what it lacked was the owner unit's marker and
+# cgroup. Same helper, same rule as every seam that may create a server: a
+# missing helper is a refusal, not a skip.
+gate=$(command -v pw-tmux-assert-owner) || gate=""
+if [[ -z "$gate" ]]; then
+	log "REFUSED: the tmux ownership helper pw-tmux-assert-owner is not installed; keeping existing manifest"
+	exit "$REFUSED_EXIT"
+fi
+if ! gate_out=$(command timeout -k 2 "$QUERY_TIMEOUT" "$gate" 2>&1 9>&-); then
+	log "REFUSED: the live tmux server is not the one the workbench owner unit stamped; keeping existing manifest: ${gate_out//$'\n'/ }"
+	exit "$REFUSED_EXIT"
+fi
 
 # ppid of a pid, robust to spaces/parens in the process comm field (field 2).
 ppid_of() {
@@ -49,6 +134,14 @@ ppid_of() {
 	stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
 	rest=${stat##*') '}          # strip up to and incl. ") " → "<state> <ppid> ..."
 	awk '{print $2}' <<<"$rest"
+}
+
+# Kernel start time of a pid (field 22), the value Claude Code records as procStart.
+starttime_of() {
+	local stat rest
+	stat=$(cat "/proc/$1/stat" 2>/dev/null) || return 1
+	rest=${stat##*') '}
+	awk '{print $20}' <<<"$rest"
 }
 
 # Walk up from a pid until we hit one of the known pane pids; echo that pane pid.
@@ -62,12 +155,23 @@ walk_to_pane() {
 	return 1
 }
 
-declare -A K_CWD K_NAME K_ACTIVE K_SID PP2KEY
+declare -A K_CWD K_NAME K_WID K_SID K_HIB PP2KEY
 nwin=0
+unparseable=0
+
+# Tab is IFS whitespace to `read`, so two adjacent separators collapse into one and every later
+# field shifts left. Any field that can be empty therefore carries a one-character "=" prefix,
+# stripped after the read, so no field is ever empty.
+FMT="#{session_name}${TAB}#{window_index}${TAB}=#{window_name}${TAB}#{pane_pid}${TAB}=#{pane_current_path}${TAB}#{window_active}${TAB}#{pane_active}${TAB}#{window_id}${TAB}=#{@pw_role}${TAB}=#{@pw_session_key}${TAB}=#{@pw_claude_sid}${TAB}=#{@pw_claude_hib_win}"
+if ! panes=$(tmux list-panes -a -F "$FMT" 2>/dev/null); then
+	log "REFUSED: could not enumerate panes (tmux query failed or timed out); keeping existing manifest"
+	exit "$REFUSED_EXIT"
+fi
 
 # One row per window (represented by its active pane). Split panes collapse to
 # the active pane's cwd — these sessions are single-pane in practice.
-while IFS=$'\t' read -r s w wn pp cwd wact pact role skey; do
+while IFS="$TAB" read -r s w wn pp cwd wact pact wid role skey hsid hwin; do
+	wn=${wn#=}; cwd=${cwd#=}; role=${role#=}; skey=${skey#=}; hsid=${hsid#=}; hwin=${hwin#=}
 	[[ "$s" == pw_* ]] || continue
 	[[ "$EXCLUDE" == *" $s "* ]] && continue
 	[[ "$pact" == "1" ]] || continue
@@ -82,11 +186,24 @@ while IFS=$'\t' read -r s w wn pp cwd wact pact role skey; do
 	# always sets all four markers together at window scope, so requiring two of them makes an
 	# accidental global option insufficient.
 	[[ -n "$role" && -n "$skey" ]] && continue
-	key="$s"$'\t'"$w"
-	K_CWD[$key]="$cwd"; K_NAME[$key]="$wn"; K_ACTIVE[$key]="$wact"
+	# A name or path carrying a tab, newline or other control character would shift
+	# every later field of its row. Such a pane cannot be recorded faithfully.
+	# A dead pane (remain-on-exit) reports no path at all; it too is skipped rather than failing every save.
+	if [[ ! "$w" =~ ^[0-9]+$ || ! "$pp" =~ ^[0-9]+$ || ! "$wid" =~ ^@[0-9]+$ || "$cwd" != /* || "$wn$cwd" == *[[:cntrl:]]* ]]; then
+		unparseable=$((unparseable + 1))
+		continue
+	fi
+	key="$s$TAB$w"
+	K_CWD[$key]="$cwd"; K_NAME[$key]="$wn"; K_WID[$key]="$wid"
+	# Hibernation markers, under the same scope-chain rule as the lane markers: the
+	# id counts only when @pw_claude_hib_win names THIS window, which a stray session-
+	# or global-scope option cannot do for every window at once.
+	if [[ -n "$hsid" && "$hwin" == "$wid" && "$hsid" =~ $UUID_RE ]]; then
+		K_HIB[$key]="$hsid"
+	fi
 	PP2KEY[$pp]="$key"
 	nwin=$((nwin + 1))
-done < <(tmux list-panes -a -F '#{session_name}	#{window_index}	#{window_name}	#{pane_pid}	#{pane_current_path}	#{window_active}	#{pane_active}	#{@pw_role}	#{@pw_session_key}' 2>/dev/null)
+done <<<"$panes"
 
 # Refuse to clobber a good manifest with an empty one: if we somehow found no
 # windows (server vanished mid-run, format mangled, etc.), keep what we have.
@@ -101,32 +218,131 @@ if [[ -d "$SESS_REG" ]]; then
 		[[ -e "$jf" ]] || continue
 		pid=$(grep -o '"pid":[0-9]*' "$jf" | head -1 | cut -d: -f2)
 		sid=$(grep -o '"sessionId":"[^"]*"' "$jf" | head -1 | cut -d'"' -f4)
+		# Claude Code writes procStart as a JSON string ("procStart":"323267140"); accept either form.
+		pst=$(grep -oE '"procStart":"?[0-9]+' "$jf" | head -1 | grep -oE '[0-9]+$')
 		[[ -n "$pid" && -n "$sid" && -d "/proc/$pid" ]] || continue
+		# A registry file outliving its Claude can name a pid the kernel has since
+		# handed to another process. procStart is the owner's own start time.
+		if [[ -n "$pst" && "$(starttime_of "$pid")" != "$pst" ]]; then
+			continue
+		fi
 		panepid=$(walk_to_pane "$pid") || continue
 		K_SID["${PP2KEY[$panepid]}"]="$sid"
 	done
 fi
 
-tmp=$(mktemp "$STATE_DIR/.manifest.XXXXXX") || { log "mktemp failed"; exit 0; }
-claude=0
+tmp=$(mktemp "$STATE_DIR/.manifest.XXXXXX") || { log "REFUSED: mktemp failed; keeping existing manifest"; exit "$REFUSED_EXIT"; }
+trap 'rm -f -- "$tmp"' EXIT
+claude=0; hibernated=0; captured=0; kept_timeout=0; kept_budget=0
+budget_start=$SECONDS
 for key in "${!K_CWD[@]}"; do
-	s="${key%%$'\t'*}"; w="${key##*$'\t'}"
-	cwd="${K_CWD[$key]}"; wn="${K_NAME[$key]}"; sid="${K_SID[$key]:-}"
+	s="${key%%"$TAB"*}"; w="${key##*"$TAB"}"
+	cwd="${K_CWD[$key]}"; wn="${K_NAME[$key]}"; wid="${K_WID[$key]}"
+	sid="${K_SID[$key]:-}"
 	hasc=0; cfile=""
 	if [[ -n "$sid" ]]; then
 		hasc=1; claude=$((claude + 1))
+	elif [[ -n "${K_HIB[$key]:-}" ]]; then
+		sid="${K_HIB[$key]}"; hasc=2; hibernated=$((hibernated + 1))
 	else
-		# Capture scrollback only for non-Claude windows (Claude redraws its own
-		# UI on --resume, so a captured TUI dump would just be noise).
+		# Capture scrollback only for plain windows (Claude redraws its own UI on
+		# --resume, so a captured TUI dump would just be noise).
 		cf="${s}__${w}.txt"
-		if tmux capture-pane -p -S -"$SCROLLBACK_LINES" -t "$s:$w" >"$CONTENT_DIR/$cf" 2>/dev/null; then
-			cfile="$cf"
+		if (( SECONDS - budget_start >= CAPTURE_BUDGET )); then
+			[[ -f "$CONTENT_DIR/$cf" ]] && cfile="$cf"
+			kept_budget=$((kept_budget + 1))
+		else
+			ctmp="$CONTENT_DIR/.$cf.$$"
+			if command timeout -k 2 "$CAPTURE_TIMEOUT" tmux "${tmux_sock_args[@]}" \
+				capture-pane -p -S -"$SCROLLBACK_LINES" -t "$wid" >"$ctmp" 2>/dev/null 9>&- \
+				&& mv -f -- "$ctmp" "$CONTENT_DIR/$cf"; then
+				cfile="$cf"; captured=$((captured + 1))
+			else
+				# Keep the previous capture rather than record none.
+				rm -f -- "$ctmp"
+				[[ -f "$CONTENT_DIR/$cf" ]] && cfile="$cf"
+				kept_timeout=$((kept_timeout + 1))
+			fi
 		fi
 	fi
 	printf '%s\n' "$s$SEP$w$SEP$wn$SEP$cwd$SEP$hasc$SEP$sid$SEP$cfile" >>"$tmp"
 done
 
 sort -t "$SEP" -k1,1 -k2,2n "$tmp" -o "$tmp"
-mv -f "$tmp" "$STATE_DIR/manifest.tsv"
+
+# Strict: the candidate must be exactly what pw-tmux-restore can replay.
+validate_candidate() {
+	awk -F "$SEP" '
+		function bad(why) { printf "line %d: %s", NR, why; failed = 1; exit }
+		NF != 7                                   { bad(NF " fields, expected 7") }
+		$1 !~ /^pw_/                              { bad("session is not a pw_* session") }
+		$2 !~ /^[0-9]+$/                          { bad("window index is not a number") }
+		$4 !~ /^\//                               { bad("cwd is not absolute") }
+		$5 !~ /^[012]$/                           { bad("hasc is not 0, 1 or 2") }
+		($5 == "0") != ($6 == "")                 { bad("sessionId presence does not match hasc") }
+		$6 != "" && ($6 !~ /^[0-9a-f-]+$/ || length($6) != 36) { bad("sessionId is not a UUID") }
+		$7 != "" && ($7 ~ /\// || $7 ~ /^\./)    { bad("content file is not a plain file name") }
+		seen[$1 SUBSEP $2]++                      { bad("duplicate window " $1 ":" $2) }
+		END { if (!failed && NR == 0) { printf "no rows"; failed = 1 } exit failed }
+	' "$1"
+}
+
+# Counted the way this script writes rows, so a manifest written by hand or by an
+# older version is compared like for like: sessions, windows, resume ids.
+count_rows() {
+	awk -F "$SEP" -v excl="$EXCLUDE" '
+		$1 ~ /^pw_/ && index(excl, " " $1 " ") == 0 { s[$1] = 1; w++; if ($6 != "") c++ }
+		END { n = 0; for (k in s) n++; printf "%d %d %d\n", n, w + 0, c + 0 }
+	' "$1"
+}
+
+if ! why=$(validate_candidate "$tmp"); then
+	log "REFUSED: the new snapshot failed validation ($why); keeping existing manifest"
+	exit "$REFUSED_EXIT"
+fi
+read -r new_s new_w new_c < <(count_rows "$tmp")
+
+refuse() {
+	local reason="$1" rejected="$STATE_DIR/rejected" stamp
+	stamp=$(date -u +%Y%m%dT%H%M%SZ)
+	if mkdir -p "$rejected" 2>/dev/null && cp -- "$tmp" "$rejected/manifest.$stamp.$$.tsv" 2>/dev/null; then
+		# Keep the five most recent rejected candidates for diagnosis.
+		ls -1t "$rejected"/manifest.*.tsv 2>/dev/null | tail -n +6 | while read -r old; do rm -f -- "$old"; done
+	fi
+	printf '%s %s\n' "$(date -Iseconds)" "$reason" >"$STATE_DIR/last-refusal" 2>/dev/null
+	log "REFUSED: $reason; keeping existing manifest (candidate kept under $rejected; PW_TMUX_ALLOW_SHRINK=1 accepts an intentional shrink)"
+	exit "$REFUSED_EXIT"
+}
+
+# drop > floor AND drop > SHRINK_PERCENT of the old count.
+materially_smaller() {
+	local old="$1" new="$2" floor="$3" drop=$(( $1 - $2 ))
+	(( drop > floor && drop * 100 > old * SHRINK_PERCENT ))
+}
+
+if [[ -f "$MANIFEST" && "$ALLOW_SHRINK" != "1" ]]; then
+	[[ -r "$MANIFEST" ]] || refuse "the existing manifest is not readable, so this snapshot cannot be compared with it"
+	read -r old_s old_w old_c < <(count_rows "$MANIFEST")
+	materially_smaller "$old_s" "$new_s" 2 && refuse "sessions would drop from $old_s to $new_s"
+	materially_smaller "$old_w" "$new_w" 3 && refuse "windows would drop from $old_w to $new_w"
+	materially_smaller "$old_c" "$new_c" 2 && refuse "Claude resume ids would drop from $old_c to $new_c"
+fi
+
+# Install: previous generation first, then the fsynced candidate by rename.
+if [[ -f "$MANIFEST" ]]; then
+	cp -p -- "$MANIFEST" "$STATE_DIR/.manifest.prev.$$" 2>/dev/null \
+		&& mv -f -- "$STATE_DIR/.manifest.prev.$$" "$STATE_DIR/manifest.tsv.prev"
+fi
+sync -- "$tmp" 2>/dev/null || true
+if ! mv -f -- "$tmp" "$MANIFEST"; then
+	log "REFUSED: could not rename the new snapshot into place; keeping existing manifest"
+	exit "$REFUSED_EXIT"
+fi
+trap - EXIT
+sync -- "$STATE_DIR" 2>/dev/null || true
 date -Iseconds >"$STATE_DIR/last-save"
-log "wrote manifest: ${#K_CWD[@]} windows, $claude with Claude"
+rm -f -- "$STATE_DIR/last-refusal"
+msg="wrote manifest: $new_w windows in $new_s sessions, $claude with Claude, $hibernated hibernated"
+msg+="; scrollback: $captured captured, $kept_timeout kept after a stalled capture, $kept_budget kept over budget"
+(( unparseable > 0 )) && msg+="; skipped $unparseable pane(s) whose name or path cannot be recorded"
+log "$msg"
