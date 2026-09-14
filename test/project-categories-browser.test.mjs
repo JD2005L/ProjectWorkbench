@@ -93,6 +93,18 @@ test('BROWSER: the category dropdown filters the rail and the selection persists
         return r && r.classList.contains('catHidden');
       }, twin, { timeout: 10000 });
       assert.ok(await row(name).isVisible(), 'the current project stays visible under Pinned only');
+
+      // The quick toggle beside the dropdown drives the same state: it reads as pressed now, and
+      // clicking it clears Pinned only — the twin returns and the label resets.
+      assert.equal(await page.getAttribute('#railPinToggle', 'aria-pressed'), 'true',
+        'the quick toggle reflects the state set through the menu');
+      await page.click('#railPinToggle');
+      await page.waitForFunction((t) => {
+        const r = document.querySelector(`.pkey[data-project="${t}"]`)?.closest('.pkeyRow');
+        return r && !r.classList.contains('catHidden');
+      }, twin, { timeout: 10000 });
+      assert.equal(await page.getAttribute('#railPinToggle', 'aria-pressed'), 'false');
+      assert.equal(await page.textContent('#railFilterLabel'), 'All projects', 'the label resets with it');
       assert.deepEqual(pageErrors, [], 'the cockpit page must raise no uncaught script error');
     });
   } finally {

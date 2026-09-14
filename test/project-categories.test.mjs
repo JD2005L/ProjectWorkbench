@@ -43,6 +43,7 @@ test('categories round-trip: manage form → sanitized registry → config → r
     const htmlBefore = await cockpitHtml(base, name);
     assert.match(htmlBefore, /id="railFilter"/, 'the dropdown renders even with no tags');
     assert.match(htmlBefore, /data-cat="\|pinned"/, 'Pinned only is offered');
+    assert.match(htmlBefore, /id="railPinToggle"/, 'the quick toggle sits next to the dropdown');
     assert.equal([...htmlBefore.matchAll(/data-cat="/g)].length, 1,
       'no category or Uncategorized options without tags');
     assert.match(htmlBefore, /class="pkeyRow"[^>]*data-cats=""/, 'rows carry an empty data attribute');

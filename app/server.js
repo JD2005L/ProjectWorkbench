@@ -2895,8 +2895,12 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railWho{display:flex;align-items:center;gap:2px;padding:4px 4px 2px;color:var(--faint);font-size:11.5px;min-width:0}
 .railWhoDot{width:8px;height:8px;flex:0 0 8px;border-radius:50%;background:var(--ok);box-shadow:0 0 8px rgba(52,211,153,.5);margin:0 9px}
 .railWhoName{opacity:0;transition:opacity .22s;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.railFilter{position:relative;flex:0 0 auto;padding:8px 6px 0}
-.railFilterBtn{display:flex;align-items:center;gap:9px;width:100%;height:34px;padding:0 4px;border-radius:9px;border:1px solid transparent;background:transparent;color:var(--dim);cursor:pointer;font:600 12px var(--font);white-space:nowrap;box-sizing:border-box;text-align:left}
+.railFilter{position:relative;flex:0 0 auto;padding:8px 6px 0;display:flex;align-items:center;gap:4px}
+.railFilterBtn{display:flex;align-items:center;gap:9px;flex:1 1 auto;min-width:0;height:34px;padding:0 4px;border-radius:9px;border:1px solid transparent;background:transparent;color:var(--dim);cursor:pointer;font:600 12px var(--font);white-space:nowrap;box-sizing:border-box;text-align:left}
+.railPinToggle{display:none;place-items:center;width:34px;height:34px;flex:0 0 34px;border-radius:9px;border:1px solid transparent;background:transparent;cursor:pointer;font-size:13px;filter:grayscale(1);opacity:.7}
+.railPinToggle:hover{background:var(--panel2);border-color:var(--line);filter:none;opacity:1}
+.railPinToggle:focus-visible{outline:2px solid var(--cyan);outline-offset:-2px}
+.railPinToggle[aria-pressed="true"]{border-color:#2f65b0;background:linear-gradient(180deg,#10233f,#0b1830);filter:none;opacity:1}
 .railFilterBtn:hover{background:var(--panel2);color:#fff;border-color:var(--line)}
 .railFilterBtn:focus-visible{outline:2px solid var(--cyan);outline-offset:-2px}
 .railFilterBtn.filtering{color:var(--cyan)}
@@ -2916,7 +2920,7 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railFilterAll{margin-top:2px;border:0;border-top:1px solid var(--line);background:transparent;color:var(--dim);font:600 12px var(--font);padding:8px 9px 6px;cursor:pointer;text-align:left;border-radius:0}
 .railFilterAll:hover{color:var(--cyan)}
 .pkeyRow.catHidden{display:none}
-@container (min-width:180px){.railBrandName{opacity:1;transform:none}#railToggle .chev{opacity:1}.pk-meta{opacity:1;transform:none}.railActLabel{opacity:1;transform:none}.railWhoName{opacity:1}.pk-pin{display:grid}.railFilterLabel{opacity:1;transform:none}.railFilterBtn .chev{opacity:1}}
+@container (min-width:180px){.railBrandName{opacity:1;transform:none}#railToggle .chev{opacity:1}.pk-meta{opacity:1;transform:none}.railActLabel{opacity:1;transform:none}.railWhoName{opacity:1}.pk-pin{display:grid}.railFilterLabel{opacity:1;transform:none}.railFilterBtn .chev{opacity:1}.railPinToggle{display:grid}}
 #railScrim{display:none}
 @media(max-width:640px){
 #rail{position:fixed;top:0;left:0;bottom:0;z-index:60;transform:translateX(-100%);transition:transform .3s cubic-bezier(.32,.72,.24,1);width:var(--rail-wo);flex-basis:var(--rail-wo)}
@@ -2972,7 +2976,7 @@ function railHtml(projects, currentName, user, deployConfigured=false){
  const filterOpts = `<label class="railFilterOpt${allCats.length?' pinnedOpt':''}"><input type="checkbox" data-cat="|pinned"><span class="n">📌 Pinned only</span></label>`
   + allCats.map(c=>`<label class="railFilterOpt"><input type="checkbox" data-cat="${esc(c.name)}"><span class="n">${esc(c.name)}</span><span class="cnt">${c.n}</span></label>`).join('')
   + (allCats.length && uncatN ? `<label class="railFilterOpt"><input type="checkbox" data-cat="|none"><span class="n">Uncategorized</span><span class="cnt">${uncatN}</span></label>` : '');
- const railFilter = `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter the project rail"><span class="railFilterIco" aria-hidden="true">🗂</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><div id="railFilterMenu" class="railFilterMenu" hidden>${filterOpts}<button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div>`;
+ const railFilter = `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter the project rail"><span class="railFilterIco" aria-hidden="true">🗂</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><button id="railPinToggle" class="railPinToggle" type="button" aria-pressed="false" title="Pinned only — quick toggle">📌</button><div id="railFilterMenu" class="railFilterMenu" hidden>${filterOpts}<button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div>`;
  return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div>${railFilter}<nav id="railKeys" class="railKeys" aria-label="Projects"><ul class="railKeysList">${keys}</ul></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
 }
 
@@ -3013,6 +3017,7 @@ const filterWrap=document.getElementById('railFilter');
 const filterBtn=document.getElementById('railFilterBtn');
 const filterMenu=document.getElementById('railFilterMenu');
 const filterLabel=document.getElementById('railFilterLabel');
+const pinToggle=document.getElementById('railPinToggle');
 let catFilter=new Set();
 function saveCatFilter(){try{localStorage.setItem('pwCatFilter',JSON.stringify([...catFilter]))}catch{}}
 function applyCatFilter(){
@@ -3022,6 +3027,7 @@ boxes.forEach(b=>{b.checked=catFilter.has(b.dataset.cat)});
 const names=boxes.filter(b=>b.checked).map(b=>b.dataset.cat==='|none'?'Uncategorized':(b.dataset.cat==='|pinned'?'Pinned only':b.dataset.cat));
 filterLabel.textContent=names.length===0?'All projects':(names.length===1?names[0]:names.length+' filters');
 filterBtn.classList.toggle('filtering',names.length>0);
+if(pinToggle)pinToggle.setAttribute('aria-pressed',catFilter.has('|pinned')?'true':'false');
 const pinnedOnly=catFilter.has('|pinned');
 const catSel=new Set([...catFilter].filter(c=>c!=='|pinned'));
 KEYS.querySelectorAll('.pkeyRow').forEach(row=>{
@@ -3035,6 +3041,7 @@ if(filterWrap){
 const known=new Set([...filterMenu.querySelectorAll('input[data-cat]')].map(b=>b.dataset.cat));
 try{for(const c of JSON.parse(localStorage.getItem('pwCatFilter')||'[]'))if(known.has(c))catFilter.add(c)}catch{}
 filterBtn.onclick=e=>{e.stopPropagation();setFilterOpen(filterMenu.hidden)};
+if(pinToggle)pinToggle.onclick=()=>{if(catFilter.has('|pinned'))catFilter.delete('|pinned');else catFilter.add('|pinned');saveCatFilter();applyCatFilter()};
 filterMenu.addEventListener('change',e=>{const b=e.target.closest('input[data-cat]');if(!b)return;if(b.checked)catFilter.add(b.dataset.cat);else catFilter.delete(b.dataset.cat);saveCatFilter();applyCatFilter()});
 document.getElementById('railFilterAll').onclick=()=>{catFilter.clear();saveCatFilter();applyCatFilter();setFilterOpen(false)};
 document.addEventListener('click',e=>{if(!filterMenu.hidden&&!filterWrap.contains(e.target))setFilterOpen(false)});
