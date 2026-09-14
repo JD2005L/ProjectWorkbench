@@ -166,9 +166,12 @@ function listPanes() {
 // even with job control on: `bash -ic 'claude; echo after'` passes the foreground-job rule and still closes its
 // window when Claude stops. Denying the shapes we can name left bypasses (`+x -ic`, `+c`, `-io vi -c`, an empty
 // --rcfile value, a script operand), so this ALLOWS only the shapes an interactive login or PW pane shell is
-// started with, and refuses everything else, including an unreadable or empty argv.
+// started with, and refuses everything else, including an unreadable or empty argv. Some flags keep a shell
+// interactive yet make it exit when the Claude job ends: -t/-o onecmd (one command, then exit) and -e/-o errexit
+// (the wrapper ends by SIGTERM, which counts as a failure). Proven window-closers, so those are refused too.
 const SHELL_LONG_FLAGS = new Set(['--noprofile', '--norc', '--login']);
-const SHELL_OPTS_WITH_VALUE = new Set(['--rcfile', '--init-file', '-o', '+o', '-O', '+O']);
+const SHELL_OPTS_WITH_VALUE = new Set(['--rcfile', '--init-file']);
+const SHELL_EDITING_MODES = new Set(['vi', 'emacs']);
 function shellRunsCommand(pid) {
   let argv;
   try { argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0'); } catch { return true; }
@@ -182,8 +185,15 @@ function shellRunsCommand(pid) {
       i++;
       continue;
     }
-    // A cluster of single-letter flags, but never c (a command string) or o/O (which take a value inside a cluster).
-    if (/^[-+][A-Za-z]+$/.test(a) && !/[coO]/.test(a.slice(1))) continue;
+    // -o/+o only to pick an editing mode; any other option name (errexit, onecmd, ...) is refused.
+    if (a === '-o' || a === '+o') {
+      if (i + 1 >= argv.length || !SHELL_EDITING_MODES.has(argv[i + 1])) return true;
+      i++;
+      continue;
+    }
+    // A cluster of single-letter flags, never c (a command string), o/O (take or change meaning with a value),
+    // e (exit on failure) or t (exit after one command).
+    if (/^[-+][A-Za-z]+$/.test(a) && !/[coOet]/.test(a.slice(1))) continue;
     return true; // any other option, `--`, or an operand (a script or command): not an interactive shell
   }
   return false;
@@ -274,7 +284,7 @@ function assess(entry, ctx) {
   if (pane.panePid === pid) return skip("Claude is the pane's own process; stopping it would close the window", base);
   if (!ancestorsOf(pid, ctx.table).includes(pane.panePid)) return skip('process is not running inside the pane the registry names', base);
   if (!SHELLS.has(comm(pane.panePid))) return skip(`the pane runs ${comm(pane.panePid) || 'an unknown process'}, not a shell; stopping Claude would close the window`, base);
-  if (shellRunsCommand(pane.panePid)) return skip("the pane's shell was started to run a command (-c) and exits when it finishes; stopping Claude would close the window", base);
+  if (shellRunsCommand(pane.panePid)) return skip("the pane's shell is not a plain interactive shell (it was started with a command, script or option that ends it when a command finishes); stopping Claude could close the window", base);
   // Job control proves an interactive shell that returns to its prompt. A `bash -c 'claude; ...'` pane shares
   // Claude's process group and exits when Claude does, which would close the window.
   const shell = procStat(pane.panePid);
@@ -387,7 +397,7 @@ function backfillCandidates(ctx, quietMs) {
     Object.assign(r, { windowId: p.windowId, paneId: p.paneId });
     if (p.windowName !== name || p.cwd !== cwd) { skip('window at that index is not the one the manifest recorded (name or cwd differs)'); continue; }
     if (p.windowPanes !== 1 || !SHELLS.has(p.cmd) || descendantsOf(p.panePid, ctx.table).length) { skip('window is not an idle shell'); continue; }
-    if (shellRunsCommand(p.panePid)) { skip("the pane's shell was started to run a command (-c)"); continue; }
+    if (shellRunsCommand(p.panePid)) { skip("the pane's shell is not a plain interactive shell"); continue; }
     const inUse = inUseReason(p, ctx.now, quietMs);
     if (inUse) { skip(inUse); continue; }
     if (windowOpt(p.windowId, '@pw_claude_sid')) { skip('window already carries hibernation markers'); continue; }
@@ -454,7 +464,7 @@ async function main() {
           // Re-check right before typing into the shell: someone may have started using it since.
           const p = listPanes().get(c.paneId);
           const why = !p ? 'window disappeared'
-            : shellRunsCommand(p.panePid) ? "the pane's shell was started to run a command (-c)"
+            : shellRunsCommand(p.panePid) ? "the pane's shell is not a plain interactive shell"
             : !shellAwaitsInput(p.panePid) ? 'shell is no longer waiting for input'
               : inUseReason(p, Date.now(), backfillQuietMs);
           if (why) r = { ...c, action: 'left-alone', reason: `changed before it could be backfilled: ${why}` };
