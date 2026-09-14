@@ -1731,6 +1731,21 @@ async function ensureTmuxSession(p){
  // allowed. THROWS (fail-closed) on any resolution/materialization failure,
  // for either case — see the policy note above.
  const cred = await credentialContext(p);
+ const tabs = Array.isArray(p.tabs) ? p.tabs : [];
+ // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
+ // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
+ // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
+ //
+ // Computed here rather than in the create branch below because EVERY return path hands it
+ // back: startProject gives ttyd a `new-session -A` argv built from this exact shape, so a
+ // session ttyd has to rebuild comes back identical to one created here — same cwd, window
+ // name, pane environment and credential shell — instead of a bare default shell.
+ const launch = {
+  cwd: p.path || workspacePath(p.name),
+  firstName: tabs[0]?.name || 'Base',
+  env: agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','DISABLE_AUTOUPDATER=1','PATH=/opt/npm-global/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]),
+  shellArgs: cred.shellArgs,
+ };
  if(exists){
   const stamped = await readSessionCredKey(sess);
   if(!stamped.ok){
@@ -1751,22 +1766,16 @@ async function ensureTmuxSession(p){
    // an unresolvable owner (credentialContext throws) and an unverifiable stamp
    // (stamped.ok === false, above) — are "cannot tell", not "known grandfathered".
    console.warn(`[per-user-claude] project "${p.name}": existing session credentials are stale (${state.reason}); attaching grandfathered — POST ${BASE}/api/term/${encodeURIComponent(p.name)}/recycle to migrate it to the current owner.`);
-   return;
+   return launch;
   }
   // Exact match (or nothing to be stale about): safe to attach. Adopt the
   // stamp on a legacy-unstamped session now that we've confirmed there is
   // nothing to be stale about (sessionCredentialState already only reports
   // stale:false-unstamped for the legitimate off case).
   if(!stamped.key) await stampSessionCredKey(sess, cred.key);
-  return;
+  return launch;
  }
- const cwd = p.path || workspacePath(p.name);
- // The per-user credential tokens go INSIDE agentEnvTokens(), not after it: when the setpriv
- // drop is active agentEnvTokens() returns a `setpriv … /usr/bin/env KEY=VAL…` argv, and only
- // tokens passed through it get the HOME/PATH rewriting and USER=/LOGNAME= insertion applied.
- const env = agentEnvTokens(['env','HOME=/root','LANG=C.UTF-8','LC_ALL=C.UTF-8','TERM=xterm-256color','COLORTERM=truecolor','IS_SANDBOX=1','COPILOT_AUTO_UPDATE=false','DISABLE_AUTOUPDATER=1','PATH=/opt/npm-global/bin:/usr/local/bin:/usr/local/sbin:/usr/bin:/bin:/usr/sbin:/sbin',...cred.tokens]);
- const tabs = Array.isArray(p.tabs) ? p.tabs : [];
- const firstName = tabs[0]?.name || 'Base';
+ const { cwd, firstName, env } = launch;
  await tmux(['new-session','-d','-s',sess,'-c',cwd,'-n',firstName,...env,'bash',...cred.shellArgs]);
  await stampSessionCredKey(sess, cred.key);
  if(tabs[0]?.cmd?.trim()) await tmux(['send-keys','-t',`${sess}:${firstName}`,tabs[0].cmd.trim(),'C-m']);
@@ -1776,6 +1785,7 @@ async function ensureTmuxSession(p){
   if(t.cmd?.trim()){ await new Promise(r=>setTimeout(r,80)); await tmux(['send-keys','-t',`${sess}:${t.name}`,t.cmd.trim(),'C-m']); }
  }
  await tmux(['select-window','-t',`${sess}:0`]).catch(()=>{});
+ return launch;
 }
 async function ensureProjectTmuxSession(p){
  // Same unified existing-session policy as ensureTmuxSession: resolves the
@@ -2261,10 +2271,32 @@ async function startProject(p){
   if(projectTerminals.has(p.name)){ const t = projectTerminals.get(p.name); try { t.proc.kill(); } catch {} projectTerminals.delete(p.name); }
   const basePath = `${BASE}/pty/${p.name}/`;
   try { await execFileAsync('pkill',['-f',`ttyd.*--base-path.*${basePath}`],{timeout:3000}); await new Promise(r=>setTimeout(r,500)); } catch {}
-  await ensureTmuxSession(p);
+  const launch = await ensureTmuxSession(p);
   const port = Number(p.port);
   const sess = tmuxSession(p.name);
-  const proc = spawn('ttyd',['--interface','127.0.0.1','--port',String(port),'--base-path',basePath,'--writable','-t','disableLeaveAlert=true','tmux',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),'attach-session','-t',sess],{
+  // ttyd RE-RUNS this command on every browser (re)connect, which makes it the only
+  // recovery seam a user can reach. A bare `attach-session` therefore turned any
+  // session that later went away — its last window's shell exited, something killed
+  // it, the server was migrated — into a permanently dead tab: "can't find session:
+  // pw_<project>", and ttyd's own "Press ⏎ to Reconnect" just re-ran the same failing
+  // attach. There is no in-app way back from that (POST /api/term/:project/recycle is
+  // API-only, with no button on it), so the project stayed unusable until an admin
+  // re-saved it from Manage.
+  //
+  // `new-session -A` attaches an existing session unchanged — identical behaviour to
+  // before on every normal connect — and rebuilds a missing one from `launch`, the
+  // shape ensureTmuxSession would have created. This is exactly what the host-mode
+  // seam has always handed ttyd (scripts/project-terminal-start), so both deployments
+  // now self-heal rather than only one. A session ttyd rebuilds carries no credential
+  // stamp, which credentialsStale() reports and the attach paths grandfather — visible
+  // drift an operator can recycle, which is the point.
+  //
+  // `-A` can bring the SERVER into existence too, so it is a server-creation seam like
+  // every entry in TMUX_SERVER_CREATING and clears the ownership gate before ttyd is
+  // handed it — its own statement, the same shape project-terminal-start uses before
+  // its exec, and for the same reason.
+  await assertTmuxOwner({ env: process.env });
+  const proc = spawn('ttyd',['--interface','127.0.0.1','--port',String(port),'--base-path',basePath,'--writable','-t','disableLeaveAlert=true','tmux','-u',...(TMUX_SOCKET?['-L',TMUX_SOCKET]:[]),'new-session','-A','-s',sess,'-c',launch.cwd,'-n',launch.firstName,...launch.env,'bash',...launch.shellArgs],{
    stdio:'ignore', detached:true, env:{...process.env, HOME:'/root', TERM:'xterm-256color'}
   });
   proc.unref();
