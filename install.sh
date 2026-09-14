@@ -291,6 +291,11 @@ install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
+# Claude Code hibernation: self-contained (no relative imports), so flat on PATH is correct. The
+# hibernator finds pw-claude-wait and pw-claude-wake beside its own real path.
+install -m 0755 "$SRC_DIR/scripts/pw-claude-hibernate"    /usr/local/bin/pw-claude-hibernate
+install -m 0755 "$SRC_DIR/scripts/pw-claude-wait"         /usr/local/bin/pw-claude-wait
+install -m 0755 "$SRC_DIR/scripts/pw-claude-wake"         /usr/local/bin/pw-claude-wake
 # Flat is correct here, unlike the two helpers below: plain bash, no relative
 # import to break. Repairs a workspace tree that a root process wrote into before
 # the writers were dropped to the pane account.
@@ -375,6 +380,8 @@ render_unit "$SRC_DIR/systemd/claude-code-update.timer"        /etc/systemd/syst
 render_unit "$SRC_DIR/systemd/pw-tmux-persist.service"         /etc/systemd/system/pw-tmux-persist.service
 render_unit "$SRC_DIR/systemd/pw-tmux-save.service"            /etc/systemd/system/pw-tmux-save.service
 render_unit "$SRC_DIR/systemd/pw-tmux-save.timer"              /etc/systemd/system/pw-tmux-save.timer
+render_unit "$SRC_DIR/systemd/pw-claude-hibernate.service"    /etc/systemd/system/pw-claude-hibernate.service
+render_unit "$SRC_DIR/systemd/pw-claude-hibernate.timer"      /etc/systemd/system/pw-claude-hibernate.timer
 # Drop-in for app-level auth enforcement (Phase 1: defaults to OFF for safe
 # rollout — flip PW_AUTH_ENFORCE=true after creating an admin via `pw-user`).
 # Only seed the default when none exists: a redeploy must never silently flip an
@@ -416,6 +423,9 @@ fi
 # is armed (its restore is a no-op until a manifest exists).
 systemctl enable --now pw-tmux-persist.service >/dev/null 2>&1 || warn "could not enable pw-tmux-persist.service"
 systemctl enable --now pw-tmux-save.timer >/dev/null 2>&1 || warn "could not enable pw-tmux-save.timer"
+# pw-claude-hibernate.timer is installed but deliberately NOT enabled: hibernating sessions is an
+# operator decision, and windows already hibernated by hand need their markers backfilled first
+# (see systemd/pw-claude-hibernate.timer).
 
 if ! command -v claude >/dev/null 2>&1; then
   log "Installing Claude Code CLI globally…"

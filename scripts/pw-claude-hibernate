@@ -1,0 +1,473 @@
+#!/usr/bin/env node
+// Project Workbench: hibernate idle Claude Code sessions without losing their windows or conversations.
+//
+// Each interactive Claude Code session holds 150-400 MB resident whether or not anyone is using it. On
+// 2026-09-14 this 16 GiB host ran 46 of them, 25 untouched for more than a week. Swap was full and
+// memory pressure stalled every task on the host a third of the time. A conversation lives on disk,
+// not in the process, so an idle one can be stopped and later resumed exactly, with
+// `claude --resume <sessionId>`. This script does that stop, keeping everything the user would notice:
+//
+//   * the tmux window stays, with its name, index, cwd and the shell (and credential environment) that
+//     launched Claude, because only a Claude running inside a shell is ever stopped;
+//   * the resume id is stamped on the window itself (@pw_claude_sid, and @pw_claude_hib_win naming that
+//     window so a stray session- or global-scope option cannot mark every window). pw-tmux-save records
+//     it as hasc=2 and pw-tmux-restore re-arms it after a reboot;
+//   * the window's shell then runs pw-claude-wait, which resumes the conversation in place when the
+//     window is opened again (pw-claude-wake presses Enter from a tmux hook) or when someone presses Enter.
+//
+// Default is a DRY RUN: it lists what would be hibernated and why every other session is left alone.
+//
+//   pw-claude-hibernate [--apply] [--idle-days N | --idle-minutes N] [--session-id UUID] [--max N]
+//                       [--stop-timeout SECONDS] [--json]
+//   pw-claude-hibernate --backfill-from-manifest [--apply] [--json]
+//   pw-claude-hibernate --install-hooks
+//
+// A session is hibernated only when ALL of these hold: its registry entry is interactive and idle; its pid
+// still carries the registry's procStart; it runs inside the single pane of a pw_* project window, under
+// that pane's shell (never as the pane's own process, which would close the window); the window is not an
+// orchestrator lane; its transcript exists and its last message is older than the idle threshold; it has
+// no child process younger than that threshold (background work); and nobody is using the window: the pane
+// is not in copy mode, no client is looking at it (attached with it as the active window), it has produced
+// no output within the threshold (typing a draft echoes), and Claude itself was not started or resumed
+// within the threshold. Claude must also be the foreground job of an interactive shell, so the shell, and
+// with it the window, outlives Claude.
+//
+// Environment: PW_TMUX_SOCKET, PW_CLAUDE_SESSIONS_DIR, PW_CLAUDE_PROJECTS_DIR, PW_TMUX_STATE_DIR,
+// PW_CLAUDE_WAIT_BIN and PW_CLAUDE_WAKE_BIN (default: beside this script).
+import { spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const HERE = path.dirname(fs.realpathSync(process.argv[1]));
+const SOCKET = process.env.PW_TMUX_SOCKET || '';
+const HOME = process.env.HOME || os.homedir();
+const SESS_REG = process.env.PW_CLAUDE_SESSIONS_DIR || path.join(HOME, '.claude', 'sessions');
+const PROJECTS_DIR = process.env.PW_CLAUDE_PROJECTS_DIR || path.join(HOME, '.claude', 'projects');
+const STATE_DIR = process.env.PW_TMUX_STATE_DIR || '/var/lib/project-workbench/tmux-persist';
+const WAIT_BIN = process.env.PW_CLAUDE_WAIT_BIN || path.join(HERE, 'pw-claude-wait');
+const WAKE_BIN = process.env.PW_CLAUDE_WAKE_BIN || path.join(HERE, 'pw-claude-wake');
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const SHELLS = new Set(['bash', 'sh', 'dash', 'zsh', 'fish', 'ksh']);
+// Each hook at the scope tmux fires it from. pane-focus-in is a window option: set at session scope it
+// is accepted without complaint and never fires (verified against tmux 3.4).
+const WAKE_HOOKS = [['client-attached', '-g'], ['client-session-changed', '-g'], ['session-window-changed', '-g'], ['pane-focus-in', '-gw']];
+const MARKERS = ['@pw_claude_sid', '@pw_claude_hib_win', '@pw_claude_hib_at'];
+const EXIT_USAGE = 64;
+const EXIT_REFUSED = 75;
+const DAY = 86400000;
+const TAB = '\t';
+
+// ---- arguments ----------------------------------------------------------------------------------------
+function usage(message) {
+  if (message) process.stderr.write(`pw-claude-hibernate: ${message}\n`);
+  process.stderr.write('usage: pw-claude-hibernate [--apply] [--idle-days N | --idle-minutes N] [--session-id UUID] [--max N] [--stop-timeout S] [--json]\n'
+    + '       pw-claude-hibernate --backfill-from-manifest [--apply] [--json]\n'
+    + '       pw-claude-hibernate --install-hooks\n');
+  process.exit(EXIT_USAGE);
+}
+function number(flag, value, { min = 0 } = {}) {
+  const n = Number(value);
+  if (value === undefined || !Number.isFinite(n) || n < min) usage(`${flag} needs a number >= ${min}`);
+  return n;
+}
+function parseArgs(argv) {
+  const o = { apply: false, idleMs: 7 * DAY, idleGiven: false, max: 10, stopTimeoutMs: 20000, sessionId: null, backfill: false, installHooks: false, json: false };
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    switch (a) {
+      case '--apply': o.apply = true; break;
+      case '--idle-days': o.idleMs = number(a, argv[++i]) * DAY; o.idleGiven = true; break;
+      case '--idle-minutes': o.idleMs = number(a, argv[++i]) * 60000; o.idleGiven = true; break;
+      case '--max': o.max = number(a, argv[++i], { min: 1 }); break;
+      case '--stop-timeout': o.stopTimeoutMs = number(a, argv[++i], { min: 1 }) * 1000; break;
+      case '--session-id': o.sessionId = argv[++i]; if (!UUID.test(String(o.sessionId))) usage('--session-id needs a Claude session UUID'); break;
+      case '--backfill-from-manifest': o.backfill = true; break;
+      case '--install-hooks': o.installHooks = true; break;
+      case '--json': o.json = true; break;
+      case '-h': case '--help': usage(); break;
+      default: usage(`unknown argument ${a}`);
+    }
+  }
+  return o;
+}
+
+// ---- tmux and /proc -----------------------------------------------------------------------------------
+// tmux turns literal tabs in -F output into underscores under a non-UTF-8 locale, so pin it.
+const TMUX_ENV = { ...process.env, LANG: 'C.UTF-8', LC_ALL: 'C.UTF-8' };
+function tmux(args, { allowFail = false } = {}) {
+  const r = spawnSync('tmux', [...(SOCKET ? ['-L', SOCKET] : []), ...args], { encoding: 'utf8', timeout: 10000, env: TMUX_ENV });
+  if (r.status === 0) return r.stdout.replace(/\n$/, '');
+  if (allowFail) return null;
+  throw new Error(`tmux ${args[0]} failed: ${(r.stderr || r.error?.message || `exit ${r.status}`).trim()}`);
+}
+const windowOpt = (target, name) => tmux(['show-options', '-wqv', '-t', target, name], { allowFail: true }) || '';
+
+function procStat(pid) {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const f = s.slice(s.lastIndexOf(') ') + 2).split(' ');
+    return { state: f[0], ppid: Number(f[1]), pgrp: Number(f[2]), tpgid: Number(f[5]), starttime: Number(f[19]) };
+  } catch { return null; }
+}
+const comm = (pid) => { try { return fs.readFileSync(`/proc/${pid}/comm`, 'utf8').trim(); } catch { return ''; } };
+const running = (pid, starttime) => { const s = procStat(pid); return !!s && s.state !== 'Z' && (starttime == null || s.starttime === starttime); };
+const CLK_TCK = Number(spawnSync('getconf', ['CLK_TCK'], { encoding: 'utf8' }).stdout?.trim()) || 100;
+const BTIME = Number(/^btime (\d+)$/m.exec(fs.readFileSync('/proc/stat', 'utf8'))?.[1] || 0);
+const startedAtMs = (starttime) => (BTIME + starttime / CLK_TCK) * 1000;
+
+function processTable() {
+  const table = new Map();
+  for (const d of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(d)) continue;
+    const s = procStat(d);
+    if (s) table.set(Number(d), s);
+  }
+  return table;
+}
+function ancestorsOf(pid, table) {
+  const out = [];
+  for (let p = pid, i = 0; i < 16; i++) {
+    const s = table.get(p) || procStat(p);
+    if (!s || !s.ppid) break;
+    out.push(s.ppid);
+    p = s.ppid;
+  }
+  return out;
+}
+function descendantsOf(pid, table) {
+  const children = new Map();
+  for (const [p, s] of table) {
+    if (!children.has(s.ppid)) children.set(s.ppid, []);
+    children.get(s.ppid).push(p);
+  }
+  const out = [];
+  for (const stack = [pid]; stack.length;) for (const c of children.get(stack.pop()) || []) { out.push(c); stack.push(c); }
+  return out;
+}
+
+function listPanes() {
+  // Fields that may be empty go last, and JavaScript's split keeps empty fields anyway.
+  const fmt = ['#{pane_id}', '#{pane_pid}', '#{window_id}', '#{window_index}', '#{window_panes}', '#{window_activity}', '#{session_attached}', '#{window_active}', '#{pane_in_mode}', '#{pane_current_command}', '#{session_name}', '#{window_name}', '#{pane_current_path}'].join(TAB);
+  const panes = new Map();
+  for (const line of (tmux(['list-panes', '-a', '-F', fmt]) || '').split('\n')) {
+    const f = line.split(TAB);
+    if (f.length !== 13 || !/^%\d+$/.test(f[0])) continue;
+    panes.set(f[0], {
+      paneId: f[0], panePid: Number(f[1]), windowId: f[2], windowIndex: Number(f[3]), windowPanes: Number(f[4]),
+      activityMs: Number(f[5]) * 1000, attached: Number(f[6]), windowActive: f[7] === '1', inMode: f[8] === '1',
+      cmd: f[9], session: f[10], windowName: f[11], cwd: f[12],
+    });
+  }
+  return panes;
+}
+
+// The pane's shell is waiting for input: asleep, owning the terminal's foreground, running nothing.
+// Judged from /proc, not the screen. Claude Code's wrapper exits before Claude does, so bash prints its
+// prompt and Claude's last words land on top of it (seen in the real-Claude proof): a screen check
+// reads that as "no prompt" and would never arm the placeholder.
+function shellAwaitsInput(panePid) {
+  const s = procStat(panePid);
+  return !!s && s.state === 'S' && s.tpgid === s.pgrp && descendantsOf(panePid, processTable()).length === 0;
+}
+
+// Signs that a person is using the window right now, shared by hibernation and backfill.
+function inUseReason(pane, now, quietMs) {
+  if (pane.inMode) return 'the pane is in copy mode (someone is scrolling it)';
+  if (pane.attached > 0 && pane.windowActive) return 'someone is looking at this window (a client is attached and it is the active window)';
+  if (now - pane.activityMs < quietMs) return `the window showed output ${fmtAge(now - pane.activityMs)} ago (it may be in use)`;
+  return null;
+}
+
+// ---- conversations on disk ----------------------------------------------------------------------------
+function transcriptOf(sid) {
+  let dirs = [];
+  try { dirs = fs.readdirSync(PROJECTS_DIR); } catch { return null; }
+  for (const d of dirs) {
+    const f = path.join(PROJECTS_DIR, d, `${sid}.jsonl`);
+    if (fs.existsSync(f)) return f;
+  }
+  return null;
+}
+// Newest message timestamp inside the transcript. File mtime is not activity: heartbeats touch it.
+function lastActivityMs(file) {
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const size = fs.fstatSync(fd).size;
+    const len = Math.min(size, 256 * 1024);
+    const buf = Buffer.alloc(len);
+    fs.readSync(fd, buf, 0, len, size - len);
+    let newest = null;
+    for (const m of buf.toString('utf8').matchAll(/"timestamp":"([^"]+)"/g)) {
+      const t = Date.parse(m[1]);
+      if (!Number.isNaN(t) && (newest === null || t > newest)) newest = t;
+    }
+    return newest;
+  } catch { return null; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+function readRegistry() {
+  let names = [];
+  try { names = fs.readdirSync(SESS_REG).filter((n) => n.endsWith('.json')); } catch { return []; }
+  return names.map((n) => {
+    const file = path.join(SESS_REG, n);
+    try { return { file, data: JSON.parse(fs.readFileSync(file, 'utf8')) }; } catch { return { file, data: null }; }
+  });
+}
+const liveEntry = (d) => d && Number.isInteger(Number(d.pid)) && UUID.test(String(d.sessionId))
+  && running(Number(d.pid), d.procStart == null ? null : Number(d.procStart));
+
+const fmtAge = (ms) => (ms >= DAY ? `${(ms / DAY).toFixed(1)}d` : ms >= 3600000 ? `${(ms / 3600000).toFixed(1)}h` : `${Math.round(ms / 60000)}m`);
+
+// ---- eligibility --------------------------------------------------------------------------------------
+function assess(entry, ctx) {
+  const d = entry.data;
+  const skip = (reason, extra = {}) => ({ ok: false, reason, ...extra });
+  if (!d) return skip('registry file is unreadable', { file: entry.file });
+  const pid = Number(d.pid);
+  const sid = String(d.sessionId || '');
+  const base = { pid, sid, file: entry.file };
+  if (!Number.isInteger(pid) || pid <= 1 || !UUID.test(sid)) return skip('registry entry has no usable pid and session id', base);
+  if (ctx.onlySid && sid !== ctx.onlySid) return null;
+  if (d.kind !== 'interactive') return skip(`not an interactive session (kind=${d.kind})`, base);
+  const st = procStat(pid);
+  if (!st || st.state === 'Z') return skip('process is not running', base);
+  if (d.procStart == null || !Number.isFinite(Number(d.procStart))) return skip('registry has no procStart proving the pid is still this session', base);
+  if (st.starttime !== Number(d.procStart)) return skip('pid now belongs to another process (procStart mismatch)', base);
+  if (d.status !== 'idle') return skip(`session is ${d.status || 'not reported idle'}`, base);
+  if (ctx.self.has(pid)) return skip('this is the session running pw-claude-hibernate', base);
+  const m = /^(.+):(@\d+)\.(%\d+)$/.exec(String(d.tmux || ''));
+  if (!m) return skip('registry does not name a tmux pane', base);
+  const pane = ctx.panes.get(m[3]);
+  if (!pane || pane.windowId !== m[2]) return skip('the pane the registry names is not on this tmux server', base);
+  Object.assign(base, { session: pane.session, window: `${pane.session}:${pane.windowIndex}`, windowId: pane.windowId, paneId: pane.paneId, panePid: pane.panePid });
+  if (!pane.session.startsWith('pw_') || pane.session === 'pw_setup') return skip('not a project session', base);
+  if (pane.windowPanes !== 1) return skip('window is split into several panes', base);
+  if (pane.panePid === pid) return skip("Claude is the pane's own process; stopping it would close the window", base);
+  if (!ancestorsOf(pid, ctx.table).includes(pane.panePid)) return skip('process is not running inside the pane the registry names', base);
+  if (!SHELLS.has(comm(pane.panePid))) return skip(`the pane runs ${comm(pane.panePid) || 'an unknown process'}, not a shell; stopping Claude would close the window`, base);
+  // Job control proves an interactive shell that returns to its prompt. A `bash -c 'claude; ...'` pane shares
+  // Claude's process group and exits when Claude does, which would close the window.
+  const shell = procStat(pane.panePid);
+  if (!shell || st.pgrp === shell.pgrp || shell.tpgid !== st.pgrp) return skip('Claude is not the foreground job of an interactive shell; stopping it could end the shell and close the window', base);
+  if (windowOpt(pane.windowId, '@pw_role') && windowOpt(pane.windowId, '@pw_session_key')) return skip('orchestrator lane', base);
+  if (ctx.liveCount.get(sid) > 1) return skip('the same conversation is open in more than one process', base);
+  const transcript = transcriptOf(sid);
+  if (!transcript) return skip('no transcript on disk to resume from', base);
+  const last = lastActivityMs(transcript);
+  if (last === null) return skip('transcript has no readable message timestamp', base);
+  base.idleMs = ctx.now - last;
+  if (base.idleMs < ctx.idleMs) return skip(`last message ${fmtAge(base.idleMs)} ago`, base);
+  const young = descendantsOf(pid, ctx.table).filter((c) => ctx.now - startedAtMs(ctx.table.get(c).starttime) < ctx.idleMs);
+  if (young.length) return skip(`${young.length} child process(es) started within the idle window (background work)`, base);
+  const inUse = inUseReason(pane, ctx.now, ctx.idleMs);
+  if (inUse) return skip(inUse, base);
+  const procAge = ctx.now - startedAtMs(st.starttime);
+  if (procAge < ctx.idleMs) return skip(`Claude was started or resumed ${fmtAge(procAge)} ago`, base);
+  return { ok: true, ...base, starttime: st.starttime, pgrp: st.pgrp };
+}
+
+// ---- actions ------------------------------------------------------------------------------------------
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(check, timeoutMs, stepMs = 100) {
+  for (const end = Date.now() + timeoutMs; Date.now() < end; await sleep(stepMs)) if (check()) return true;
+  return check();
+}
+const shq = (s) => `'${String(s).replace(/'/g, "'\\''")}'`;
+
+function appendLog(record) {
+  try { fs.appendFileSync(path.join(STATE_DIR, 'hibernation.log'), JSON.stringify({ at: new Date().toISOString(), ...record }) + '\n'); } catch { /* the window markers remain the durable record */ }
+}
+function unmark(windowId) { for (const k of [...MARKERS, '@pw_claude_waiting']) tmux(['set-option', '-wu', '-t', windowId, k], { allowFail: true }); }
+function mark(windowId, sid) {
+  tmux(['set-option', '-w', '-t', windowId, '@pw_claude_sid', sid]);
+  tmux(['set-option', '-w', '-t', windowId, '@pw_claude_hib_win', windowId]);
+  tmux(['set-option', '-w', '-t', windowId, '@pw_claude_hib_at', new Date().toISOString()]);
+  return windowOpt(windowId, '@pw_claude_sid') === sid && windowOpt(windowId, '@pw_claude_hib_win') === windowId;
+}
+// Never throws: by the time this runs Claude is already stopped, and a failure here must not abort the run.
+async function armWaiter(paneId, windowId, sid) {
+  if (listPanes().get(paneId)?.inMode) tmux(['send-keys', '-t', paneId, '-X', 'cancel'], { allowFail: true });
+  // C-u first: discard anything on the line (readline, and the tty's own line kill) without running it.
+  const typed = [['C-u'], ['-l', ` ${shq(WAIT_BIN)} ${sid}`], ['Enter']]
+    .every((keys) => tmux(['send-keys', '-t', paneId, ...keys], { allowFail: true }) !== null);
+  return typed && until(() => { const w = windowOpt(windowId, '@pw_claude_waiting'); return /^\d+$/.test(w) && running(Number(w)); }, 5000);
+}
+
+function installHooks() {
+  // The path is spliced into a tmux command string; allow only characters that need no quoting there.
+  if (!/^[A-Za-z0-9_./+@-]+$/.test(WAKE_BIN)) throw new Error(`refusing to install hooks for an unsafe wake path: ${JSON.stringify(WAKE_BIN)}`);
+  const command = `run-shell -b "'${WAKE_BIN}' '#{socket_path}' '#{window_id}'"`;
+  const added = [];
+  for (const [hook, scope] of WAKE_HOOKS) {
+    const current = tmux(['show-hooks', scope, hook], { allowFail: true }) || '';
+    if (current.includes('pw-claude-wake')) continue;
+    tmux(['set-hook', `${scope}a`, hook, command]);
+    added.push(hook);
+  }
+  return added;
+}
+
+async function hibernate(c, o) {
+  const fail = (reason) => ({ ...c, action: 'left-running', reason });
+  if (!mark(c.windowId, c.sid)) { unmark(c.windowId); return fail('could not verify the hibernation markers on the window'); }
+  // Stop the job the shell launched: its whole process group, which assess() proved is not the shell's.
+  const target = -c.pgrp;
+  const signal = (sig) => { try { process.kill(target, sig); } catch { /* already gone */ } };
+  if (!running(c.pid, c.starttime)) { unmark(c.windowId); return fail('process exited before it could be stopped'); }
+  signal('SIGTERM');
+  let stopped = await until(() => !running(c.pid, c.starttime), o.stopTimeoutMs / 2);
+  if (!stopped) {
+    signal('SIGINT'); await sleep(300); signal('SIGINT');
+    stopped = await until(() => !running(c.pid, c.starttime), o.stopTimeoutMs / 2);
+  }
+  if (!stopped) { unmark(c.windowId); return fail(`Claude did not exit within ${o.stopTimeoutMs / 1000}s`); }
+  const back = await until(() => { const p = listPanes().get(c.paneId); return !!p && p.windowId === c.windowId && SHELLS.has(p.cmd); }, 5000);
+  if (!back) {
+    const still = listPanes().get(c.paneId);
+    appendLog({ event: 'hibernate-incomplete', sid: c.sid, window: c.window, windowId: c.windowId, reason: still ? 'shell prompt did not return' : 'pane disappeared' });
+    return { ...c, action: 'stopped-without-placeholder', reason: still ? `the shell prompt did not return; resume by running claude --resume ${c.sid} in that window` : 'the pane disappeared after Claude exited' };
+  }
+  appendLog({ event: 'stopped', sid: c.sid, window: c.window, windowId: c.windowId, idleMs: c.idleMs });
+  let armed = false;
+  try {
+    armed = await until(() => shellAwaitsInput(c.panePid), 5000) && await armWaiter(c.paneId, c.windowId, c.sid);
+  } catch { armed = false; }
+  appendLog({ event: 'hibernated', sid: c.sid, window: c.window, windowId: c.windowId, idleMs: c.idleMs, waiter: armed });
+  return { ...c, action: 'hibernated', waiter: armed };
+}
+
+// Windows that were already hibernated before markers existed: the manifest still carries their resume ids.
+function backfillCandidates(ctx, quietMs) {
+  const manifest = path.join(STATE_DIR, 'manifest.tsv');
+  let rows = [];
+  try { rows = fs.readFileSync(manifest, 'utf8').split('\n').filter(Boolean).map((l) => l.split('\x1f')); } catch { return { error: `cannot read ${manifest}` }; }
+  const live = new Set([...ctx.liveCount.keys()]);
+  const byTarget = new Map([...ctx.panes.values()].map((p) => [`${p.session}:${p.windowIndex}`, p]));
+  const results = [];
+  for (const f of rows) {
+    if (f.length !== 7 || !(f[4] === '1' || f[4] === '2') || !UUID.test(f[5])) continue;
+    const [session, index, name, cwd, , sid] = f;
+    const r = { sid, window: `${session}:${index}` };
+    const skip = (reason) => results.push({ ok: false, reason, ...r });
+    if (ctx.onlySid && sid !== ctx.onlySid) continue;
+    if (!session.startsWith('pw_') || session === 'pw_setup') { skip('not a project session'); continue; }
+    if (live.has(sid)) { skip('conversation is running'); continue; }
+    const p = byTarget.get(r.window);
+    if (!p) { skip('window no longer exists'); continue; }
+    Object.assign(r, { windowId: p.windowId, paneId: p.paneId });
+    if (p.windowName !== name || p.cwd !== cwd) { skip('window at that index is not the one the manifest recorded (name or cwd differs)'); continue; }
+    if (p.windowPanes !== 1 || !SHELLS.has(p.cmd) || descendantsOf(p.panePid, ctx.table).length) { skip('window is not an idle shell'); continue; }
+    const inUse = inUseReason(p, ctx.now, quietMs);
+    if (inUse) { skip(inUse); continue; }
+    if (windowOpt(p.windowId, '@pw_claude_sid')) { skip('window already carries hibernation markers'); continue; }
+    if (!transcriptOf(sid)) { skip('no transcript on disk to resume from'); continue; }
+    if (!shellAwaitsInput(p.panePid)) { skip('shell is not waiting for input'); continue; }
+    results.push({ ok: true, ...r });
+  }
+  return { results };
+}
+
+// ---- main ---------------------------------------------------------------------------------------------
+async function main() {
+  const o = parseArgs(process.argv.slice(2));
+  // Same gate as every seam that may touch the shared server: a missing helper is a refusal.
+  const gate = spawnSync('pw-tmux-assert-owner', [], { encoding: 'utf8', timeout: 15000, env: TMUX_ENV });
+  if (gate.status !== 0) {
+    process.stderr.write(`pw-claude-hibernate: REFUSED: ${gate.error ? 'pw-tmux-assert-owner is not installed' : 'the tmux server is not the workbench-owned server'}\n${gate.stderr || ''}`);
+    process.exit(EXIT_REFUSED);
+  }
+  if (o.installHooks) {
+    const added = installHooks();
+    process.stdout.write(added.length ? `installed wake hooks: ${added.join(', ')}\n` : 'wake hooks already installed\n');
+    return 0;
+  }
+
+  const table = processTable();
+  const registry = readRegistry();
+  const countLive = (entries) => {
+    const counts = new Map();
+    for (const e of entries) if (liveEntry(e.data)) counts.set(e.data.sessionId, (counts.get(e.data.sessionId) || 0) + 1);
+    return counts;
+  };
+  const liveCount = countLive(registry);
+  // Backfill's windows have sat at a prompt for hours, not days: by default it only needs ten quiet minutes.
+  const backfillQuietMs = o.idleGiven ? o.idleMs : 10 * 60000;
+  const ctx = { now: Date.now(), idleMs: o.idleMs, onlySid: o.sessionId, table, panes: listPanes(), liveCount, self: new Set([process.pid, ...ancestorsOf(process.pid, table)]) };
+  const out = { mode: o.backfill ? 'backfill' : 'hibernate', apply: o.apply, idle: fmtAge(o.idleMs), acted: [], skipped: [] };
+
+  let candidates;
+  if (o.backfill) {
+    const b = backfillCandidates(ctx, backfillQuietMs);
+    if (b.error) { process.stderr.write(`pw-claude-hibernate: ${b.error}\n`); return 1; }
+    candidates = b.results.filter((r) => r.ok);
+    out.skipped = b.results.filter((r) => !r.ok);
+  } else {
+    const results = registry.map((e) => assess(e, ctx)).filter(Boolean);
+    candidates = results.filter((r) => r.ok).sort((a, b) => b.idleMs - a.idleMs);
+    out.skipped = results.filter((r) => !r.ok);
+    if (candidates.length > o.max) {
+      for (const c of candidates.slice(o.max)) out.skipped.push({ ...c, ok: false, reason: `over --max ${o.max} for this run` });
+      candidates = candidates.slice(0, o.max);
+    }
+  }
+
+  let failures = 0;
+  if (!o.apply) {
+    out.acted = candidates.map((c) => ({ ...c, action: 'would-hibernate' }));
+  } else if (candidates.length) {
+    installHooks();
+    for (const c of candidates) {
+      let r;
+      try {
+        if (o.backfill) {
+          // Re-check right before typing into the shell: someone may have started using it since.
+          const p = listPanes().get(c.paneId);
+          const why = !p ? 'window disappeared'
+            : !shellAwaitsInput(p.panePid) ? 'shell is no longer waiting for input'
+              : inUseReason(p, Date.now(), backfillQuietMs);
+          if (why) r = { ...c, action: 'left-alone', reason: `changed before it could be backfilled: ${why}` };
+          else if (!mark(c.windowId, c.sid)) { unmark(c.windowId); r = { ...c, action: 'left-alone', reason: 'could not verify markers' }; }
+          else {
+            appendLog({ event: 'marked', sid: c.sid, window: c.window, windowId: c.windowId });
+            const armed = await armWaiter(c.paneId, c.windowId, c.sid);
+            appendLog({ event: 'backfilled', sid: c.sid, window: c.window, windowId: c.windowId, waiter: armed });
+            r = { ...c, action: 'backfilled', waiter: armed };
+          }
+        } else {
+          // Re-judge from fresh state right before stopping: an earlier candidate's stop can take up to
+          // --stop-timeout, and someone may have started using this window in the meantime.
+          let data = null;
+          try { data = JSON.parse(fs.readFileSync(c.file, 'utf8')); } catch { /* exited or rewritten */ }
+          const freshTable = processTable();
+          const fresh = assess({ file: c.file, data }, {
+            ...ctx, now: Date.now(), table: freshTable, panes: listPanes(), liveCount: countLive(readRegistry()),
+            self: new Set([process.pid, ...ancestorsOf(process.pid, freshTable)]),
+          });
+          r = fresh && fresh.ok
+            ? await hibernate(fresh, o)
+            : { ...c, action: 'left-running', reason: `changed before it could be hibernated: ${fresh ? fresh.reason : 'no longer registered'}` };
+        }
+      } catch (err) {
+        // One window's failure must never take the rest of the run down with it.
+        r = { ...c, action: 'error', reason: err.message };
+        appendLog({ event: 'error', sid: c.sid, window: c.window, reason: err.message });
+      }
+      if (r.action !== 'hibernated' && r.action !== 'backfilled') failures++;
+      out.acted.push(r);
+    }
+  }
+
+  if (o.json) {
+    process.stdout.write(JSON.stringify(out, null, 2) + '\n');
+  } else {
+    const verb = o.apply ? '' : '(dry run) ';
+    process.stdout.write(`${verb}${out.mode}: idle threshold ${out.idle}; ${out.acted.length} to act on, ${out.skipped.length} left alone\n`);
+    for (const a of out.acted) process.stdout.write(`  ${a.action.padEnd(16)} ${a.sid}  ${a.window || ''}${a.idleMs ? `  idle ${fmtAge(a.idleMs)}` : ''}${a.reason ? `  (${a.reason})` : ''}${a.waiter === false ? `  (placeholder did not start; run claude --resume ${a.sid} in that window)` : ''}\n`);
+    for (const s of out.skipped) process.stdout.write(`  ${'skip'.padEnd(16)} ${s.sid || '-'}  ${s.window || ''}  ${s.reason}\n`);
+  }
+  return failures ? 1 : 0;
+}
+
+main().then((code) => process.exit(code), (err) => { process.stderr.write(`pw-claude-hibernate: ${err.message}\n`); process.exit(1); });

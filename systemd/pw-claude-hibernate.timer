@@ -1,0 +1,14 @@
+[Unit]
+Description=Project Workbench: periodically hibernate idle Claude Code sessions
+
+[Timer]
+# NOT enabled by install.sh. Turn it on deliberately, after any window that was already hibernated by
+# hand carries its markers (`pw-claude-hibernate --backfill-from-manifest --apply`):
+#     systemctl enable --now pw-claude-hibernate.timer
+OnBootSec=30min
+OnUnitActiveSec=1h
+RandomizedDelaySec=5min
+Unit=pw-claude-hibernate.service
+
+[Install]
+WantedBy=timers.target

@@ -38,6 +38,10 @@ MANIFEST="$STATE_DIR/manifest.tsv"
 SESS_REG="${PW_CLAUDE_SESSIONS_DIR:-$HOME/.claude/sessions}"
 PROJECTS_DIR="${PW_CLAUDE_PROJECTS_DIR:-$HOME/.claude/projects}"
 RESTORE_CLAUDE="${PW_TMUX_RESTORE_CLAUDE:-1}"   # set 0 to restore shells but not Claude
+# A hibernated window (manifest hasc=2, see pw-claude-hibernate) gets its placeholder back instead
+# of a running Claude, so a reboot does not relaunch every conversation that was put to sleep.
+WAIT_BIN="${PW_CLAUDE_WAIT_BIN:-/usr/local/bin/pw-claude-wait}"
+HIBERNATE_BIN="${PW_CLAUDE_HIBERNATE_BIN:-pw-claude-hibernate}"
 MAX_CLAUDE="${PW_TMUX_MAX_CLAUDE:-30}"          # safety cap on auto-launched sessions
 LOG="${PW_TMUX_LOG:-$STATE_DIR/persist.log}"
 SEP=$'\x1f'                                      # manifest field separator (matches pw-tmux-save)
@@ -193,7 +197,14 @@ if [[ -d "$SESS_REG" ]]; then
 		[[ -e "$jf" ]] || continue
 		pid=$(grep -o '"pid":[0-9]*' "$jf" | head -1 | cut -d: -f2)
 		sid=$(grep -o '"sessionId":"[^"]*"' "$jf" | head -1 | cut -d'"' -f4)
-		[[ -n "$pid" && -n "$sid" && -d "/proc/$pid" ]] && LIVE_SID[$sid]=1
+		pst=$(grep -oE '"procStart":"?[0-9]+' "$jf" | head -1 | grep -oE '[0-9]+$')
+		[[ -n "$pid" && -n "$sid" && -d "/proc/$pid" ]] || continue
+		# A registry file outliving its Claude can name a reused pid; procStart is the owner's start time.
+		if [[ -n "$pst" ]]; then
+			stat_line=$(cat "/proc/$pid/stat" 2>/dev/null) || continue
+			[[ "$(awk '{print $20}' <<<"${stat_line##*') '}")" == "$pst" ]] || continue
+		fi
+		LIVE_SID[$sid]=1
 	done
 fi
 
@@ -402,6 +413,7 @@ sleep 1
 # creation time above; `claude --resume` inherits it from the shell it runs
 # in, so nothing further is needed here for attribution.
 claude_count=0
+hibernated_count=0
 while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
 	[[ -n "$s" ]] || continue
 	[[ "${CREATED[$s]:-}" == "own" ]] || continue
@@ -422,10 +434,43 @@ while IFS=$SEP read -r s w wn cwd hasc sid cfile; do
 			claude_count=$((claude_count + 1))
 			log "resumed claude $sid in $s:$idx"
 		fi
+	elif [[ "$hasc" == "2" && -n "$sid" ]]; then
+		if [[ ! "$sid" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]]; then
+			log "hibernated row for $s:$idx has no valid session id; leaving shell"
+		elif [[ "$RESTORE_CLAUDE" != "1" ]]; then
+			continue
+		elif [[ -n "${LIVE_SID[$sid]:-}" ]]; then
+			log "hibernated claude $sid is already live elsewhere; leaving shell in $s:$idx"
+		elif ! compgen -G "$PROJECTS_DIR/*/$sid.jsonl" >/dev/null 2>&1; then
+			log "no transcript for hibernated $sid; leaving shell in $s:$idx"
+		else
+			# Re-stamp on the NEW window (a recreated window has a new id), then put the placeholder back.
+			wid=$(tmux display-message -p -t "$s:$idx" '#{window_id}' 2>/dev/null)
+			if [[ "$wid" =~ ^@[0-9]+$ ]] \
+				&& tmux set-option -w -t "$wid" @pw_claude_sid "$sid" 2>>"$LOG" \
+				&& tmux set-option -w -t "$wid" @pw_claude_hib_win "$wid" 2>>"$LOG" \
+				&& tmux set-option -w -t "$wid" @pw_claude_hib_at "$(date -Iseconds)" 2>>"$LOG"; then
+				tmux send-keys -t "$s:$idx" -l " $(printf '%q' "$WAIT_BIN") $sid"
+				tmux send-keys -t "$s:$idx" C-m
+				hibernated_count=$((hibernated_count + 1))
+				log "re-armed hibernated claude $sid in $s:$idx (resumes when the window is opened)"
+			else
+				log "could not mark hibernated $sid on $s:$idx; leaving shell"
+			fi
+		fi
 	elif [[ -n "$cfile" && -f "$CONTENT_DIR/$cfile" ]]; then
 		tmux send-keys -t "$s:$idx" "cat -- $(printf '%q' "$CONTENT_DIR/$cfile")" C-m
 	fi
 done <"$MANIFEST"
+
+# The wake hooks live on the server, so a new server needs them again before anyone opens a window.
+if (( hibernated_count > 0 )); then
+	if command -v "$HIBERNATE_BIN" >/dev/null 2>&1 && "$HIBERNATE_BIN" --install-hooks >>"$LOG" 2>&1; then
+		log "wake hooks present for $hibernated_count hibernated window(s)"
+	else
+		log "could not install wake hooks; hibernated windows resume only when Enter is pressed in them"
+	fi
+fi
 
 # Report what actually happened. The old unconditional "restore complete" was
 # emitted even when every session had been refused, which is precisely how a
@@ -438,8 +483,8 @@ for s in "${!CREATED[@]}"; do [[ "${CREATED[$s]}" == "skip" ]] && refused=$((ref
 created=0
 for s in "${!CREATED[@]}"; do [[ "${CREATED[$s]}" == "own" ]] && created=$((created + 1)); done
 if (( refused > 0 )); then
-	log "restore finished WITH REFUSALS: created $created session(s), refused $refused; launched $claude_count Claude session(s)"
+	log "restore finished WITH REFUSALS: created $created session(s), refused $refused; launched $claude_count Claude session(s); re-armed $hibernated_count hibernated"
 else
-	log "restore complete; created $created session(s); launched $claude_count Claude session(s)"
+	log "restore complete; created $created session(s); launched $claude_count Claude session(s); re-armed $hibernated_count hibernated"
 fi
 exit 0

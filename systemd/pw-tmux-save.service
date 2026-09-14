@@ -3,9 +3,15 @@ Description=Project Workbench: snapshot tmux sessions for reboot persistence
 
 [Service]
 Type=oneshot
+EnvironmentFile=-/etc/project-workbench/pw.env
 User=@PW_USER@
 Group=@PW_GROUP@
 Environment=HOME=@PW_HOME@
 Environment=LANG=C.UTF-8
 Environment=LC_ALL=C.UTF-8
+# A snapshot must never compete with the sessions it records (2026-09-14: one run sat 8.5 minutes in
+# capture-pane on a saturated host). The script bounds itself; these bound the unit around it.
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=180
 ExecStart=/usr/local/bin/pw-tmux-save
