@@ -9,7 +9,7 @@
 //
 // Protocol: one JSON job object on stdin, one JSON result object on stdout.
 //
-//   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…}
+//   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…,"sharedSettings":…}
 //         {"action":"prune","base":…,"keep":[…]}
 //         {"action":"status","base":…,"username":…}
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
@@ -91,6 +91,7 @@ async function main() {
         username: job.username,
         ghToken: job.ghToken || '',
         sharedClaudeJson: job.sharedClaudeJson || '',
+        sharedSettings: job.sharedSettings || '',
       });
     process.stdout.write(JSON.stringify({ ok: true, result }));
   } catch (e) {

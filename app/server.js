@@ -79,6 +79,9 @@ const USER_CRED_BASE = process.env.PW_USER_CRED_BASE || '/home/admin/pw-users';
 // The shared/default Claude config (source for seeding managed MCP servers into
 // each per-user config dir so team MCP — teamkb/pulse/skillhub — still loads).
 const sharedClaudeJson = path.join(process.env.HOME || '/home/admin', '.claude.json');
+// The shared settings.json is the source for the per-user infrastructure keys (hooks +
+// notification channel) -- see SEEDED_SETTINGS_KEYS in app/user-credentials.js.
+const sharedSettings = path.join(process.env.HOME || '/home/admin', '.claude', 'settings.json');
 const setupTtydPort = 7680;
 const setupTmuxSession = 'pw_setup';
 const internalHandoffToken = process.env.PW_INTERNAL_HANDOFF_TOKEN || '';
@@ -751,7 +754,7 @@ async function credentialContext(project){
  try {
   const cred = await ensureUserCredentials({
    fsp: fs, base: USER_CRED_BASE, username: owner.username,
-   ghToken: owner.ghToken, sharedClaudeJson,
+   ghToken: owner.ghToken, sharedClaudeJson, sharedSettings,
    owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
   });
   return {

@@ -105,6 +105,22 @@ export function isEncodedUserName(segment) {
 export function userCredRoot(base, username) {
   return path.join(base, encodeUserName(username));
 }
+/**
+ * Keys in settings.json that are PW INSTANCE INFRASTRUCTURE rather than user preference, and so
+ * must exist in every per-user config dir:
+ *
+ *   hooks                 - hooks.Stop runs pw-stop-hook.sh, which writes the marker under
+ *                           /var/lib/project-workbench/pending that the dashboard renders as a
+ *                           project's amber "turn done" flag.
+ *   preferredNotifChannel - 'terminal_bell' is what makes Claude ring the BEL that tmux records
+ *                           as window_bell_flag, the second (live) half of that same flag.
+ *
+ * Deliberately NOT here: theme, model, effortLevel (personal), and permissions /
+ * skipDangerousModePermissionPrompt (an authority grant, which must be a deliberate act per
+ * account rather than something a credential job propagates).
+ */
+export const SEEDED_SETTINGS_KEYS = Object.freeze(['hooks', 'preferredNotifChannel']);
+
 export function userClaudeConfigDir(base, username) {
   return path.join(userCredRoot(base, username), 'claude');
 }
@@ -233,7 +249,7 @@ async function regularFileExists(fsp, file) {
 // Everything that touches the credential tree. Runs EITHER in-process (when the
 // dashboard already is the terminal account) OR inside credential-writer.mjs
 // after the privilege drop. It never chowns: whoever runs it is the owner.
-export async function applyCredentialJob({ fsp, base, username, ghToken = '', sharedClaudeJson = '' }) {
+export async function applyCredentialJob({ fsp, base, username, ghToken = '', sharedClaudeJson = '', sharedSettings = '' }) {
   const credRoot = userCredRoot(base, username);
   const configDir = userClaudeConfigDir(base, username);
 
@@ -258,6 +274,29 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
     }
     await writeChecked(fsp, cfgFile, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
     seeded = true;
+  }
+
+  // settings.json needs MERGE semantics, not the "only on first creation" guard .claude.json
+  // uses above. Claude Code writes this file ITSELF the moment a user changes theme or model, so
+  // an absent-file guard loses the race and the hooks never land -- which is exactly how enabling
+  // per-user credentials silently killed the turn-done flag for every project on 2026-09-14
+  // (the per-user settings.json existed, holding only {model, theme, enabledPlugins}).
+  // Only absent keys are filled, so a user's own preferences are never touched.
+  const settingsFile = path.join(configDir, 'settings.json');
+  if (sharedSettings) {
+    try {
+      const shared = JSON.parse(await fsp.readFile(sharedSettings, 'utf8')) || {};
+      let current = {};
+      if (await regularFileExists(fsp, settingsFile)) {
+        try { current = JSON.parse(await fsp.readFile(settingsFile, 'utf8')) || {}; }
+        catch { current = {}; }   // unparseable: treat as empty rather than refusing to seed
+      }
+      let changed = false;
+      for (const key of SEEDED_SETTINGS_KEYS) {
+        if (shared[key] !== undefined && current[key] === undefined) { current[key] = shared[key]; changed = true; }
+      }
+      if (changed) await writeChecked(fsp, settingsFile, `${JSON.stringify(current, null, 2)}\n`);
+    } catch { /* no shared settings, or unreadable: leave the per-user file alone */ }
   }
 
   const envFile = userSessionEnvFile(base, username);
@@ -390,11 +429,12 @@ export async function ensureUserCredentials({
   username,
   ghToken = '',
   sharedClaudeJson = '',
+  sharedSettings = '',
   owner = null,
   currentUid = null,
   runJob = null,
 }) {
-  const job = { action: 'ensure', base, username, ghToken, sharedClaudeJson };
+  const job = { action: 'ensure', base, username, ghToken, sharedClaudeJson, sharedSettings };
   const plan = credentialExecutionPlan({ owner, currentUid });
   const result = plan.drop
     ? await runJob(job, plan)

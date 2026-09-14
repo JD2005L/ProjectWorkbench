@@ -61,6 +61,7 @@ async function main() {
   const secretKeyPath = process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key';
   const credBase = process.env.PW_USER_CRED_BASE || '/home/admin/pw-users';
   const sharedClaudeJson = path.join(process.env.HOME || '/home/admin', '.claude.json');
+  const sharedSettings = path.join(process.env.HOME || '/home/admin', '.claude', 'settings.json');
 
   let owner;
   try {
@@ -97,6 +98,7 @@ async function main() {
       username: owner.username,
       ghToken: owner.ghToken,
       sharedClaudeJson,
+      sharedSettings,
       owner: terminalOwner,
       currentUid: process.getuid?.() ?? null,
       runJob,
