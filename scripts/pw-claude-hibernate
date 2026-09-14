@@ -334,13 +334,51 @@ function mark(windowId, sid) {
   tmux(['set-option', '-w', '-t', windowId, '@pw_claude_hib_at', new Date().toISOString()]);
   return windowOpt(windowId, '@pw_claude_sid') === sid && windowOpt(windowId, '@pw_claude_hib_win') === windowId;
 }
+// Typing the placeholder must not light the window's "turn done" notice. C-u on an empty readline line rings
+// the terminal bell; tmux (monitor-bell) records it on a window nobody is viewing, and the dashboard shows that
+// as amber and latches it. So bell monitoring is off for the window while the keys go in, and put back once
+// tmux has drawn the placeholder's banner, which comes after anything the typing rang. A bell the window
+// already carries stays: turning monitoring off does not clear it. The window's own setting, if it had one, is
+// kept in BELL_MUTE_MARK until restored, so a run that dies in between is repaired by the next one.
+const BELL_MUTE_MARK = '@pw_claude_bell_muted';
+function muteBell(windowId) {
+  const own = tmux(['show-options', '-wqv', '-t', windowId, 'monitor-bell'], { allowFail: true });
+  if (own === null) return;
+  tmux(['set-option', '-w', '-t', windowId, BELL_MUTE_MARK, `${own || 'inherit'}|${Date.now()}`], { allowFail: true });
+  tmux(['set-option', '-w', '-t', windowId, 'monitor-bell', 'off'], { allowFail: true });
+}
+function restoreBell(windowId) {
+  const [own] = windowOpt(windowId, BELL_MUTE_MARK).split('|');
+  if (!own) return;
+  if (own === 'inherit') tmux(['set-option', '-wu', '-t', windowId, 'monitor-bell'], { allowFail: true });
+  else tmux(['set-option', '-w', '-t', windowId, 'monitor-bell', own], { allowFail: true });
+  tmux(['set-option', '-wu', '-t', windowId, BELL_MUTE_MARK], { allowFail: true });
+}
+// A mute left behind by a run that died between muting and restoring (older than any arming takes).
+function restoreAbandonedBellMutes() {
+  const out = tmux(['list-windows', '-a', '-F', `#{window_id}\t#{${BELL_MUTE_MARK}}`], { allowFail: true }) || '';
+  for (const line of out.split('\n')) {
+    const [windowId, mark = ''] = line.split('\t');
+    const at = Number(mark.split('|')[1]);
+    if (/^@\d+$/.test(windowId) && mark && !(Date.now() - at < 60000)) restoreBell(windowId);
+  }
+}
+
 // Never throws: by the time this runs Claude is already stopped, and a failure here must not abort the run.
 async function armWaiter(paneId, windowId, sid) {
-  if (listPanes().get(paneId)?.inMode) tmux(['send-keys', '-t', paneId, '-X', 'cancel'], { allowFail: true });
-  // C-u first: discard anything on the line (readline, and the tty's own line kill) without running it.
-  const typed = [['C-u'], ['-l', ` ${shq(WAIT_BIN)} ${sid}`], ['Enter']]
-    .every((keys) => tmux(['send-keys', '-t', paneId, ...keys], { allowFail: true }) !== null);
-  return typed && until(() => { const pid = waiterPidOf(windowOpt(windowId, '@pw_claude_waiting')); return !!pid && running(pid); }, 5000);
+  muteBell(windowId);
+  try {
+    if (listPanes().get(paneId)?.inMode) tmux(['send-keys', '-t', paneId, '-X', 'cancel'], { allowFail: true });
+    // C-u first: discard anything on the line (readline, and the tty's own line kill) without running it.
+    const typed = [['C-u'], ['-l', ` ${shq(WAIT_BIN)} ${sid}`], ['Enter']]
+      .every((keys) => tmux(['send-keys', '-t', paneId, ...keys], { allowFail: true }) !== null);
+    const waiting = typed && await until(() => { const pid = waiterPidOf(windowOpt(windowId, '@pw_claude_waiting')); return !!pid && running(pid); }, 5000);
+    // The banner on screen means tmux has read the pane's output past the typing, bell included.
+    if (waiting) await until(() => (tmux(['capture-pane', '-p', '-J', '-t', paneId], { allowFail: true }) || '').includes(`Conversation: ${sid}`), 3000);
+    return waiting;
+  } finally {
+    restoreBell(windowId);
+  }
 }
 
 function installHooks() {
@@ -525,6 +563,7 @@ async function main() {
     process.stderr.write(`pw-claude-hibernate: REFUSED: ${gate.error ? 'pw-tmux-assert-owner is not installed' : 'the tmux server is not the workbench-owned server'}\n${gate.stderr || ''}`);
     process.exit(EXIT_REFUSED);
   }
+  if (o.apply) restoreAbandonedBellMutes();
   if (o.installHooks) {
     const added = installHooks();
     process.stdout.write(added.length ? `installed wake hooks: ${added.join(', ')}\n` : 'wake hooks already installed\n');
