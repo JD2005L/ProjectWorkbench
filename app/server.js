@@ -561,6 +561,33 @@ async function sendBoxFile(res, p, box, rawName, { attachment = false } = {}){
 // app/credential-writer.mjs, handing it the job (token included) on stdin so it
 // never reaches a command line. See app/user-credentials.js for the full note.
 const CREDENTIAL_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), 'credential-writer.mjs');
+
+// scripts/ is a sibling of app/ in every deployment (both mounted under the same
+// install root). Used to reclaim workspace ownership after a runAsRoot deploy — see
+// reclaimWorkspaceOwnership().
+const FIX_OWNERSHIP_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'scripts', 'pw-fix-workspace-ownership');
+
+// A runAsRoot deploy slot runs its script as root by design (podman/systemctl/host
+// paths it genuinely needs — see deployExec). But anything that script writes INTO
+// the workspace then lands root-owned: VisualIdentity's publish does a `git commit`,
+// leaving root:root `.git/index` and objects the pane account can no longer write,
+// so the next agent commit fails "permission denied". Rather than forbid the commit
+// (it is the whole point of publishing), heal the drift right after: hand any
+// root-owned path in that ONE workspace back to the pane account. The tool is
+// dry-run-safe, prunes canonical/_inbox/_outbox, and only touches uid/gid 0, so a
+// re-run is a no-op. Best-effort: a failure here must not fail an otherwise-good
+// deploy, but it is surfaced in the deploy output so an operator sees it ran.
+async function reclaimWorkspaceOwnership(projectName){
+ try {
+  const { stdout, stderr } = await execFileAsync(FIX_OWNERSHIP_HELPER, ['--apply', projectName], {
+   timeout: 120000,
+   env: { ...process.env, PW_WORKSPACES: workspaceRoot, PW_TERMINAL_USER: TERMINAL_PRIV.user },
+  });
+  return (stdout || '') + (stderr || '');
+ } catch(e){
+  return `workspace-ownership reclaim failed (non-fatal): ${e?.message || e}`;
+ }
+}
 function runCredentialJob(job, plan){
  const argv = credentialDropArgv({ owner: plan.owner, execPath: process.execPath, helperPath: CREDENTIAL_HELPER });
  return spawnCredentialJob({ spawn, argv, job });
@@ -4784,6 +4811,13 @@ if(DEPLOY_CENTRE){
   } catch(e) {
    status = 'failed';
    output = (e.stdout || '') + (e.stderr || '') + '\n' + (e.message || '');
+  }
+  // A root deploy can leave root-owned drift in the workspace (e.g. a publish that
+  // `git commit`s). Reclaim it whether the deploy passed or failed — a failed one
+  // can have written just as much — so the pane account keeps working afterward.
+  if(tc.runAsRoot){
+   const reclaim = await reclaimWorkspaceOwnership(project);
+   if(reclaim && reclaim.trim()) output += '\n' + reclaim.trim();
   }
   const duration = ((Date.now()-start)/1000).toFixed(1);
   if(manifest){
