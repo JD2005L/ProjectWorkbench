@@ -135,7 +135,8 @@ The service state layout is deliberately split:
 | `stateDir/jobs/<UUID>` | Root-owned `0711`, created/managed by the core for each job. |
 | `settings.json`, `targets.json`, and each job's `job.json`/retained event data | Root-owned `0600`; directory traversal never grants access to metadata. |
 | `stateDir/jobs/<UUID>/stage` | Owned by `buildUser`, mode `0700`; only the allocated build stage is handed to that account. |
-| `stateDir/jobs/<UUID>/artifacts` | A separate root-controlled handoff directory, not part of the builder-owned source stage; the core grants only the required runtime artifact access. |
+| `stateDir/jobs/<UUID>/artifacts` | A separate root-owned `0711` handoff directory, not part of the builder-owned source stage. |
+| `stateDir/jobs/<UUID>/artifacts/candidate.oci` | Owned by `root:<runtime primary GID>`, mode `0440`. The runtime account receives group read access, not ownership or write access. |
 
 Mode `0711` provides traversal, not directory listing, to other users. It lets
 an unprivileged build reach its allocated stage without making job metadata
@@ -256,8 +257,9 @@ new local builder's group-name conflict check do not require a matching
 runtime primary-group record.
 
 The broker runs as root only for validated policy, protected metadata, source
-stage ownership setup, and fixed account switching. Project scripts and npm
-steps run under the dedicated non-root builder with `NoNewPrivileges=yes`.
+stage ownership setup, and fixed account switching. Both `script` and `iis`
+jobs, and npm dependency steps, run under the dedicated non-root builder with
+`NoNewPrivileges=yes`.
 Trusted rootless Podman steps use `--cgroup-manager=cgroupfs` within their
 delegated step unit so build/run children cannot escape cancellation into user
 manager scopes. They must still be able to use subordinate UID/GID helpers;
@@ -267,24 +269,37 @@ Image building uses the builder's rootless store; image import and application
 restart use the configured non-root runtime account.
 
 The runner survives a PW restart. A **runner** restart stops its bound
-transient system units and their process trees. Persisted active jobs become
-interrupted at startup and are never automatically replayed. Review their
-results and deliberately submit a new job when appropriate. This binding
-supervises deployment steps, not the PW service or the independently managed
-application units that are deployment destinations.
+transient system units and their process trees. Startup recovery identifies
+steps by the specific job UUID and checks that each unit's `BindsTo` includes
+the configured broker unit before stopping it. Both conditions are required;
+recovery does not stop unrelated units or units belonging to another
+supervisor. A foreign binding or an unconfirmed stop is a recovery failure,
+not permission to kill unrelated work or report a clean interruption.
 
-Source, isolated home directories, and handoff artifacts are removed once
-execution has safely stopped. A failed stop halts scheduling and defers cleanup
-until recovery has stopped the exact owned units. Recovery preserves the failed
-outcome; it does not replay scripts or credentials.
+Persisted active jobs become interrupted only after owned execution is safely
+stopped; they are never automatically replayed. Review their results and
+deliberately submit a new job when appropriate. These bindings supervise
+deployment steps, not PW or the independently managed application units that
+are deployment destinations.
+
+The per-job `stage`, `home`, and `artifacts` directories are removed immediately
+after execution has safely stopped, including safely terminated failed or
+cancelled execution. They do not wait for the history retention window. A
+failed stop halts scheduling and defers cleanup until recovery has stopped the
+exact owned units, rather than deleting files a live process might still use.
+Recovery preserves an already recorded failed outcome; it does not replay
+scripts or credentials.
 
 Retained logs contain **operational events only**, alongside protected job
 metadata. Redacted raw stdout/stderr is bounded in-memory/live output, not a
 durable transcript: it can be truncated or expire and is lost on broker
 restart. The runner does not write raw command output to its retained journal
-or backups. The retention setting governs operational history, not retention
-of full console output. Scripts must still avoid emitting credentials; output
-redaction is not permission to print secrets.
+or backups. Retained metadata is pruned at startup and then hourly according
+to the retention setting; this is separate from immediate per-job staging
+cleanup. Retention governs operational history, not full console output.
+Scripts must still avoid emitting credentials; output redaction is not
+permission to print secrets.
+
 The version API reports the last successful retained deployment, not a fresh
 runtime probe. Version metadata can be unavailable after its history expires.
 
@@ -362,10 +377,21 @@ copy the stamp and the application must read it. Without `versionFile`, source
 files are not implicitly rewritten. `versionField` optionally checks that field
 in the health endpoint's JSON response.
 
-For a root `package-lock.json`, dependencies are installed with non-root
-`npm ci --omit=dev` before the image build. Other Dockerfiles manage their own
-dependencies. Base images use Podman's `--pull=missing` policy, so a newly
-provisioned builder does not require per-project manual cache seeding.
+The Podman adapter runs host-side
+`npm ci --omit=dev --no-audit --no-fund` only when the committed source has a
+`package-lock.json` at its root. Normal npm lifecycle scripts remain enabled:
+they run as the non-root builder with `NoNewPrivileges=yes`, without privilege
+elevation. Without a root lockfile, the host npm step is skipped and the
+Dockerfile/Containerfile handles dependencies, including for non-Node
+containers. A lockfile only in a nested project directory does not trigger the
+host npm step.
+
+Base images use Podman's `--pull=missing` policy, fetching missing images into
+the dedicated builder's rootless store. A newly provisioned builder does not
+require per-project manual cache seeding or runner enrollment. Registry
+connectivity, trust, and any required registry credentials remain
+operator-provided prerequisites; unavailable images fail the job rather than
+granting additional privileges.
 
 The container adapter checks an isolated candidate, transfers it through a
 root-owned artifact readable by the runtime group, promotes it, and restarts
