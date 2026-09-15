@@ -9,6 +9,9 @@ import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, rend
 import { deployCss } from '../app/deploy-css.js';
 import { resolveDeployReauth } from '../app/deploy-reauth.js';
 import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
+import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
+import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
+import { validateRecipe } from '../app/deployment/protocol.js';
 
 export const serverSource = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -18,7 +21,7 @@ function section(start, end) {
  if (from < 0 || to < 0) throw new Error(`Server harness seam missing: ${start}`);
  return serverSource.slice(from, to);
 }
-function functionSource(name) {
+export function functionSource(name) {
  const match = new RegExp(`^(?:async )?function ${name}\\(`, 'm').exec(serverSource);
  if (!match) throw new Error(`Server function missing: ${name}`);
  const rest = serverSource.slice(match.index);
@@ -28,11 +31,11 @@ function functionSource(name) {
 export function serverTemplate(name) {
  const match = new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\n').exec(serverSource);
  if (!match) throw new Error(`Server template missing: ${name}`);
- return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc });
+ return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc });
 }
 
 export function deployRouteHarness(root, options = {}) {
- const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [];
+ const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [];
  const project = { name: 'demo', path: root, ...options.project };
  let config = options.config || { demo: { dev: { script: 'legacy-saved-script', versionCmd: 'legacy-version-command', reauth: false } } };
  const user = { username: 'operator', role: 'admin', projects: '*', ...options.user };
@@ -51,6 +54,8 @@ export function deployRouteHarness(root, options = {}) {
   BASE: '/pw', DEPLOY_CENTRE: true, deployCss, deployInputsClientSrc,
   DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth,
   deployInputNotice, describeDeploySelection, renderDeployInputs, agentSpawnDrop,
+  deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin, validateRecipe,
+  deploymentService: options.deploymentService || { client: async () => null },
   TERMINAL_PRIV: resolveTerminalPriv({ PW_DEPLOY_MODE: 'container', PW_TERMINAL_UID: '1001', PW_TERMINAL_GID: '1001', PW_TERMINAL_USER: 'pane' }),
   process: { env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP, HOME: options.nativeExec ? root : '/root', USER: 'root', LOGNAME: 'root', DEPLOY_OPTION: 'must-not-leak' } },
   console,
@@ -75,6 +80,7 @@ export function deployRouteHarness(root, options = {}) {
   },
   appendDeployLog: async entry => history.push(plain(entry)),
   readDeployLog: async () => history.map(plain),
+  reclaimWorkspaceOwnership: async name => { reclaims.push(name); return options.onReclaim ? options.onReclaim(name) : ''; },
   audit: async (event, detail) => audit.push({ event, ...plain(detail) }),
   getLocalVersion: async () => { sourceReads++; return { version: 'V1.26.0909.1200', hash: 'abc123' }; },
   execFileAsync: async (file, args, execOptions) => {
@@ -95,6 +101,7 @@ export function deployRouteHarness(root, options = {}) {
  const helpers = [
   functionSource('esc'), functionSource('validName'), functionSource('deployExec'),
   functionSource('getDeployedVersion'), functionSource('getDeployEnv'),
+  functionSource('deploymentHistory'),
   section('const DEFAULT_DEPLOY_SLOTS = ', 'async function getLocalVersion('),
   section('const DEPLOY_STAMP_RE = ', 'function hasDeployConfigFor('),
  ].join('\n');
@@ -102,15 +109,16 @@ export function deployRouteHarness(root, options = {}) {
  vm.runInContext(helpers + '\n' + deployment, context, { filename: 'server-deployment-routes.js' });
  context.deployScript = serverTemplate('deployScript');
  return {
-  routes, executions, audit, history, middleware, boundaryCalls, users,
+  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims,
   get config() { return config; },
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },
   get saves() { return saves; },
-  async call(method, route, { body = {}, params = {}, caller = user } = {}) {
+  async call(method, route, { body = {}, params = {}, caller = user, headers = {}, query = {} } = {}) {
    const handlers = routes.get(`${method} /pw${route}`);
    if (!handlers) throw new Error(`Unknown harness route ${method} ${route}`);
-   const req = { body, params, user: caller };
+   const requestHeaders = { host: 'workbench.example.test', origin: 'http://workbench.example.test', ...headers };
+   const req = { body, params, user: caller, query, protocol: 'http', get: name => requestHeaders[name.toLowerCase()] };
    const res = {
     statusCode: 200,
     status(code) { this.statusCode = code; return this; },

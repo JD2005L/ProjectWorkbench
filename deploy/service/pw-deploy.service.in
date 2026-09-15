@@ -1,0 +1,26 @@
+# Managed by Project Workbench deployment service installer.
+[Unit]
+Description=Project Workbench host deployment broker
+After=network.target
+
+[Service]
+Type=exec
+User=root
+Group=root
+WorkingDirectory=@RELEASE@
+ExecStart=/usr/bin/node @RELEASE@/app/deployment/service.js --config @CONFIG@
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+UMask=0077
+RuntimeDirectory=pw-deploy
+RuntimeDirectoryMode=0700
+KillMode=control-group
+TimeoutStopSec=45s
+SendSIGKILL=yes
+Restart=on-failure
+RestartSec=5s
+RestartPreventExitStatus=78
+# Root is the fixed-command broker only. Step units drop UID; script/npm
+# steps have NoNewPrivileges=yes. Do not block rootless Podman's UID helpers.
+
+[Install]
+WantedBy=multi-user.target

@@ -9,6 +9,10 @@ Project Workbench runs in one of two modes, selected by `PW_DEPLOY_MODE`:
 
 Host mode is unchanged from upstream. The rest of this doc covers container mode.
 
+The optional [shared deployment service](docs/deployment-service.md) handles
+project deployment jobs. Its LOCAL/EXTERNAL backend choice is separate from
+`PW_DEPLOY_MODE`.
+
 ## Container mode
 
 Build the image and run it. The app spawns each project's terminal as a

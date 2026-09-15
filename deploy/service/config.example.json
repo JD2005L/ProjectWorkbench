@@ -1,0 +1,13 @@
+{
+  "listen": { "host": "127.0.0.1", "port": 3800 },
+  "tokenFile": "/etc/pw-deploy/service.token",
+  "stateDir": "/var/lib/pw-deploy",
+  "buildUser": "pw-deploy-build",
+  "runtimeUser": "pw-deploy-build",
+  "healthHosts": ["127.0.0.1", "::1"],
+  "unitName": "pw-deploy.service",
+  "adapters": ["script", "iis", "podman"],
+  "maxConcurrent": 1,
+  "defaultTimeoutSeconds": 600,
+  "retentionDays": 7
+}

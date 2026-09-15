@@ -32,6 +32,12 @@ import { assertTmuxOwner } from './tmux-owner-gate.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { mountOrchestrator } from './orchestrator/index.js';
+import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
+import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
+import { exportWorkspaceSnapshot } from './deployment/source.js';
+import { mountDeploymentRoutes, sendDeploymentHealth } from './deployment/routes.js';
+import { deploymentSubmitClientSrc, renderDeploymentSettings, deploymentSettingsScript, renderDeploymentNotice, renderExecutionRecipe } from './deployment/ui.js';
+import { validateRecipe } from './deployment/protocol.js';
 
 const app = express();
 const BASE = (process.env.PW_BASE_PATH || '').replace(/\/+$/, '');
@@ -87,7 +93,7 @@ const setupTmuxSession = 'pw_setup';
 const internalHandoffToken = process.env.PW_INTERNAL_HANDOFF_TOKEN || '';
 // `prompt` (safer default) makes Claude ask before each tool use; `skip` passes
 // --dangerously-skip-permissions and runs every tool unattended.
-const defaultWorkbenchSettings = { permissionMode:'prompt', mcpMode:'isolated', enabledClis:['claude'], updateClis:['claude'], timezone:'', defaultProject:'' };
+const defaultWorkbenchSettings = { permissionMode:'prompt', mcpMode:'isolated', enabledClis:['claude'], updateClis:['claude'], timezone:'', defaultProject:'', deployment:DEFAULT_DEPLOYMENT_SETTINGS };
 const PERMISSION_MODES = ['prompt','skip'];
 function normalizePermissionMode(v){ return PERMISSION_MODES.includes(v) ? v : 'prompt'; }
 const SUPPORTED_CLIS = {
@@ -120,6 +126,8 @@ try {
  console.error('[orchestrator] The orchestrator is disabled. No jobs will be accepted.');
 }
 
+// Public readiness must not read an account store or turn into a login page.
+app.get(BASE + '/api/deploy-service/health', (_req, res) => sendDeploymentHealth(deploymentService, res));
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
@@ -1070,8 +1078,7 @@ async function applyDefaultProjectFlag(prevName, projectName, raw){
  const claimed = cur === projectName || (!!prevName && cur === prevName);
  const next = want ? projectName : (claimed ? '' : cur);
  if(next === cur) return;
- settings.defaultProject = next;
- await saveWorkbenchSettings(settings);
+ await saveWorkbenchSettings({ defaultProject:next });
 }
 async function withSessionsLock(mutate){
  return withLifecycleLock(SESSIONS_LOCK_PATH, async () => {
@@ -1312,6 +1319,13 @@ function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
 // the exact same implementation, not a second hand-copied one that could
 // silently drift from it.
 const { encrypt, decrypt } = makeSecretCrypto({ secretKeyPath: SECRET_KEY_PATH });
+const workbenchSettingsStore = createWorkbenchSettingsStore({ filePath:workbenchSettingsPath, defaults:defaultWorkbenchSettings, encrypt, decrypt });
+const deploymentService = createDeploymentService({
+ settingsStore: workbenchSettingsStore,
+ snapshot: async workspace => exportWorkspaceSnapshot({
+  workspace, owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined,
+ }),
+});
 
 // ─── Deploy Centre helpers ──────────────────────────────────────────────────
 async function loadDeployConfig(){ try { return JSON.parse(await fs.readFile(deployConfigPath,'utf8')); } catch { return {}; } }
@@ -1362,6 +1376,8 @@ function deployExec(tc, argvTail, env, timeoutMs, cwd){
  return execFileAsync(argv[0], argv.slice(1), { timeout: timeoutMs, env: execEnv, ...(cwd ? { cwd } : {}) });
 }
 async function getDeployedVersion(project, target, cfg, env){
+ const external = await deploymentService.client();
+ if(external) return (await external.version(project, target)).version;
  const pc = cfg[project]; if(!pc || !pc[target]) return null;
  const versionCmd = pc[target].versionCmd;
  if(!versionCmd) return null;
@@ -1370,6 +1386,10 @@ async function getDeployedVersion(project, target, cfg, env){
   const { stdout } = await deployExec(pc[target], ['bash','-c',versionCmd], execEnv, 30000);
   return stdout.trim() || null;
  } catch { return null; }
+}
+async function deploymentHistory(project, external){
+ if(external === undefined) external = await deploymentService.client();
+ return external ? (await external.jobs({ project, limit:200 })).map(deploymentHistoryEntry).reverse() : readDeployLog(project);
 }
 function getDeployEnv(users, preferredUser){
  if(preferredUser?.deployPassword) return { DEPLOY_USER: preferredUser.deployUser || preferredUser.username, DEPLOY_PASSWORD: decrypt(preferredUser.deployPassword) };
@@ -1395,7 +1415,7 @@ async function getDeploySlotState(project, target, cfg){
  try {
   const manifest = await resolveDeployManifest(workspace, target);
   return manifest
-   ? { managed:true, manifest, slot:{ ...slot, label:manifest.label, options:[] }, config:{ ...saved, script:manifest.script, versionCmd:'' }, workspace }
+   ? { managed:true, manifest, slot:{ ...slot, label:manifest.label, options:[] }, config:{ ...saved, script:manifest.script, versionCmd:'', ...(manifest.execution ? { execution:manifest.execution } : {}) }, workspace }
    : { managed:false, manifest:null, slot, config:saved, workspace };
  } catch(error) {
   if(!(error instanceof DeployManifestError)) throw error;
@@ -1406,6 +1426,11 @@ async function getDeploySlotState(project, target, cfg){
 }
 async function getProjectDeployStates(project, cfg){
  return Promise.all(['dev','prod'].map(target => getDeploySlotState(project, target, cfg)));
+}
+function deploySlotConfigured(state, project, target, external){
+ if(state.error) return false;
+ const execution = state.manifest?.execution ?? state.config.execution ?? project.deploySlots?.[target]?.execution;
+ return !!state.config.script || !!(external && execution?.adapter === 'podman');
 }
 function deployManifestFailure(res, error){
  return res.status(error.statusCode).json({ ok:false, error:error.message, staleManifest:error.staleManifest });
@@ -2130,13 +2155,12 @@ async function getClaudeUpdateStamp(){
 }
 
 async function loadWorkbenchSettings(){
- try { const raw = await fs.readFile(workbenchSettingsPath,'utf8'); return { ...defaultWorkbenchSettings, ...JSON.parse(raw) }; }
- catch { return { ...defaultWorkbenchSettings }; }
+ return workbenchSettingsStore.load();
 }
 async function saveWorkbenchSettings(s){
- await fs.mkdir(path.dirname(workbenchSettingsPath),{recursive:true});
- await fs.writeFile(workbenchSettingsPath, JSON.stringify(s,null,2)+'\n');
- await syncWrapperEnv(s);
+ const saved = await workbenchSettingsStore.updateGeneral(s);
+ await syncWrapperEnv(saved);
+ return saved;
 }
 async function syncWrapperEnv(s){
  const body = [
@@ -2521,6 +2545,7 @@ const designTokensCss = `:root{--bg:#070c18;--bg2:#0e1728;--panel:#141f38;--pane
 const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="deployModalTitle"><div class="modal-box" style="max-width:900px"><header><h2 id="deployModalTitle">Deploy</h2><button class="modal-close" id="deployCloseBtn" aria-label="Close" type="button">×</button></header><div class="body" id="deployModalBody" style="padding:1rem 1.25rem"><p class="muted">Loading…</p></div></div></div>`;
 const deployModalScript = `<script>(function(){
  ${deployInputsClientSrc}
+ ${deploymentSubmitClientSrc}
  const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;
  const title=document.getElementById('deployModalTitle'),body=document.getElementById('deployModalBody'),closeBtn=document.getElementById('deployCloseBtn');
  let loadGeneration=0,opener=null;
@@ -2573,6 +2598,8 @@ const deployModalScript = `<script>(function(){
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
      output.textContent='Running deployment script…';j=await runDeploy(pw,save);
     }
+    j=await followExternalDeployment(j,{base:'${BASE}',output,card});
+    if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
     output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');
     const vEl=card.querySelector('.current-version');if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
@@ -2597,6 +2624,7 @@ const deployModalScript = `<script>(function(){
 const deployScript = `<script>
 (function(){
  ${deployInputsClientSrc}
+ ${deploymentSubmitClientSrc}
  deployInputs.bind(document);
  function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]))}
  document.querySelectorAll('.save-config').forEach(btn=>{
@@ -2644,6 +2672,8 @@ const deployScript = `<script>
      output.textContent='Running deployment script…';
      j=await runDeploy(pw,save);
     }
+    j=await followExternalDeployment(j,{base:'${BASE}',output,card});
+    if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
     if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');return}
     output.textContent='✅ SUCCESS ('+j.duration+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
@@ -2668,7 +2698,7 @@ const deployScript = `<script>
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log');
     const j=await r.json();if(!j.ok)throw new Error(j.error);
     if(!j.log.length){logDiv.innerHTML='<p class="muted">No deployments yet.</p>'}
-    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td></tr>').join('')+'</tbody></table>'}
+    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':e.active?'':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td></tr>').join('')+'</tbody></table>'}
     logDiv.style.display='block';btn.textContent='Hide history';
    }catch(e){logDiv.innerHTML='<p class="muted">Error: '+esc(e.message)+'</p>';logDiv.style.display='block'}
   };
@@ -3248,8 +3278,10 @@ app.get(BASE + '/', requireAuth, async (req,res)=>{
  // open terminals. First-run nudges live on the landing + /settings, never at
  // the cost of reaching a working cockpit.
  if(canOpenTerminal && projects.length){
-  const target = await landingProject(req, projects);
-  return res.redirect(BASE + '/term/' + encodeURIComponent(target.name) + '/' + (req.query.manage === '1' ? '?manage=1' : ''));
+  try {
+   const target = await landingProject(req, projects);
+   return res.redirect(BASE + '/term/' + encodeURIComponent(target.name) + '/' + (req.query.manage === '1' ? '?manage=1' : ''));
+  } catch(error) { return deploymentFailure(res, error); }
  }
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
@@ -3289,8 +3321,10 @@ app.get(BASE + '/manage', requireAdmin, async (req,res)=>{
  // last-visited (or first) project's cockpit with ?manage=1.
  const projects = filterProjectsForUser(await loadProjects(), req.user);
  if(projects.length === 0) return res.redirect(BASE + '/?manage=1');
- const target = await landingProject(req, projects);
- res.redirect(BASE + '/term/' + encodeURIComponent(target.name) + '/?manage=1');
+ try {
+  const target = await landingProject(req, projects);
+  res.redirect(BASE + '/term/' + encodeURIComponent(target.name) + '/?manage=1');
+ } catch(error) { return deploymentFailure(res, error); }
 });
 
 // Shared by the dashboard form (admin session) and the machine API (scoped service token).
@@ -3551,13 +3585,16 @@ app.get(BASE + '/term/:project/', requireTerminalAccess, async (req,res)=>{ awai
  void rememberLastProject(req.user?.username, p.name);   // deliberately not awaited
  const adminManage = req.user.role === 'admin' ? (manageModalHtml + manageModalScript) : '';
  const tabPresetsJson = JSON.stringify(Array.isArray(p.tabs) ? p.tabs : []).replace(/</g,'\\u003c');
- const _ws = await loadWorkbenchSettings();
+ let _ws;
+ try { _ws = await loadWorkbenchSettings(); }
+ catch(error) { return deploymentFailure(res, error); }
  const cliTabsJson = JSON.stringify((_ws.enabledClis||[]).filter(k=>k in SUPPORTED_CLIS).map(k=>({label:SUPPORTED_CLIS[k].label,bin:SUPPORTED_CLIS[k].bin}))).replace(/</g,'\\u003c');
  await clearPending(p);
  let deployConfigured = false;
  if(DEPLOY_CENTRE){
   const dCfg = await loadDeployConfig();
-  deployConfigured = hasDeployConfigFor(p.name, dCfg) || (await getProjectDeployStates(p, dCfg)).some(state => state.managed);
+  deployConfigured = hasDeployConfigFor(p.name, dCfg) || (await getProjectDeployStates(p, dCfg)).some((state, index) =>
+   state.managed || deploySlotConfigured(state, p, ['dev','prod'][index], _ws.deployment?.backend === 'external'));
  }
  // No client-side "do we have a saved password?" hint: both deploy surfaces now
  // request first and let the server answer needPassword, so a hint could only
@@ -3707,7 +3744,7 @@ app.get(BASE + '/api/preview/:project/logs', requireAuth, requireProjectAccess, 
 app.get(BASE + '/api/setup/state', requireAdmin, async (_req,res)=>{ try {
  const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatuses()]);
  const updateStamp = await getClaudeUpdateStamp();
- res.json({ ok:true, settings, clis, updateStamp });
+ res.json({ ok:true, settings:publicWorkbenchSettings(settings), clis, updateStamp });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 // ---- scheduled tasks -------------------------------------------------------
@@ -3765,15 +3802,15 @@ app.post(BASE + '/api/tasks/:id/run', requireAdmin, async (req,res)=>{ try {
 } catch(e){ res.status(500).json({ok:false,error:e.message}); }});
 
 app.post(BASE + '/api/setup/state', requireAdmin, async (req,res)=>{ try {
- const s = await loadWorkbenchSettings();
+ const patch = {};
  const body = req.body || {};
- if(typeof body.permissionMode === 'string') s.permissionMode = normalizePermissionMode(body.permissionMode);
- if(typeof body.mcpMode === 'string' && ['inherit','isolated','custom'].includes(body.mcpMode)) s.mcpMode = body.mcpMode;
- if(Array.isArray(body.enabledClis)) s.enabledClis = [...new Set(body.enabledClis.filter(c => c in SUPPORTED_CLIS))];
- if(Array.isArray(body.updateClis)) s.updateClis = [...new Set(body.updateClis.filter(c => c in SUPPORTED_CLIS))];
- await saveWorkbenchSettings(s);
+ if(typeof body.permissionMode === 'string') patch.permissionMode = normalizePermissionMode(body.permissionMode);
+ if(typeof body.mcpMode === 'string' && ['inherit','isolated','custom'].includes(body.mcpMode)) patch.mcpMode = body.mcpMode;
+ if(Array.isArray(body.enabledClis)) patch.enabledClis = [...new Set(body.enabledClis.filter(c => c in SUPPORTED_CLIS))];
+ if(Array.isArray(body.updateClis)) patch.updateClis = [...new Set(body.updateClis.filter(c => c in SUPPORTED_CLIS))];
+ const s = await saveWorkbenchSettings(patch);
  await audit('setup_state_change', { permissionMode: s.permissionMode, mcpMode: s.mcpMode, enabledClis: s.enabledClis, updateClis: s.updateClis }, req);
- res.json({ ok:true, settings:s });
+ res.json({ ok:true, settings:publicWorkbenchSettings(s) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.post(BASE + '/api/setup/heal/nginx', requireAdminOrLocal, async (_req,res)=>{ try {
@@ -3853,7 +3890,7 @@ const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fi
 const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.tok-row{padding:.55rem 0;border-bottom:1px solid #1f2937}.tok-row:last-child{border-bottom:0}.tok-row.revoked{opacity:.55}.tok-tag{font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;background:#7f1d1d;color:#fecaca;border-radius:3px;padding:1px 5px;vertical-align:middle}.tok-new{margin:.6rem 0;padding:.6rem .7rem;border:1px solid #a16207;border-radius:6px;background:#1c1917}.tok-new pre{margin:.35rem 0;padding:.45rem .5rem;background:#0b0f19;border-radius:4px;overflow-x:auto;font-size:.8rem;color:#fde68a;user-select:all}#tokScopes{border:1px solid #334155;border-radius:6px;padding:.4rem .6rem;margin:.5rem 0}#tokScopes legend{padding:0 .3rem;font-size:.8rem;color:#94a3b8}#tokScopes label{display:block;font-weight:400;margin:.2rem 0}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}/* display:flex above outranks the UA [hidden] rule, so a hidden field stays visible unless this re-asserts it — the same trap as .tabMenu vs .projLinks[hidden]. */.t-grid label[hidden]{display:none}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-agentrow{display:flex;align-items:center;gap:.6rem;margin:.5rem 0 .2rem;font-size:.85rem;color:#cbd5e1}.t-agentrow label{display:flex;align-items:center;gap:.35rem}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
 .um-form{display:flex;flex-direction:column;gap:.9rem}.um-form label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.um-form label.inline{flex-direction:row;align-items:center;gap:.45rem}.um-form label.inline input[type=checkbox]{width:auto;margin:0}.proj-picker{border:1px solid #1f2937;border-radius:8px;padding:.5rem .65rem;background:#0b1220}.proj-picker .star{display:flex;align-items:center;gap:.45rem;color:#fde68a;font-size:.85rem;padding-bottom:.45rem;border-bottom:1px solid #1f2937;margin-bottom:.45rem}.proj-picker .star input{width:auto;margin:0}.proj-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.3rem .85rem;max-height:240px;overflow-y:auto}.proj-list.disabled{opacity:.45;pointer-events:none}.proj-list label{flex-direction:row;align-items:center;gap:.4rem;font-size:.82rem;color:#cbd5e1;padding:.2rem 0;cursor:pointer}.proj-list label input{width:auto;margin:0}.proj-list .empty{color:#94a3b8;font-style:italic;font-size:.82rem}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}`;
 
-const settingsScript = `<script>(function(){const tabs=document.querySelectorAll('.s-tabs button');const sections=document.querySelectorAll('.s-main section');function activate(id){tabs.forEach(b=>b.classList.toggle('active',b.dataset.tab===id));sections.forEach(s=>s.classList.toggle('active',s.id==='tab-'+id));try{history.replaceState(null,'','#'+id)}catch{}}tabs.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));const init=(location.hash||'#users').slice(1);activate(['users','clis','env','system','firstrun'].includes(init)?init:'users');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(el,t,err){if(!el)return;el.textContent=t||'';el.classList.toggle('err',!!err)}
+const settingsScript = `<script>(function(){const tabs=document.querySelectorAll('.s-tabs button');const sections=document.querySelectorAll('.s-main section');function activate(id){tabs.forEach(b=>b.classList.toggle('active',b.dataset.tab===id));sections.forEach(s=>s.classList.toggle('active',s.id==='tab-'+id));try{history.replaceState(null,'','#'+id)}catch{}}tabs.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));const init=(location.hash||'#users').slice(1);activate(['users','clis','env','deployment','tasks','tokens','system','firstrun'].includes(init)?init:'users');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(el,t,err){if(!el)return;el.textContent=t||'';el.classList.toggle('err',!!err)}
 // --- Users tab ---
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
@@ -3971,10 +4008,11 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
 <section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed. When per-user Claude is enabled (<code>PW_PER_USER_CLAUDE</code>), the <b>Claude</b> column shows whether a user has completed their own Claude login — used automatically for the projects they own (their <code>primaryUser</code> assignment).</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
 <section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead">Install or update each assistant, then sign in. Tokens land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Sign-in terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
+${renderDeploymentSettings(BASE)}
 <section id="tab-tasks"><h2>Scheduled tasks</h2><p class="lead">Run a command in your projects on a clock. Each run opens a named tab in the project's terminal, so you can read what it did afterwards.</p>
 <div class="s-card"><h3>Tasks</h3><div id="taskRows"><p class="muted">loading…</p></div><div id="taskStatus" class="muted"></div></div>
 <div class="s-card"><h3 id="taskFormTitle">Add a task</h3>
@@ -3998,7 +4036,7 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
 <div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
-${wizardModalHtml}${wizardScript}${settingsScript}${footer}</body></html>`);
+${wizardModalHtml}${wizardScript}${settingsScript}${deploymentSettingsScript(BASE)}${footer}</body></html>`);
 });
 
 // ============================================================================
@@ -4536,7 +4574,7 @@ app.get(BASE + '/api/system/status', requireAdmin, async (_req,res) => {
    wrapperEnvPresent: await fs.access(wrapperEnvPath).then(() => true).catch(() => false),
   };
   const firstRunNeeded = !checks.claudeInstalled || !checks.claudeAuthenticated || !checks.atLeastOneAdmin;
-  res.json({ ok:true, claudeVersion, updateStamp, userCount: users.length, settings, checks, firstRunNeeded });
+  res.json({ ok:true, claudeVersion, updateStamp, userCount: users.length, settings:publicWorkbenchSettings(settings), checks, firstRunNeeded });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
 
@@ -4550,6 +4588,11 @@ app.get(BASE + '/api/system/firstrun', async (_req,res) => {
  } catch { res.json({ ok:true, firstRunNeeded: false }); }
 });
 
+mountDeploymentRoutes(app, {
+ base:BASE, service:deploymentService, requireAuth, requireAdmin, requireProjectAccess,
+ loadProjects, filterProjectsForUser, audit, publicHealth:false,
+});
+
 if(DEPLOY_CENTRE){
  const fmtDeployLog = (entry) => {
   if(!entry) return 'Never deployed';
@@ -4557,16 +4600,18 @@ if(DEPLOY_CENTRE){
   return `${entry.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')} by ${entry.user}${selection ? ' | '+selection : ''}`;
  };
 
- function managedDeployTarget(p, target, state, entry){
+ function managedDeployTarget(p, target, state, entry, external = false){
   const { slot, config, manifest, error } = state;
   const opening = `<div class="target-card ${target}" data-project="${esc(p.name)}" data-target="${target}" data-managed="1" data-probeable="0" data-label="${esc(slot.label)}"${config.reauth?' data-reauth="1"':''}${manifest ? ` data-manifest="${esc(JSON.stringify(manifest))}"` : ''}>
    <h3>${slot.icon?esc(slot.icon)+' ':''}${esc(slot.label)}</h3>`;
   if(error) return `${opening}<p class="deploy-manifest-error" role="alert">${esc(error.message)}</p><p class="repo-managed-note">Repository-managed slot. Fix .pw/deploy.json or its choice metadata; a saved deployment script will not be used.</p></div>`;
   return `${opening}
    <p class="repo-managed-note">Repository-managed by <code>.pw/deploy.json</code>. Script and inputs are read-only here.</p>
+   ${renderExecutionRecipe(manifest.execution, external)}
    ${renderDeployInputs(manifest, 'deploy-'+p.name+'-'+target, esc)}
    <p class="manifest-notice">${esc(deployInputNotice(manifest))}</p>
    <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(entry))}</span></div>
+   ${external ? `<p>Latest job version: ${esc(entry?.version || 'none recorded')}${entry?.jobId ? ` | <a href="${BASE}/deploy-service?job=${encodeURIComponent(entry.jobId)}">View job</a>` : ''}</p>` : ''}
    <button class="button ${target==='prod'?'danger ':''}small deploy-btn" type="button"${manifest.inputs.length?' disabled':''}>Deploy</button>
    <div class="deploy-output" role="status" aria-live="polite"></div>
    <div class="config-section"><label>Repository-managed deploy script (bash, read-only)<textarea class="deploy-script" readonly>${esc(manifest.script)}</textarea></label></div>
@@ -4578,6 +4623,7 @@ if(DEPLOY_CENTRE){
  }
 
  async function deployPageCard(p, cfg, isAdmin){
+  const external = await deploymentService.client();
   const states = await getProjectDeployStates(p, cfg);
   const [devState, prodState] = states;
   const devCfg = devState.config;
@@ -4585,19 +4631,20 @@ if(DEPLOY_CENTRE){
   const devSlot = devState.slot; const prodSlot = prodState.slot;
   const devOptSel = deployOptionSelect(devSlot); const prodOptSel = deployOptionSelect(prodSlot);
   const independent = usesIndependentVersions(states);
-  const localVersion = independent ? null : await getLocalVersion(p.path || workspacePath(p.name));
-  const log = await readDeployLog(p.name);
+  const localVersion = independent || external ? null : await getLocalVersion(p.path || workspacePath(p.name));
+  const log = await deploymentHistory(p.name, external);
   const devLog = log.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = log.filter(e=>e.target==='prod').slice(-1)[0];
   return `<div class="project-card" data-project="${esc(p.name)}">
    <h2>${esc(p.name)}</h2>
+   ${renderDeploymentNotice(BASE, p.name, !!external)}
    ${deploySourceSummary(localVersion, independent)}
    <div class="targets">
-    ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
+    ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog, !!external) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-probeable="${external||devCfg.versionCmd?'1':'0'}" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
-     <div class="version-line">Version: <span class="version current-version">—</span>${devCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
+     <div class="version-line">${external?'Last successful version':'Version'}: <span class="version current-version">—</span>${external||devCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Refresh deployment version">↻</button>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
-     ${devCfg.script ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : (isAdmin ? `<span class="no-config">Configure script below</span>` : `<span class="no-config">Not configured</span>`)}
+     ${deploySlotConfigured(devState, p, 'dev', external) ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : (isAdmin ? `<span class="no-config">Configure script below</span>` : `<span class="no-config">Not configured</span>`)}
      <div class="deploy-output"></div>
      ${isAdmin ? `<div class="config-section">
       <label>Deploy script (bash)</label>
@@ -4607,11 +4654,11 @@ if(DEPLOY_CENTRE){
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
     </div>`}
-    ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
+    ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog, !!external) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${external||prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
-     <div class="version-line">Version: <span class="version current-version">—</span>${prodCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Re-check deployed version">↻</button>`:''}</div>
+     <div class="version-line">${external?'Last successful version':'Version'}: <span class="version current-version">—</span>${external||prodCfg.versionCmd?`<button class="button secondary small probe-btn" type="button" title="Refresh deployment version">↻</button>`:''}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
-     ${prodCfg.script ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : (isAdmin ? `<span class="no-config">Configure script below</span>` : `<span class="no-config">Not configured</span>`)}
+     ${deploySlotConfigured(prodState, p, 'prod', external) ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : (isAdmin ? `<span class="no-config">Configure script below</span>` : `<span class="no-config">Not configured</span>`)}
      <div class="deploy-output"></div>
      ${isAdmin ? `<div class="config-section">
       <label>Deploy script (bash)</label>
@@ -4628,6 +4675,7 @@ if(DEPLOY_CENTRE){
  }
 
  async function deployModalCard(p, cfg, isAdmin, deployEnv, states){
+  const external = await deploymentService.client();
   states ||= await getProjectDeployStates(p, cfg);
   const [devState, prodState] = states;
   const devCfg = devState.config;
@@ -4638,21 +4686,21 @@ if(DEPLOY_CENTRE){
   const [devVersion, prodVersion, localVersion, allLog] = await Promise.all([
    devState.managed ? null : getDeployedVersion(p.name,'dev',cfg,deployEnv),
    prodState.managed ? null : getDeployedVersion(p.name,'prod',cfg,deployEnv),
-   independent ? null : getLocalVersion(p.path || workspacePath(p.name)),
-   readDeployLog(p.name)
+   independent || external ? null : getLocalVersion(p.path || workspacePath(p.name)),
+   deploymentHistory(p.name, external)
   ]);
   const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
-  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':'fail'}">${e.status==='success'||e.ok?'✅ OK':'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
-  return `<div class="deploy-tabs"><button class="deploy-tab active" data-tab="deploy-panel">Deploy</button><button class="deploy-tab" data-tab="history-panel">History</button></div>
+  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
+  return `${renderDeploymentNotice(BASE, p.name, !!external)}<div class="deploy-tabs"><button class="deploy-tab active" data-tab="deploy-panel">Deploy</button><button class="deploy-tab" data-tab="history-panel">History</button></div>
    <div id="deploy-panel" class="deploy-tab-panel">
    ${deploySourceSummary(localVersion, independent)}
    <div class="targets">
-    ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
+    ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog, !!external) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
-     <div>Version: <span class="version current-version">${esc(devVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, devVersion)}</div>
+     <div>${external?'Last successful version':'Version'}: <span class="version current-version">${esc(devVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, devVersion)}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
-     ${devCfg.script ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
+     ${deploySlotConfigured(devState, p, 'dev', external) ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
      <div class="deploy-output"></div>
      ${isAdmin ? `<div class="config-section">
       <label>Deploy script (bash)</label>
@@ -4662,11 +4710,11 @@ if(DEPLOY_CENTRE){
       <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
      </div>` : ''}
     </div>`}
-    ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
+    ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog, !!external) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
-     <div>Version: <span class="version current-version">${esc(prodVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, prodVersion)}</div>
+     <div>${external?'Last successful version':'Version'}: <span class="version current-version">${esc(prodVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, prodVersion)}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
-     ${prodCfg.script ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
+     ${deploySlotConfigured(prodState, p, 'prod', external) ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
      <div class="deploy-output"></div>
      ${isAdmin ? `<div class="config-section">
       <label>Deploy script (bash)</label>
@@ -4679,23 +4727,26 @@ if(DEPLOY_CENTRE){
    </div>
    </div>
    <div id="history-panel" class="deploy-tab-panel" style="display:none">
+    ${external ? `<p><a href="${BASE}/deploy-service?project=${encodeURIComponent(p.name)}">Open durable service history, job details, and live logs</a></p>` : ''}
     ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th></tr></thead><tbody>${historyRows}</tbody></table>` : `<p class="muted">No deployment history yet.</p>`}
    </div>`;
  }
 
  app.get(BASE + '/deploy', requireAuth, async (req,res)=>{
+  try {
   const isAdmin = req.user?.role === 'admin';
   const projects = await loadProjects();
   const cfg = await loadDeployConfig();
   const visibleProjects = filterProjectsForUser(projects, req.user);
   const cards = await Promise.all(visibleProjects.map(p => deployPageCard(p, cfg, isAdmin)));
   const noProjects = visibleProjects.length === 0 ? `<p class="muted">No projects configured. <a href="${BASE}/manage">Add a project</a> first.</p>` : '';
-  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Re-check the deployed version for every project">↻ Probe all</button><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
+  res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Deployment Centre — Project Workbench</title><style>${deployCss}</style></head><body class="deploy-page"><div class="top"><div><h1>Deployment Centre</h1><p class="subtitle">Deploy projects to dev or production servers</p></div><div class="top-actions"><button id="probe-all" class="button secondary" type="button" title="Refresh deployment versions for every project">↻ Refresh versions</button><a class="button secondary" href="${BASE}/deploy-service">Service jobs</a><a class="button secondary" href="${BASE}/">Dashboard</a></div></div>${noProjects}${cards.join('\n')}${deployScript}</body></html>`);
+  } catch(error) { return deploymentFailure(res, error); }
  });
 
  app.post(BASE + '/api/deploy/config', requireAdmin, async (req,res)=>{
   try {
-   const { project, target, script, versionCmd } = req.body || {};
+   const { project, target, script, versionCmd, execution } = req.body || {};
    if(!project || !validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
    if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
    if(project === '__proto__' || project === 'constructor' || project === 'prototype') return res.status(400).json({ok:false,error:'Invalid project name'});
@@ -4707,26 +4758,30 @@ if(DEPLOY_CENTRE){
     if(state.managed) return res.status(409).json({ok:false,error:'This slot is repository-managed. Edit .pw/deploy.json in the project; its script and inputs cannot be saved here.'});
    }
    if(!cfg[project]) cfg[project] = {};
-   cfg[project][target] = { ...(cfg[project][target]||{}), script: String(script||'').trim(), versionCmd: String(versionCmd||'').trim() };
+   cfg[project][target] = { ...(cfg[project][target]||{}), script: String(script||'').trim(), versionCmd: String(versionCmd||'').trim(),
+    ...(execution === undefined ? {} : { execution:validateRecipe(execution) }) };
    await saveDeployConfig(cfg);
    await audit('deploy_config_update', { project, target }, req);
    res.json({ok:true});
-  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+  } catch(e){ return deploymentFailure(res, e); }
  });
 
  app.get(BASE + '/api/deploy/status', requireAuth, async (req,res)=>{
   try {
+   const external = await deploymentService.client();
    const projects = filterProjectsForUser(await loadProjects(), req.user);
    const cfg = await loadDeployConfig();
    const states = await Promise.all(projects.map(p => getProjectDeployStates(p, cfg)));
    let deployEnv = null;
-   if(states.some(slots => slots.some(state => !state.managed && state.config.versionCmd))){
+   if(!external && states.some(slots => slots.some(state => !state.managed && state.config.versionCmd))){
     const users = await loadUsers();
     deployEnv = getDeployEnv(users, users.find(u => u.username === req.user?.username));
    }
    const status = await Promise.all(projects.map(async (p, index) => {
     const targets = await Promise.all(['dev','prod'].map(async (target, i) => {
      const state = states[index][i];
+     if(external) return { ...await external.version(p.name, target), configured:deploySlotConfigured(state, p, target, external), managed:state.managed,
+      ...(state.managed ? { manifest:state.manifest, error:state.error?.message } : {}), metadata:true };
      return state.managed
       ? { version:null, configured:!!state.manifest, managed:true, manifest:state.manifest, error:state.error?.message }
       : { version:await getDeployedVersion(p.name,target,cfg,deployEnv), configured:!!state.config.script };
@@ -4754,7 +4809,8 @@ if(DEPLOY_CENTRE){
    try { selection = validateManifestRequest(manifest, req.body); }
    catch(error) { if(error instanceof DeployManifestError) return deployManifestFailure(res, error); throw error; }
   }
-  if(!tc || !tc.script) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
+  const execution = manifest?.execution ?? tc?.execution ?? p.deploySlots?.[target]?.execution;
+  if(!tc || (!tc.script && execution?.adapter !== 'podman')) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
   const users = await loadUsers();
   const currentUser = users.find(u => u.username === req.user?.username);
   const submitted = req.body?.password || '';
@@ -4800,6 +4856,22 @@ if(DEPLOY_CENTRE){
   }
   const deployPassword = effectivePassword || '';
   const deployUser = currentUser?.deployUser || currentUser?.username || req.user?.username || '';
+  try {
+   const client = await deploymentService.client();
+   if(client) return await requireDeploymentOrigin(req, res, async () => {
+    const job = await deploymentService.enqueue({
+     client, project, target, workspace:state.workspace, config:tc, manifest, selection, option,
+     execution:p.deploySlots?.[target]?.execution, deployUser, deployPassword,
+    });
+    await audit('deploy_service_enqueue', { project, target, jobId:job.id, revision:job.revision }, req);
+    return res.status(202).json({ ok:true, backend:'external', queued:true, job,
+     jobUrl:BASE + '/deploy-service?job=' + encodeURIComponent(job.id), user:req.user?.username });
+   });
+   if(validateRecipe(manifest?.execution ?? tc.execution ?? p.deploySlots?.[target]?.execution).adapter !== 'script'){
+    return res.status(400).json({ok:false,error:'This execution recipe requires the external deployment backend; no local deployment was attempted.',code:'deployment_external_recipe_required'});
+   }
+  } catch(error) { return deploymentFailure(res, error); }
+  if(!tc.script) return res.status(400).json({ok:false,error:'This recipe requires the external deployment backend; no local script is configured.'});
   const executionEnv = { ...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword,
    ...(manifest ? selection.env : { DEPLOY_OPTION:option }) };
   if(manifest) delete executionEnv.DEPLOY_OPTION;
@@ -4854,7 +4926,11 @@ if(DEPLOY_CENTRE){
  });
 
  app.get(BASE + '/api/deploy/:project/log', requireAuth, requireProjectAccess, async (req,res)=>{
-  try { res.json({ok:true, log: await readDeployLog(req.params.project)}); }
+  try {
+   const external = await deploymentService.client();
+   if(external && req.user.role !== 'admin' && !await projectByName(req.params.project)) return res.status(403).json({ok:false,error:'Not authorized for this deployment project.'});
+   res.json({ok:true, log: await deploymentHistory(req.params.project, external)});
+  }
   catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
 
@@ -4863,13 +4939,16 @@ if(DEPLOY_CENTRE){
    const { project, target } = req.params;
    if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
    if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
+   const external = await deploymentService.client();
    const cfg = await loadDeployConfig();
    const p = await projectByName(project);
+   if(external && req.user.role !== 'admin' && !p) return res.status(403).json({ok:false,error:'Not authorized for this deployment project.'});
    if(p){
     const state = await getDeploySlotState(p, target, cfg);
     if(state.error) return deployManifestFailure(res, state.error);
-    if(state.managed) return res.json({ok:true, version:null, configured:true, managed:true, manifest:state.manifest});
+    if(state.managed) return res.json({ok:true, ...(external ? await external.version(project, target) : { version:null }), configured:true, managed:true, manifest:state.manifest, ...(external ? { metadata:true } : {})});
    }
+   if(external) return res.json({ok:true, ...await external.version(project, target), configured:true, metadata:true});
    const tc = cfg[project]?.[target];
    if(!tc?.versionCmd) return res.json({ok:true, version:null, configured:false});
    const users = await loadUsers();
@@ -4888,8 +4967,9 @@ if(DEPLOY_CENTRE){
    const isAdmin = req.user?.role === 'admin';
    const cfg = await loadDeployConfig();
    const states = await getProjectDeployStates(p, cfg);
+   const external = await deploymentService.client();
    let deployEnv = null;
-   if(states.some(state => !state.managed && state.config.versionCmd)){
+   if(!external && states.some(state => !state.managed && state.config.versionCmd)){
     const users = await loadUsers();
     deployEnv = getDeployEnv(users, users.find(u => u.username === req.user?.username));
    }
