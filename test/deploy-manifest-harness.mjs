@@ -11,6 +11,9 @@ import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, rend
 import { deployCss } from '../app/deploy-css.js';
 import { resolveDeployReauth } from '../app/deploy-reauth.js';
 import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
+import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
+import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
+import { validateRecipe } from '../app/deployment/protocol.js';
 
 export const serverSource = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -20,7 +23,7 @@ function section(start, end) {
  if (from < 0 || to < 0) throw new Error(`Server harness seam missing: ${start}`);
  return serverSource.slice(from, to);
 }
-function functionSource(name) {
+export function functionSource(name) {
  const match = new RegExp(`^(?:async )?function ${name}\\(`, 'm').exec(serverSource);
  if (!match) throw new Error(`Server function missing: ${name}`);
  const rest = serverSource.slice(match.index);
@@ -45,7 +48,7 @@ export function deploymentSectionCallees() {
 export function serverTemplate(name) {
  const match = new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\n').exec(serverSource);
  if (!match) throw new Error(`Server template missing: ${name}`);
- return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc });
+ return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc });
 }
 
 // scripts/ is a sibling of app/ in every deployment, and server.js builds this exact path for the
@@ -73,6 +76,8 @@ export function deployRouteHarness(root, options = {}) {
   BASE: '/pw', DEPLOY_CENTRE: true, deployCss, deployInputsClientSrc,
   DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth,
   deployInputNotice, describeDeploySelection, renderDeployInputs, agentSpawnDrop,
+  deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin, validateRecipe,
+  deploymentService: options.deploymentService || { client: async () => null },
   TERMINAL_PRIV: resolveTerminalPriv({ PW_DEPLOY_MODE: 'container', PW_TERMINAL_UID: '1001', PW_TERMINAL_GID: '1001', PW_TERMINAL_USER: 'pane' }),
   process: { env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP, HOME: options.nativeExec ? root : '/root', USER: 'root', LOGNAME: 'root', DEPLOY_OPTION: 'must-not-leak' } },
   console,
@@ -128,6 +133,7 @@ export function deployRouteHarness(root, options = {}) {
  const helpers = [
   functionSource('esc'), functionSource('validName'), functionSource('deployExec'),
   functionSource('getDeployedVersion'), functionSource('getDeployEnv'),
+  functionSource('deploymentHistory'),
   functionSource('reclaimWorkspaceOwnership'),
   section('const DEFAULT_DEPLOY_SLOTS = ', 'async function getLocalVersion('),
   section('const DEPLOY_STAMP_RE = ', 'function hasDeployConfigFor('),
@@ -141,10 +147,11 @@ export function deployRouteHarness(root, options = {}) {
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },
   get saves() { return saves; },
-  async call(method, route, { body = {}, params = {}, caller = user } = {}) {
+  async call(method, route, { body = {}, params = {}, caller = user, headers = {}, query = {} } = {}) {
    const handlers = routes.get(`${method} /pw${route}`);
    if (!handlers) throw new Error(`Unknown harness route ${method} ${route}`);
-   const req = { body, params, user: caller };
+   const requestHeaders = { host: 'workbench.example.test', origin: 'http://workbench.example.test', ...headers };
+   const req = { body, params, user: caller, query, protocol: 'http', get: name => requestHeaders[name.toLowerCase()] };
    const res = {
     statusCode: 200,
     status(code) { this.statusCode = code; return this; },

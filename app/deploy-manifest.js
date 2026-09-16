@@ -2,11 +2,12 @@ import fs from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { DeploymentError, validateEnvironment, validateRecipe } from './deployment/protocol.js';
 
 const TARGETS = ['dev', 'prod'];
 const BUMPS = ['patch', 'minor', 'major'];
 const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);
-const RESERVED_ENV = new Set(['DEPLOY_PROJECT', 'DEPLOY_TARGET', 'DEPLOY_USER', 'DEPLOY_PASSWORD', 'DEPLOY_OPTION']);
+const RESERVED_ENV = new Set(['DEPLOY_PROJECT', 'DEPLOY_TARGET', 'DEPLOY_OPTION']);
 const MAX_JSON_BYTES = 1024 * 1024;
 
 export class DeployManifestError extends Error {
@@ -198,9 +199,13 @@ async function resolveManifest(workspace, target) {
  fields(manifest.slots, TARGETS, 'slots');
  if (!Object.hasOwn(manifest.slots, target)) return null;
  const slot = manifest.slots[target];
- fields(slot, ['label', 'script', 'inputs', 'version'], `slots.${target}`);
+ fields(slot, ['label', 'script', 'inputs', 'version', 'execution'], `slots.${target}`);
  const label = text(slot.label, `slots.${target}.label`);
- if (typeof slot.script !== 'string' || !slot.script.trim() || slot.script.length > 65536 || slot.script.includes('\0')) fail(`slots.${target}.script must be non-empty bash text`);
+ const execution = slot.execution === undefined ? undefined : validateRecipe(slot.execution);
+ const script = slot.script === undefined && execution?.adapter === 'podman' ? '' : slot.script;
+ if (typeof script !== 'string' || (!script.trim() && execution?.adapter !== 'podman') || script.length > 65536 || script.includes('\0')) {
+  fail(`slots.${target}.script must be valid bash text (non-empty unless execution.adapter is podman)`);
+ }
  const declaredInputs = slot.inputs === undefined ? [] : slot.inputs;
  if (!Array.isArray(declaredInputs) || declaredInputs.length > 8) fail(`slots.${target}.inputs must be an array of at most 8 required selects`);
  const names = new Set();
@@ -214,6 +219,7 @@ async function resolveManifest(workspace, target) {
   if (input.type !== 'select' || input.required !== true) fail(`${where}.${input.name} must be a required select`);
   text(input.label, `${where}.${input.name}.label`);
   if (typeof input.env !== 'string' || !/^DEPLOY_[A-Z][A-Z0-9_]{0,47}$/.test(input.env) || RESERVED_ENV.has(input.env) || envs.has(input.env)) fail(`${where}.${input.name} has an invalid, reserved, or duplicate env name`);
+  validateEnvironment({ [input.env]: '' });
   envs.add(input.env);
   if (Object.hasOwn(input, 'source') === Object.hasOwn(input, 'choices')) fail(`${where}.${input.name} needs exactly one of source or choices`);
   let choices;
@@ -237,7 +243,7 @@ async function resolveManifest(workspace, target) {
   if (!bump || bump === identity || bump.choices.length !== 3 || !BUMPS.every(value => bump.choices.some(choice => choice.value === value))) fail('version.bumpInput must name the patch/minor/major select');
   version = { input: identity.name, bumpInput: bump.name };
  }
- const resolved = { schemaVersion: 1, target, label, script: slot.script, inputs, version };
+ const resolved = { schemaVersion: 1, target, label, script, inputs, version, ...(execution ? { execution } : {}) };
  const revision = crypto.createHash('sha256').update(JSON.stringify({ resolved, fingerprints })).digest('hex');
  return { ...resolved, revision };
 }
@@ -246,6 +252,7 @@ export async function resolveDeployManifest(workspace, target) {
  try { return await resolveManifest(workspace, target); }
  catch (error) {
   if (error instanceof DeployManifestError) throw error;
+  if (error instanceof DeploymentError) throw new DeployManifestError(error.message, error.statusCode);
   if (typeof error.code === 'string') throw new DeployManifestError(`cannot read repository deployment data (${error.code})`);
   throw error;
  }
