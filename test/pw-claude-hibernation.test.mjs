@@ -1261,3 +1261,48 @@ test('a requested wake refuses a window whose conversation is already open', { t
     await teardown(ctx);
   }
 });
+
+test('a conversation with nothing to resume never spends an automatic retry', { timeout: 60000 }, async () => {
+  // A transcript can exist and still hold no conversation: a window hibernated before anything was
+  // said keeps only settings records. Claude Code refuses exactly those with "No conversation found
+  // with session ID" and exits 1 — which the retry budget counted as a transient failure. Three
+  // visits later the window was beyond the reach of every wake hook, for a conversation that was
+  // never resumable and never would be. Observed live on PVI2: 4 of 13 waiting windows held such a
+  // transcript, one already two attempts down.
+  const ctx = await setup();
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_nothing', fake: { PW_CLAUDE_WAKE_RETRIES: '2' } });
+    await hibernated(ctx, c);
+    // Exactly the shape of the real ones: titles, mode, permission-mode, last-prompt — no messages.
+    const at = new Date().toISOString();
+    fs.writeFileSync(path.join(ctx.projects, 'proj', `${c.sid}.jsonl`),
+      ['mode', 'permission-mode', 'last-prompt', 'ai-title', 'bridge-session']
+        .map((t) => `{"type":"${t}","timestamp":"${at}"}`).join('\n') + '\n');
+
+    // Open the tab far more often than the budget would survive.
+    let attempt = Number(/:(\d+)$/.exec(await opt(ctx, c.windowId, '@pw_claude_waiting'))?.[1] || 0);
+    for (let visit = 0; visit < 4; visit++) {
+      await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+      const want = attempt + 1;
+      assert.ok(await until(async () => Number(/:(\d+)$/.exec(await opt(ctx, c.windowId, '@pw_claude_waiting'))?.[1] || 0) >= want, 15000),
+        `visit ${visit + 1}: the placeholder must offer itself again`);
+      attempt = Number(/:(\d+)$/.exec(await opt(ctx, c.windowId, '@pw_claude_waiting'))?.[1] || 0);
+    }
+
+    assert.deepEqual(failedResumes(ctx), [], 'Claude is never launched for a conversation it cannot open');
+    assert.deepEqual(resumes(ctx), []);
+    assert.notEqual(await opt(ctx, c.windowId, '@pw_claude_waiting'), '',
+      'and after four visits it is STILL advertising — the budget was never spent, so the hooks can still reach it');
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid, 'the id is kept throughout');
+    const shown = await paneText(ctx, c);
+    assert.match(shown, /nothing to resume/, 'and the pane says what is actually wrong');
+    assert.match(shown, /no automatic attempt is spent on it/);
+    assert.doesNotMatch(shown, /Resuming did not work/, 'this is not a failed resume, and must not read as one');
+
+    // Not a dead end: give it a real conversation and the next visit resumes it normally.
+    transcript(ctx, c.sid, 0);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => resumes(ctx).length === 1, 15000), 'a transcript with messages resumes as usual');
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
+  } finally { await teardown(ctx); }
+});
