@@ -36,6 +36,38 @@ explicit runner restart. Optional target pause/timeout overrides are
 operational controls, not a prerequisite for a new project. Changing the
 global backend does not translate arbitrary old shell scripts.
 
+### Existing applications with legacy resource names
+
+New projects use the project/target naming convention automatically. An existing
+application may have an image, container and user unit whose shared name does not
+match that convention. Do not rename its live runtime or remove the destination
+guard to make it fit. An operator can preserve that name through the optional
+`resourceNames` object in the root-owned host policy:
+
+```json
+{
+  "resourceNames": {
+    "ExampleDashboard/prod": "legacy-dashboard"
+  }
+}
+```
+
+This is a destination binding, not a new execution identity or a root grant.
+The key is the exact PW project name and `dev` or `prod` target. The value is
+the existing shared image/container/user-unit name, without a tag or `.service`
+suffix. For that target it becomes the default and the only permitted image and
+service name; an explicit recipe must match it. The name is also reserved against
+other projects, including a project whose normal naming convention would produce
+the same name. Duplicate bindings are rejected.
+
+Only legacy exceptions need entries; new conventionally named projects still
+inherit the backend without registration. Bindings cannot be changed through
+jobs, project recipes, runtime settings or PW target controls. They are part of
+the operator-controlled policy and take effect on an explicit runner restart.
+The operator must first confirm the destination belongs to that project and
+target. A binding does not create, rename, migrate or start any runtime resource,
+and does not enable rootful containers or system units.
+
 ## Host prerequisites
 
 Use a reviewed checkout and an operator-maintained Linux/systemd host. The

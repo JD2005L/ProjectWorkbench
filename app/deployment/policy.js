@@ -1,6 +1,6 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
-import { ADAPTERS, fields, fail, resourceName, targetKey } from './protocol.js';
+import { ADAPTERS, fields, fail, record, resourceName, targetKey, validateRecipe } from './protocol.js';
 
 const ACCOUNT = /^[A-Za-z_][A-Za-z0-9_.-]{0,79}$/;
 const DEFAULT_SETTINGS = Object.freeze({
@@ -30,9 +30,25 @@ export function validateTargetSettings(value, previous = {}) {
   return result;
 }
 
+function validateResourceNames(value = {}) {
+  if (!record(value) || Object.keys(value).length > 1000) fail('Invalid resource name bindings');
+  const entries = Object.entries(value);
+  const reserved = new Set();
+  for (const [key, name] of entries) {
+    const [project, target, ...extra] = key.split('/');
+    if (extra.length || targetKey(project, target) !== key) fail('Invalid resource name binding target');
+    if (typeof name !== 'string') fail('Invalid resource name binding');
+    validateRecipe({ adapter: 'podman', image: name });
+    if (reserved.has(name)) fail('Resource name bindings must be unique');
+    reserved.add(name);
+  }
+  return Object.fromEntries(entries);
+}
+
 export function validateHostConfig(value) {
   fields(value, ['listen', 'tokenFile', 'stateDir', 'buildUser', 'runtimeUser', 'healthHosts',
-    'unitName', 'maxConcurrent', 'defaultTimeoutSeconds', 'retentionDays', 'adapters'], 'host policy');
+    'unitName', 'maxConcurrent', 'defaultTimeoutSeconds', 'retentionDays', 'adapters',
+    'resourceNames'], 'host policy');
   for (const field of ['tokenFile', 'stateDir']) {
     if (typeof value[field] !== 'string' || !path.posix.isAbsolute(value[field])
         || /[\0\r\n]/.test(value[field]) || path.posix.normalize(value[field]) !== value[field]
@@ -59,9 +75,10 @@ export function validateHostConfig(value) {
   }
   const adapters = value.adapters || ADAPTERS;
   if (!Array.isArray(adapters) || !adapters.length || adapters.some(adapter => !ADAPTERS.includes(adapter))) fail('Invalid adapter allowlist');
+  const resourceNames = validateResourceNames(value.resourceNames);
   const settings = validateSettings(Object.fromEntries(
     ['maxConcurrent', 'defaultTimeoutSeconds', 'retentionDays'].filter(key => value[key] !== undefined).map(key => [key, value[key]])));
-  return { ...value, unitName, healthHosts, adapters, defaults: settings };
+  return { ...value, unitName, healthHosts, adapters, resourceNames, defaults: settings };
 }
 
 export async function readProtectedFile(file, { secret = false } = {}) {
@@ -89,10 +106,14 @@ export function resolveJobPolicy(config, settings, overrides, request) {
   if (request.recipe.adapter === 'podman') {
     const canonical = resourceName(request.project, request.target);
     const compact = `${request.project.replace(/[_.]+/g, '-').toLowerCase()}${request.target === 'dev' ? '-dev' : ''}`;
-    const allowed = new Set([canonical, compact]);
-    const image = request.recipe.image || canonical;
-    const service = request.recipe.service || canonical;
-    if (!allowed.has(image) || !allowed.has(service)) {
+    const binding = config.resourceNames?.[key];
+    const allowed = new Set(binding ? [binding] : [canonical, compact]);
+    const image = request.recipe.image || binding || canonical;
+    const service = request.recipe.service || binding || canonical;
+    const reservedElsewhere = new Set(Object.entries(config.resourceNames || {})
+      .filter(([owner]) => owner !== key).map(([, name]) => name));
+    if (!allowed.has(image) || !allowed.has(service)
+        || reservedElsewhere.has(image) || reservedElsewhere.has(service)) {
       fail('Container image and service must belong to the selected project and target', 'resource_not_allowed', 403);
     }
     if (request.recipe.healthUrl) {

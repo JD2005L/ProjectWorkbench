@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { DeploymentEngine } from '../app/deployment/engine.js';
-import { DeploymentError } from '../app/deployment/protocol.js';
+import { DeploymentError, validateJob, validateRecipe } from '../app/deployment/protocol.js';
 import { validateSettings, validateTargetSettings, resolveJobPolicy } from '../app/deployment/policy.js';
 import { lineRedactor } from '../app/deployment/output.js';
 import { deploymentConfig, deploymentRequest, MemoryJobStore, until } from './deploy-service-fixtures.mjs';
@@ -139,6 +139,65 @@ test('privileged identity and command overrides cannot be set through admin runt
   assert.throws(() => resolveJobPolicy(config, config.defaults, {}, deploymentRequest({
     recipe: { adapter: 'podman', healthUrl: 'http://169.254.169.254/' },
   })), /not approved/);
+});
+
+test('operator-owned legacy names preserve an existing destination without enrolling other projects', () => {
+  const config = deploymentConfig({ resourceNames: { 'ExampleDashboard/prod': 'legacy-dashboard' } });
+  const resolve = overrides => resolveJobPolicy(config, config.defaults, {}, deploymentRequest({
+    project: 'ExampleDashboard', recipe: { adapter: 'podman' }, ...overrides,
+  }));
+  const defaulted = resolve({});
+  assert.equal(defaulted.image, 'legacy-dashboard');
+  assert.equal(defaulted.service, 'legacy-dashboard');
+  assert.deepEqual(defaulted.resourceKeys, ['podman-service/legacy-dashboard', 'podman-image/legacy-dashboard']);
+  assert.equal(resolve({
+    recipe: { adapter: 'podman', image: 'legacy-dashboard', service: 'legacy-dashboard' },
+  }).service, 'legacy-dashboard');
+  assert.throws(() => resolve({
+    recipe: { adapter: 'podman', service: 'example-dashboard' },
+  }), error => error.code === 'resource_not_allowed');
+  assert.equal(resolve({ target: 'dev' }).service, 'example-dashboard-dev');
+  assert.equal(resolve({ project: 'NewProject' }).service, 'new-project');
+});
+
+test('a legacy binding reserves its name even against another project canonical or compact name', () => {
+  for (const name of ['legacy-dashboard', 'legacydashboard']) {
+    const config = deploymentConfig({ resourceNames: { 'ExampleDashboard/prod': name } });
+    for (const recipe of [{ adapter: 'podman', image: name }, { adapter: 'podman', service: name }]) {
+      assert.throws(() => resolveJobPolicy(config, config.defaults, {}, deploymentRequest({
+        project: 'LegacyDashboard', recipe,
+      })), error => error.code === 'resource_not_allowed');
+    }
+    assert.throws(() => resolveJobPolicy(config, config.defaults, {}, deploymentRequest({
+      project: name, recipe: { adapter: 'podman' },
+    })), error => error.code === 'resource_not_allowed');
+  }
+  const config = deploymentConfig({ resourceNames: { 'ExampleDashboard/prod': 'legacy-dashboard-dev' } });
+  assert.throws(() => resolveJobPolicy(config, config.defaults, {}, deploymentRequest({
+    project: 'LegacyDashboard', target: 'dev', recipe: { adapter: 'podman' },
+  })), error => error.code === 'resource_not_allowed');
+});
+
+test('invalid, duplicate or runtime-editable legacy bindings are refused', () => {
+  for (const resourceNames of [
+    null, [], 'legacy',
+    { 'ExampleDashboard': 'legacy-dashboard' },
+    { 'ExampleDashboard/staging': 'legacy-dashboard' },
+    { 'ExampleDashboard/prod/extra': 'legacy-dashboard' },
+    { '__proto__/prod': 'legacy-dashboard' },
+    { 'ExampleDashboard/prod': '' },
+    { 'ExampleDashboard/prod': undefined },
+    { 'ExampleDashboard/prod': '../legacy-dashboard' },
+    { 'ExampleDashboard/prod': 'registry.example/app:latest' },
+    { 'ExampleDashboard/prod': 12 },
+    { 'ExampleDashboard/prod': 'legacy-dashboard', 'AnotherProject/prod': 'legacy-dashboard' },
+    Object.fromEntries(Array.from({ length: 1001 }, (_, index) => [`Example${index}/prod`, `legacy-${index}`])),
+  ]) assert.throws(() => deploymentConfig({ resourceNames }));
+  const resourceNames = { 'ExampleDashboard/prod': 'legacy-dashboard' };
+  assert.throws(() => validateSettings({ resourceNames }));
+  assert.throws(() => validateTargetSettings({ resourceNames }));
+  assert.throws(() => validateJob(deploymentRequest({ resourceNames })));
+  assert.throws(() => validateRecipe({ adapter: 'podman', resourceNames }));
 });
 
 test('split secrets and overlong log lines cannot bypass live-output redaction', () => {
