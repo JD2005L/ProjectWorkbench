@@ -8,34 +8,74 @@
 # its placeholder (pw-claude-wait) is waiting in the foreground; the window is its session's current window; and a client is
 # attached to that session, i.e. a person is actually looking at it. Then it presses Enter in the window,
 # which resumes the conversation in place.
+#
+# `--requested` is the same wake asked for BY A PERSON — the cockpit's terminal calling
+# POST /api/term/<project>/windows/<index>/wake, on a window the dashboard has shown them as
+# hibernated. It keeps every safety gate above except one: it does not require the placeholder to
+# still be advertising @pw_claude_waiting. pw-claude-wait stops advertising once its automatic
+# retries are spent, and from then on NO hook can reach it — the window is live, silent, and
+# resumable only by someone pressing Enter in the pane. A person asking once is not the retry loop
+# the cap exists to stop, so the request is honoured; the cap still governs the hooks.
 set -u
 
 sock="${1:-}"
 wid="${2:-}"
-[[ "$wid" =~ ^@[0-9]+$ ]] || exit 0
+mode="${3:-hook}"
+[[ "$mode" == "hook" || "$mode" == "--requested" ]] || { echo "pw-claude-wake: unknown mode $mode" >&2; exit 2; }
+requested=0
+[[ "$mode" == "--requested" ]] && requested=1
 
 t() {
 	if [[ -n "$sock" ]]; then timeout 5 tmux -S "$sock" "$@"; else timeout 5 tmux "$@"; fi
 }
+# A hook is fire-and-forget, so it says nothing and always exits 0. A request has a caller waiting
+# on an answer, and an answer of "nothing happened, and here is why" is the whole point — a UI that
+# reports a resume it never performed is the false-healthy state this endpoint exists to end.
+refuse() {
+	(( requested )) || exit 0
+	echo "$1"
+	exit 1
+}
 
-sid=$(t show-options -wqv -t "$wid" @pw_claude_sid 2>/dev/null) || exit 0
-named=$(t show-options -wqv -t "$wid" @pw_claude_hib_win 2>/dev/null) || exit 0
-[[ -n "$sid" && "$named" == "$wid" ]] || exit 0
+# Validated after refuse() exists, so a bad window id answers a request instead of exiting 0 — which
+# a caller could not tell apart from a resume that worked.
+[[ "$wid" =~ ^@[0-9]+$ ]] || refuse 'the window could not be read'
+
+sid=$(t show-options -wqv -t "$wid" @pw_claude_sid 2>/dev/null) || refuse 'the window could not be read'
+named=$(t show-options -wqv -t "$wid" @pw_claude_hib_win 2>/dev/null) || refuse 'the window could not be read'
+[[ -n "$sid" && "$named" == "$wid" ]] || refuse 'this window holds no hibernated conversation'
 
 # "<pid>:<attempt>" (a placeholder from before attempts were numbered records the pid alone).
-waiting=$(t show-options -wqv -t "$wid" @pw_claude_waiting 2>/dev/null) || exit 0
-[[ "$waiting" =~ ^([0-9]+)(:[0-9]+)?$ ]] || exit 0
+waiting=$(t show-options -wqv -t "$wid" @pw_claude_waiting 2>/dev/null) || refuse 'the window could not be read'
+if [[ ! "$waiting" =~ ^([0-9]+)(:[0-9]+)?$ ]]; then
+	(( requested )) || exit 0
+	# No advertised pid to check, so the pane's own FOREGROUND command stands in for every /proc
+	# check below: pw-claude-wait re-execs itself as `claude-resume`, and tmux reports the
+	# foreground job here — a placeholder suspended with Ctrl-Z reads as its shell instead, which is
+	# exactly the case Enter must never reach. Re-checked inside the send below, so the check and
+	# the keystroke cannot be separated by a resume that lands in between.
+	read -r cmd attached active pane < <(t display-message -p -t "$wid" '#{pane_current_command} #{session_attached} #{window_active} #{pane_id}' 2>/dev/null) || refuse 'the window could not be read'
+	[[ "$cmd" == "claude-resume" ]] || refuse 'nothing is waiting to resume in this window'
+	[[ "$attached" =~ ^[0-9]+$ ]] && (( attached > 0 )) || refuse 'no terminal is attached to this session'
+	[[ "$active" == "1" ]] || refuse 'this window is not the one on screen'
+	[[ "$pane" =~ ^%[0-9]+$ ]] || refuse 'the window could not be read'
+	t if-shell -F -t "$wid" "#{==:#{pane_current_command},claude-resume}" "send-keys -t $pane Enter"
+	echo "resuming $sid"
+	exit 0
+fi
 wpid=${BASH_REMATCH[1]}
-[[ -r "/proc/$wpid/cmdline" ]] || exit 0
-tr '\0' ' ' <"/proc/$wpid/cmdline" | grep -q 'pw-claude-wait' || exit 0
+[[ -r "/proc/$wpid/cmdline" ]] || refuse 'nothing is waiting to resume in this window'
+tr '\0' ' ' <"/proc/$wpid/cmdline" | grep -q 'pw-claude-wait' || refuse 'nothing is waiting to resume in this window'
 # Enter reaches the placeholder only while it is the terminal's foreground job. Stopped with Ctrl-Z, the
 # shell has the terminal, and Enter would run whatever is typed at its prompt.
-st=$(cat "/proc/$wpid/stat" 2>/dev/null) || exit 0
+st=$(cat "/proc/$wpid/stat" 2>/dev/null) || refuse 'nothing is waiting to resume in this window'
 read -r state _ pgrp _ _ tpgid _ <<<"${st##*) }"
-[[ "$state" != [Tt] && "$pgrp" == "$tpgid" ]] || exit 0
+[[ "$state" != [Tt] && "$pgrp" == "$tpgid" ]] || refuse 'the window is suspended at its shell; press Enter in it to resume'
 
-read -r attached active pane < <(t display-message -p -t "$wid" '#{session_attached} #{window_active} #{pane_id}' 2>/dev/null) || exit 0
-[[ "$attached" =~ ^[0-9]+$ ]] && (( attached > 0 )) && [[ "$active" == "1" && "$pane" =~ ^%[0-9]+$ ]] || exit 0
+read -r attached active pane < <(t display-message -p -t "$wid" '#{session_attached} #{window_active} #{pane_id}' 2>/dev/null) || refuse 'the window could not be read'
+[[ "$attached" =~ ^[0-9]+$ ]] && (( attached > 0 )) || refuse 'no terminal is attached to this session'
+[[ "$active" == "1" ]] || refuse 'this window is not the one on screen'
+[[ "$pane" =~ ^%[0-9]+$ ]] || refuse 'the window could not be read'
 
 # Several hooks fire for one visit (attach, session and window change, focus), each in its own run-shell.
 # Checking the claim and pressing Enter in ONE tmux command makes them atomic: the server runs a client's
@@ -44,3 +84,5 @@ read -r attached active pane < <(t display-message -p -t "$wid" '#{session_attac
 # The attempt number makes a wake that read the value before an attempt failed miss the next attempt.
 t if-shell -F -t "$wid" "#{==:#{@pw_claude_waiting},$waiting}" \
     "set-option -wu -t $wid @pw_claude_waiting ; send-keys -t $pane Enter"
+(( requested )) && echo "resuming $sid"
+exit 0

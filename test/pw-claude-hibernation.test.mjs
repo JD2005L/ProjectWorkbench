@@ -1100,3 +1100,124 @@ test('wake hooks are installed once and never replace hooks that were already th
     assert.equal(attached.filter((l) => l.includes('pw-claude-wake')).length, 1);
   } finally { await teardown(ctx); }
 });
+
+// ---------------------------------------------------------------------------------------------
+// `--requested`: the wake a PERSON asks for, through the dashboard.
+//
+// The automatic retry cap (above) is what stops a broken resume from looping. Its side effect is a
+// window nobody can get back: the placeholder stops advertising @pw_claude_waiting, every hook then
+// declines, and the window sits there live, silent, and — until this change — indistinguishable in
+// the dashboard from an idle one. Someone sitting on that project cockpit saw a healthy terminal
+// and no way forward; reopening the project was the only thing that ever brought it back.
+//
+// So a request from a person is honoured past the cap (one visit is not a loop), while every gate
+// that makes pressing Enter into a pane SAFE is kept exactly as the hooks have it — and, unlike a
+// hook, a request answers: it exits non-zero and says why rather than failing silently into a UI
+// that would report a resume it never performed.
+const wakeRequested = (socketPath, windowId) => {
+  const r = { code: 0, out: '' };
+  try { r.out = execFileSync('bash', [WAKE, socketPath, windowId, '--requested'], { encoding: 'utf8' }).trim(); }
+  catch (e) { r.code = typeof e.status === 'number' ? e.status : -1; r.out = String(e.stdout || '').trim(); }
+  return r;
+};
+
+test('a requested wake resumes a conversation the hooks have given up on', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    const failFlag = path.join(ctx.dir, 'resume-fails');
+    fs.writeFileSync(failFlag, '');
+    const c = await claudeWindow(ctx, { session: 'pw_asked', fake: { FAKE_FAIL_FILE: failFlag, PW_CLAUDE_WAKE_RETRIES: '1' } });
+    await hibernated(ctx, c);
+    // Spend the one automatic retry, which is what strands the window.
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => failedResumes(ctx).length === 1));
+    assert.ok(await until(async () => (await opt(ctx, c.windowId, '@pw_claude_waiting')) === ''), 'the placeholder stops advertising once the cap is spent');
+    fs.rmSync(failFlag); // whatever broke the resume is fixed; nothing automatic will ever try again
+
+    await tmux(ctx.sock, ['set-hook', '-gu', 'client-attached']); // this test drives the wake itself
+    client = attachClient(ctx, 'pw_asked');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000));
+    const socketPath = await tmux(ctx.sock, ['display-message', '-p', '#{socket_path}']);
+
+    // Proof the window really is beyond the hooks' reach: the ordinary wake still declines it.
+    execFileSync('bash', [WAKE, socketPath, c.windowId]);
+    await sleep(800);
+    assert.deepEqual(resumes(ctx), [], 'sanity: no hook can resume this window any more');
+
+    const asked = wakeRequested(socketPath, c.windowId);
+    assert.equal(asked.code, 0, asked.out);
+    assert.equal(asked.out, `resuming ${c.sid}`, 'and it reports which conversation it resumed');
+    assert.ok(await until(() => resumes(ctx).length === 1, 15000), 'the request resumes it');
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`], 'the same conversation, in the same pane');
+    assert.ok(await resumedPid(ctx, c), 'and it is really live');
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
+});
+
+test('a requested wake never presses Enter into a placeholder suspended at its shell', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  let client;
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_askedz' });
+    await hibernated(ctx, c);
+    const waiter = waiterPid(await opt(ctx, c.windowId, '@pw_claude_waiting'));
+    // Strand it the same way, then suspend the placeholder so the SHELL owns the terminal.
+    await tmux(ctx.sock, ['set-option', '-w', '-t', c.windowId, '-u', '@pw_claude_waiting']);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'C-z']);
+    assert.ok(await until(() => stateOf(waiter) === 'T'));
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['display-message', '-p', '-t', c.paneId, '#{pane_current_command}'])) === 'bash'));
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, '-l', 'echo HALF-TYPED-$((6*7))']);
+    await tmux(ctx.sock, ['set-hook', '-gu', 'client-attached']);
+    client = attachClient(ctx, 'pw_askedz');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000));
+    const socketPath = await tmux(ctx.sock, ['display-message', '-p', '#{socket_path}']);
+
+    const asked = wakeRequested(socketPath, c.windowId);
+    assert.equal(asked.code, 1, 'a request may not press Enter at a shell prompt, however explicitly it was asked for');
+    assert.match(asked.out, /nothing is waiting to resume|suspended at its shell/);
+    await sleep(1000);
+    assert.doesNotMatch(await paneText(ctx, c), /HALF-TYPED-42/, 'the half-typed line must not run');
+    assert.deepEqual(resumes(ctx), []);
+
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'C-u']);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, '-l', 'fg']);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => stateOf(waiter) === 'S'), 'fg puts the placeholder back');
+    const again = wakeRequested(socketPath, c.windowId);
+    assert.equal(again.code, 0, again.out);
+    assert.ok(await until(() => resumes(ctx).length === 1), 'and the request works once it is safe');
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
+});
+
+test('a requested wake refuses, and says why, when nobody is looking or nothing is hibernated', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_askedno' });
+    await hibernated(ctx, c);
+    await tmux(ctx.sock, ['set-option', '-w', '-t', c.windowId, '-u', '@pw_claude_waiting']);
+    const socketPath = await tmux(ctx.sock, ['display-message', '-p', '#{socket_path}']);
+
+    // Detached: the same rule the hooks apply. A wake presses Enter into a live terminal, so it
+    // happens where a person can see the result, never into a session nobody has open.
+    const detached = wakeRequested(socketPath, c.windowId);
+    assert.equal(detached.code, 1);
+    assert.match(detached.out, /no terminal is attached/);
+    assert.deepEqual(resumes(ctx), []);
+
+    // A window with no markers is not a failure to report loudly, but it is never a success.
+    const plain = await tmux(ctx.sock, ['new-window', '-d', '-P', '-F', '#{window_id}', '-t', 'pw_askedno', 'bash']);
+    const bare = wakeRequested(socketPath, plain.trim());
+    assert.equal(bare.code, 1);
+    assert.match(bare.out, /no hibernated conversation/);
+
+    // And a malformed target can never look like a resume that happened.
+    const bogus = wakeRequested(socketPath, 'not-a-window');
+    assert.equal(bogus.code, 1);
+  } finally { await teardown(ctx); }
+});
