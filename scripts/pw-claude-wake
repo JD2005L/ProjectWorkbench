@@ -54,8 +54,33 @@ if [[ ! "$waiting" =~ ^([0-9]+)(:[0-9]+)?$ ]]; then
 	# foreground job here — a placeholder suspended with Ctrl-Z reads as its shell instead, which is
 	# exactly the case Enter must never reach. Re-checked inside the send below, so the check and
 	# the keystroke cannot be separated by a resume that lands in between.
-	read -r cmd attached active pane < <(t display-message -p -t "$wid" '#{pane_current_command} #{session_attached} #{window_active} #{pane_id}' 2>/dev/null) || refuse 'the window could not be read'
+	read -r cmd attached active pane panepid < <(t display-message -p -t "$wid" '#{pane_current_command} #{session_attached} #{window_active} #{pane_id} #{pane_pid}' 2>/dev/null) || refuse 'the window could not be read'
 	[[ "$cmd" == "claude-resume" ]] || refuse 'nothing is waiting to resume in this window'
+	# `claude-resume` is also what the placeholder is called while the Claude it resumed RUNS — the
+	# name is kept on purpose. Enter there would submit whatever the person had half-typed into that
+	# conversation, so the process tree, not the name, decides: a placeholder blocked on `read` has no
+	# child. Unreadable counts as running; we never press Enter into a pane we cannot prove is waiting.
+	# The placeholder is usually a CHILD of the pane (hibernation types it into the window's login
+	# shell), but it can be the pane process itself, so find it rather than assume a depth.
+	waiter=""
+	frontier="$panepid"
+	for _ in 1 2 3 4; do
+		[[ -n "$frontier" ]] || break
+		next=""
+		for pid in $frontier; do
+			# argv[0] is the identity: `exec -a claude-resume` is how the placeholder names itself, it is
+			# what tmux reports as the pane command, and it is what the dashboard matches on — one rule
+			# in all three places. The script path is accepted too, for a placeholder started directly.
+			argv0=$(tr '\0' '\n' <"/proc/$pid/cmdline" 2>/dev/null | head -1)
+			if [[ "${argv0##*/}" == "claude-resume" || "$argv0" == *pw-claude-wait* ]]; then waiter="$pid"; break; fi
+			next="$next $(tr ' ' '\n' <"/proc/$pid/task/$pid/children" 2>/dev/null | tr '\n' ' ')"
+		done
+		[[ -n "$waiter" ]] && break
+		frontier="$next"
+	done
+	[[ -n "$waiter" ]] || refuse 'nothing is waiting to resume in this window'
+	kids=$(tr -d ' \n' <"/proc/$waiter/task/$waiter/children" 2>/dev/null)
+	[[ -z "$kids" ]] || refuse 'this window already has its conversation open'
 	[[ "$attached" =~ ^[0-9]+$ ]] && (( attached > 0 )) || refuse 'no terminal is attached to this session'
 	[[ "$active" == "1" ]] || refuse 'this window is not the one on screen'
 	[[ "$pane" =~ ^%[0-9]+$ ]] || refuse 'the window could not be read'

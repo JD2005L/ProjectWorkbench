@@ -1221,3 +1221,43 @@ test('a requested wake refuses, and says why, when nobody is looking or nothing 
     assert.equal(bogus.code, 1);
   } finally { await teardown(ctx); }
 });
+
+test('a requested wake refuses a window whose conversation is already open', { timeout: 60000 }, async () => {
+  // The defect this pins cost a live conversation an unasked-for keystroke. pw-claude-wait re-execs
+  // itself as `claude-resume` and KEEPS that name while the Claude it resumed runs — deliberately,
+  // so it looks like neither a shell nor Claude to the schedulers that inspect panes — and it keeps
+  // the hibernation markers too. So markers, pane command and (once retries are spent, or once it
+  // has resumed) the missing advertisement all read identically for "waiting" and "running".
+  // Reading them as "waiting" sends Enter into a running Claude, which submits whatever the person
+  // had half-typed. Only the process tree tells the two apart.
+  const ctx = await setup();
+  let client;
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_open' });
+    await hibernated(ctx, c);
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => resumes(ctx).length === 1, 15000), 'the conversation is open again');
+    assert.ok(await resumedPid(ctx, c), 'and really running');
+    // Exactly the shape the route sees: markers kept, nothing advertised, pane still `claude-resume`.
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_sid'), c.sid);
+    assert.equal(await opt(ctx, c.windowId, '@pw_claude_waiting'), '', 'a running Claude advertises nothing');
+    assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', c.paneId, '#{pane_current_command}']), 'claude-resume',
+      'and is still called claude-resume — which is why the name cannot be the test');
+
+    await tmux(ctx.sock, ['set-hook', '-gu', 'client-attached']);
+    client = attachClient(ctx, 'pw_open');
+    assert.ok(await until(async () => (await tmux(ctx.sock, ['list-clients'])).trim().length > 0, 10000));
+    const socketPath = await tmux(ctx.sock, ['display-message', '-p', '#{socket_path}']);
+
+    const before = inputs(ctx).length;
+    const asked = wakeRequested(socketPath, c.windowId);
+    assert.equal(asked.code, 1, 'a request may not press Enter into a conversation that is already open');
+    assert.match(asked.out, /already has its conversation open/);
+    await sleep(1200);
+    assert.equal(inputs(ctx).length, before, 'and nothing reached the running conversation');
+    assert.equal(resumes(ctx).length, 1, 'nor was it resumed a second time');
+  } finally {
+    client?.kill('SIGKILL');
+    await teardown(ctx);
+  }
+});

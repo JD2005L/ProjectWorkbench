@@ -88,6 +88,27 @@ test('a hibernated window is reported as hibernated, and a stray marker cannot f
       if (!waiting?.hibernated) await new Promise((r) => setTimeout(r, 150));
     }
     assert.equal(waiting.hibernated, true, 'a window whose pane holds the waiting placeholder IS hibernated');
+
+    // REGRESSION: and a placeholder that has RESUMED its conversation is not. It keeps the
+    // `claude-resume` name and the markers while that Claude runs, so the only thing that separates
+    // the two states is the process tree — a waiting placeholder has no child, a resumed one has
+    // the Claude as its child. Reading it the other way badges a live conversation and then sends
+    // it an Enter, submitting whatever the person had half-typed.
+    const busy = path.join(dir, 'claude-resume-busy');
+    fs.writeFileSync(busy, '#!/bin/bash\nexec -a claude-resume /bin/bash -c \'sleep 300 & read -r _\'\n');
+    fs.chmodSync(busy, 0o755);
+    const busyId = (await tmux(sock, ['new-window', '-d', '-P', '-F', '#{window_id}', '-t', session, busy])).trim();
+    await tmux(sock, ['set-option', '-w', '-t', busyId, '@pw_claude_sid', SID]);
+    await tmux(sock, ['set-option', '-w', '-t', busyId, '@pw_claude_hib_win', busyId]);
+    let busyRow = null;
+    for (let i = 0; i < 40; i++) {
+      busyRow = (await windowsOf(base, name)).find((w) => w.windowId === busyId);
+      if (busyRow?.hibernationMarkers) break;
+      await new Promise((r) => setTimeout(r, 150));
+    }
+    assert.equal(busyRow.hibernationMarkers, true, 'it carries the same markers');
+    assert.equal(busyRow.hibernated, false,
+      'but a placeholder holding a conversation OPEN is not waiting to reopen one');
   }, { prefix: 'pw-hib-' });
 });
 

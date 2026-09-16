@@ -1673,23 +1673,21 @@ function parseTmuxWindows(stdout){
   // Hibernation fields are read from the END of the line, because a window NAME may contain the
   // separator and would shift every positional index after it. The six leading fields keep their
   // historical positions; these five cannot be knocked out of place by a name.
-  const tail = parts.slice(-5);
-  const [windowId, hibSid, hibWindow, waiting, paneCommand] = parts.length >= 11 ? tail : ['', '', '', '', ''];
+  const tail = parts.slice(-6);
+  const [windowId, hibSid, hibWindow, waiting, paneCommand, panePid] = parts.length >= 12 ? tail : ['', '', '', '', '', ''];
   // The markers count only when they name THIS window: scripts/pw-claude-hibernate stamps
   // @pw_claude_hib_win with the window's own id precisely so a stray session- or global-scope
   // option cannot make every window look hibernated (the same rule scripts/pw-tmux-save applies).
   const hibernationMarkers = !!hibSid && !!windowId && hibWindow === windowId;
-  // …but markers alone do not mean hibernated NOW. pw-claude-wait keeps them across a resume (it
-  // still owns the window, and a conversation that is stopped again must not lose its id), so a
-  // live resumed Claude carries them too. What separates the two states is the pane: the
-  // placeholder re-execs itself as `claude-resume`, and tmux reports the pane's FOREGROUND job
-  // here. Requiring it keeps the badge off a window whose conversation is already back — the same
-  // false-healthy mistake in the opposite direction.
+  // …but markers alone do not mean hibernated NOW. pw-claude-wait keeps them across a resume, so a
+  // live resumed Claude carries them too — and it keeps the `claude-resume` process name while that
+  // Claude runs, deliberately, so the pane command cannot separate the two states either. Only the
+  // process tree can, which listTmuxWindows adds: see placeholderIsRunning().
   return {
    index, name:parts[1] || `#${parts[0]}`, active:parts[2] === '1', bell,
    attached:Number(parts[4]) || 0, activity:Number(parts[5]) || 0,
-   windowId, hibernationMarkers,
-   hibernated: hibernationMarkers && paneCommand === 'claude-resume',
+   windowId, panePid, hibernationMarkers,
+   placeholderInPane: hibernationMarkers && paneCommand === 'claude-resume',
    // Whether the tmux wake hooks can still resume it on their own: pw-claude-wait stops
    // advertising @pw_claude_waiting once its automatic retries are spent, and pw-claude-wake then
    // declines. Those windows are the ones only a person can get back.
@@ -1747,11 +1745,57 @@ function computeWorking(sessionName, w, now){
  if(process.env.PW_WORK_DEBUG && sessionName === 'pw_AmrikPublic') console.log('[workdbg]', JSON.stringify({ key, now, act: w.activity, stampAge, ch: changes.length, chSpan: changeSpan, sl: slots.length, slSpan: slotSpan, ratio: +ratio.toFixed(2), sustained, active: w.active, attached: w.attached, on }));
  return on;
 }
+// Is the placeholder in this pane holding a conversation OPEN, rather than waiting to reopen one?
+//
+// Nothing tmux reports can answer that. pw-claude-wait re-execs itself as `claude-resume` and keeps
+// that name for the whole life of the window — while it waits AND while the Claude it resumed runs
+// — on purpose, so it looks like neither a shell nor Claude to the schedulers that inspect panes.
+// It also keeps the hibernation markers across a resume, and clears @pw_claude_waiting both when it
+// resumes and when its automatic retries are spent. So markers, pane command and advertisement all
+// read identically for "waiting" and "running".
+//
+// The process tree does answer it: a placeholder blocked on `read` has no child; one that resumed
+// has that Claude as its child. Getting this wrong is not cosmetic — a running conversation would
+// be badged hibernated and then sent an Enter, which submits whatever the person had half-typed.
+function procChildren(pid){
+ if(!pid) return [];
+ try { return String(fsSync.readFileSync(`/proc/${Number(pid)}/task/${Number(pid)}/children`,'utf8')).trim().split(/\s+/).filter(Boolean); }
+ catch { return []; }
+}
+function procArgv0(pid){
+ try {
+  const raw = fsSync.readFileSync(`/proc/${Number(pid)}/cmdline`,'utf8').split('\0')[0] || '';
+  return raw.slice(raw.lastIndexOf('/') + 1);
+ } catch { return ''; }
+}
+// 'waiting' | 'running' | 'none'. The placeholder is usually a CHILD of the pane (hibernation types
+// it into the window's login shell), but it can be the pane process itself, so this finds it rather
+// than assuming a depth. Anything we cannot resolve is 'none' — never 'waiting' — because the safe
+// direction is to leave a pane alone rather than badge it and send it an Enter.
+function placeholderState(panePid){
+ const seen = new Set();
+ let frontier = [String(panePid || '')].filter(Boolean);
+ for(let depth = 0; depth < 4 && frontier.length; depth++){
+  const next = [];
+  for(const pid of frontier){
+   if(seen.has(pid)) continue;
+   seen.add(pid);
+   if(procArgv0(pid) === 'claude-resume') return procChildren(pid).length ? 'running' : 'waiting';
+   next.push(...procChildren(pid));
+  }
+  frontier = next;
+ }
+ return 'none';
+}
 async function listTmuxWindows(project){
- const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}|#{window_id}|#{@pw_claude_sid}|#{@pw_claude_hib_win}|#{@pw_claude_waiting}|#{pane_current_command}']);
+ const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}|#{window_id}|#{@pw_claude_sid}|#{@pw_claude_hib_win}|#{@pw_claude_waiting}|#{pane_current_command}|#{pane_pid}']);
  const now = Math.floor(Date.now()/1000);
  const session = tmuxSession(project);
- return parseTmuxWindows(stdout).map(w => ({ ...w, working: computeWorking(session, w, now) }));
+ return parseTmuxWindows(stdout).map(({ placeholderInPane, ...w }) => ({
+  ...w,
+  hibernated: placeholderInPane && placeholderState(w.panePid) === 'waiting',
+  working: computeWorking(session, w, now),
+ }));
 }
 
 async function tmuxWindowDetails(project){
