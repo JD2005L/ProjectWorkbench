@@ -1,7 +1,9 @@
 // Like preload-harness.mjs, execute real server source in a VM with explicit
 // boundary doubles. No host services, production stores, or Linux login locks.
 import fs from 'node:fs';
+import path from 'node:path';
 import vm from 'node:vm';
+import { fileURLToPath } from 'node:url';
 import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from '../app/deploy-manifest.js';
@@ -28,11 +30,31 @@ export function functionSource(name) {
  const end = rest.slice(1).search(/\n(?:async function |function |const |let |app\.)/);
  return end < 0 ? rest : rest.slice(0, end + 1);
 }
+// The deployment section as the harness executes it, and the server's own top-level functions that
+// it calls. The harness hand-declares that dependency list, and nothing used to notice when the
+// production section grew a call the list did not carry: 5d17c94 added reclaimWorkspaceOwnership()
+// to the deploy route and every runAsRoot route test started throwing
+// "ReferenceError: reclaimWorkspaceOwnership is not defined" from a synthesized filename. These two
+// exports let a test hold the list to the source. See deploy-ownership-reclaim.test.mjs.
+export const deploymentSection = () => section('if(DEPLOY_CENTRE){\n const fmtDeployLog', '\napp.use((err,_req,res,_next)');
+export function deploymentSectionCallees() {
+ const declared = [...serverSource.matchAll(/^(?:async )?function ([A-Za-z_$][\w$]*)\(/gm)].map(match => match[1]);
+ const body = deploymentSection();
+ // Own-name calls only: a bounded, enumerable set (the server's top-level functions), matched where
+ // they are CALLED and not as a property, so this needs no JavaScript parser to stay exact.
+ return [...new Set(declared)].filter(name => new RegExp(`(?<![\\w$.])${name}\\s*\\(`).test(body)).sort();
+}
+
 export function serverTemplate(name) {
  const match = new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\n').exec(serverSource);
  if (!match) throw new Error(`Server template missing: ${name}`);
  return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc });
 }
+
+// scripts/ is a sibling of app/ in every deployment, and server.js builds this exact path for the
+// ownership tool. The harness uses the real path so a route test proves which tool the deploy would
+// run, not merely that it ran something.
+export const FIX_OWNERSHIP_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'pw-fix-workspace-ownership');
 
 export function deployRouteHarness(root, options = {}) {
  const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [];
@@ -70,6 +92,8 @@ export function deployRouteHarness(root, options = {}) {
   filterProjectsForUser: projects => projects,
   projectByName: async name => name === project.name ? project : null,
   workspacePath: () => root,
+  workspaceRoot: root,
+  FIX_OWNERSHIP_HELPER,
   loadUsers: async () => { credentialReads++; return users; },
   decrypt: value => value.replace(/^sealed:/, ''),
   encrypt: value => `sealed:${value}`,
@@ -80,11 +104,19 @@ export function deployRouteHarness(root, options = {}) {
   },
   appendDeployLog: async entry => history.push(plain(entry)),
   readDeployLog: async () => history.map(plain),
-  reclaimWorkspaceOwnership: async name => { reclaims.push(name); return options.onReclaim ? options.onReclaim(name) : ''; },
   audit: async (event, detail) => audit.push({ event, ...plain(detail) }),
   getLocalVersion: async () => { sourceReads++; return { version: 'V1.26.0909.1200', hash: 'abc123' }; },
   execFileAsync: async (file, args, execOptions) => {
    const execution = { file, args: [...args], options: { ...execOptions, env: { ...execOptions.env } } };
+   // The ownership reclaim is its own seam, kept out of `executions`: that array is the DEPLOY
+   // command the operator's slot runs, and an assertion about it must not be satisfiable — or
+   // broken — by a maintenance tool that happens to run as root right after. Its default result is
+   // silent so deploy-output fixtures stay exactly what the deploy script printed; onReclaim gives
+   // a test the real production shape (output appended, failures swallowed).
+   if (file === FIX_OWNERSHIP_HELPER) {
+    reclaims.push(execution);
+    return options.onReclaim ? options.onReclaim(execution) : { stdout: '', stderr: '' };
+   }
    executions.push(execution);
    if (options.nativeExec) {
     if (file !== 'bash') throw new Error('The native deployment harness only executes Bash fixtures.');
@@ -102,6 +134,7 @@ export function deployRouteHarness(root, options = {}) {
   functionSource('esc'), functionSource('validName'), functionSource('deployExec'),
   functionSource('getDeployedVersion'), functionSource('getDeployEnv'),
   functionSource('deploymentHistory'),
+  functionSource('reclaimWorkspaceOwnership'),
   section('const DEFAULT_DEPLOY_SLOTS = ', 'async function getLocalVersion('),
   section('const DEPLOY_STAMP_RE = ', 'function hasDeployConfigFor('),
  ].join('\n');
@@ -109,7 +142,7 @@ export function deployRouteHarness(root, options = {}) {
  vm.runInContext(helpers + '\n' + deployment, context, { filename: 'server-deployment-routes.js' });
  context.deployScript = serverTemplate('deployScript');
  return {
-  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims,
+  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, context,
   get config() { return config; },
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },

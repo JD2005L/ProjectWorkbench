@@ -31,7 +31,7 @@ async function freePort() {
 }
 
 /** Boot an isolated dashboard with one project, run fn({ base, name, sock }), always tear down. */
-export async function withCockpit(fn, { prefix = 'pw-cockpit-' } = {}) {
+export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = {} } = {}) {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
@@ -55,6 +55,7 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-' } = {}) {
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
     PW_API_TOKENS_PATH: path.join(dir, 'api-tokens.json'),
     PW_AUDIT_LOG: path.join(dir, 'audit.log'),
+    ...extraEnv,
   };
   const logs = [];
   const child = spawn(process.execPath, [path.join(APP_DIR, 'server.js')], { cwd: APP_DIR, env, stdio: ['ignore', 'pipe', 'pipe'] });

@@ -253,7 +253,8 @@ test('PW dispatch: local script semantics and explicit root ownership repair rem
     const result = await harness.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
     assert.equal(result.body.ok, !failed);
     assert.equal(harness.executions[0].file, 'bash');
-    assert.deepEqual(harness.reclaims, ['demo']);
+    assert.equal(harness.reclaims.length, 1);
+    assert.deepEqual(harness.reclaims[0].args, ['--apply', 'demo']);
     assert.equal(harness.history.length, 1);
   }
 });

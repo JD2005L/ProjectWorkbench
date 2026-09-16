@@ -112,6 +112,19 @@ running_elsewhere() {
 # transcript. Pane ids start again at %0 when the tmux server does, and a nested `claude -p` inherits the
 # pane, so an entry must also be interactive, name this window, and belong to a Claude started after this
 # placeholder.
+# Does this conversation actually hold anything to resume? A real transcript carries `user` and
+# `assistant` records. One for a window that was hibernated before anything was said carries only
+# settings — mode, permission-mode, last-prompt, titles — and Claude Code refuses exactly those with
+# "No conversation found with session ID". `grep -m1` stops at the first hit, so a multi-megabyte
+# transcript costs no more than a small one.
+conversation_has_messages() {
+	local f
+	for f in "$PROJECTS_DIR"/*/"$sid".jsonl; do
+		[[ -f "$f" ]] || continue
+		grep -qEm1 '"type": *"(user|assistant)"' "$f" && return 0
+	done
+	return 1
+}
 conversation_left_here() {
 	[[ -n "$pane" && "$my_start" =~ ^[0-9]+$ ]] || return 1
 	local wid jf pst other found="" n=0
@@ -148,7 +161,7 @@ main() {
 	fi
 	# The terminal as the shell handed it over, put back after every attempt: a Claude killed outright (the OOM
 	# killer, a crash) leaves it in raw mode, where Enter no longer ends a line and Ctrl-C no longer interrupts.
-	local tty_state rc next failures=0 attempt=0 reason=""
+	local tty_state rc next failures=0 attempt=0 reason="" empty=""
 	tty_state=$(stty -g 2>/dev/null) || tty_state=""
 
 	trap 'unset_window_opts @pw_claude_waiting' EXIT
@@ -156,7 +169,13 @@ main() {
 		# From here until Claude starts, Ctrl-C cancels, as the banner says; that includes the settle below.
 		trap cancelled INT
 		keep_markers
-		if (( failures == 0 )); then
+		if [[ -n "$empty" ]]; then
+			printf '\n\033[1mThis conversation has nothing to resume.\033[0m\n'
+			printf 'Its transcript holds only settings, no messages — what Claude Code reports as "No conversation\n'
+			printf 'found". Retrying cannot change that, so no automatic attempt is spent on it.\n'
+			printf 'Conversation: %s\n' "$sid"
+			printf 'Press Enter to look again, or Ctrl-C to return to the shell.\n'
+		elif (( failures == 0 )); then
 			printf '\n\033[1mClaude Code is hibernated in this window to free memory.\033[0m\n'
 			printf 'It resumes here when you open this tab, or press Enter now. Ctrl-C returns to the shell.\n'
 			printf 'Conversation: %s\n' "$sid"
@@ -170,9 +189,10 @@ main() {
 			fi
 		fi
 		if (( failures < AUTO_RETRIES )); then
-			# One visit fires several hooks. Let the rest of the visit that caused a failure pass before offering the
-			# next attempt, so they cannot use up the retries; Enter pressed meanwhile is kept for the read below.
-			(( failures == 0 )) || sleep "$SETTLE"
+			# One visit fires several hooks. Let the rest of the visit that caused a failure — or that found
+			# nothing to resume — pass before offering the next attempt, so they cannot use up the retries;
+			# Enter pressed meanwhile is kept for the read below.
+			if (( failures > 0 )) || [[ -n "$empty" ]]; then sleep "$SETTLE"; fi
 			attempt=$((attempt + 1))
 			set_window_opt @pw_claude_waiting "$$:$attempt"
 		else
@@ -194,6 +214,15 @@ main() {
 			failures=$((failures + 1)); reason="no transcript for this conversation was found"
 			continue
 		fi
+		# A transcript can EXIST and still hold no conversation. Launching Claude for one costs a startup
+		# and returns "No conversation found", which the retry budget below would count as a transient
+		# failure: three visits and the window is beyond the reach of every wake hook, for a conversation
+		# that was never resumable. It is not transient, so it spends no attempt.
+		if ! conversation_has_messages; then
+			empty=1
+			continue
+		fi
+		empty=""
 		if ! command -v "$CLAUDE_BIN" >/dev/null 2>&1; then
 			failures=$((failures + 1)); reason="$CLAUDE_BIN is not on PATH"
 			continue
