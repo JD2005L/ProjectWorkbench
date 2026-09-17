@@ -115,7 +115,8 @@ export async function atomicFile(file, bytes, {
   policy = {},
 } = {}) {
   const directory = path.dirname(file);
-  await inspectPath(directory, { ...policy, owner: policy.parentsOwner ?? 0, kind: 'directory' });
+  // File privacy does not require a private parent; ownership and write restrictions still apply.
+  await inspectPath(directory, { ...policy, owner: policy.parentsOwner ?? 0, kind: 'directory', privateFile: false });
   const temporary = path.join(directory, `.${path.basename(file)}.pw-deploy-${crypto.randomUUID()}`);
   const handle = await fs.open(temporary,
     constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW || 0), 0o600);
