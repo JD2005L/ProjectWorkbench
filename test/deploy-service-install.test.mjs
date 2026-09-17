@@ -59,6 +59,7 @@ test('new configuration matches the service contract and does not enroll targets
   assert.deepEqual(accepted.listen, { host: '127.0.0.1', port: 3800 });
   assert.equal(accepted.runtimeUser, 'pw-deploy-build');
   assert.equal(accepted.buildUser, 'pw-deploy-build');
+  assert.deepEqual(accepted.resourceNames, {});
   assert.equal(accepted.unitName, 'pw-deploy.service');
   const withoutUnitName = { ...defaults };
   delete withoutUnitName.unitName;
@@ -76,7 +77,7 @@ test('existing runtime identity does not replace the dedicated builder or become
   const host = validateHostConfig(defaultConfiguration(parseOptions(['--runtime-user', 'existing-runtime'])));
   assert.equal(host.buildUser, 'pw-deploy-build');
   assert.equal(host.runtimeUser, 'existing-runtime');
-  for (const field of ['buildUser', 'runtimeUser', 'unitName']) {
+  for (const field of ['buildUser', 'runtimeUser', 'unitName', 'resourceNames']) {
     assert.throws(() => validateSettings({ [field]: 'replacement' }), /Unknown/);
     assert.throws(() => validateTargetSettings({ [field]: 'replacement' }), /Unknown/);
   }
@@ -100,11 +101,14 @@ test('systemd-run preflight supports named-user supervision without requiring --
   assert.throws(() => validateSystemdRunHelp(null), /invalid help text/);
 });
 
-test('documented synthetic manifest and Podman wire recipe match the actual validators', async t => {
+test('documented manifests, Podman recipe and legacy binding match the actual validators', async t => {
   const { root } = fixture(t);
   const document = fs.readFileSync(path.join(REPO, 'docs', 'deployment-service.md'), 'utf8');
   const examples = [...document.matchAll(/```json\r?\n([\s\S]*?)\r?\n```/g)].map(match => JSON.parse(match[1]));
-  assert.equal(examples.length, 2);
+  assert.equal(examples.length, 3);
+  const bindings = examples.find(example => example.resourceNames);
+  assert.deepEqual(validateHostConfig({ ...defaultConfiguration(parseOptions([])), ...bindings }).resourceNames,
+    { 'ExampleDashboard/prod': 'legacy-dashboard' });
   const manifest = examples.find(example => example.slots?.dev?.script);
   const containerManifest = examples.find(example => example.slots?.dev?.execution);
   const recipe = containerManifest?.slots.dev.execution;

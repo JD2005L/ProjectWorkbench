@@ -7,6 +7,7 @@
   "healthHosts": ["127.0.0.1", "::1"],
   "unitName": "pw-deploy.service",
   "adapters": ["script", "iis", "podman"],
+  "resourceNames": {},
   "maxConcurrent": 1,
   "defaultTimeoutSeconds": 600,
   "retentionDays": 7

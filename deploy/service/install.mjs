@@ -90,7 +90,7 @@ export function defaultConfiguration(options) {
     listen: options.socket ? { socketPath: '/run/pw-deploy/control.sock' } : { host: options.host, port: options.port },
     tokenFile: `${options.configDir}/service.token`, stateDir: options.stateDir,
     buildUser: options.buildUser, runtimeUser: options.runtimeUser, healthHosts: ['127.0.0.1', '::1'],
-    unitName: UNIT, adapters: ['script', 'iis', 'podman'],
+    unitName: UNIT, adapters: ['script', 'iis', 'podman'], resourceNames: {},
     maxConcurrent: 1, defaultTimeoutSeconds: 600, retentionDays: 7,
   };
 }
