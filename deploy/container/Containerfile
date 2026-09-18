@@ -1,0 +1,85 @@
+FROM docker.io/library/node:20-bookworm-slim AS deploy-tools
+
+ARG PW_DOTNET_CHANNELS="8.0 10.0"
+ARG PODMAN_VERSION=5.8.2
+ARG PODMAN_SHA256=88f7c21e8399a8f5edd1ef7b5c2e12b29706d0a4f24463f264a0e88d887ebbbf
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    NODE_OPTIONS="--dns-result-order=ipv4first --no-network-family-autoselection" \
+    NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt \
+    DOTNET_CLI_TELEMETRY_OPTOUT=1 \
+    DOTNET_NOLOGO=1 \
+    POWERSHELL_TELEMETRY_OPTOUT=1 \
+    PW_DEPLOY_CONFIG=/etc/pw-deploy/config.json
+
+RUN apt-get -o Acquire::ForceIPv4=true update && \
+    apt-get install -y --no-install-recommends \
+      bash ca-certificates curl git jq openssh-client python3 python3-pip \
+      smbclient krb5-user libicu72 util-linux && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -s /usr/local/bin/node /usr/bin/node && \
+    ln -s /usr/local/bin/npm /usr/bin/npm && \
+    useradd --uid 1001 --user-group --no-create-home --home-dir /workspace/home \
+      --shell /usr/sbin/nologin deploy-job
+
+RUN set -eu; \
+    curl -fsSL "https://github.com/podman-container-tools/podman/releases/download/v${PODMAN_VERSION}/podman-remote-static-linux_amd64.tar.gz" -o /tmp/podman.tar.gz; \
+    printf '%s  %s\n' "$PODMAN_SHA256" /tmp/podman.tar.gz | sha256sum --check --status; \
+    tar -xzf /tmp/podman.tar.gz -C /tmp bin/podman-remote-static-linux_amd64; \
+    install -m 0755 /tmp/bin/podman-remote-static-linux_amd64 /usr/bin/podman; \
+    rm /tmp/podman.tar.gz /tmp/bin/podman-remote-static-linux_amd64; \
+    rmdir /tmp/bin; \
+    /usr/bin/podman --version
+
+# Same deployment-time .NET/WinRM/SMB tooling as PW, installed in the image only.
+RUN set -eu; \
+    pip3 install --no-cache-dir --break-system-packages pywinrm; \
+    curl -fsSL https://dot.net/v1/dotnet-install.sh -o /tmp/dotnet-install.sh; \
+    for channel in $PW_DOTNET_CHANNELS; do \
+      bash /tmp/dotnet-install.sh --channel "$channel" --install-dir /usr/share/dotnet; \
+    done; \
+    rm /tmp/dotnet-install.sh; \
+    ln -s /usr/share/dotnet/dotnet /usr/local/bin/dotnet; \
+    chmod -R a+rX /usr/share/dotnet; \
+    dotnet --list-sdks; \
+    python3 -c 'import winrm, requests_ntlm'; \
+    command -v smbclient >/dev/null
+
+# Microsoft's documented Debian package-repository installation.
+RUN set -eu; \
+    curl -fsSL https://packages.microsoft.com/config/debian/12/packages-microsoft-prod.deb -o /tmp/packages-microsoft-prod.deb; \
+    dpkg -i /tmp/packages-microsoft-prod.deb; \
+    rm /tmp/packages-microsoft-prod.deb; \
+    apt-get -o Acquire::ForceIPv4=true update; \
+    apt-get install -y --no-install-recommends powershell; \
+    rm -rf /var/lib/apt/lists/*; \
+    pwsh -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSVersion.ToString()'
+
+FROM deploy-tools
+ARG PW_DEPLOY_REVISION
+RUN test -n "$PW_DEPLOY_REVISION" && \
+    printf '%s' "$PW_DEPLOY_REVISION" | grep -Eq '^[a-f0-9]{40}$|^[a-f0-9]{64}$'
+WORKDIR /opt/pw-deploy
+COPY deploy/container/package.json ./
+COPY app/deployment/ ./app/deployment/
+COPY app/atomic-file.js app/lifecycle-lock.js app/VERSION ./app/
+COPY deploy/container/health.mjs ./health.mjs
+COPY deploy/container/runtime-relay.py ./runtime-relay.py
+RUN mkdir -p /etc/pw-deploy /var/lib/pw-deploy /workspace/source /workspace/home && \
+    chmod 0755 /opt/pw-deploy /opt/pw-deploy/app /opt/pw-deploy/app/deployment && \
+    chmod 0700 /var/lib/pw-deploy && \
+    chown -R 1001:1001 /workspace && \
+    node --input-type=module -e 'await import("./app/deployment/container-service.js")'
+
+LABEL org.opencontainers.image.title="Contained deployment service" \
+      org.opencontainers.image.revision=$PW_DEPLOY_REVISION \
+      io.pw-deploy.worker="true" \
+      io.pw-deploy.api-version="1"
+
+EXPOSE 3800
+USER 0:0
+HEALTHCHECK --interval=30s --timeout=7s --start-period=30s --retries=3 \
+    CMD ["node", "/opt/pw-deploy/health.mjs"]
+ENTRYPOINT ["node", "/opt/pw-deploy/app/deployment/container-service.js"]
+CMD ["--config", "/etc/pw-deploy/config.json"]

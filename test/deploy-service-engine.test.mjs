@@ -367,3 +367,85 @@ test('a journal failure cannot release a queued deployment into an unsupervised 
   assert.equal(fatal.length, 1);
   assert.equal(starts, 1);
 });
+
+test('shutdown aborts running jobs even when recording a queued interruption fails', async t => {
+  const store = new MemoryJobStore(), save = store.saveJob.bind(store);
+  let failingId, control, aborted = false;
+  store.saveJob = async job => {
+    if (job.id === failingId && job.phase === 'interrupted') throw new Error('Synthetic shutdown journal failure');
+    return save(job);
+  };
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store,
+    executor: { deploy: (_request, value) => new Promise((_resolve, reject) => {
+      control = value;
+      control.signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(control.signal.reason);
+      }, { once: true });
+    }) },
+  });
+  await engine.init();
+  t.after(async () => {
+    store.saveJob = save;
+    for (const active of engine.active.values()) active.controller.abort(new Error('Fixture cleanup'));
+    await Promise.allSettled([...engine.active.values()].map(active => active.promise));
+  });
+  await engine.submit(deploymentRequest());
+  await until(() => control);
+  failingId = (await engine.submit(deploymentRequest({ requestId: 'fixture-shutdown-queued' }))).id;
+  await assert.rejects(engine.close(), /shutdown journal failure/);
+  assert.equal(aborted, true);
+  assert.equal(engine.active.size, 0);
+  assert.equal(engine.requests.size, 0);
+});
+
+test('shutdown waits for admitted submissions before interrupting the final queue', async () => {
+  const store = new MemoryJobStore(), save = store.saveJob.bind(store);
+  let admit, entered, starts = 0, closed = false;
+  const admission = new Promise(resolve => { admit = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  store.saveJob = async job => {
+    if (job.phase === 'queued') { entered(); await admission; }
+    return save(job);
+  };
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store, executor: { deploy: async () => { starts++; } },
+  });
+  await engine.init();
+  const submitted = engine.submit(deploymentRequest());
+  await ready;
+  const stopping = engine.close().then(() => { closed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  const closedBeforeAdmission = closed;
+  admit();
+  const job = await submitted;
+  await stopping;
+  assert.equal(closedBeforeAdmission, false);
+  assert.equal(starts, 0);
+  assert.equal(engine.queue.length, 0);
+  assert.equal(engine.requests.size, 0);
+  assert.equal(store.jobs.get(job.id).state, 'interrupted');
+});
+
+test('retention never erases the only recovery checkpoint for unresolved cleanup', async t => {
+  let current = new Date('2026-01-01T00:00:00.000Z');
+  const store = new MemoryJobStore();
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store, now: () => current,
+    executor: { deploy: async (_request, control) => {
+      await control.onEvent('cleanup_failed');
+      throw new Error('Synthetic unresolved cleanup');
+    } },
+  });
+  await engine.init();
+  t.after(() => engine.close());
+  const submitted = await engine.submit(deploymentRequest());
+  await until(() => engine.get(submitted.id).finishedAt);
+  current = new Date('2026-02-01T00:00:00.000Z');
+  await engine.prune();
+  assert.equal(store.jobs.has(submitted.id), true);
+  await engine.event(engine.get(submitted.id), 'recovery_complete');
+  await engine.prune();
+  assert.equal(store.jobs.has(submitted.id), false);
+});

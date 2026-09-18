@@ -57,7 +57,8 @@ async function apiFixture(t, options = {}) {
     client: async () => { if (options.connectionError) throw options.connectionError; return options.local ? null : client; },
     requiredClient: async () => { if (options.connectionError) throw options.connectionError; return client; },
     settingsStore: {
-      load: async () => ({ deployment: { backend: 'external', endpoint: 'https://deploy.example.test', credential: 'enc:YWJjZA==' } }),
+      load: async () => ({ deployment: { backend: options.local ? 'local' : 'external', endpoint: 'https://deploy.example.test', credential: 'enc:YWJjZA==',
+        ...(options.consoleUrl ? { consoleUrl: options.consoleUrl } : {}) } }),
       updateDeployment: async body => { calls.push(['backend', body]); return { backend: body.backend, endpoint: 'https://deploy.example.test', hasCredential: true }; },
     },
   };
@@ -168,6 +169,41 @@ test('PW API: public landing health is generic JSON, not a login redirect or adm
   const page = await ready.request('/deploy-service', { user: '' });
   assert.equal(page.status, 302);
   assert.equal((await ready.request('/api/deploy-service/jobs', { user: '' })).status, 401);
+});
+
+test('PW console: configured standalone administration destination preserves only bounded job selectors', async t => {
+  const f = await apiFixture(t, { local: true, consoleUrl: 'https://console.example.test/deploy-service' });
+  const result = await f.request('/deploy-service?job=job-own-001&project=OwnApp&target=dev&token=not-forwarded', { user: 'admin' });
+  assert.equal(result.status, 303);
+  assert.equal(result.headers.get('location'), 'https://console.example.test/deploy-service?job=job-own-001&project=OwnApp&target=dev');
+  assert.equal((await f.request('/deploy-service', { user: '' })).status, 302);
+  const own = await f.request('/deploy-service');
+  assert.equal(own.status, 200);
+  assert.match(own.body, /OwnApp/);
+  assert.doesNotMatch(own.body, /OtherApp/);
+  assert.equal((await f.request('/api/deploy-service/health', { user: '' })).body.backend, 'local');
+});
+
+test('PW console: no destination keeps legacy rendering; malformed selectors cannot become redirect content', async t => {
+  const legacy = await apiFixture(t);
+  assert.equal((await legacy.request('/deploy-service', { user: 'admin' })).status, 200);
+  const f = await apiFixture(t, { consoleUrl: 'https://console.example.test/deploy-service' });
+  for (const query of ['job=%2Fsecret', 'job=a&job=b', 'project=../OtherApp', 'target=unknown']) {
+    const result = await f.request(`/deploy-service?${query}`, { user: 'admin' });
+    assert.equal(result.status, 400);
+    assert.equal(result.headers.get('location'), null);
+  }
+});
+
+test('PW connection settings remain administrator-only and accessible after the standalone console is configured', async t => {
+  const f = await apiFixture(t, { local: true, consoleUrl: 'https://console.example.test/deploy-service' });
+  const result = await f.request('/deploy-service/connection', { user: 'admin' });
+  assert.equal(result.status, 200);
+  assert.equal(result.headers.get('location'), null);
+  assert.match(result.body, /Deployment connection/i);
+  assert.equal((await f.request('/deploy-service/connection')).status, 403);
+  assert.notEqual((await f.request('/deploy-service/connection', { user: '' })).status, 200);
+  assert.equal((await f.request('/api/deploy-service/health', { user: '' })).body.backend, 'local');
 });
 
 async function workspace(t) {

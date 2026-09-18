@@ -40,7 +40,25 @@ export function mountDeploymentRoutes(app, {
   // This is deliberately JSON even without a login, and reveals no endpoint,
   // queue, target, account, or credential details.
   if (publicHealth) app.get(`${api}/health`, (_req, res) => sendDeploymentHealth(service, res));
+  app.get(`${base}/deploy-service/connection`, requireAdmin, route(async (_req, res) => {
+    res.type('html').send(renderDeploymentPage({ base, admin: true, connectionOnly: true }));
+  }));
   app.get(`${base}/deploy-service`, requireAuth, route(async (req, res) => {
+    if (req.user.role === 'admin') {
+      const { consoleUrl } = publicDeploymentSettings(await service.settingsStore.load());
+      if (consoleUrl) {
+        const destination = new URL(consoleUrl);
+        if (req.query.job !== undefined) {
+          if (typeof req.query.job !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(req.query.job)) {
+            throw new DeploymentError('Invalid deployment job selector.');
+          }
+          destination.searchParams.set('job', req.query.job);
+        }
+        if (req.query.project !== undefined) destination.searchParams.set('project', projectName(req.query.project));
+        if (req.query.target !== undefined) destination.searchParams.set('target', targetName(req.query.target));
+        return res.redirect(303, destination.href);
+      }
+    }
     res.type('html').send(renderDeploymentPage({ base, admin: req.user.role === 'admin', projects: await visible(req) }));
   }));
   app.get(`${api}/backend`, requireAdmin, route(async (_req, res) => {

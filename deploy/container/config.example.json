@@ -1,0 +1,32 @@
+{
+  "mode": "container",
+  "listen": { "host": "0.0.0.0", "port": 3800 },
+  "tokenFile": "/run/secrets/pw-deploy-api",
+  "stateDir": "/var/lib/pw-deploy",
+  "healthHosts": ["127.0.0.1", "::1"],
+  "adapters": ["script", "iis", "podman"],
+  "maxConcurrent": 1,
+  "defaultTimeoutSeconds": 600,
+  "retentionDays": 7,
+  "resourceNames": {},
+  "ui": {
+    "basePath": "/deploy-service",
+    "publicOrigin": "https://deploy.example.test",
+    "tokenFile": "/run/secrets/pw-deploy-ui",
+    "sessionMinutes": 30
+  },
+  "container": {
+    "instanceId": "11111111-1111-4111-8111-111111111111",
+    "builderSocket": "/run/pw-deploy/podman.sock",
+    "workerImage": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+    "maxMemoryMiB": 2048,
+    "maxPids": 512,
+    "runtime": {
+      "host": "runtime.example.test",
+      "port": 22,
+      "user": "app-runtime",
+      "keyFile": "/run/secrets/pw-deploy-runtime-key",
+      "knownHostsFile": "/etc/pw-deploy/known_hosts"
+    }
+  }
+}
