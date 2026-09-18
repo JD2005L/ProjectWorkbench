@@ -5,7 +5,7 @@ import {
   runtimeFixtureGate, validateRuntimeFixtureMetadata, fixtureLayout, candidateReference,
   runtimeFixturePolicy, runtimeContainersConf, runtimeFixtureUnit, runtimeUnitCommands,
   syntheticRuntimeDockerfile, syntheticRuntimeBuildContext, assertPrivateRuntimeStore,
-  assertRuntimeRelayContainer, assertSyntheticRuntimeImage, assertRuntimeUnitProperties,
+  assertRuntimeRelayContainer, assertSyntheticRuntimeImage, assertRuntimeUnitProperties, assertRuntimeUserMapping,
   assertProtectedRuntimeInventory, runtimeExecArgv, assertFixedRuntimeTransport,
   relayOutcomeIsCertain, runtimeRelayPreflight,
   normalizeRuntimeImageId,
@@ -151,6 +151,7 @@ test('relay inspect validation refuses host authority and unconfirmed exec sessi
     i => { i.HostConfig.Privileged = true; },
     i => { i.HostConfig.PidMode = 'host'; }, i => { i.HostConfig.IpcMode = 'host'; },
     i => { i.HostConfig.UTSMode = 'host'; }, i => { i.HostConfig.CgroupMode = 'host'; },
+    i => { i.HostConfig.UsernsMode = 'host'; },
     i => { i.HostConfig.NetworkMode = 'host'; }, i => { i.HostConfig.ReadonlyRootfs = false; },
     i => { i.HostConfig.CapAdd = ['CAP_SYS_ADMIN']; }, i => { i.HostConfig.SecurityOpt = []; },
     i => { i.HostConfig.PortBindings = { '18080/tcp': [{ HostPort: '18080' }] }; },
@@ -209,6 +210,31 @@ test('synthetic source contains a real versioned unhealthy-capable loopback HTTP
   assertSyntheticRuntimeImage(info, m, 'healthy');
   info.Config.Cmd[0] = 'wrong-version';
   assert.throws(() => assertSyntheticRuntimeImage(info, m, 'healthy'));
+});
+
+test('linked unit paths require the exact resolved private fragment and unchanged command authority', () => {
+  const m = metadata(), l = fixtureLayout(m);
+  const linked = unitProperties(m).replace(`FragmentPath=${l.unitFile}`,
+    `FragmentPath=/fixture-links/${l.service}.service`);
+  assert.throws(() => assertRuntimeUnitProperties(linked, m));
+  assertRuntimeUnitProperties(linked, m, l.unitFile);
+  assert.throws(() => assertRuntimeUnitProperties(linked, m, '/another/private/unit.service'));
+  assert.throws(() => assertRuntimeUnitProperties(linked.replace('--pull=never', '--pull=always'), m, l.unitFile));
+  assert.throws(() => assertRuntimeUnitProperties(linked.replace('/fixture-links/', '/fixture-links/../'), m, l.unitFile));
+  assert.throws(() => assertRuntimeUnitProperties(
+    linked.replace(`FragmentPath=/fixture-links/${l.service}.service`, 'FragmentPath=/fixture-links/other.service'), m, l.unitFile));
+});
+
+test('same-number relay mapping rejects initial namespaces and every host-root exposure', () => {
+  const large = 135567826;
+  assertRuntimeUserMapping(`0 100000 65536\n${large} ${large} 1\n`, large);
+  assertRuntimeUserMapping('0 100000 1001\n1001 1001 1\n1002 101001 64535\n', 1001);
+  for (const text of [
+    '0 0 4294967295\n', `0 100000 65536\n${large} ${large} 1\n200000000 0 1\n`,
+    `${large} ${large} 1\n`, `0 100000 65536\n${large} ${large + 1} 1\n`,
+    `0 100000 65536\n${large} ${large} 0\n`, '0 100000 -1\n', '',
+    `0 100000 65536\n${large} ${large} 4294967295\n`,
+  ]) assert.throws(() => assertRuntimeUserMapping(text, large));
 });
 
 test('Podman inspection identities normalize only exact bare or sha256 digests', () => {

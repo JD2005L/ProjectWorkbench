@@ -286,6 +286,7 @@ function assertConstrainedContainer(info, imageId, user = '1001:1001') {
   // Podman versions use different cgroup inspection keys; /proc is also checked
   // on the live path, so an absent presentation field never establishes isolation.
   for (const key of ['CgroupMode', 'CgroupnsMode']) assert.notEqual(info.HostConfig[key], 'host');
+  assert.notEqual(info.HostConfig.UsernsMode, 'host', 'host user namespace is forbidden');
   assert.deepEqual(info.HostConfig.CapAdd ?? [], [], 'no additional capabilities');
   assert.ok(info.HostConfig.SecurityOpt?.includes('no-new-privileges'), 'no-new-privileges required');
   assert.deepEqual(info.Config.Healthcheck?.Test ?? ['NONE'], ['NONE'], 'automatic image healthchecks must be disabled');
@@ -323,7 +324,7 @@ export function assertSyntheticRuntimeImage(info, metadata, role) {
   assert.deepEqual(info.Config?.Volumes ?? {}, {}, 'synthetic image cannot request volumes');
 }
 
-export function assertRuntimeUnitProperties(text, metadata) {
+export function assertRuntimeUnitProperties(text, metadata, resolvedFragmentPath) {
   const properties = {};
   for (const line of text.trim().split('\n')) {
     const index = line.indexOf('=');
@@ -335,7 +336,11 @@ export function assertRuntimeUnitProperties(text, metadata) {
   const l = fixtureLayout(metadata);
   assert.equal(properties.Id, `${l.service}.service`);
   assert.equal(properties.LoadState, 'loaded');
-  assert.equal(properties.FragmentPath, l.unitFile);
+  assert.ok(path.posix.isAbsolute(properties.FragmentPath), 'unit fragment must be an absolute path');
+  assert.equal(path.posix.normalize(properties.FragmentPath), properties.FragmentPath);
+  assert.equal(path.posix.basename(properties.FragmentPath), `${l.service}.service`);
+  assert.equal(resolvedFragmentPath ?? properties.FragmentPath, l.unitFile,
+    'loaded unit fragment must resolve to the exact protected fixture file');
   assert.equal(properties.DropInPaths, '');
   assert.equal(properties.NeedDaemonReload, 'no');
   assert.equal(properties.Type, 'notify');
@@ -350,6 +355,24 @@ export function assertRuntimeUnitProperties(text, metadata) {
     assert.equal(match[2], argv.join(' '), `${key} differs from the fixed synthetic unit`);
   }
   return properties;
+}
+
+export function assertRuntimeUserMapping(text, hostId) {
+  assert.ok(Number.isSafeInteger(hostId) && hostId > 0 && hostId < 2147483647);
+  assert.equal(typeof text, 'string');
+  const mappings = text.trim().split('\n').map(line => {
+    assert.match(line, /^\s*[0-9]+\s+[0-9]+\s+[0-9]+\s*$/);
+    const [inside, outside, size] = line.trim().split(/\s+/).map(Number);
+    assert.ok([inside, outside, size].every(Number.isSafeInteger));
+    assert.ok(inside >= 0 && outside > 0 && size > 0,
+      'private rootless mappings must never include host root');
+    assert.ok(inside + size <= 4294967295 && outside + size <= 4294967295);
+    return { inside, outside, size };
+  });
+  assert.ok(mappings.some(({ inside }) => inside === 0), 'container root must have a non-host-root mapping');
+  assert.ok(mappings.some(({ inside, outside, size }) =>
+    hostId >= inside && hostId < inside + size && outside + hostId - inside === hostId),
+  'relay must preserve the existing non-root host account numeric identity');
 }
 
 export function assertProtectedRuntimeInventory(actual, expected) {
@@ -613,7 +636,11 @@ export async function exerciseRuntimeRelayLifecycle(metadata, { signal, diagnost
       'Type', 'Restart', 'KillMode', 'ExecStart', 'ExecStop', 'ExecStopPost'];
     const result = await invoke('/usr/bin/systemctl', ['--user', 'show', `${l.service}.service`,
       `--property=${properties.join(',')}`], options);
-    assertRuntimeUnitProperties(result.output, m);
+    const fragments = [...result.output.matchAll(/^FragmentPath=(.+)$/gm)];
+    assert.equal(fragments.length, 1, 'unit must report exactly one fragment');
+    const fragment = fragments[0][1];
+    assert.equal(path.posix.basename(fragment), `${l.service}.service`);
+    assertRuntimeUnitProperties(result.output, m, await fs.realpath(fragment));
   };
   const storeCheck = async options => {
     assertPrivateRuntimeStore(JSON.parse((await privatePodman(['info', '--format=json'], options)).output), m);
@@ -651,7 +678,7 @@ export async function exerciseRuntimeRelayLifecycle(metadata, { signal, diagnost
   };
   const isolatedNamespaces = async pid => {
     assert.ok(Number.isSafeInteger(pid) && pid > 1);
-    for (const namespace of ['mnt', 'pid', 'net', 'cgroup']) {
+    for (const namespace of ['user', 'mnt', 'pid', 'net', 'cgroup']) {
       assert.notEqual(await fs.readlink(`/proc/${pid}/ns/${namespace}`), await fs.readlink(`/proc/self/ns/${namespace}`),
         `fixture container unexpectedly shares the host ${namespace} namespace`);
     }
@@ -696,11 +723,7 @@ export async function exerciseRuntimeRelayLifecycle(metadata, { signal, diagnost
     assert.equal(relayImage.Config?.Labels?.['io.pw-deploy.worker'], 'true');
     for (const kind of ['uid', 'gid']) {
       const mapping = await fs.readFile(`/proc/${relayContainer.State.Pid}/${kind}_map`, 'utf8');
-      const matches = mapping.trim().split('\n').some(line => {
-        const [inside, outside, size] = line.trim().split(/\s+/).map(Number);
-        return m[kind] >= inside && m[kind] < inside + size && outside + m[kind] - inside === m[kind];
-      });
-      assert.equal(matches, true, `relay ${kind} must preserve the existing non-root host account's numeric identity`);
+      assertRuntimeUserMapping(mapping, m[kind]);
     }
     const relayUser = `--user=${m.uid}:${m.gid}`;
     const available = (await privatePodman(['exec', relayUser, m.relay.containerId,
