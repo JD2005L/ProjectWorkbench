@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   validateContainerConfig, validateContainerUidMap, validateUiLocation, validateContainerCredentials,
+  validateContainerBuildCapabilities, assertContainerBuildSupport,
 } from '../app/deployment/container-config.js';
 import { resolveJobPolicy, validateHostConfig } from '../app/deployment/policy.js';
 import { deploymentRequest } from './deploy-service-fixtures.mjs';
@@ -67,6 +68,22 @@ test('container root must map to a non-host-root identity; malformed/identity ma
   validateContainerUidMap('0 100000 65536\n');
   for (const value of ['', '0 0 4294967295', '0 2000 0', '0 2000 nope', '1 2000 65536',
     '0 2000 1\n1001 0 1', '0 -1 65536']) assert.throws(() => validateContainerUidMap(value));
+});
+
+test('Podman controller builds require chroot capability in both effective and bounding sets', () => {
+  validateContainerBuildCapabilities('CapEff:\t0000000000040000\nCapBnd:\t0000000000040000\n');
+  for (const status of [
+    '', null, 'CapEff: invalid\nCapBnd: 0000000000040000\n',
+    'CapEff: 0000000000000000\nCapBnd: 0000000000040000\n',
+    'CapEff: 0000000000040000\nCapBnd: 0000000000000000\n',
+  ]) {
+    assert.throws(() => validateContainerBuildCapabilities(status),
+      error => error.code === 'container_build_capability_missing');
+  }
+});
+
+test('script-only controllers do not require build-only capabilities or a Linux status probe', async () => {
+  await assertContainerBuildSupport({ adapters: ['script', 'iis'] });
 });
 
 test('shared destination safeguards do not relax the legacy native listener policy', () => {

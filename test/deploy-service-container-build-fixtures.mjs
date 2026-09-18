@@ -494,7 +494,7 @@ export async function exerciseContainerBuildFixture({
     await fs.mkdir(fixtureDirectory, { mode: 0o700 });
     await fs.mkdir(positiveDirectory, { mode: 0o700 });
     await executor.init();
-    const builderInfo = JSON.parse((await executor.builderRaw(positiveControl, ['info', '--format', 'json'], {
+    const builderInfo = JSON.parse((await executor.builderRaw({ ...positiveControl, onOutput: () => {} }, ['info', '--format', 'json'], {
       captureStdout: true, maxStdoutBytes: 1024 * 1024,
     })).output);
     ensure(builderInfo?.host?.security?.rootless === true

@@ -17,6 +17,7 @@ Secret=pw-deploy-known-hosts,type=mount,target=/etc/pw-deploy/known_hosts,uid=0,
 ReadOnly=true
 NoNewPrivileges=true
 DropCapability=all
+AddCapability=SYS_CHROOT
 User=0
 Group=0
 Tmpfs=/tmp:rw,nosuid,nodev,size=512m

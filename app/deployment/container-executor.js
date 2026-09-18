@@ -368,7 +368,8 @@ export class ContainerExecutor {
   // Streams the dependency-installed workspace straight from the builder's
   // `podman cp` output into `podman build`'s stdin, never buffering the
   // (potentially large, npm-ci-inflated) archive in this process and never
-  // extracting it to local disk. The trailing "/." on the cp source copies
+  // extracting it in Node. The Podman client unpacks the archive in the
+  // controller's bounded /tmp tmpfs. The trailing "/." on the cp source copies
   // directory *contents* with no wrapping prefix, matching a Dockerfile
   // context rooted at ".".
   async buildFromContainer(control, sourceContainerName, buildArgs) {

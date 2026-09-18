@@ -471,7 +471,7 @@ test('live fixture payloads remain valid deployment protocol requests', () => {
 test(BUILD ? 'isolated live builder proves dependency workspace transfer and remote build cancellation'
   : 'isolated live container controller proves scripts, deadlines, cancellation, and owned-only recovery', {
   skip: !LIVE,
-  timeout: 300_000,
+  timeout: BUILD ? 360_000 : 300_000,
 }, async t => {
   assert.equal(process.platform, 'linux', 'PW_DEPLOY_LIVE_FIXTURE=1 requires Linux');
   assert.equal(typeof process.getuid, 'function', 'PW_DEPLOY_LIVE_FIXTURE=1 requires a Unix UID');
@@ -491,12 +491,13 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   const fixtureStem = `${PREFIX}${instanceId}`;
   const controllerAName = `${fixtureStem}-controller-a`;
   const controllerBName = `${fixtureStem}-controller-b`;
+  const controllerRefusedName = `${fixtureStem}-controller-missing-cap`;
   const decoyName = `${fixtureStem}-decoy`;
   const configSecret = `${fixtureStem}-config`;
   const apiSecret = `${fixtureStem}-api`;
   const uiSecret = `${fixtureStem}-ui`;
   const stateVolume = `${fixtureStem}-state`;
-  const intendedContainers = new Set([controllerAName, controllerBName, decoyName]);
+  const intendedContainers = new Set([controllerAName, controllerBName, controllerRefusedName, decoyName]);
   const intendedSecrets = new Set([configSecret, apiSecret, uiSecret]);
   const importedReferences = new Set();
   const processHandles = new Set();
@@ -782,13 +783,51 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   });
 
   if (BUILD) {
-    const { exerciseContainerBuildFixture } = await import('./deploy-service-container-build-fixtures.mjs');
     preserveBuildResources = true;
-    const evidence = await exerciseContainerBuildFixture({
-      socketPath, instanceId, imageId, storageBase, signal: t.signal,
+    const moduleUrl = new URL('./deploy-service-container-build-fixtures.mjs', import.meta.url).href;
+    const driver = `
+      import assert from 'node:assert/strict';
+      import fs from 'node:fs/promises';
+      import { exerciseContainerBuildFixture } from ${JSON.stringify(moduleUrl)};
+      try {
+        let input = '';
+        for await (const chunk of process.stdin) {
+          input += chunk;
+          assert.ok(Buffer.byteLength(input) <= 4096);
+        }
+        const context = JSON.parse(input);
+        assert.equal(process.getuid(), 0);
+        const mappings = (await fs.readFile('/proc/self/uid_map', 'utf8')).trim()
+          .split('\\n').map(line => line.trim().split(/\\s+/).map(Number));
+        const root = mappings.find(entry => entry[0] === 0);
+        assert.ok(root && root[1] === context.hostUid && root[1] !== 0);
+        const status = await fs.readFile('/proc/self/status', 'utf8');
+        for (const field of ['CapEff', 'CapBnd']) {
+          const value = new RegExp('^' + field + ':\\\\s*([0-9a-f]+)$', 'mi').exec(status)?.[1];
+          assert.equal(BigInt('0x' + value), 1n << 18n);
+        }
+        const evidence = await exerciseContainerBuildFixture({
+          ...context, signal: AbortSignal.timeout(220000),
+        });
+        console.log(JSON.stringify(evidence));
+      } catch (error) {
+        console.error(error.message);
+        process.exitCode = 1;
+      }
+    `;
+    const built = await run('/usr/bin/timeout', [
+      '--signal=TERM', '--kill-after=10s', '250s',
+      PODMAN, ...privateArgs, 'unshare', '/usr/bin/setpriv',
+      '--bounding-set=-all,+sys_chroot', '--inh-caps=-all', '--ambient-caps=-all',
+      '--no-new-privs', process.execPath, '--input-type=module', '-e', driver,
+    ], {
+      env: privateEnv, input: JSON.stringify({ socketPath, instanceId, imageId, storageBase, hostUid: uid }),
+      signal: t.signal, ownedProcesses: processHandles, timeoutMs: 265_000,
+      allowedExitCodes: [0, 1, 124, 125, 137],
     });
+    assert.equal(built.code, 0, `Isolated build driver failed: ${built.stderr.slice(-8192)}`);
     preserveBuildResources = false;
-    t.diagnostic(`PW_DEPLOY_BUILD_EVIDENCE=${JSON.stringify(evidence)}`);
+    t.diagnostic(`PW_DEPLOY_BUILD_EVIDENCE=${built.stdout.trim()}`);
     return;
   }
 
@@ -801,7 +840,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
     tokenFile: '/run/secrets/pw-deploy-api',
     stateDir: '/var/lib/pw-deploy',
     healthHosts: ['127.0.0.1', '::1'],
-    adapters: ['script'],
+    adapters: ['script', 'podman'],
     maxConcurrent: 1,
     defaultTimeoutSeconds: 30,
     retentionDays: 1,
@@ -841,7 +880,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   assert.equal(stateLabels?.['io.pw-deploy.instance'], instanceId);
   assert.equal(stateLabels?.['io.pw-deploy.live-fixture'], instanceId);
 
-  const controllerArgs = name => [
+  const controllerArgs = (name, buildCapability = true) => [
     'create', '--name', name,
     '--label', 'io.pw-deploy.controller=true',
     '--label', `io.pw-deploy.instance=${instanceId}`,
@@ -850,6 +889,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
     '--read-only',
     '--user=0:0',
     '--cap-drop=all',
+    ...(buildCapability ? ['--cap-add=SYS_CHROOT'] : []),
     '--security-opt=no-new-privileges',
     '--log-driver=none',
     '--timeout=180',
@@ -955,6 +995,14 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
     assert.deepEqual(await resourceNames('container', labels), []);
     assert.deepEqual(await resourceNames('volume', labels), []);
   };
+
+  await privatePodman(controllerArgs(controllerRefusedName, false));
+  const refused = await privatePodman(['start', '--attach', controllerRefusedName], {
+    allowedExitCodes: [1], timeoutMs: 15_000,
+  });
+  assert.match(refused.stderr, /Podman builds require SYS_CHROOT inside the rootless controller container/);
+  assert.equal(await containerStatus(controllerRefusedName), 'exited');
+  await stopAndRemoveContainer(controllerRefusedName);
 
   let controller = await startController('a');
   for (const route of ['/health', '/deploy-service/health']) {

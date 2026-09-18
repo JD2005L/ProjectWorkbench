@@ -198,8 +198,16 @@ reviewed unit in the dedicated account's approved user search path, such as
 `/etc/containers/systemd/users/<builder-uid>/pw-deploy.container`.
 Do not place it in the all-users directory or run it as a root/system Quadlet.
 
-It uses a read-only root filesystem, dropped capabilities, container
-no-new-privileges, a private writable state volume and bounded temporary memory.
+It uses a read-only root filesystem, drops all capabilities except
+`SYS_CHROOT`, sets container no-new-privileges, and provides a private writable
+state volume and bounded temporary memory. `SYS_CHROOT` is needed only inside
+the controller's rootless user namespace: Podman 5.8.2's remote build client
+chroots while unpacking a streamed build context in the controller's `/tmp`
+tmpfs. Without it, upstream tar extraction can fall back to parsing the archive
+as a Dockerfile and report a misleading missing-FROM error. Startup explicitly
+checks the effective and bounding capability when Podman recipes are enabled.
+Script/IIS-only controllers do not need this capability. Project workers do not
+receive it, and project commands still run as 1001:1001 with no capabilities.
 The controller's namespace UID 0 is **not host UID 0**. Startup refuses an
 identity-mapped host-root user namespace and a non-rootless builder daemon.
 Do not set host service `NoNewPrivileges` on the Podman launcher in a way that

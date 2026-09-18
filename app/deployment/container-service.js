@@ -9,7 +9,7 @@ import { DeploymentEngine } from './engine.js';
 import { JobStore } from './store.js';
 import { createDeploymentServer } from './service.js';
 import {
-  assertContainerIsolation, readContainerConfig, readContainerCredentials, validateContainerCredentials,
+  assertContainerIsolation, assertContainerBuildSupport, readContainerConfig, readContainerCredentials, validateContainerCredentials,
 } from './container-config.js';
 import { ContainerExecutor } from './container-executor.js';
 import { createStandaloneWeb } from './standalone-web.js';
@@ -140,6 +140,7 @@ async function main() {
   process.umask(0o077);
   await assertContainerIsolation();
   const config = await readContainerConfig(path.resolve(process.argv[3]));
+  await assertContainerBuildSupport(config);
   const credentials = await readContainerCredentials(config);
   const store = new JobStore(config.stateDir);
   await store.init();

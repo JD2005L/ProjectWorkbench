@@ -60,10 +60,11 @@ test('runtime policy example separates legacy resource names and exact proxy hea
 test('Quadlet uses rootless runtime facilities and separate namespace-owned secrets without broad grants', async () => {
   const file = await read('pw-deploy.container.example');
   for (const line of ['PublishPort=127.0.0.1:3800:3800', 'ReadOnly=true',
-    'NoNewPrivileges=true', 'DropCapability=all', 'WantedBy=default.target']) {
+    'NoNewPrivileges=true', 'DropCapability=all', 'AddCapability=SYS_CHROOT', 'WantedBy=default.target']) {
     assert.ok(file.includes(line), line);
   }
   assert.equal((file.match(/^Secret=.*uid=0,gid=0,mode=0400$/gm) || []).length, 5);
+  assert.deepEqual(file.match(/^AddCapability=.*$/gm), ['AddCapability=SYS_CHROOT']);
   assert.doesNotMatch(file, /SecurityLabelDisable|Privileged=|Network=host|Pid=host|\/run\/podman\/podman\.sock|CapDrop=/);
   assert.match(file, /^Volume=%t\/podman\/podman\.sock:\/run\/pw-deploy\/podman\.sock:ro$/m);
 });

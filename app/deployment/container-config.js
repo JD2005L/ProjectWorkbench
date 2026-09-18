@@ -113,6 +113,26 @@ export async function assertContainerIsolation() {
   validateContainerUidMap(await fs.readFile('/proc/self/gid_map', 'utf8'));
 }
 
+export function validateContainerBuildCapabilities(status) {
+  const required = 1n << 18n;
+  for (const field of ['CapEff', 'CapBnd']) {
+    const value = typeof status === 'string'
+      ? new RegExp(`^${field}:\\s*([0-9a-f]{16})$`, 'mi').exec(status)?.[1] : undefined;
+    if (!value || (BigInt(`0x${value}`) & required) === 0n) {
+      throw new DeploymentError(
+        'Podman builds require SYS_CHROOT inside the rootless controller container',
+        503, 'container_build_capability_missing',
+      );
+    }
+  }
+}
+
+export async function assertContainerBuildSupport(config) {
+  if (config.adapters.includes('podman')) {
+    validateContainerBuildCapabilities(await fs.readFile('/proc/self/status', 'utf8'));
+  }
+}
+
 export function validateContainerCredentials({ token, uiToken }) {
   for (const value of [token, uiToken]) {
     if (typeof value !== 'string' || !/^[A-Za-z0-9._~+/-]{32,512}=*$/.test(value) || value.length > 512) {
