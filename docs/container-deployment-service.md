@@ -201,6 +201,9 @@ The complete HTTP transaction runs in a separately supervised standard-library
 helper with an absolute ten-second budget, including connection, headers and
 body. A per-read socket timeout is not its lifetime guarantee. Cancellation
 terminates and reaps the helper; an unconfirmed reap remains an explicit failure.
+An unconfirmed stop preserves `process_failed`; it is not relabeled as an
+ordinary endpoint `health_failed` response. The former requires process
+reconciliation rather than assuming the endpoint was merely unhealthy.
 
 Candidate cleanup conditionally untags the exact candidate reference from its
 expected image identity. It never removes an image ID with unrelated aliases

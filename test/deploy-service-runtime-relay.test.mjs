@@ -621,6 +621,29 @@ elif mode == "reap_unconfirmed":
     print(json.dumps({"raised": False}))
   except relay.RelayError as error:
     print(json.dumps({"raised": True, "code": error.code}))
+elif mode in ("probe_unconfirmed_stop", "probe_unavailable", "probe_cancelled"):
+  waits = []
+  class FakeProc:
+    def poll(self): return None
+    def wait(self, timeout=None):
+      waits.append(timeout)
+      raise subprocess.TimeoutExpired("controlled-helper", timeout)
+  relay._stop_process = lambda process: None
+  relay._kill_process = lambda process: None
+  def command(*args, **kwargs):
+    if mode == "probe_unconfirmed_stop":
+      relay._terminate_and_reap(FakeProc())
+    elif mode == "probe_cancelled":
+      raise relay.RelayError("Runtime connector was cancelled", "cancelled")
+    else:
+      raise relay.RelayError("Controlled helper failure", "process_failed")
+  relay.run_command = command
+  try:
+    relay._probe_health("http://127.0.0.1:12345/health")
+    print(json.dumps({"raised": False}))
+  except relay.RelayError as error:
+    print(json.dumps({"raised": True, "code": error.code, "waits": len(waits),
+      "unconfirmed": isinstance(error, relay.UnconfirmedProcessStop)}))
 elif mode == "cancel_retains_tracking":
   # When a cancel/exceptional path cannot confirm the helper stopped, tracking
   # must be retained (not discarded) and the unconfirmed-stop error surfaced.
@@ -680,6 +703,16 @@ test('an unconfirmed reap surfaces an error instead of success-shaped cleanup', 
   const value = await runCommandAttempt('reap_unconfirmed');
   assert.deepEqual(value, { raised: true, code: 'process_failed' });
 });
+
+for (const [scenario, code, waits, unconfirmed] of [
+  ['probe_unconfirmed_stop', 'process_failed', 2, true],
+  ['probe_unavailable', 'health_failed', 0, false],
+  ['probe_cancelled', 'cancelled', 0, false],
+]) {
+  test(`health wrapper preserves the ${scenario} error contract`, { skip: !PYTHON }, async () => {
+    assert.deepEqual(await runCommandAttempt(scenario), { raised: true, code, waits, unconfirmed });
+  });
+}
 
 test('run_command retains helper tracking and surfaces the error on an unconfirmed cancel stop (POSIX)', {
   skip: process.platform === 'win32' ? 'requires POSIX pipe readiness polling' : !PYTHON,

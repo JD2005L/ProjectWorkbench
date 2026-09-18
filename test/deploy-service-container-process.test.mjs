@@ -122,9 +122,10 @@ test('runtime response allows the full bounded JSON body plus its framing header
   assert.equal((await pending).value, value);
 });
 
-test('runtime refusal codes preserve scoped health policy and cancellation errors', async () => {
+test('runtime refusal codes preserve health policy, cancellation and process-stop errors', async () => {
   for (const [code, expected] of [
     ['health_target_not_allowed', 'health_target_not_allowed'],
+    ['process_failed', 'process_failed'],
     ['cancelled', 'cancelled'],
     ['unknown_runtime_error', 'runtime_protocol_error'],
   ]) {

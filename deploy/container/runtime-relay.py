@@ -68,6 +68,11 @@ class RelayError(Exception):
         self.code = code
 
 
+class UnconfirmedProcessStop(RelayError):
+    def __init__(self):
+        super().__init__('Runtime helper could not be stopped', 'process_failed')
+
+
 def _check_terminated():
     if TERMINATED:
         raise RelayError('Runtime connector was cancelled', 'cancelled')
@@ -118,7 +123,7 @@ def _terminate_and_reap(process):
     try:
         process.wait(timeout=REAP_WAIT_SECONDS)
     except subprocess.TimeoutExpired:
-        raise RelayError('Runtime helper could not be stopped', 'process_failed')
+        raise UnconfirmedProcessStop()
 
 
 def _termination_signal(_signum, _frame):
@@ -833,13 +838,14 @@ def _probe_health(health_url):
     # Bound the entire transaction with the corrected process budget. The child
     # writes nothing until it has fully read the (bounded) body, so a dribbling
     # or stalled peer is stopped when run_command's absolute deadline fires,
-    # after which the child is terminated and reaped. Cancellation is preserved;
-    # every other failure is reported as a generic health failure with no
-    # subprocess text leaked.
+    # after which the child is terminated and reaped. Cancellation and an
+    # unconfirmed stop retain their meaning; endpoint failures stay generic.
     argv = [sys.executable, '-I', '-c', _HEALTH_PROBE_SCRIPT, health_url, str(MAX_RESPONSE_BYTES)]
     try:
         result = run_command(argv, timeout=HEALTH_PROBE_TIMEOUT_SECONDS,
             max_output_bytes=MAX_RESPONSE_BYTES + 3, env={'PATH': '/usr/bin:/bin'})
+    except UnconfirmedProcessStop:
+        raise
     except RelayError as exc:
         if exc.code == 'cancelled':
             raise
