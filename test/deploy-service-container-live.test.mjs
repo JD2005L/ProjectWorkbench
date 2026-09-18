@@ -662,6 +662,7 @@ test('isolated live container controller proves script execution, cancellation, 
     DBUS_SESSION_BUS_ADDRESS: `unix:path=${realBus}`,
   };
   privateArgs = ['--remote=false', '--root', graphRoot, '--runroot', runRoot, '--tmpdir', tmpDir];
+  console.log(`PW_DEPLOY_FIXTURE_RESOURCES=${JSON.stringify({ instanceId, storageBase, xdgRuntimeDir, graphRoot, runRoot, tmpDir, socketPath })}`);
 
   const normalIdentity = normalizeImageId((await run(PODMAN, [
     '--remote=false', 'image', 'inspect', '--format', '{{.Id}}', suppliedImage,
@@ -682,6 +683,8 @@ test('isolated live container controller proves script execution, cancellation, 
   assert.equal(info?.host?.security?.rootless, true);
   assert.equal(info?.store?.graphRoot, graphRoot);
   assert.equal(info?.store?.runRoot, runRoot);
+  assert.equal(info?.store?.volumePath, path.join(graphRoot, 'volumes'));
+  assert.equal(info?.store?.imageCopyTmpDir, transferTemp);
   assert.equal((await privatePodman(['ps', '-a', '--format', '{{.ID}}'])).stdout.trim(), '');
   privateIdentityVerified = true;
 
