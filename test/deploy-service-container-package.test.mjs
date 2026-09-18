@@ -13,6 +13,32 @@ const repo = path.resolve(directory, '..');
 const packaging = path.join(repo, 'deploy', 'container');
 const read = file => fs.readFile(path.join(packaging, file), 'utf8');
 
+function unitEntries(contents) {
+  let section = '';
+  const entries = [];
+  for (const raw of contents.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line || /^[#;]/.test(line)) continue;
+    const header = /^\[([^\]]+)\]$/.exec(line);
+    if (header) {
+      section = header[1];
+      continue;
+    }
+    const assignment = /^([^=]+)=(.*)$/.exec(line);
+    if (assignment) entries.push({ section, key: assignment[1].trim(), value: assignment[2].trim() });
+  }
+  return entries;
+}
+
+function assertControllerCapabilities(contents) {
+  const entries = unitEntries(contents).filter(entry => entry.section === 'Container');
+  assert.deepEqual(entries.filter(entry => entry.key === 'DropCapability').map(entry => entry.value), ['all']);
+  assert.deepEqual(entries.filter(entry => entry.key === 'AddCapability').map(entry => entry.value), ['SYS_CHROOT']);
+  for (const entry of entries.filter(entry => entry.key === 'PodmanArgs')) {
+    assert.doesNotMatch(entry.value, /--cap-add|--privileged/);
+  }
+}
+
 test('container example config uses separate mounted credentials, pinned image and immutable runtime authority', async () => {
   const config = validateContainerConfig(JSON.parse(await read('config.example.json')));
   assert.equal(config.mode, 'container');
@@ -59,14 +85,35 @@ test('runtime policy example separates legacy resource names and exact proxy hea
 
 test('Quadlet uses rootless runtime facilities and separate namespace-owned secrets without broad grants', async () => {
   const file = await read('pw-deploy.container.example');
+  const entries = unitEntries(file);
+  const container = entries.filter(entry => entry.section === 'Container');
   for (const line of ['PublishPort=127.0.0.1:3800:3800', 'ReadOnly=true',
-    'NoNewPrivileges=true', 'DropCapability=all', 'AddCapability=SYS_CHROOT', 'WantedBy=default.target']) {
-    assert.ok(file.includes(line), line);
+    'NoNewPrivileges=true']) {
+    assert.ok(container.some(entry => `${entry.key}=${entry.value}` === line), line);
   }
-  assert.equal((file.match(/^Secret=.*uid=0,gid=0,mode=0400$/gm) || []).length, 5);
-  assert.deepEqual(file.match(/^AddCapability=.*$/gm), ['AddCapability=SYS_CHROOT']);
+  assertControllerCapabilities(file);
+  assert.equal(container.filter(entry => entry.key === 'Secret' && /uid=0,gid=0,mode=0400$/.test(entry.value)).length, 5);
+  assert.ok(entries.some(entry => entry.section === 'Install'
+    && entry.key === 'WantedBy' && entry.value === 'default.target'));
   assert.doesNotMatch(file, /SecurityLabelDisable|Privileged=|Network=host|Pid=host|\/run\/podman\/podman\.sock|CapDrop=/);
-  assert.match(file, /^Volume=%t\/podman\/podman\.sock:\/run\/pw-deploy\/podman\.sock:ro$/m);
+  assert.ok(container.some(entry => entry.key === 'Volume'
+    && entry.value === '%t/podman/podman.sock:/run/pw-deploy/podman.sock:ro'));
+});
+
+test('Quadlet capability contract rejects comments, misplaced directives and additional grants', async () => {
+  const file = await read('pw-deploy.container.example');
+  for (const directive of ['DropCapability=all', 'AddCapability=SYS_CHROOT']) {
+    for (const comment of ['#', ';']) {
+      assert.throws(() => assertControllerCapabilities(file.replace(directive, `${comment}${directive}`)));
+    }
+    assert.throws(() => assertControllerCapabilities(
+      file.replace(directive, '').replace('[Service]', `[Service]\n${directive}`),
+    ));
+    assert.throws(() => assertControllerCapabilities(file.replace(directive, `${directive}\n${directive}`)));
+  }
+  for (const extra of ['AddCapability=SYS_ADMIN', 'PodmanArgs=--cap-add=SYS_ADMIN', 'PodmanArgs=--privileged']) {
+    assert.throws(() => assertControllerCapabilities(file.replace('[Container]', `[Container]\n${extra}`)));
+  }
 });
 
 test('proxy streams credential-bearing input and build helper exports only committed package source', async () => {
