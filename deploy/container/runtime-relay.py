@@ -12,8 +12,6 @@ import subprocess
 import sys
 import tarfile
 import time
-import urllib.error
-import urllib.request
 from urllib.parse import urlsplit
 
 try:
@@ -31,7 +29,9 @@ MAX_METADATA_BYTES = 1024 * 1024
 IMPORT_READ_TIMEOUT_SECONDS = 300
 IMPORT_LOAD_TIMEOUT_SECONDS = 300
 REQUEST_READ_TIMEOUT_SECONDS = 10
+HEALTH_PROBE_TIMEOUT_SECONDS = 10
 MAX_HELPER_OUTPUT_BYTES = 1024 * 1024
+REAP_WAIT_SECONDS = 5
 DEFAULT_POLICY_FILE = '/etc/pw-deploy/runtime-policy.json'
 PODMAN_BIN = '/usr/bin/podman'
 SYSTEMCTL_BIN = '/usr/bin/systemctl'
@@ -51,8 +51,12 @@ ALLOWED_ACTIONS = {
     'service_preflight', 'container_status', 'image_tag', 'image_remove_candidate',
     'image_import', 'service_restart', 'service_is_active', 'health_check',
 }
-LOOPBACK_HOSTS = {'127.0.0.1', '::1', 'localhost'}
-WILDCARD_HOST_IPS = {'', '0.0.0.0', '::'}
+LOOPBACK_HOSTS = {'127.0.0.1', '::1', 'localhost'}  # informational; direct binding uses the family-precise sets below
+IPV4_LOOPBACK = '127.0.0.1'
+IPV6_LOOPBACK = '::1'
+DIRECT_LOOPBACK_HOSTS = {IPV4_LOOPBACK, IPV6_LOOPBACK}
+IPV4_WILDCARD = '0.0.0.0'
+IPV6_WILDCARD = '::'
 ALLOWED_POLICY_FIELDS = {'resourceNames', 'healthHosts', 'maxImageBytes', 'healthTargets'}
 ACTIVE_PROCESSES = set()
 TERMINATED = False
@@ -95,15 +99,26 @@ def _kill_process(process):
 
 
 def _terminate_and_reap(process):
+    """Escalate SIGTERM->SIGKILL and confirm the helper is actually reaped.
+
+    Returns once the process has been collected. If even a post-SIGKILL wait
+    cannot confirm the process is gone, a RelayError is raised so the caller
+    surfaces an unconfirmed stop instead of a success-shaped cleanup; the
+    caller must keep the process tracked in ACTIVE_PROCESSES in that case.
+    """
+    if process.poll() is not None:
+        return
     _stop_process(process)
     try:
-        process.wait(timeout=5)
+        process.wait(timeout=REAP_WAIT_SECONDS)
+        return
     except subprocess.TimeoutExpired:
-        _kill_process(process)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            pass
+        pass
+    _kill_process(process)
+    try:
+        process.wait(timeout=REAP_WAIT_SECONDS)
+    except subprocess.TimeoutExpired:
+        raise RelayError('Runtime helper could not be stopped', 'process_failed')
 
 
 def _termination_signal(_signum, _frame):
@@ -240,10 +255,16 @@ def _valid_target_key(key):
 def _health_url_shape_ok(url, health_hosts):
     if not isinstance(url, str) or not url or len(url) > 2048:
         return False
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        return False
     if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password or parsed.query or parsed.fragment:
         return False
-    return (parsed.hostname or '').strip('[]') in health_hosts
+    if port is not None and not 1 <= port <= 65535:
+        return False
+    return (host or '').strip('[]') in health_hosts
 
 
 def load_policy(path=DEFAULT_POLICY_FILE):
@@ -291,22 +312,22 @@ def runtime_environment():
     }
 
 
-def run_command(argv, *, timeout=30, allowed_exit_codes=(0,), max_output_bytes=MAX_HELPER_OUTPUT_BYTES):
+def run_command(argv, *, timeout=30, allowed_exit_codes=(0,), max_output_bytes=MAX_HELPER_OUTPUT_BYTES, env=None):
     _check_terminated()
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-            env=runtime_environment(), start_new_session=True)
+            env=runtime_environment() if env is None else env, start_new_session=True)
     except OSError:
         raise RelayError('Runtime helper could not start', 'process_failed')
     ACTIVE_PROCESSES.add(process)
     stdout_fd = process.stdout.fileno()
     chunks, total, deadline = [], 0, time.monotonic() + timeout
+    reaped = False
     try:
         while True:
             _check_terminated()
             now = time.monotonic()
             if now >= deadline:
-                _terminate_and_reap(process)
                 raise RelayError('Runtime helper timed out', 'process_failed')
             ready, _, _ = select.select([stdout_fd], [], [], deadline - now)
             if not ready:
@@ -316,20 +337,30 @@ def run_command(argv, *, timeout=30, allowed_exit_codes=(0,), max_output_bytes=M
                 break
             total += len(chunk)
             if total > max_output_bytes:
-                _terminate_and_reap(process)
                 raise RelayError('Runtime helper produced too much output', 'process_failed')
             chunks.append(chunk)
         try:
-            process.wait(timeout=5)
+            process.wait(timeout=REAP_WAIT_SECONDS)
         except subprocess.TimeoutExpired:
-            _terminate_and_reap(process)
             raise RelayError('Runtime helper timed out', 'process_failed')
+        reaped = True
+    except BaseException:
+        # Any exceptional or cancellation exit must terminate and confirm the
+        # helper is reaped before propagating. If reaping cannot be confirmed
+        # (_terminate_and_reap raises) we deliberately keep the process tracked
+        # in ACTIVE_PROCESSES and surface that unconfirmed-stop error, rather
+        # than closing/discarding a still-live helper. The original error is
+        # only re-raised after a confirmed reap.
+        _terminate_and_reap(process)
+        reaped = True
+        raise
     finally:
-        try:
-            process.stdout.close()
-        except OSError:
-            pass
-        ACTIVE_PROCESSES.discard(process)
+        if reaped:
+            try:
+                process.stdout.close()
+            except OSError:
+                pass
+            ACTIVE_PROCESSES.discard(process)
     _check_terminated()
     if process.returncode not in allowed_exit_codes:
         raise RelayError('Runtime helper failed', 'process_failed')
@@ -488,16 +519,19 @@ def validate_oci_archive(source, approved_reference, expected_image_id, revision
     labels = config.get('config', {}).get('Labels') if isinstance(config.get('config'), dict) else None
     if not isinstance(labels, dict) or labels.get('org.opencontainers.image.revision') != revision:
         raise RelayError('OCI revision is inconsistent', 'invalid_image')
-    # Cap the canonical archive size BEFORE staging it: the tar layout is
-    # deterministic (512-byte header + padded data per member, plus directory
-    # entries and the 1024-byte trailer), so we can reject an oversized result
-    # up front rather than after writing it into the memfd.
-    projected = 1024 + 512 * len(allowed_dirs)
+    # Cap the canonical archive size BEFORE staging it. The tar layout is
+    # deterministic: a 512-byte header plus 512-padded data for every member,
+    # directory headers, two zero end-of-archive blocks (1024), and then the
+    # whole file padded up to a multiple of tarfile.RECORDSIZE (10240) on close.
+    # Missing that record padding previously let a logically-6144-byte archive
+    # be written as 10240 bytes past the limit, so include it here.
+    blocks = 1024 + 512 * len(allowed_dirs)
     for name in ['oci-layout', 'index.json', *blob_names]:
         member = member_by_name[name]
-        projected += 512 + (member.size + 511) // 512 * 512
-        if projected > max_bytes:
-            raise RelayError('Canonical OCI archive exceeded its limit', 'invalid_image')
+        blocks += 512 + (member.size + 511) // 512 * 512
+    projected = (blocks + tarfile.RECORDSIZE - 1) // tarfile.RECORDSIZE * tarfile.RECORDSIZE
+    if projected > max_bytes:
+        raise RelayError('Canonical OCI archive exceeded its limit', 'invalid_image')
     if not hasattr(os, 'memfd_create') or sys.platform != 'linux':
         raise RelayError('Memory-backed OCI import is unavailable on this platform', 'process_failed')
     output_fd = os.memfd_create('pw-deploy-oci-canonical', os.MFD_CLOEXEC)
@@ -640,14 +674,24 @@ def handle_image_import(policy, request, stream):
         except OSError:
             raise RelayError('Image import process could not start', 'process_failed')
         ACTIVE_PROCESSES.add(process)
+        reaped = False
         try:
-            process.wait(timeout=IMPORT_LOAD_TIMEOUT_SECONDS)
-        except subprocess.TimeoutExpired:
+            _check_terminated()
+            try:
+                process.wait(timeout=IMPORT_LOAD_TIMEOUT_SECONDS)
+            except subprocess.TimeoutExpired:
+                raise RelayError('Image import timed out', 'process_failed')
+            _check_terminated()
+            reaped = True
+        except BaseException:
+            # Terminate and confirm the loader is reaped on any timeout or
+            # cancellation; keep it tracked if reaping cannot be confirmed.
             _terminate_and_reap(process)
-            raise RelayError('Image import timed out', 'process_failed')
+            reaped = True
+            raise
         finally:
-            ACTIVE_PROCESSES.discard(process)
-        _check_terminated()
+            if reaped:
+                ACTIVE_PROCESSES.discard(process)
         if process.returncode:
             raise RelayError('Image import failed', 'process_failed')
     finally:
@@ -671,18 +715,55 @@ def handle_service_is_active(policy, request, _stream):
     return {'state': systemctl(['is-active', f'{service}.service'], allowed_exit_codes=(0, 3)).stdout.decode().strip()}
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None
+
+
+
+# Health probing runs in a supervised, isolated child interpreter so the WHOLE
+# HTTP transaction (connect, headers, body) is bounded by run_command's absolute
+# wall-clock deadline, output cap and cancellation-aware reaping. This avoids the
+# unbounded/blocking behaviour of a direct urlopen().read() over a dribbling peer
+# and never leaves an abandoned thread or socket behind. Proxies are disabled and
+# redirects are refused inside the child. The child frames its result on stdout:
+#   b'O' + 2-byte big-endian HTTP status + body bytes   (a response was received)
+#   b'E'                                                 (connect/transport error)
+_HEALTH_PROBE_SCRIPT = (
+    "import sys, urllib.request\n"
+    "url = sys.argv[1]\n"
+    "max_body = int(sys.argv[2])\n"
+    "class _NR(urllib.request.HTTPRedirectHandler):\n"
+    "    def redirect_request(self, *a, **k):\n"
+    "        return None\n"
+    "opener = urllib.request.build_opener(_NR, urllib.request.ProxyHandler({}))\n"
+    "out = sys.stdout.buffer\n"
+    "try:\n"
+    "    resp = opener.open(url, timeout=%d)\n"
+    "except Exception:\n"
+    "    out.write(b'E'); out.flush(); sys.exit(0)\n"
+    "try:\n"
+    "    status = getattr(resp, 'status', None) or resp.getcode() or 0\n"
+    "    body = resp.read(max_body + 1)\n"
+    "finally:\n"
+    "    resp.close()\n"
+    "out.write(b'O')\n"
+    "out.write(min(int(status), 65535).to_bytes(2, 'big'))\n"
+    "out.write(body)\n"
+    "out.flush()\n"
+) % HEALTH_PROBE_TIMEOUT_SECONDS
 
 
 def _validate_health_url(health_url, health_hosts):
     if not isinstance(health_url, str) or not health_url or len(health_url) > 2048:
         raise RelayError('Invalid health URL', 'invalid_request')
-    parsed = urlsplit(health_url)
+    try:
+        parsed = urlsplit(health_url)
+        host, port = parsed.hostname, parsed.port
+    except ValueError:
+        raise RelayError('Invalid health URL', 'invalid_request')
     if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise RelayError('Invalid health URL', 'invalid_request')
-    if (parsed.hostname or '').strip('[]') not in health_hosts:
+    if port is not None and not 1 <= port <= 65535:
+        raise RelayError('Invalid health URL', 'invalid_request')
+    if (host or '').strip('[]') not in health_hosts:
         raise RelayError('Health endpoint host is not approved', 'health_host_not_allowed')
     return parsed
 
@@ -707,7 +788,10 @@ def _published_ports(service):
     if not isinstance(ports, dict):
         raise RelayError('Container port metadata is invalid', 'health_failed')
     published = set()
-    for bindings in ports.values():
+    for key, bindings in ports.items():
+        # Keys are "<container-port>/<proto>"; the protocol must be preserved so
+        # a UDP publication can never satisfy a TCP (HTTP) health probe.
+        proto = key.rsplit('/', 1)[1].lower() if isinstance(key, str) and '/' in key else ''
         if bindings is None:
             continue
         if not isinstance(bindings, list):
@@ -717,34 +801,57 @@ def _published_ports(service):
                 raise RelayError('Container port metadata is invalid', 'health_failed')
             host_ip, host_port = binding.get('HostIp') or '', binding.get('HostPort')
             if isinstance(host_port, str) and host_port.isdigit():
-                published.add((host_ip, int(host_port)))
+                published.add((proto, host_ip, int(host_port)))
     return published
 
 
 def _require_direct_loopback_binding(service, parsed):
     host = (parsed.hostname or '').strip('[]')
-    if parsed.scheme != 'http' or host not in LOOPBACK_HOSTS:
-        raise RelayError('A direct health URL must use http on a loopback host', 'health_target_not_allowed')
+    # Only literal loopback addresses are accepted for a direct probe. Ambiguous
+    # names such as "localhost" (which may resolve to either family) must use an
+    # explicit immutable healthTargets binding instead of being guessed here.
+    if parsed.scheme != 'http' or host not in DIRECT_LOOPBACK_HOSTS:
+        raise RelayError('A direct health URL must use http on a literal loopback address', 'health_target_not_allowed')
     if parsed.port is None:
         raise RelayError('A direct health URL must specify a published port', 'health_target_not_allowed')
+    # Bind to the exact TCP protocol, address family and address of the URL.
+    # A wildcard host binding only covers the destination when it is the wildcard
+    # of the SAME family (0.0.0.0 for IPv4, :: for IPv6); there is no cross-family
+    # coverage, and an empty HostIp never matches.
+    if host == IPV4_LOOPBACK:
+        acceptable = {IPV4_LOOPBACK, IPV4_WILDCARD}
+    else:
+        acceptable = {IPV6_LOOPBACK, IPV6_WILDCARD}
     published = _published_ports(service)
-    reachable = any(port == parsed.port and (host_ip in WILDCARD_HOST_IPS or host_ip in LOOPBACK_HOSTS)
-        for host_ip, port in published)
+    reachable = any(proto == 'tcp' and port == parsed.port and host_ip in acceptable
+        for proto, host_ip, port in published)
     if not reachable:
         raise RelayError('Health port is not published by this container', 'health_target_not_allowed')
 
 
 def _probe_health(health_url):
-    opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+    # Bound the entire transaction with the corrected process budget. The child
+    # writes nothing until it has fully read the (bounded) body, so a dribbling
+    # or stalled peer is stopped when run_command's absolute deadline fires,
+    # after which the child is terminated and reaped. Cancellation is preserved;
+    # every other failure is reported as a generic health failure with no
+    # subprocess text leaked.
+    argv = [sys.executable, '-I', '-c', _HEALTH_PROBE_SCRIPT, health_url, str(MAX_RESPONSE_BYTES)]
     try:
-        with opener.open(health_url, timeout=5) as response:
-            if response.status != 200:
-                raise RelayError('Health endpoint did not return OK', 'health_failed')
-            return response.read(MAX_RESPONSE_BYTES + 1)
-    except urllib.error.HTTPError:
-        raise RelayError('Health endpoint did not return OK', 'health_failed')
-    except urllib.error.URLError:
+        result = run_command(argv, timeout=HEALTH_PROBE_TIMEOUT_SECONDS,
+            max_output_bytes=MAX_RESPONSE_BYTES + 3, env={'PATH': '/usr/bin:/bin'})
+    except RelayError as exc:
+        if exc.code == 'cancelled':
+            raise
         raise RelayError('Health endpoint was unreachable', 'health_failed')
+    data = result.stdout
+    if not data or data[:1] == b'E':
+        raise RelayError('Health endpoint was unreachable', 'health_failed')
+    if data[:1] != b'O' or len(data) < 3:
+        raise RelayError('Health endpoint response was malformed', 'health_failed')
+    if int.from_bytes(data[1:3], 'big') != 200:
+        raise RelayError('Health endpoint did not return OK', 'health_failed')
+    return data[3:]
 
 
 def handle_health_check(policy, request, _stream):

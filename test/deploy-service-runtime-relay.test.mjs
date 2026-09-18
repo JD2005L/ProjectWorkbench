@@ -318,14 +318,40 @@ test('image_import caps the canonical archive before staging it into a memfd', {
   assert.deepEqual(value.podmanCalls, []);
 });
 
+test('image_import accounts for tar record padding when capping the canonical archive', { skip: !PYTHON }, async () => {
+  // The canonical archive's logical content is 6144 bytes but tarfile pads the
+  // whole file up to RECORDSIZE (10240) on close. A limit that sits between the
+  // two (8192) must still be rejected up front, before any memfd is created.
+  const value = await importAttempt(ociArchive(), {}, 8192);
+  assert.equal(value.result.ok, false);
+  assert.equal(value.result.code, 'invalid_image', value.result.message);
+  assert.match(value.result.message, /Canonical/);
+  assert.deepEqual(value.podmanCalls, []);
+});
+
 const HEALTH_HARNESS = String.raw`
-import importlib.util, json, os, sys, threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
+import importlib.util, json, os, sys, threading, time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 spec = importlib.util.spec_from_file_location("relay", sys.argv[2])
 relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay)
 scenario = sys.argv[1]
 class Handler(BaseHTTPRequestHandler):
   def do_GET(self):
+    if scenario == "dribble":
+      # Emit the status line and headers immediately, then trickle the body one
+      # byte at a time for far longer than the probe budget so the relay must
+      # bound the whole transaction rather than block on response.read().
+      self.send_response(200)
+      self.send_header("Content-Type", "application/json")
+      self.send_header("Content-Length", "200")
+      self.end_headers()
+      for _ in range(200):
+        try:
+          self.wfile.write(b"a"); self.wfile.flush()
+        except Exception:
+          return
+        time.sleep(0.1)
+      return
     body = json.dumps({"ok": True, "version": "1.2.3"}).encode()
     self.send_response(200)
     self.send_header("Content-Type", "application/json")
@@ -333,7 +359,7 @@ class Handler(BaseHTTPRequestHandler):
     self.end_headers()
     self.wfile.write(body)
   def log_message(self, *args): pass
-server = HTTPServer(("127.0.0.1", 0), Handler)
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
 port = server.server_address[1]
 threading.Thread(target=server.serve_forever, daemon=True).start()
 other_port = port + 1 if port < 65535 else port - 1
@@ -344,6 +370,11 @@ ports_map = {
   "direct_ok": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]},
   "image_mismatch": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]},
   "direct_wrong_port": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(other_port)}]},
+  "dribble": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]},
+  "direct_udp_only": {"3000/udp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]},
+  "direct_v6_url_v4_published": {"3000/tcp": [{"HostIp": "127.0.0.1", "HostPort": str(port)}]},
+  "direct_v4_url_v6_published": {"3000/tcp": [{"HostIp": "::1", "HostPort": str(port)}]},
+  "direct_wildcard_v4": {"3000/tcp": [{"HostIp": "0.0.0.0", "HostPort": str(port)}]},
 }.get(scenario, {})
 def podman(args, **kwargs):
   head = args[:2]
@@ -358,7 +389,7 @@ def podman(args, **kwargs):
       return Result(0, json.dumps(ports_map).encode())
   raise AssertionError("unexpected podman action: " + json.dumps(args))
 relay.podman = podman
-health_hosts = ["127.0.0.1", "health.internal"]
+health_hosts = ["127.0.0.1", "::1", "health.internal"]
 health_targets = {}
 if scenario == "direct_ok":
   os.environ["http_proxy"] = "http://127.0.0.1:1"
@@ -371,16 +402,31 @@ elif scenario == "proxy_ok":
   health_targets = {"myproj/prod": health_url}
 elif scenario == "proxy_unapproved":
   health_url = "https://health.internal/health"
+elif scenario == "dribble":
+  relay.HEALTH_PROBE_TIMEOUT_SECONDS = 2
+  health_url = "http://127.0.0.1:%d/healthz" % port
+elif scenario == "direct_udp_only":
+  health_url = "http://127.0.0.1:%d/healthz" % port
+elif scenario == "direct_v6_url_v4_published":
+  health_url = "http://[::1]:%d/healthz" % port
+elif scenario == "direct_v4_url_v6_published":
+  health_url = "http://127.0.0.1:%d/healthz" % port
+elif scenario == "direct_wildcard_v4":
+  health_url = "http://127.0.0.1:%d/healthz" % port
+elif scenario == "bad_port_request":
+  health_url = "http://127.0.0.1:99999/healthz"
 else:
   health_url = "http://127.0.0.1:%d/healthz" % port
 policy = {"resourceNames": {}, "healthHosts": health_hosts, "maxImageBytes": 1024, "healthTargets": health_targets}
 request = {"requestId": "request_1", "action": "health_check", "project": "myproj", "target": "prod",
   "service": "myproj", "expectedImageId": expected, "healthUrl": health_url, "versionField": "version"}
+started = time.monotonic()
 try:
   result = relay.handle_health_check(policy, request, None)
   value = {"ok": True, "result": result}
 except relay.RelayError as error:
   value = {"ok": False, "code": error.code}
+value["elapsed"] = time.monotonic() - started
 server.shutdown()
 print(json.dumps(value))
 `;
@@ -390,29 +436,77 @@ async function healthAttempt(scenario) {
   return JSON.parse(stdout);
 }
 
-test('health_check accepts a direct loopback probe bound to the container port with a matching image', { skip: !PYTHON }, async () => {
+const POSIX_HEALTH_SKIP = process.platform === 'win32'
+  ? 'health probing runs a supervised subprocess with POSIX pipe readiness polling'
+  : !PYTHON;
+
+test('health_check accepts a direct loopback probe bound to the container port with a matching image', { skip: POSIX_HEALTH_SKIP }, async () => {
   const value = await healthAttempt('direct_ok');
-  assert.deepEqual(value, { ok: true, result: { version: '1.2.3' } });
+  assert.equal(value.ok, true, JSON.stringify(value));
+  assert.deepEqual(value.result, { version: '1.2.3' });
 });
 
 test('health_check rejects a direct probe against a port this container does not publish', { skip: !PYTHON }, async () => {
   const value = await healthAttempt('direct_wrong_port');
-  assert.deepEqual(value, { ok: false, code: 'health_target_not_allowed' });
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'health_target_not_allowed');
 });
 
-test('health_check accepts an operator-approved proxy target without a published port', { skip: !PYTHON }, async () => {
+test('health_check accepts an operator-approved proxy target without a published port', { skip: POSIX_HEALTH_SKIP }, async () => {
   const value = await healthAttempt('proxy_ok');
-  assert.deepEqual(value, { ok: true, result: { version: '1.2.3' } });
+  assert.equal(value.ok, true, JSON.stringify(value));
+  assert.deepEqual(value.result, { version: '1.2.3' });
 });
 
 test('health_check rejects a proxied URL that has no operator binding', { skip: !PYTHON }, async () => {
   const value = await healthAttempt('proxy_unapproved');
-  assert.deepEqual(value, { ok: false, code: 'health_target_not_allowed' });
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'health_target_not_allowed');
 });
 
 test('health_check refuses to probe when the container is not running the expected image', { skip: !PYTHON }, async () => {
   const value = await healthAttempt('image_mismatch');
-  assert.deepEqual(value, { ok: false, code: 'health_failed' });
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'health_failed');
+});
+
+test('health_check rejects a UDP publication for a TCP HTTP health probe', { skip: !PYTHON }, async () => {
+  const value = await healthAttempt('direct_udp_only');
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'health_target_not_allowed');
+});
+
+test('health_check rejects an IPv6 loopback URL when only the IPv4 loopback port is published', { skip: !PYTHON }, async () => {
+  const value = await healthAttempt('direct_v6_url_v4_published');
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'health_target_not_allowed');
+});
+
+test('health_check rejects an IPv4 loopback URL when only the IPv6 loopback port is published', { skip: !PYTHON }, async () => {
+  const value = await healthAttempt('direct_v4_url_v6_published');
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'health_target_not_allowed');
+});
+
+test('health_check rejects a request-time health URL with an out-of-range port', { skip: !PYTHON }, async () => {
+  const value = await healthAttempt('bad_port_request');
+  assert.equal(value.ok, false);
+  assert.equal(value.code, 'invalid_request');
+});
+
+test('health_check accepts an IPv4 loopback URL covered by a same-family wildcard publication', { skip: POSIX_HEALTH_SKIP }, async () => {
+  const value = await healthAttempt('direct_wildcard_v4');
+  assert.equal(value.ok, true, JSON.stringify(value));
+  assert.deepEqual(value.result, { version: '1.2.3' });
+});
+
+test('health_check bounds a dribbling response with an absolute deadline instead of blocking', {
+  skip: process.platform === 'win32' ? 'health probing runs a supervised subprocess with POSIX pipe readiness polling' : !PYTHON,
+}, async () => {
+  const value = await healthAttempt('dribble');
+  assert.equal(value.ok, false, JSON.stringify(value));
+  assert.equal(value.code, 'health_failed');
+  assert.ok(value.elapsed < 8, `probe should be bounded, took ${value.elapsed}s`);
 });
 
 const READ_REQUEST_HARNESS = String.raw`
@@ -473,7 +567,7 @@ test('read_request enforces an absolute deadline on idle partial input (POSIX pi
 });
 
 const RUN_COMMAND_HARNESS = String.raw`
-import importlib.util, json, os, sys
+import importlib.util, json, os, subprocess, sys, time
 spec = importlib.util.spec_from_file_location("relay", sys.argv[2])
 relay = importlib.util.module_from_spec(spec); spec.loader.exec_module(relay)
 mode = sys.argv[1]
@@ -488,6 +582,54 @@ elif mode == "home":
   os.environ["HOME"] = "/tmp/tampered-home-should-be-ignored"
   env = relay.runtime_environment()
   print(json.dumps({"home": env["HOME"], "expected": pwd.getpwuid(os.getuid()).pw_dir}))
+elif mode == "reap_escalates":
+  # A helper that ignores SIGTERM must still be escalated to SIGKILL and reaped.
+  relay.REAP_WAIT_SECONDS = 1
+  child = subprocess.Popen(
+    [sys.executable, "-c", "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)"],
+    start_new_session=True)
+  relay.ACTIVE_PROCESSES.add(child)
+  start = time.monotonic()
+  relay._terminate_and_reap(child)
+  elapsed = time.monotonic() - start
+  relay.ACTIVE_PROCESSES.discard(child)
+  print(json.dumps({"returncode": child.returncode, "alive": child.poll() is None, "elapsed": elapsed}))
+elif mode == "reap_unconfirmed":
+  # If even a post-SIGKILL wait cannot confirm the process is gone, the cleanup
+  # must surface an error rather than silently returning success-shaped.
+  relay.REAP_WAIT_SECONDS = 1
+  relay._stop_process = lambda p: None
+  relay._kill_process = lambda p: None
+  class FakeProc:
+    returncode = None
+    def poll(self): return None
+    def wait(self, timeout=None): raise subprocess.TimeoutExpired("fake", timeout)
+  try:
+    relay._terminate_and_reap(FakeProc())
+    print(json.dumps({"raised": False}))
+  except relay.RelayError as error:
+    print(json.dumps({"raised": True, "code": error.code}))
+elif mode == "cancel_retains_tracking":
+  # When a cancel/exceptional path cannot confirm the helper stopped, tracking
+  # must be retained (not discarded) and the unconfirmed-stop error surfaced.
+  captured = {}
+  def fake_reap(process):
+    captured["process"] = process
+    raise relay.RelayError("Runtime helper could not be stopped", "process_failed")
+  relay._terminate_and_reap = fake_reap
+  out = {"raised": False}
+  try:
+    relay.run_command([sys.executable, "-c", "import time;time.sleep(30)"], timeout=1)
+  except relay.RelayError as error:
+    process = captured.get("process")
+    out = {"raised": True, "code": error.code, "tracked": process in relay.ACTIVE_PROCESSES}
+    if process is not None:
+      try:
+        process.kill(); process.wait(timeout=5)
+      except Exception:
+        pass
+      relay.ACTIVE_PROCESSES.discard(process)
+  print(json.dumps(out))
 `;
 
 async function runCommandAttempt(mode) {
@@ -508,6 +650,30 @@ test('runtime_environment derives HOME from the account record, not the caller (
   const value = await runCommandAttempt('home');
   assert.equal(value.home, value.expected);
   assert.notEqual(value.home, '/tmp/tampered-home-should-be-ignored');
+});
+
+test('a SIGTERM-ignoring helper is escalated to SIGKILL and confirmed reaped (POSIX)', {
+  skip: process.platform === 'win32' ? 'requires POSIX process groups and signals' : !PYTHON,
+}, async () => {
+  const value = await runCommandAttempt('reap_escalates');
+  assert.equal(value.alive, false, 'helper must be reaped');
+  assert.notEqual(value.returncode, null, 'reap must be confirmed');
+  assert.ok(value.returncode < 0, `helper should be killed by a signal, got ${value.returncode}`);
+  assert.ok(value.elapsed >= 0.9, `SIGTERM window should be honored before escalation, got ${value.elapsed}`);
+});
+
+test('an unconfirmed reap surfaces an error instead of success-shaped cleanup', { skip: !PYTHON }, async () => {
+  const value = await runCommandAttempt('reap_unconfirmed');
+  assert.deepEqual(value, { raised: true, code: 'process_failed' });
+});
+
+test('run_command retains helper tracking and surfaces the error on an unconfirmed cancel stop (POSIX)', {
+  skip: process.platform === 'win32' ? 'requires POSIX pipe readiness polling' : !PYTHON,
+}, async () => {
+  const value = await runCommandAttempt('cancel_retains_tracking');
+  assert.equal(value.raised, true);
+  assert.equal(value.code, 'process_failed');
+  assert.equal(value.tracked, true, 'a still-live helper must remain tracked');
 });
 
 const POLICY_HARNESS = String.raw`
@@ -561,6 +727,33 @@ test('load_policy rejects a healthTargets URL whose host is not allowlisted', { 
     resourceNames: {},
     healthHosts: ['127.0.0.1'],
     healthTargets: { 'myproj/prod': 'http://evil.example/health' },
+  });
+  assert.deepEqual(value, { ok: false, code: 'runtime_policy_invalid' });
+});
+
+test('load_policy rejects a healthTargets URL with an out-of-range port', { skip: !PYTHON }, async () => {
+  const value = await policyAttempt({
+    resourceNames: {},
+    healthHosts: ['127.0.0.1'],
+    healthTargets: { 'myproj/prod': 'http://127.0.0.1:99999/health' },
+  });
+  assert.deepEqual(value, { ok: false, code: 'runtime_policy_invalid' });
+});
+
+test('load_policy rejects a healthTargets URL with a non-numeric port', { skip: !PYTHON }, async () => {
+  const value = await policyAttempt({
+    resourceNames: {},
+    healthHosts: ['127.0.0.1'],
+    healthTargets: { 'myproj/prod': 'http://127.0.0.1:not-a-port/health' },
+  });
+  assert.deepEqual(value, { ok: false, code: 'runtime_policy_invalid' });
+});
+
+test('load_policy rejects a healthTargets URL with a malformed IPv6 bracket', { skip: !PYTHON }, async () => {
+  const value = await policyAttempt({
+    resourceNames: {},
+    healthHosts: ['::1'],
+    healthTargets: { 'myproj/prod': 'http://[::1/health' },
   });
   assert.deepEqual(value, { ok: false, code: 'runtime_policy_invalid' });
 });
