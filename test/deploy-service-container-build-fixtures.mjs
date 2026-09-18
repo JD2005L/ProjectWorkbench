@@ -741,12 +741,14 @@ export async function exerciseContainerBuildFixture({
 
   if (primaryError && cleanupErrors.length) {
     throw new AggregateError([primaryError, ...cleanupErrors],
-      'Container build fixture failed and cleanup was incomplete');
+      `Container build fixture failed and cleanup was incomplete: ${[primaryError, ...cleanupErrors]
+        .map(error => `${error.code || error.name}: ${error.message}`).join(' | ').slice(0, 8192)}`);
   }
   if (primaryError) throw primaryError;
   if (cleanupErrors.length === 1) throw cleanupErrors[0];
   if (cleanupErrors.length > 1) {
-    throw new AggregateError(cleanupErrors, 'Container build fixture cleanup was incomplete');
+    throw new AggregateError(cleanupErrors,
+      `Container build fixture cleanup was incomplete: ${cleanupErrors.map(error => error.message).join(' | ').slice(0, 8192)}`);
   }
   return result;
 }
