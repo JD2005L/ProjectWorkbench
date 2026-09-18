@@ -348,8 +348,9 @@ function fakeBuilder({
       const worker = workerFor(name, container);
       const originalClose = child._close;
       child._close = (code, signal) => {
-        if (container) container.status = 'exited';
-        activeWorkers.delete(name);
+        // Disconnecting the local client does not prove the daemon stopped the worker.
+        if (container && !child._killedWith) container.status = 'exited';
+        if (container?.status === 'exited') activeWorkers.delete(name);
         originalClose(code, signal);
       };
       activeWorkers.set(name, { worker, child });
@@ -906,7 +907,9 @@ test('podman() builds, transfers and promotes a candidate image when there is no
   const config = containerConfig();
   const executor = new ContainerExecutor(config, { spawnProcess });
   const control = makeControl({ jobId: 'job-podman-1', policy: { image: 'exampleapp', service: 'exampleapp' } });
-  const request = podmanRequest();
+  const request = podmanRequest({
+    recipe: { adapter: 'podman', image: 'exampleapp', service: 'exampleapp', healthUrl: 'http://127.0.0.1:4321/health' },
+  });
 
   const result = await executor.deploy(request, control);
 
@@ -932,6 +935,11 @@ test('podman() builds, transfers and promotes a candidate image when there is no
   const transfer = runtime.calls.find(call => call.action === 'image_import');
   assert.equal(transfer.expectedImageId, `sha256:${'c'.repeat(64)}`);
   assert.equal(transfer.revision, request.revision);
+  const health = runtime.calls.find(call => call.action === 'health_check');
+  assert.equal(health.project, request.project);
+  assert.equal(health.target, request.target);
+  assert.equal(health.service, control.policy.service);
+  assert.equal(health.expectedImageId, `sha256:${'c'.repeat(64)}`);
 
   assert.equal(runtime.calls.some(call => call.action === 'image_tag' && call.tagSuffix === 'rollback'), false,
     'no rollback snapshot should be taken when there was no previous image');

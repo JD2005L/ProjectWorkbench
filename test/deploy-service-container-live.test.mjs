@@ -917,14 +917,16 @@ test('isolated live container controller proves script execution, cancellation, 
     controller, succeeded.id, current => TERMINAL.has(current.state),
     'the real script job to finish',
   );
-  assert.equal(completed.state, 'succeeded');
+  const completedLog = await jobLog(controller, succeeded.id);
+  const completedLogText = JSON.stringify(completedLog);
+  let failureDetail = JSON.stringify({ job: completed, log: completedLog });
+  for (const value of [apiToken, uiToken, syntheticSecret]) failureDetail = failureDetail.replaceAll(value, '[redacted]');
+  assert.equal(completed.state, 'succeeded', failureDetail);
   assert.equal(completed.version, '1.2.3');
   const version = await api(controller, `/v1/version/${encodeURIComponent(project)}/dev`);
   assert.equal(version.response.status, 200);
   assert.equal(version.json.version, '1.2.3');
   assert.equal(version.json.revision, 'a'.repeat(40));
-  const completedLog = await jobLog(controller, succeeded.id);
-  const completedLogText = JSON.stringify(completedLog);
   assert.match(completedLogText, /SCRIPT_PROBE_OK/);
   assert.doesNotMatch(completedLogText, new RegExp(syntheticSecret.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')));
   assert.match(completedLogText, /\[redacted\]/);

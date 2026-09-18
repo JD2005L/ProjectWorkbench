@@ -21,6 +21,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 import { DeploymentError } from './protocol.js';
 import {
   spawnChild, runProcess, pipeProcesses, buildTarArchive, confirmStopped,
+  observeProcess, processDeadline, terminateAndReap,
 } from './container-process.js';
 import { runtimeRequest, nextRuntimeRequestId } from './runtime-client.js';
 import { RuntimeCandidateJournal, validateRuntimeCandidate } from './container-journal.js';
@@ -294,59 +295,24 @@ export class ContainerExecutor {
   // and confirms the container rather than merely killing our local CLI.
   async startWorker(control, name, envelope, { capture = false } = {}) {
     control.signal.throwIfAborted();
-    const child = spawnChild(PODMAN, this.podmanRemoteArgs(['start', '--attach', '--interactive', name]), {
-      env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
-    });
-    let stopping;
-    let failure;
-    let output = '';
-    let overflow = false;
-    const stop = () => {
-      if (stopping) return;
-      stopping = this.stopContainer(control, name).catch(error => {
-        failure = failure || error;
-        child.kill('SIGTERM');
-        child.stdin.destroy();
-        child.stdout.destroy();
-        child.stderr.destroy();
-      });
-    };
-    const onAbort = () => stop();
-    control.signal.addEventListener('abort', onAbort, { once: true });
-    if (control.signal.aborted) stop();
-    child.stdin.on('error', error => {
-      if (error.code !== 'EPIPE') {
-        failure = failure || new DeploymentError('Worker input failed', 502, 'step_input_failed');
-        stop();
-      }
-    });
-    child.stdin.end(JSON.stringify(envelope));
-    child.stdout.setEncoding('utf8');
-    child.stdout.on('data', text => {
-      control.onOutput(text);
-      if (!capture || overflow) return;
-      if (Buffer.byteLength(output) + Buffer.byteLength(text) > MAX_CAPTURE_BYTES) {
-        overflow = true;
-        failure = failure || new DeploymentError('Step response exceeded its limit', 502, 'step_output_too_large');
-        stop();
-      } else {
-        output += text;
-      }
-    });
-    child.stderr.setEncoding('utf8');
-    child.stderr.on('data', text => control.onOutput(text));
     try {
-      const exitCode = await new Promise((resolve, reject) => {
-        child.on('error', () => reject(new DeploymentError('Worker container could not start', 503, 'builder_unavailable')));
-        child.on('close', code => resolve(code));
+      const result = await this.builderRaw(control, ['start', '--attach', '--interactive', name], {
+        input: JSON.stringify(envelope),
+        captureStdout: capture,
+        maxStdoutBytes: MAX_CAPTURE_BYTES,
+        timeoutMs: this.remainingDeadlineMs(control) + 3000,
+        onAbort: () => this.stopContainer(control, name),
+        failure: () => new DeploymentError('Deployment step failed', 502, 'step_failed'),
       });
-      if (stopping) await stopping;
-      if (failure) throw failure;
-      control.signal.throwIfAborted();
-      if (exitCode !== 0) throw new DeploymentError('Deployment step failed', 502, 'step_failed');
-      return { output: output.trim(), exitCode };
-    } finally {
-      control.signal.removeEventListener('abort', onAbort);
+      return { ...result, output: result.output.trim() };
+    } catch (error) {
+      if (error.code === 'process_output_too_large') {
+        throw new DeploymentError('Step response exceeded its limit', 502, 'step_output_too_large');
+      }
+      if (error.code === 'process_unavailable') {
+        throw new DeploymentError('Worker container could not start', 503, 'builder_unavailable');
+      }
+      throw error;
     }
   }
 
@@ -389,7 +355,9 @@ export class ContainerExecutor {
 
   async buildFromTar(control, tarBuffer, buildArgs) {
     control.signal.throwIfAborted();
-    await this.builderRaw(control, ['build', ...buildArgs, '-'], { input: tarBuffer });
+    await this.builderRaw(control, ['build', ...buildArgs, '-'], {
+      input: tarBuffer, timeoutMs: this.remainingDeadlineMs(control),
+    });
   }
 
   // Streams the dependency-installed workspace straight from the builder's
@@ -409,6 +377,7 @@ export class ContainerExecutor {
     });
     await pipeProcesses(copy, build, {
       signal: control.signal,
+      timeoutMs: this.remainingDeadlineMs(control),
       maxBytes: MAX_BUILD_CONTEXT_BYTES,
       onProducerStderr: text => control.onOutput(text),
       onConsumerStderr: text => control.onOutput(text),
@@ -432,17 +401,23 @@ export class ContainerExecutor {
     };
     validateRuntimeCandidate(checkpoint, { ...request, id: control.jobId }, this.config);
     await this.candidateJournal.write(control.jobDirectory, checkpoint);
-    const save = spawnChild(PODMAN, this.podmanRemoteArgs(['save', '--format=oci-archive', candidateTag]), {
-      env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
-    });
-    save.stdin.end(); // `podman save` reads no stdin; close it immediately
-    let spawnError;
-    save.on('error', error => { spawnError = error; });
-    save.stderr.setEncoding('utf8');
-    save.stderr.on('data', text => control.onOutput(text));
-    let result;
+    control.signal.throwIfAborted();
+    const timeoutMs = this.remainingDeadlineMs(control);
+    const scope = processDeadline(control.signal, timeoutMs,
+      new DeploymentError('Runtime mutation outcome is uncertain', 503, 'runtime_mutation_uncertain'));
+    let save, exchange;
+    const output = text => {
+      try { control.onOutput(text); } catch (error) { scope.abort(error); }
+    };
     try {
-      result = await runtimeRequest(this.config.container.runtime, {
+      save = spawnChild(PODMAN, this.podmanRemoteArgs(['save', '--format=oci-archive', candidateTag]), {
+        env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
+      });
+      const observed = observeProcess(save);
+      save.stdin.end();
+      save.stderr.setEncoding('utf8');
+      save.stderr.on('data', output);
+      exchange = runtimeRequest(this.config.container.runtime, {
         requestId: nextRuntimeRequestId(control.jobId),
         action: 'image_import',
         project: request.project,
@@ -451,22 +426,29 @@ export class ContainerExecutor {
         jobId: control.jobId,
         expectedImageId,
         revision: request.revision,
-      }, { signal: control.signal, ociStream: save.stdout, maxOciBytes: MAX_IMAGE_BYTES, spawnProcess: this.spawnProcess });
+      }, { signal: scope.signal, ociStream: save.stdout, maxOciBytes: MAX_IMAGE_BYTES,
+        spawnProcess: this.spawnProcess, timeoutMs });
+      const result = await scope.wait(exchange);
+      const saved = await scope.wait(observed.promise);
+      scope.signal.throwIfAborted();
+      if (observed.error || saved.code !== 0) {
+        throw new DeploymentError('Could not export the deployment image', 502, 'artifact_transfer_failed');
+      }
+      if (!result || result.imageId !== expectedImageId) {
+        throw new DeploymentError('Runtime relay returned an invalid image identity', 502, 'invalid_image');
+      }
+      return result.imageId;
     } catch (error) {
-      save.kill('SIGTERM');
+      scope.abort(error);
+      save?.stdout.destroy();
+      const [reaped, requested] = await Promise.allSettled([terminateAndReap([save]), exchange]);
+      if (reaped.status === 'rejected') throw reaped.reason;
+      if (requested.status === 'rejected' && requested.reason?.code === 'cancellation_failed') throw requested.reason;
       throw error;
+    } finally {
+      scope.dispose();
+      save?.stderr.removeListener('data', output);
     }
-    const saveExit = await new Promise(resolve => {
-      if (save.exitCode !== null) resolve(save.exitCode);
-      else save.on('close', code => resolve(code));
-    });
-    if (spawnError || saveExit !== 0) {
-      throw new DeploymentError('Could not export the deployment image', 502, 'artifact_transfer_failed');
-    }
-    if (!result || result.imageId !== expectedImageId) {
-      throw new DeploymentError('Runtime relay returned an invalid image identity', 502, 'invalid_image');
-    }
-    return result.imageId;
   }
 
   // Polls the runtime relay for unit-active + running-image-identity +
@@ -482,6 +464,10 @@ export class ContainerExecutor {
           const health = await runtimeRequest(this.config.container.runtime, {
             requestId: nextRuntimeRequestId(control.jobId),
             action: 'health_check',
+            project: request.project,
+            target: request.target,
+            service,
+            expectedImageId: imageId,
             healthUrl: request.recipe.healthUrl,
             versionField: request.recipe.versionField,
           }, { signal: control.signal, spawnProcess: this.spawnProcess });

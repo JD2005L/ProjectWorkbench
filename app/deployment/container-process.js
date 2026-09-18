@@ -4,46 +4,71 @@
 // array; untrusted content only ever crosses through a bounded stdin write or
 // a bounded piped stream, never through argv or environment variables.
 import { spawn } from 'node:child_process';
+import { Transform } from 'node:stream';
+import { pipeline } from 'node:stream/promises';
 import { DeploymentError } from './protocol.js';
 
 const DEFAULT_GRACE_MS = 5000;
 const DEFAULT_REAP_MS = 5000;
+const observations = new WeakMap();
+
+export function observeProcess(child) {
+  if (observations.has(child)) return observations.get(child);
+  let resolve;
+  const state = { closed: false, error: null, promise: new Promise(done => { resolve = done; }) };
+  const finish = (code, signal) => {
+    if (state.closed) return;
+    state.closed = true;
+    resolve({ code, signal });
+  };
+  child.once('error', error => {
+    state.error = error;
+    if (!child.pid) finish(null, null);
+  });
+  child.once('close', finish);
+  observations.set(child, state);
+  return state;
+}
 
 export function spawnChild(command, args, { env, spawnProcess = spawn } = {}) {
-  if (!Array.isArray(args) || args.some(value => typeof value !== 'string')) {
+  if (!Array.isArray(args) || args.some(value => typeof value !== 'string' || value.includes('\0'))) {
     throw new DeploymentError('Invalid helper process arguments', 500, 'invalid_process_invocation');
   }
-  return spawnProcess(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  const child = spawnProcess(command, args, { env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  observeProcess(child);
+  return child;
 }
 
-function waitForClose(child) {
-  return new Promise(resolve => {
-    if (child.exitCode !== null && child.exitCode !== undefined) {
-      resolve({ code: child.exitCode, signal: null });
-      return;
-    }
-    child.once('close', (code, signal) => resolve({ code, signal }));
-  });
-}
-
-function delay(ms) {
-  return new Promise(resolve => {
-    const timer = setTimeout(resolve, ms);
-    timer.unref?.();
-  });
-}
-
-function sendSignal(child, signal) {
-  if (child.exitCode !== null && child.exitCode !== undefined) return;
-  let sent;
+async function settledWithin(promise, timeoutMs) {
+  let timer;
   try {
-    sent = child.kill(signal);
-  } catch {
-    throw new DeploymentError('Could not terminate helper process', 503, 'cancellation_failed');
+    return await Promise.race([
+      promise.then(() => true),
+      new Promise(resolve => { timer = setTimeout(() => resolve(false), timeoutMs); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
+export function processDeadline(signal, timeoutMs, timeoutError) {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 2147483647) {
+    throw new DeploymentError('Invalid helper deadline', 500, 'invalid_process_invocation');
   }
-  if (sent === false && (child.exitCode === null || child.exitCode === undefined)) {
-    throw new DeploymentError('Could not terminate helper process', 503, 'cancellation_failed');
-  }
+  const controller = new AbortController();
+  const stopped = new Promise(resolve => controller.signal.addEventListener('abort',
+    () => resolve(controller.signal.reason), { once: true }));
+  const abort = reason => { if (!controller.signal.aborted) controller.abort(reason); };
+  const onAbort = () => abort(signal.reason ?? new DeploymentError('Deployment cancelled', 409, 'cancelled'));
+  const timer = setTimeout(() => abort(timeoutError), timeoutMs);
+  signal?.addEventListener('abort', onAbort, { once: true });
+  if (signal?.aborted) onAbort();
+  return {
+    signal: controller.signal, abort,
+    wait: promise => Promise.race([promise, stopped.then(error => { throw error; })]),
+    dispose() {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', onAbort);
+    },
+  };
 }
 
 // Every process that this boundary starts is either observed to close or
@@ -52,18 +77,34 @@ export async function terminateAndReap(children, {
   closePromises = new Map(), graceMs = DEFAULT_GRACE_MS, reapMs = DEFAULT_REAP_MS,
 } = {}) {
   const unique = [...new Set(children.filter(Boolean))];
-  const closings = unique.map(child => closePromises.get(child) ?? waitForClose(child));
-  for (const child of unique) sendSignal(child, 'SIGTERM');
-  if (!unique.length || await Promise.race([
-    Promise.all(closings).then(() => true),
-    delay(graceMs).then(() => false),
-  ])) return Promise.all(closings);
-  for (const child of unique) sendSignal(child, 'SIGKILL');
-  if (await Promise.race([
-    Promise.all(closings).then(() => true),
-    delay(reapMs).then(() => false),
-  ])) return Promise.all(closings);
-  throw new DeploymentError('Helper process did not stop after cancellation', 503, 'cancellation_failed');
+  const closings = unique.map(child => closePromises.get(child) ?? observeProcess(child).promise);
+  const failures = [];
+  const send = signal => {
+    for (const child of unique) {
+      if (observeProcess(child).closed || child.exitCode != null || child.signalCode != null) continue;
+      try {
+        if (child.kill(signal) === false) failures.push(new Error(`Helper refused ${signal}`));
+      } catch (error) { failures.push(error); }
+    }
+  };
+  const closed = Promise.all(closings);
+  send('SIGTERM');
+  if (!unique.length || await settledWithin(closed, graceMs)) return closed;
+  send('SIGKILL');
+  if (await settledWithin(closed, reapMs)) return closed;
+  const failure = new DeploymentError('Helper process did not stop after cancellation', 503, 'cancellation_failed');
+  if (failures.length) failure.cause = new AggregateError(failures, 'Helper termination failed');
+  throw failure;
+}
+
+export async function terminateTransfer(children, transfer, options = {}) {
+  const outcomes = Promise.allSettled([terminateAndReap(children, options), transfer]);
+  const budget = (options.graceMs ?? DEFAULT_GRACE_MS) + (options.reapMs ?? DEFAULT_REAP_MS) + 1000;
+  if (!(await settledWithin(outcomes, budget))) {
+    throw new DeploymentError('Transfer cleanup did not complete', 503, 'cancellation_failed');
+  }
+  const [reaped] = await outcomes;
+  if (reaped.status === 'rejected') throw reaped.reason;
 }
 
 // Runs a short-lived helper to completion with bounded stdout capture. Used
@@ -72,61 +113,69 @@ export async function terminateAndReap(children, {
 export async function runProcess(command, args, {
   env, spawnProcess, signal, input, onAbort, onStdout, onStderr,
   captureStdout = false, maxStdoutBytes = 65536, allowedExitCodes = [0],
-  timeoutMs = 60000, terminationOptions,
+  timeoutMs = 60000, terminationOptions, onAbortTimeoutMs = 30000,
   failure = exitCode => new DeploymentError(`Helper process exited with ${exitCode}`, 502, 'step_failed'),
 } = {}) {
   if (signal?.aborted) throw signal.reason ?? new DeploymentError('Deployment cancelled', 409, 'cancelled');
-  const child = spawnChild(command, args, { env, spawnProcess });
-  const close = waitForClose(child);
-  const closePromises = new Map([[child, close]]);
-  let termination;
-  const abort = () => {
-    if (termination) return;
-    termination = Promise.resolve().then(async () => {
-      if (onAbort) await onAbort(child);
-      await terminateAndReap([child], { closePromises, ...terminationOptions });
-    });
-  };
-  signal?.addEventListener('abort', abort, { once: true });
-  let spawnError, overflow = false, stdoutSize = 0;
+  const scope = processDeadline(signal, timeoutMs,
+    new DeploymentError('Helper process timed out', 504, 'process_timeout'));
+  let child, state, stdoutSize = 0;
   const stdoutChunks = [];
-  child.stdout.setEncoding('utf8');
-  child.stdout.on('data', chunk => {
-    onStdout?.(chunk);
-    if (!captureStdout || overflow) return;
-    stdoutSize += Buffer.byteLength(chunk);
-    if (stdoutSize > maxStdoutBytes) {
-      overflow = true;
-      abort();
+  const output = chunk => {
+    try {
+      onStdout?.(chunk);
+      if (!captureStdout || scope.signal.aborted) return;
+      stdoutSize += Buffer.byteLength(chunk);
+      if (stdoutSize > maxStdoutBytes) {
+        scope.abort(new DeploymentError('Helper process output exceeded its limit', 502, 'process_output_too_large'));
+      } else stdoutChunks.push(chunk);
+    } catch (error) { scope.abort(error); }
+  };
+  const stderr = chunk => {
+    try { onStderr?.(chunk); } catch (error) { scope.abort(error); }
+  };
+  const inputError = () => {
+    if (input !== undefined && input.length) {
+      scope.abort(new DeploymentError('Helper input could not be delivered', 502, 'artifact_transfer_failed'));
     }
-    else stdoutChunks.push(chunk);
-  });
-  child.stderr.setEncoding('utf8');
-  child.stderr.on('data', chunk => onStderr?.(chunk));
-  child.on('error', error => { spawnError = error; });
-  child.stdin.on('error', () => {}); // surfaced through the exit code, not here
-  if (input === undefined) child.stdin.end();
-  else child.stdin.end(input);
-  const timedOut = await Promise.race([
-    close.then(() => false),
-    delay(timeoutMs).then(() => true),
-  ]);
-  if (timedOut) {
-    termination = terminateAndReap([child], { closePromises, ...terminationOptions });
-    await termination;
-    signal?.removeEventListener('abort', abort);
-    throw new DeploymentError('Helper process timed out', 504, 'process_timeout');
+  };
+  try {
+    child = spawnChild(command, args, { env, spawnProcess });
+    state = observeProcess(child);
+    child.stdout.setEncoding('utf8');
+    child.stdout.on('data', output);
+    child.stderr.setEncoding('utf8');
+    child.stderr.on('data', stderr);
+    child.stdin.on('error', inputError);
+    scope.signal.throwIfAborted();
+    child.stdin.end(input);
+    const { code: exitCode, signal: exitSignal } = await scope.wait(state.promise);
+    scope.signal.throwIfAborted();
+    if (state.error) throw new DeploymentError('Helper process could not start', 503, 'process_unavailable');
+    if (!allowedExitCodes.includes(exitCode)) throw failure(exitCode ?? `signal ${exitSignal}`);
+    return { exitCode, output: stdoutChunks.join('') };
+  } catch (error) {
+    if (child && (!state.closed || scope.signal.aborted)) {
+      const cleanup = [terminateAndReap([child], terminationOptions)];
+      if (onAbort) cleanup.push((async () => {
+        if (!(await settledWithin(Promise.resolve().then(() => onAbort(child)), onAbortTimeoutMs))) {
+          throw new DeploymentError('Owned execution cleanup timed out', 503, 'cancellation_failed');
+        }
+      })());
+      const results = await Promise.allSettled(cleanup);
+      const errors = results.filter(result => result.status === 'rejected').map(result => result.reason);
+      if (errors.length) {
+        const failed = new DeploymentError('Could not confirm owned execution stopped', 503, 'cancellation_failed');
+        failed.cause = new AggregateError(errors, 'Execution cleanup failed');
+        throw failed;
+      }
+    }
+    throw error;
+  } finally {
+    scope.dispose();
+    child?.stdout.removeListener('data', output);
+    child?.stderr.removeListener('data', stderr);
   }
-  const { code: exitCode, signal: exitSignal } = await close;
-  signal?.removeEventListener('abort', abort);
-  if (termination) await termination;
-  if (spawnError) throw new DeploymentError('Helper process could not start', 503, 'process_unavailable');
-  if (signal?.aborted) throw signal.reason ?? new DeploymentError('Deployment cancelled', 409, 'cancelled');
-  if (overflow) throw new DeploymentError('Helper process output exceeded its limit', 502, 'process_output_too_large');
-  if (!allowedExitCodes.includes(exitCode)) {
-    throw failure(exitCode ?? `signal ${exitSignal}`);
-  }
-  return { exitCode, output: stdoutChunks.join('') };
 }
 
 // Wires producer.stdout straight into consumer.stdin without ever buffering
@@ -139,50 +188,54 @@ export async function pipeProcesses(producer, consumer, {
   producerFailure = () => new DeploymentError('Source transfer failed', 502, 'artifact_transfer_failed'),
   consumerFailure = () => new DeploymentError('Destination process failed', 502, 'step_failed'),
 } = {}) {
-  if (signal?.aborted) throw signal.reason ?? new DeploymentError('Deployment cancelled', 409, 'cancelled');
-  const producerExit = waitForClose(producer);
-  const consumerExit = waitForClose(consumer);
-  const closePromises = new Map([[producer, producerExit], [consumer, consumerExit]]);
-  let termination;
-  const abort = () => {
-    if (!termination) termination = terminateAndReap([producer, consumer], { closePromises, ...terminationOptions });
+  const producerState = observeProcess(producer);
+  const consumerState = observeProcess(consumer);
+  let scope, transfer;
+  const outputs = [];
+  const drain = (stream, callback) => {
+    const listener = chunk => {
+      try { callback?.(chunk); } catch (error) { scope.abort(error); }
+    };
+    stream.setEncoding('utf8');
+    stream.on('data', listener);
+    outputs.push([stream, listener]);
   };
-  signal?.addEventListener('abort', abort, { once: true });
-  producer.stderr.setEncoding('utf8');
-  producer.stderr.on('data', chunk => onProducerStderr?.(chunk));
-  consumer.stderr.setEncoding('utf8');
-  consumer.stderr.on('data', chunk => onConsumerStderr?.(chunk));
-  // consumer.stdout (e.g. `podman build`'s human-readable log) must always be
-  // drained even when the caller does not care about it: an unread pipe
-  // fills its OS buffer and deadlocks the consumer once it tries to write
-  // past that limit, which would otherwise hang the whole transfer.
-  consumer.stdout.setEncoding('utf8');
-  consumer.stdout.on('data', chunk => onConsumerStdout?.(chunk));
-  let producerSpawnError, consumerSpawnError;
-  producer.on('error', error => { producerSpawnError = error; });
-  consumer.on('error', error => { consumerSpawnError = error; });
-  let transferError;
   try {
-    await Promise.race([
-      pipeBounded(producer.stdout, consumer.stdin, maxBytes),
-      delay(timeoutMs).then(() => { throw new DeploymentError('Artifact transfer timed out', 504, 'artifact_transfer_failed'); }),
-    ]);
+    scope = processDeadline(signal, timeoutMs,
+      new DeploymentError('Artifact transfer timed out', 504, 'artifact_transfer_failed'));
+    scope.signal.throwIfAborted();
+    drain(producer.stderr, onProducerStderr);
+    drain(consumer.stderr, onConsumerStderr);
+    drain(consumer.stdout, onConsumerStdout);
+    const checked = (state, failed) => state.promise.then(result => {
+      if (state.error) throw new DeploymentError('Helper process could not start', 503, 'process_unavailable');
+      if (result.code !== 0) throw failed(result.code);
+      return result;
+    });
+    transfer = pipeBounded(producer.stdout, consumer.stdin, maxBytes, undefined, { signal: scope.signal });
+    const [, produced, consumed] = await scope.wait(Promise.all([
+      transfer, checked(producerState, producerFailure), checked(consumerState, consumerFailure),
+    ]));
+    scope.signal.throwIfAborted();
+    if (producerState.error || consumerState.error) {
+      throw new DeploymentError('Helper process could not start', 503, 'process_unavailable');
+    }
+    if (produced.code !== 0) throw producerFailure(produced.code);
+    if (consumed.code !== 0) throw consumerFailure(consumed.code);
+    return { producerCode: produced.code, consumerCode: consumed.code };
   } catch (error) {
-    transferError = error;
-    abort();
+    scope?.abort(error);
+    producer.stdout.destroy();
+    consumer.stdin.destroy();
+    await terminateTransfer([producer, consumer], transfer, terminationOptions);
+    if (producerState.error || consumerState.error) {
+      throw new DeploymentError('Helper process could not start', 503, 'process_unavailable');
+    }
+    throw error;
+  } finally {
+    scope?.dispose();
+    for (const [stream, listener] of outputs) stream.removeListener('data', listener);
   }
-  const [{ code: producerCode }, { code: consumerCode }] = termination
-    ? await termination
-    : await Promise.all([producerExit, consumerExit]);
-  signal?.removeEventListener('abort', abort);
-  if (signal?.aborted) throw signal.reason ?? new DeploymentError('Deployment cancelled', 409, 'cancelled');
-  if (producerSpawnError || consumerSpawnError) {
-    throw new DeploymentError('Helper process could not start', 503, 'process_unavailable');
-  }
-  if (transferError) throw transferError;
-  if (producerCode !== 0) throw producerFailure(producerCode);
-  if (consumerCode !== 0) throw consumerFailure(consumerCode);
-  return { producerCode, consumerCode };
 }
 
 const TAR_BLOCK = 512;
@@ -204,7 +257,7 @@ function splitTarPath(filePath) {
   throw new DeploymentError('Source path is too long to package', 400, 'artifact_transfer_failed');
 }
 
-function tarHeader(filePath, size, mode, uid, gid) {
+function tarHeader(filePath, size, mode, uid, gid, type = '0') {
   const { name, prefix } = splitTarPath(filePath);
   const header = Buffer.alloc(TAR_BLOCK);
   header.write(name, 0, 100, 'utf8');
@@ -214,7 +267,7 @@ function tarHeader(filePath, size, mode, uid, gid) {
   header.write(tarOctal(size, 12), 124, 12, 'ascii');
   header.write(tarOctal(0, 12), 136, 12, 'ascii');
   header.write('        ', 148, 8, 'ascii');
-  header.write('0', 156, 1, 'ascii'); // typeflag: regular file
+  header.write(type, 156, 1, 'ascii');
   header.write('ustar\0', 257, 6, 'ascii');
   header.write('00', 263, 2, 'ascii');
   header.write(prefix, 345, 155, 'utf8');
@@ -240,7 +293,15 @@ export function buildTarArchive(files, options = {}) {
     }
   }
   const parts = [];
+  const directories = new Set();
   for (const file of files) {
+    const segments = file.path.split('/');
+    for (let end = 1; end < segments.length; end += 1) {
+      const directory = segments.slice(0, end).join('/');
+      if (directories.has(directory)) continue;
+      parts.push(tarHeader(directory, 0, 0o755, uid, gid, '5'));
+      directories.add(directory);
+    }
     const content = Buffer.from(file.data, 'base64');
     parts.push(tarHeader(file.path, content.length, file.executable ? 0o755 : 0o644, uid, gid));
     parts.push(content);
@@ -254,27 +315,27 @@ export function buildTarArchive(files, options = {}) {
 // Streams a producer's stdout directly into a consumer's stdin without ever
 // buffering the whole transfer in the controller (a build context tar or an
 // OCI image archive can be far larger than any single captured response).
-export function pipeBounded(readable, writable, maxBytes, onChunk) {
-  return new Promise((resolve, reject) => {
-    let size = 0, settled = false;
-    const finish = (error, value) => {
-      if (settled) return;
-      settled = true;
-      readable.removeListener('data', count);
-      if (error) { readable.destroy(); writable.destroy(); reject(error); }
-      else resolve(value);
-    };
-    function count(chunk) {
-      size += chunk.length;
-      onChunk?.(chunk, size);
-      if (size > maxBytes) finish(new DeploymentError('Transfer exceeded its size limit', 413, 'artifact_transfer_failed'));
-    }
-    readable.on('data', count);
-    readable.on('error', finish);
-    writable.on('error', finish);
-    writable.on('finish', () => finish(null, size));
-    readable.pipe(writable);
+export async function pipeBounded(readable, writable, maxBytes, onChunk, { signal } = {}) {
+  let size = 0;
+  const count = new Transform({
+    transform(chunk, encoding, callback) {
+      try {
+        size += Buffer.byteLength(chunk, encoding);
+        if (size > maxBytes) {
+          throw new DeploymentError('Transfer exceeded its size limit', 413, 'artifact_transfer_failed');
+        }
+        onChunk?.(chunk, size);
+        callback(null, chunk);
+      } catch (error) { callback(error); }
+    },
   });
+  try {
+    await pipeline(readable, count, writable, { signal });
+    return size;
+  } catch (error) {
+    if (signal?.aborted) throw signal.reason;
+    throw error;
+  }
 }
 
 // Confirms a Podman-managed resource actually stopped before the caller
