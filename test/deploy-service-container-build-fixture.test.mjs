@@ -79,7 +79,7 @@ test('trusted build observer binds the nonce, private PID namespace, OCI root an
   };
   assert.deepEqual(bindObservedBuild(observation), {
     runtimeId: 'buildah-buildah12345', pid: 1234, bundle: observation.state.bundle,
-    storageId: id, layerId: layer,
+    storageId: id,
   });
   for (const mutate of [
     value => { value.state.bundle = '/var/tmp/foreign-buildah12345'; },

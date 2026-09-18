@@ -561,10 +561,8 @@ export async function exerciseContainerBuildFixture({
         throw new Error('Remote build completed without emitting its controlled RUN marker');
       }),
     ]), 30_000, 'Timed out waiting for the controlled remote-build marker');
-    cancellationIdentityValue = await observer.identify(cancellationMarker, runtimeBaseline);
     const externalBeforeAbort = await externalContainers(executor, cleanupControl);
-    ensure(externalBeforeAbort.some(item => item.id === cancellationIdentityValue.storageId),
-      `Controlled build identity ${cancellationIdentityValue.storageId} was not visible in the private Podman store`);
+    cancellationIdentityValue = await observer.identify(cancellationMarker, runtimeBaseline, externalBeforeAbort);
     cancellationAbort.abort(new DeploymentError(
       'Synthetic fixture build cancellation', 409, 'cancelled',
     ));

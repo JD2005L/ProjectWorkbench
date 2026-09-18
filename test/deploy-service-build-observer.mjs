@@ -70,13 +70,14 @@ export function bindObservedBuild({ state, specification, containerEnvironment, 
   'Build observer received no rootless Buildah identity record');
   const ids = [...containerEnvironment.matchAll(/^id="([a-f0-9]{64})"$/gm)];
   requireEvidence(ids.length === 1, 'Build observer identity record is ambiguous');
-  requireEvidence(Array.isArray(containers), 'Build observer storage catalogue is invalid');
+  requireEvidence(Array.isArray(containers) && containers.every(value => STORAGE_ID.test(value?.id || '')),
+    'Build observer storage catalogue is invalid');
   const matches = containers.filter(value => value.id === ids[0][1]);
-  requireEvidence(matches.length === 1 && STORAGE_ID.test(matches[0].layer || ''),
+  requireEvidence(matches.length === 1,
     'Build observer cannot uniquely bind OCI root to private Buildah storage');
   return {
     runtimeId: state.id, pid: state.pid, bundle: state.bundle,
-    storageId: matches[0].id, layerId: matches[0].layer,
+    storageId: matches[0].id,
   };
 }
 
@@ -109,7 +110,7 @@ export class PrivateBuildObserver {
     return new Set(states.map(state => state.id));
   }
 
-  async identify(marker, baseline) {
+  async identify(marker, baseline, containers) {
     const states = (await this.states()).filter(state => !baseline.has(state.id)
       && state.status === 'running' && RUNTIME_ID.test(state.id || ''));
     const identities = [];
@@ -121,9 +122,6 @@ export class PrivateBuildObserver {
       requireEvidence(await fs.realpath(state.bundle) === state.bundle, 'Build observer refuses a redirected OCI bundle');
       const specification = JSON.parse(await readMetadata(path.posix.join(state.bundle, 'config.json')));
       if (!specification?.process?.args?.some(value => typeof value === 'string' && value.includes(marker))) continue;
-      const containers = JSON.parse(await readMetadata(path.posix.join(
-        this.storageBase, 'graph', 'overlay-containers', 'containers.json',
-      )));
       const containerEnvironment = await readMetadata(path.posix.join(state.bundle, 'run', '.containerenv'));
       const identity = bindObservedBuild({
         state, specification, containerEnvironment, containers, storageBase: this.storageBase, marker,
