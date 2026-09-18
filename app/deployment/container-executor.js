@@ -92,6 +92,10 @@ function withVersionStamp(request) {
   return files;
 }
 
+function workerSourceArchive(files) {
+  return buildTarArchive(files.map(file => ({ ...file, path: `source/${file.path}` })), { uid: 1001, gid: 1001 });
+}
+
 export class ContainerExecutor {
   constructor(config, { spawnProcess, now = () => Date.now(), candidateJournal = new RuntimeCandidateJournal() } = {}) {
     this.config = config;
@@ -259,7 +263,8 @@ export class ContainerExecutor {
   }
 
   async copyInto(control, containerName, tarBuffer) {
-    await this.builderRaw(control, ['cp', '--archive=false', '-', `${containerName}:/workspace/source`], { input: tarBuffer });
+    // Seed source/ through the existing volume root before the guardian starts.
+    await this.builderRaw(control, ['cp', '--archive=false', '-', `${containerName}:/workspace`], { input: tarBuffer });
   }
 
   // Creates (but does not start) a disposable worker container from the
@@ -551,7 +556,7 @@ export class ContainerExecutor {
         input: '',
         deadlineMs: this.remainingDeadlineMs(control),
       }, {
-        copyIn: buildTarArchive(files, { uid: 1001, gid: 1001 }),
+        copyIn: workerSourceArchive(files),
         after: async name => {
           await control.onEvent('building_image');
           await this.buildFromContainer(control, name, buildArgs);
@@ -677,7 +682,7 @@ export class ContainerExecutor {
       env,
       input: `${request.script}\n`,
       deadlineMs: this.remainingDeadlineMs(control),
-    }, { copyIn: buildTarArchive(files, { uid: 1001, gid: 1001 }) });
+    }, { copyIn: workerSourceArchive(files) });
     let version = null;
     if (request.versionCommand && request.versionCommand.trim()) {
       await control.onEvent('reading_version');

@@ -296,6 +296,7 @@ function fakeBuilder({
   const volumes = new Map();
   const images = new Map();
   const activeWorkers = new Map();
+  const seedArchives = [];
 
   function workerFor(name, container) {
     return workers[name] || (container?.phase && workers[container.phase]) || workers.default || workerReply({ exitCode: 0 });
@@ -393,7 +394,14 @@ function fakeBuilder({
       const reference = operands.find(value => value !== '-');
       const container = reference?.split(':')[0];
       if (!resolveContainerKey(container)) { respond(child, { exitCode: 125 }); return; }
-      respond(child, { stdout: operands[1] === '-' ? 'FAKE-BUILD-CONTEXT' : '', exitCode: 0 });
+      if (operands[0] === '-' && reference.split(':')[1] !== '/workspace') {
+        respond(child, { stderr: 'destination must be a directory when copying from stdin', exitCode: 125 });
+        return;
+      }
+      respond(child, {
+        stdout: operands[1] === '-' ? 'FAKE-BUILD-CONTEXT' : '', exitCode: 0,
+        onInput: input => { if (operands[0] === '-') seedArchives.push(input); },
+      });
       return;
     }
     if (a === 'build') {
@@ -422,7 +430,7 @@ function fakeBuilder({
     child._fail(new Error(`fakeBuilder: unhandled podman command ${JSON.stringify(args)}`));
   }
   return {
-    podman, containers, volumes, images, activeWorkers,
+    podman, containers, volumes, images, activeWorkers, seedArchives,
   };
 }
 
@@ -681,6 +689,12 @@ test('no host bind-mount paths are ever used - only the named per-job workspace 
   const cpArgs = calls.map(call => stripRemote(call.args)).find(args => args[0] === 'cp'
     && args[1] === '--archive=false' && args[2] === '-');
   assert.ok(cpArgs, 'expected source to be copied in via `podman cp -`');
+  assert.equal(cpArgs.at(-1), 'pw-deploy-job-job-vol-script:/workspace');
+  assert.equal(builder.seedArchives.length, 1);
+  const header = builder.seedArchives[0].subarray(0, 512);
+  assert.equal(header.toString('utf8', 0, 100).replace(/\0.*$/, ''), 'source');
+  assert.equal(header.toString('ascii', 156, 157), '5');
+  assert.equal(Number.parseInt(header.toString('ascii', 108, 115), 8), 1001);
 });
 
 // =============================================================================
