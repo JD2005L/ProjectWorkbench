@@ -20,7 +20,7 @@ fi
 
 git archive --format=tar "$revision" \
   app/deployment app/atomic-file.js app/lifecycle-lock.js app/VERSION deploy/container |
-  podman build --pull=missing --file deploy/container/Containerfile \
+  podman build --format=docker --pull=missing --file deploy/container/Containerfile \
     --build-arg "PW_DEPLOY_REVISION=$revision" --tag "$image" -
 
 podman image inspect --format '{{.Id}}' "$image"

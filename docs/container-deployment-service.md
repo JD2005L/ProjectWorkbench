@@ -63,6 +63,11 @@ or transfer that reviewed image through the existing image-distribution process,
 then pin both the controller and `container.workerImage` to its immutable ID or
 repository digest. Do not use `latest` for the worker.
 
+The build explicitly selects Docker image format to preserve the controller's
+`HEALTHCHECK` metadata, which Podman's default OCI image format discards. This
+does not change the rootless Podman/OCI container boundary. Image transfer must
+preserve that configuration and its exact image ID.
+
 The image includes Node/npm, Bash/setpriv, the remote Podman client, SSH, Python
 WinRM/NTLM support, SMB/Kerberos clients, .NET SDK channels 8.0 and 10.0, and
 PowerShell. Required project SDK/target compatibility is still checked by the
@@ -121,6 +126,8 @@ credential through its settings endpoints.
 The console uses a bounded, memory-only administrator session, Secure/HttpOnly/
 SameSite cookies, exact-origin and per-session CSRF checks, and no token-bearing
 URLs or browser localStorage. A controller restart signs the console out.
+Bounded job/project/target links survive sign-in, expired sessions and credential
+retries; an arbitrary external return URL is never accepted.
 It does not depend on PW's login service or PW being running. This is a service
 administrator console, not an additional per-project user directory.
 
@@ -199,6 +206,10 @@ add body logging, a public raw worker socket, or an unauthenticated admin route.
 5. Coordinate source/recipe adoption and an approved isolated canary. Only then
    select EXTERNAL for compatible targets. No application deployment is started
    by saving a console URL or connection setting.
+
+When PW runs in a different container, its localhost is not the deployment
+host. Use the approved HTTPS proxy API origin reachable from PW, or the approved
+private service network; do not enable host networking to make a loopback URL work.
 
 PW administrators are directed to the configured standalone console. PW retains
 permission-filtered per-project status/log views as an API client, so moving

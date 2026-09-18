@@ -60,6 +60,7 @@ test('proxy streams credential-bearing input and build helper exports only commi
   const build = await read('build.sh');
   assert.match(build, /git status --porcelain=v1/);
   assert.match(build, /git archive --format=tar "\$revision"/);
+  assert.match(build, /podman build --format=docker --pull=missing/);
   assert.match(build, /app\/deployment app\/atomic-file\.js app\/lifecycle-lock\.js app\/VERSION deploy\/container/);
   assert.doesNotMatch(build, /sudo|dnf |apt-get|npm install|systemctl|--privileged|git reset/);
 });

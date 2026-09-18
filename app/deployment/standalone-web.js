@@ -9,7 +9,7 @@
 import crypto from 'node:crypto';
 import { reply, jsonBody } from './service.js';
 import {
-  API_VERSION, SERVICE_NAME, TERMINAL_STATES, DeploymentError, fields, publicJob, projectName, targetName,
+  API_VERSION, SERVICE_NAME, TERMINAL_STATES, DeploymentError, fields, publicJob, projectName, targetName, consoleSelectorQuery,
 } from './protocol.js';
 import { JOB_STATES } from './client.js';
 import { renderDeploymentPage, renderStandaloneLogin, renderStandaloneNotice } from './ui.js';
@@ -168,9 +168,9 @@ export function createStandaloneWeb({
     return { html, nonce: value };
   }
 
-  function renderLogin(status, error) {
+  function renderLogin(status, error, query = '') {
     const value = nonce();
-    return { status, nonce: value, html: renderStandaloneLogin({ basePath, error, nonce: value }) };
+    return { status, nonce: value, html: renderStandaloneLogin({ basePath, error, nonce: value, query }) };
   }
 
   function renderNotice(status, title, message) {
@@ -266,11 +266,13 @@ export function createStandaloneWeb({
     await apiDispatch(apiPath, request, response, url, activeSession);
   }
 
-  async function loginRoute(request, response) {
-    if (session(request)) return sendRedirect(response, 303, `${basePath}/`);
+  async function loginRoute(request, response, url) {
+    const query = consoleSelectorQuery(url.searchParams);
+    const destination = `${basePath}/${query ? `?${query}` : ''}`;
+    if (session(request)) return sendRedirect(response, 303, destination);
     const method = request.method;
     if (method === 'GET' || method === 'HEAD') {
-      const page = renderLogin(200);
+      const page = renderLogin(200, '', query);
       return sendHtml(response, page.status, page.html, page.nonce);
     }
     if (method !== 'POST') {
@@ -279,17 +281,17 @@ export function createStandaloneWeb({
     }
     if (request.headers.origin !== origin) {
       request.resume();
-      const page = renderLogin(403, 'This console requires a direct, same-origin sign-in request.');
+      const page = renderLogin(403, 'This console requires a direct, same-origin sign-in request.', query);
       return sendHtml(response, page.status, page.html, page.nonce);
     }
     if (limiter.hit(clientKey(request))) {
       request.resume();
-      const page = renderLogin(429, 'Too many sign-in attempts. Wait a few minutes and try again.');
+      const page = renderLogin(429, 'Too many sign-in attempts. Wait a few minutes and try again.', query);
       return sendHtml(response, page.status, page.html, page.nonce);
     }
     if (activeLogins >= maxConcurrentLogins) {
       request.resume();
-      const page = renderLogin(429, 'The console is busy. Try signing in again shortly.');
+      const page = renderLogin(429, 'The console is busy. Try signing in again shortly.', query);
       return sendHtml(response, page.status, page.html, page.nonce);
     }
     activeLogins += 1;
@@ -299,16 +301,16 @@ export function createStandaloneWeb({
       const valid = typeof supplied === 'string' && supplied.length > 0 && supplied.length <= 512
         && crypto.timingSafeEqual(tokenHash, crypto.createHash('sha256').update(supplied).digest());
       if (!valid) {
-        const page = renderLogin(401, 'Invalid administrator token.');
+        const page = renderLogin(401, 'Invalid administrator token.', query);
         return sendHtml(response, page.status, page.html, page.nonce);
       }
       const created = sessions.create();
       if (!created) {
-        const page = renderLogin(503, 'Too many active console sessions. Try again shortly.');
+        const page = renderLogin(503, 'Too many active console sessions. Try again shortly.', query);
         return sendHtml(response, page.status, page.html, page.nonce);
       }
       const cookie = serializeSessionCookie({ basePath, value: created.id, maxAgeSeconds: created.maxAgeSeconds });
-      return sendRedirect(response, 303, `${basePath}/`, cookie);
+      return sendRedirect(response, 303, destination, cookie);
     } finally {
       activeLogins -= 1;
     }
@@ -348,9 +350,10 @@ export function createStandaloneWeb({
     return sendRedirect(response, 303, `${basePath}/login`, cookie);
   }
 
-  async function consoleRoute(request, response) {
+  async function consoleRoute(request, response, url) {
+    const query = consoleSelectorQuery(url.searchParams);
     const activeSession = session(request);
-    if (!activeSession) return sendRedirect(response, 303, `${basePath}/login`);
+    if (!activeSession) return sendRedirect(response, 303, `${basePath}/login${query ? `?${query}` : ''}`);
     const page = renderConsole(activeSession);
     return sendHtml(response, 200, page.html, page.nonce);
   }
@@ -366,11 +369,11 @@ export function createStandaloneWeb({
       if (sub === API_PREFIX || sub.startsWith(`${API_PREFIX}/`)) {
         await apiRoute(sub.slice(API_PREFIX.length) || '/', request, response, url);
       } else if (sub === '/login') {
-        await loginRoute(request, response);
+        await loginRoute(request, response, url);
       } else if (sub === '/logout' && request.method === 'POST') {
         await logoutRoute(request, response);
       } else if (sub === '/' && (request.method === 'GET' || request.method === 'HEAD')) {
-        await consoleRoute(request, response);
+        await consoleRoute(request, response, url);
       } else {
         request.resume();
         reply(response, 404, { ok: false, error: 'Deployment console endpoint not found', code: 'not_found' });

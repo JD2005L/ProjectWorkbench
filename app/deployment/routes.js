@@ -1,4 +1,4 @@
-import { DeploymentError, fields, projectName, targetName, TERMINAL_STATES } from './protocol.js';
+import { DeploymentError, fields, projectName, targetName, TERMINAL_STATES, consoleSelectorQuery } from './protocol.js';
 import { publicDeploymentSettings } from './settings.js';
 import { deploymentFailure, requireDeploymentOrigin } from './pw.js';
 import { renderDeploymentPage } from './ui.js';
@@ -48,14 +48,7 @@ export function mountDeploymentRoutes(app, {
       const { consoleUrl } = publicDeploymentSettings(await service.settingsStore.load());
       if (consoleUrl) {
         const destination = new URL(consoleUrl);
-        if (req.query.job !== undefined) {
-          if (typeof req.query.job !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(req.query.job)) {
-            throw new DeploymentError('Invalid deployment job selector.');
-          }
-          destination.searchParams.set('job', req.query.job);
-        }
-        if (req.query.project !== undefined) destination.searchParams.set('project', projectName(req.query.project));
-        if (req.query.target !== undefined) destination.searchParams.set('target', targetName(req.query.target));
+        destination.search = consoleSelectorQuery(req.query);
         return res.redirect(303, destination.href);
       }
     }

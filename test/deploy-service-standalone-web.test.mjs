@@ -307,6 +307,60 @@ test('GET /login renders a sign-in form for anonymous visitors; an already-authe
   assert.equal(redirected.headers.location, `${BASE_PATH}/`);
 });
 
+test('console sign-in preserves bounded job selectors through missing/expired sessions and credential retries', async t => {
+  const app = await fixture(t);
+  const query = '?job=job-running-2&project=ExampleApp&target=dev';
+  const action = html => html.match(/<form method="post" action="([^"]+)"/)?.[1].replaceAll('&amp;', '&');
+  const signIn = (url, token) => app.request(url, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+    body: new URLSearchParams({ token }).toString(),
+  });
+  for (const expired of [false, true]) {
+    let headers = {};
+    if (expired) {
+      const { cookie } = await app.loggedIn();
+      headers = { Cookie: cookie };
+      app.advance(31 * 60000);
+    }
+    const redirected = await app.request(`${BASE_PATH}/${query}&returnTo=https://evil.example.test/&token=ignored`, { headers });
+    assert.equal(redirected.status, 303);
+    assert.equal(redirected.headers.location, `${BASE_PATH}/login${query}`);
+    const login = await app.request(redirected.headers.location, { headers });
+    assert.equal(login.status, 200);
+    assert.equal(action(login.text), `${BASE_PATH}/login${query}`);
+    const rejected = await signIn(action(login.text), 'fixture-wrong-token');
+    assert.equal(rejected.status, 401);
+    assert.equal(action(rejected.text), action(login.text));
+    const accepted = await signIn(action(rejected.text), UI_TOKEN);
+    assert.equal(accepted.status, 303);
+    assert.equal(accepted.headers.location, `${BASE_PATH}/${query}`);
+    const cookie = cookieValue(accepted.headers['set-cookie']);
+    const page = await app.request(accepted.headers.location, { headers: { Cookie: cookie } });
+    assert.equal(page.status, 200);
+    const signedInLogin = await app.request(`${BASE_PATH}/login${query}`, { headers: { Cookie: cookie } });
+    assert.equal(signedInLogin.headers.location, `${BASE_PATH}/${query}`);
+  }
+});
+
+test('console continuation rejects malformed or repeated selectors and never accepts an external return URL', async t => {
+  const app = await fixture(t);
+  for (const query of ['job=../bad', `job=${'x'.repeat(101)}`, 'project=../bad', 'target=staging',
+    'job=one&job=two', 'project=One&project=Two', 'target=dev&target=prod']) {
+    for (const route of [`${BASE_PATH}/`, `${BASE_PATH}/login`]) {
+      const response = await app.request(`${route}?${query}`);
+      assert.equal(response.status, 400, `${route}?${query}`);
+      assert.equal(response.headers.location, undefined);
+      assert.equal(response.headers['set-cookie'], undefined);
+    }
+  }
+  const accepted = await app.request(`${BASE_PATH}/login?returnTo=https://evil.example.test/`, {
+    method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded', Origin: ORIGIN },
+    body: new URLSearchParams({ token: UI_TOKEN }).toString(),
+  });
+  assert.equal(accepted.status, 303);
+  assert.equal(accepted.headers.location, `${BASE_PATH}/`);
+});
+
 test('missing, wrong and oversized administrator credentials are all rejected without a session, and repeated failures are throttled', async t => {
   // maxLoginAttempts counts the *rejected* attempts already recorded before a
   // call is refused, so 3 lets exactly the three credential attempts below

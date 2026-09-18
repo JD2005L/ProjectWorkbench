@@ -400,13 +400,13 @@ ${adminPanel}</main><script${nonceAttr}>(${deploymentPageBrowser.toString()})(${
 // yet to forge. `error`, when present, is operator-facing text describing
 // why a previous attempt did not succeed (never which part of a credential
 // was wrong, since there is only one field).
-export function renderStandaloneLogin({ basePath, error = '', nonce }) {
+export function renderStandaloneLogin({ basePath, error = '', nonce, query = '' }) {
   const nonceAttr = nonce ? ` nonce="${escape(nonce)}"` : '';
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Deployment console sign-in</title><style${nonceAttr}>${deploymentUiCss}</style></head><body class="ds-page"><main class="ds-login">
 <h1>Deployment console</h1>
 ${error ? `<p role="alert">${escape(error)}</p>` : ''}
-<section><form method="post" action="${escape(basePath)}/login">
+<section><form method="post" action="${escape(`${basePath}/login${query ? `?${query}` : ''}`)}">
 <label for="ds-login-token">Administrator token</label>
 <input id="ds-login-token" name="token" type="password" autocomplete="current-password" required maxlength="512" autofocus>
 <button type="submit">Sign in</button>
