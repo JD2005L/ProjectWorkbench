@@ -68,6 +68,9 @@ test('image contains engine, web console and job tools without PW or host runtim
   assert.match(application, /COPY deploy\/container\/runtime-policy\.example\.json \.\/runtime-policy\.example\.json/);
   assert.match(application, /COPY deploy\/container\/builder-relay\.py \.\/builder-relay\.py/);
   assert.match(application, /COPY deploy\/container\/builder-policy\.example\.json \.\/builder-policy\.example\.json/);
+  assert.match(application, /find \/opt\/pw-deploy -type d -exec chmod 0755 \{\} \+/);
+  assert.match(application, /find \/opt\/pw-deploy -type f -exec chmod 0644 \{\} \+/);
+  assert.match(application, /chmod 0755 \/opt\/pw-deploy\/runtime-relay\.py \/opt\/pw-deploy\/builder-relay\.py/);
   assert.match(file, /ENTRYPOINT \["node", "\/opt\/pw-deploy\/app\/deployment\/container-service\.js"\]/);
   assert.doesNotMatch(file, /nsenter|--privileged|systemctl|systemd-run|entrypoint\.sh/);
 });

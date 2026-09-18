@@ -70,7 +70,9 @@ COPY deploy/container/runtime-policy.example.json ./runtime-policy.example.json
 COPY deploy/container/builder-relay.py ./builder-relay.py
 COPY deploy/container/builder-policy.example.json ./builder-policy.example.json
 RUN mkdir -p /etc/pw-deploy /var/lib/pw-deploy /workspace/source /workspace/home && \
-    chmod 0755 /opt/pw-deploy /opt/pw-deploy/app /opt/pw-deploy/app/deployment && \
+    find /opt/pw-deploy -type d -exec chmod 0755 {} + && \
+    find /opt/pw-deploy -type f -exec chmod 0644 {} + && \
+    chmod 0755 /opt/pw-deploy/runtime-relay.py /opt/pw-deploy/builder-relay.py && \
     chmod 0700 /var/lib/pw-deploy && \
     chown -R 1001:1001 /workspace && \
     node --input-type=module -e 'await import("./app/deployment/container-service.js")'

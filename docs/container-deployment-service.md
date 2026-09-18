@@ -93,6 +93,11 @@ The build explicitly selects Docker image format to preserve the controller's
 does not change the rootless Podman/OCI container boundary. Image transfer must
 preserve that configuration and its exact image ID.
 
+The image normalizes its packaged source permissions rather than inheriting
+Git archive's group-writable defaults: directories and the two connector
+entrypoints are 0755, other source/templates are 0644. Connector copies must
+remain root-owned and not group/other-writable when installed on the host.
+
 The image includes Node/npm, Bash/setpriv, the remote Podman client, SSH, Python
 WinRM/NTLM support, SMB/Kerberos clients, .NET SDK channels 8.0 and 10.0, and
 PowerShell. Required project SDK/target compatibility is still checked by the
