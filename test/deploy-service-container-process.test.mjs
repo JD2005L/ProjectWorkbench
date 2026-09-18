@@ -122,6 +122,25 @@ test('runtime response allows the full bounded JSON body plus its framing header
   assert.equal((await pending).value, value);
 });
 
+test('runtime refusal codes preserve scoped health policy and cancellation errors', async () => {
+  for (const [code, expected] of [
+    ['health_target_not_allowed', 'health_target_not_allowed'],
+    ['cancelled', 'cancelled'],
+    ['unknown_runtime_error', 'runtime_protocol_error'],
+  ]) {
+    const connector = child();
+    const body = Buffer.from(JSON.stringify({ ok: false, code, error: 'Fixture refusal' }));
+    const frame = Buffer.concat([Buffer.from(String(body.length).padStart(10, '0')), body]);
+    const pending = runtimeRequest(runtime, { action: 'health_check' }, { spawnProcess: () => connector });
+    queueMicrotask(() => {
+      connector.stdout.end(frame);
+      connector.exitCode = 0;
+      connector.emit('close', 0, null);
+    });
+    await assert.rejects(pending, error => error instanceof DeploymentError && error.code === expected);
+  }
+});
+
 test('pipeline deadline includes process exit after all bytes are transferred', async () => {
   const producer = child(), consumer = child();
   const controller = new AbortController();

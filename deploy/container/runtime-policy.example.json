@@ -1,0 +1,15 @@
+{
+  "resourceNames": {
+    "example-app/prod": "example-app",
+    "example-app/dev": "example-app-dev"
+  },
+  "healthHosts": [
+    "127.0.0.1",
+    "::1",
+    "health.internal.example"
+  ],
+  "maxImageBytes": 1073741824,
+  "healthTargets": {
+    "example-app/prod": "https://health.internal.example/example-app/healthz"
+  }
+}

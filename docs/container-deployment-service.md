@@ -133,24 +133,56 @@ administrator console, not an additional per-project user directory.
 
 ## Runtime connector
 
-Use the supplied `deploy/container/runtime-relay.py` and its documented
-operator policy under the existing non-root runtime identity. The connector and
+Use the supplied `deploy/container/runtime-relay.py` and
+`deploy/container/runtime-policy.example.json` under the existing non-root
+runtime identity. The completed policy belongs at
+`/etc/pw-deploy/runtime-policy.json`, in an administrator-owned directory,
+root-owned and not writable by the runtime account. The connector and
 its policy must be protected from that account's deployment workloads. Pin the
 host key and use a dedicated SSH key restricted to the connector's fixed
 command: no interactive shell, forwarding, agent forwarding, PTY or user rc.
 Do not grant a generic sudo/SSH command or expose a Podman API as the runtime
 connector.
 
-The reviewed image also contains this connector at
-`/opt/pw-deploy/runtime-relay.py`. Provision the host copy from the same reviewed
-release, not an unrelated workspace or a mutable download. It remains the small
-necessary host boundary, not a host installation of the deployment engine.
+The reviewed image contains this connector at `/opt/pw-deploy/runtime-relay.py`
+and the non-operational policy template at
+`/opt/pw-deploy/runtime-policy.example.json`. Provision the host copy from the
+same reviewed release, not an unrelated workspace or a mutable download. It
+remains the small necessary host boundary, not a host installation of the
+deployment engine.
 
 The controller sends bounded operation metadata and, for image import only,
 an OCI stream. The connector independently validates the selected project,
 target, image/service names, legacy reservations and allowed health hosts.
 It returns selected operational metadata, never container environments, unit
 definitions, application secrets or arbitrary logs.
+
+Only the following policy fields are accepted. Invalid target keys, unexpected
+fields or unsafe URLs fail closed; the web console cannot change this policy.
+
+| Field | Operator-controlled purpose |
+| --- | --- |
+| `resourceNames` | Optional exact `<project>/<target>` bindings for pre-existing legacy image/unit/container names. Standard names require no exception. |
+| `healthHosts` | Allowed health hostnames or addresses; allowing a host alone does not authorize arbitrary services or ports on it. |
+| `healthTargets` | Optional exact `<project>/<target>` to health URL bindings for approved reverse proxies, HTTPS or other non-direct routes. |
+| `maxImageBytes` | Image-transfer limit within the connector's hard bounds. |
+
+Every health request carries the project, target, service and expected image
+identity. The connector requires that exact image in the running container
+before and after the probe. Direct HTTP loopback probes must use a port published
+by that container. Other routes need the exact approved `healthTargets` URL as
+well as the host allowlist; ordinary direct probes remain enrollment-free.
+Redirects, URL credentials, queries and fragments are rejected, and inherited
+proxy environment variables are ignored. A `health_target_not_allowed` outcome
+is a policy refusal, not permission to probe a different endpoint.
+
+Candidate cleanup conditionally untags the exact candidate reference from its
+expected image identity. It never removes an image ID with unrelated aliases
+or follows a candidate tag that was reassigned. A normal untagged image/cache
+entry may remain; job cleanup does not perform blind image garbage collection.
+Request framing, upload and helper-output bounds are enforced by the connector,
+independently of the caller. Its `HOME` comes from the runtime account record,
+not an inherited caller environment.
 
 Existing application user units remain the authority for start/stop and runtime
 mounts/environment. An absent unit is a provisioning error. Do not replace it

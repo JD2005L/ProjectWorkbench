@@ -16,6 +16,11 @@ import urllib.error
 import urllib.request
 from urllib.parse import urlsplit
 
+try:
+    import pwd
+except ImportError:
+    pwd = None
+
 HEADER_BYTES = 10
 MAX_REQUEST_BYTES = 65536
 MAX_RESPONSE_BYTES = 262144
@@ -25,6 +30,8 @@ MAX_ARCHIVE_MEMBERS = 64
 MAX_METADATA_BYTES = 1024 * 1024
 IMPORT_READ_TIMEOUT_SECONDS = 300
 IMPORT_LOAD_TIMEOUT_SECONDS = 300
+REQUEST_READ_TIMEOUT_SECONDS = 10
+MAX_HELPER_OUTPUT_BYTES = 1024 * 1024
 DEFAULT_POLICY_FILE = '/etc/pw-deploy/runtime-policy.json'
 PODMAN_BIN = '/usr/bin/podman'
 SYSTEMCTL_BIN = '/usr/bin/systemctl'
@@ -44,6 +51,9 @@ ALLOWED_ACTIONS = {
     'service_preflight', 'container_status', 'image_tag', 'image_remove_candidate',
     'image_import', 'service_restart', 'service_is_active', 'health_check',
 }
+LOOPBACK_HOSTS = {'127.0.0.1', '::1', 'localhost'}
+WILDCARD_HOST_IPS = {'', '0.0.0.0', '::'}
+ALLOWED_POLICY_FIELDS = {'resourceNames', 'healthHosts', 'maxImageBytes', 'healthTargets'}
 ACTIVE_PROCESSES = set()
 TERMINATED = False
 
@@ -84,6 +94,18 @@ def _kill_process(process):
         process.kill()
 
 
+def _terminate_and_reap(process):
+    _stop_process(process)
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        _kill_process(process)
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+
 def _termination_signal(_signum, _frame):
     global TERMINATED
     TERMINATED = True
@@ -91,12 +113,38 @@ def _termination_signal(_signum, _frame):
         _stop_process(process)
 
 
-def read_exact(stream, size):
+def _stream_input_fd(stream):
+    try:
+        return stream.fileno()
+    except (AttributeError, OSError, io.UnsupportedOperation):
+        return None
+
+
+def read_exact(stream, size, deadline, input_fd):
+    """Read exactly ``size`` bytes bounded by an absolute wall-clock deadline.
+
+    The deadline is never reset per byte or per chunk, so idle or trickled
+    input can never extend the budget. On Linux real descriptors are drained
+    with readiness polling plus ``os.read`` so a buffered reader can neither
+    prefetch bytes destined for a following stream nor block for a full
+    ``read(size)``. Bounded in-memory fixtures (``BytesIO``) expose no
+    descriptor and are read directly; they cannot block, so no production
+    bypass toggle is involved.
+    """
     chunks = []
     remaining = size
     while remaining:
         _check_terminated()
-        chunk = stream.read(remaining)
+        now = time.monotonic()
+        if now >= deadline:
+            raise RelayError('Request timed out', 'invalid_request')
+        if input_fd is not None:
+            ready, _, _ = select.select([input_fd], [], [], deadline - now)
+            if not ready:
+                raise RelayError('Request timed out', 'invalid_request')
+            chunk = os.read(input_fd, remaining)
+        else:
+            chunk = stream.read(remaining)
         if not chunk:
             raise RelayError('Request was truncated', 'invalid_request')
         chunks.append(chunk)
@@ -105,14 +153,16 @@ def read_exact(stream, size):
 
 
 def read_request(stream):
-    header = read_exact(stream, HEADER_BYTES)
+    deadline = time.monotonic() + REQUEST_READ_TIMEOUT_SECONDS
+    input_fd = _stream_input_fd(stream)
+    header = read_exact(stream, HEADER_BYTES, deadline, input_fd)
     if not re.match(rb'^[0-9]{10}$', header):
         raise RelayError('Request framing is invalid', 'invalid_request')
     size = int(header)
     if size < 1 or size > MAX_REQUEST_BYTES:
         raise RelayError('Request size is out of bounds', 'invalid_request')
     try:
-        value = json.loads(read_exact(stream, size).decode('utf-8'))
+        value = json.loads(read_exact(stream, size, deadline, input_fd).decode('utf-8'))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise RelayError('Request was not valid JSON', 'invalid_request')
     if not isinstance(value, dict):
@@ -180,6 +230,22 @@ def image_identity(value, label='image identity'):
     return value if value.startswith('sha256:') else f'sha256:{value}'
 
 
+def _valid_target_key(key):
+    if not isinstance(key, str):
+        return False
+    parts = key.split('/')
+    return len(parts) == 2 and bool(NAME_RE.match(parts[0])) and parts[1] in ('dev', 'prod')
+
+
+def _health_url_shape_ok(url, health_hosts):
+    if not isinstance(url, str) or not url or len(url) > 2048:
+        return False
+    parsed = urlsplit(url)
+    if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password or parsed.query or parsed.fragment:
+        return False
+    return (parsed.hostname or '').strip('[]') in health_hosts
+
+
 def load_policy(path=DEFAULT_POLICY_FILE):
     try:
         info = os.lstat(path)
@@ -194,32 +260,38 @@ def load_policy(path=DEFAULT_POLICY_FILE):
             value = json.load(handle)
     except (OSError, json.JSONDecodeError):
         raise RelayError('Runtime policy could not be read', 'runtime_policy_invalid')
-    if not isinstance(value, dict):
-        raise RelayError('Runtime policy must be a JSON object', 'runtime_policy_invalid')
+    if not isinstance(value, dict) or set(value) - ALLOWED_POLICY_FIELDS:
+        raise RelayError('Runtime policy is invalid', 'runtime_policy_invalid')
     resource_names, health_hosts = value.get('resourceNames', {}), value.get('healthHosts', [])
     max_image_bytes = value.get('maxImageBytes', DEFAULT_MAX_IMAGE_BYTES)
-    if (not isinstance(resource_names, dict) or any(not isinstance(k, str) or not isinstance(v, str)
+    health_targets = value.get('healthTargets', {})
+    if (not isinstance(resource_names, dict) or any(not _valid_target_key(k) or not isinstance(v, str)
             or not RESOURCE_RE.match(v) for k, v in resource_names.items())
             or not isinstance(health_hosts, list) or not health_hosts or len(health_hosts) > 32
             or any(not isinstance(host, str) or not HEALTH_HOST_RE.match(host) for host in health_hosts)
             or not isinstance(max_image_bytes, int) or isinstance(max_image_bytes, bool)
-            or not 1 <= max_image_bytes <= DEFAULT_MAX_IMAGE_BYTES):
+            or not 1 <= max_image_bytes <= DEFAULT_MAX_IMAGE_BYTES
+            or not isinstance(health_targets, dict) or len(health_targets) > 256
+            or any(not _valid_target_key(k) or not _health_url_shape_ok(v, health_hosts)
+                for k, v in health_targets.items())):
         raise RelayError('Runtime policy is invalid', 'runtime_policy_invalid')
-    return {'resourceNames': resource_names, 'healthHosts': health_hosts, 'maxImageBytes': max_image_bytes}
+    return {'resourceNames': resource_names, 'healthHosts': health_hosts,
+            'maxImageBytes': max_image_bytes, 'healthTargets': health_targets}
 
 
 def runtime_environment():
     uid = os.getuid()
     runtime_dir = f'/run/user/{uid}'
+    home = pwd.getpwuid(uid).pw_dir if pwd is not None else os.path.expanduser('~')
     return {
         'PATH': '/usr/bin:/bin',
-        'HOME': os.path.expanduser('~'),
+        'HOME': home,
         'XDG_RUNTIME_DIR': runtime_dir,
         'DBUS_SESSION_BUS_ADDRESS': f'unix:path={runtime_dir}/bus',
     }
 
 
-def run_command(argv, *, timeout=30, allowed_exit_codes=(0,)):
+def run_command(argv, *, timeout=30, allowed_exit_codes=(0,), max_output_bytes=MAX_HELPER_OUTPUT_BYTES):
     _check_terminated()
     try:
         process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
@@ -227,22 +299,41 @@ def run_command(argv, *, timeout=30, allowed_exit_codes=(0,)):
     except OSError:
         raise RelayError('Runtime helper could not start', 'process_failed')
     ACTIVE_PROCESSES.add(process)
+    stdout_fd = process.stdout.fileno()
+    chunks, total, deadline = [], 0, time.monotonic() + timeout
     try:
-        stdout, _ = process.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _stop_process(process)
+        while True:
+            _check_terminated()
+            now = time.monotonic()
+            if now >= deadline:
+                _terminate_and_reap(process)
+                raise RelayError('Runtime helper timed out', 'process_failed')
+            ready, _, _ = select.select([stdout_fd], [], [], deadline - now)
+            if not ready:
+                continue
+            chunk = os.read(stdout_fd, 65536)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > max_output_bytes:
+                _terminate_and_reap(process)
+                raise RelayError('Runtime helper produced too much output', 'process_failed')
+            chunks.append(chunk)
         try:
             process.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            _kill_process(process)
-            process.wait(timeout=5)
-        raise RelayError('Runtime helper timed out', 'process_failed')
+            _terminate_and_reap(process)
+            raise RelayError('Runtime helper timed out', 'process_failed')
     finally:
+        try:
+            process.stdout.close()
+        except OSError:
+            pass
         ACTIVE_PROCESSES.discard(process)
     _check_terminated()
     if process.returncode not in allowed_exit_codes:
         raise RelayError('Runtime helper failed', 'process_failed')
-    return type('CommandResult', (), {'returncode': process.returncode, 'stdout': stdout})()
+    return type('CommandResult', (), {'returncode': process.returncode, 'stdout': b''.join(chunks)})()
 
 
 def podman(args, **kwargs):
@@ -397,6 +488,16 @@ def validate_oci_archive(source, approved_reference, expected_image_id, revision
     labels = config.get('config', {}).get('Labels') if isinstance(config.get('config'), dict) else None
     if not isinstance(labels, dict) or labels.get('org.opencontainers.image.revision') != revision:
         raise RelayError('OCI revision is inconsistent', 'invalid_image')
+    # Cap the canonical archive size BEFORE staging it: the tar layout is
+    # deterministic (512-byte header + padded data per member, plus directory
+    # entries and the 1024-byte trailer), so we can reject an oversized result
+    # up front rather than after writing it into the memfd.
+    projected = 1024 + 512 * len(allowed_dirs)
+    for name in ['oci-layout', 'index.json', *blob_names]:
+        member = member_by_name[name]
+        projected += 512 + (member.size + 511) // 512 * 512
+        if projected > max_bytes:
+            raise RelayError('Canonical OCI archive exceeded its limit', 'invalid_image')
     if not hasattr(os, 'memfd_create') or sys.platform != 'linux':
         raise RelayError('Memory-backed OCI import is unavailable on this platform', 'process_failed')
     output_fd = os.memfd_create('pw-deploy-oci-canonical', os.MFD_CLOEXEC)
@@ -433,10 +534,7 @@ def stage_oci_stream(stream, max_bytes):
     staged = os.fdopen(fd, 'w+b')
     deadline, total = time.monotonic() + IMPORT_READ_TIMEOUT_SECONDS, 0
     try:
-        try:
-            input_fd = stream.fileno()
-        except (AttributeError, OSError, io.UnsupportedOperation):
-            input_fd = None
+        input_fd = _stream_input_fd(stream)
         while True:
             _check_terminated()
             if time.monotonic() >= deadline:
@@ -501,7 +599,26 @@ def handle_image_remove_candidate(policy, request, _stream):
     )
     if current != expected:
         raise RelayError('Candidate image was replaced', 'resource_conflict')
-    podman(['image', 'rm', '--no-prune', candidate])
+    # Atomic removal primitive: ``podman image untag <expectedImageId> <candidate-ref>``.
+    # Podman resolves the first argument to the expected image and refuses to
+    # remove the tag unless <candidate-ref> is currently one of THAT image's
+    # names. If the tag was reassigned to a different image between the inspect
+    # above and now, the untag fails and we report the conflict rather than
+    # deleting the replacement. Because untag only detaches the exact name (it
+    # never removes an image by ID), unrelated tags/aliases of the expected
+    # image are preserved. It may leave a normal untagged layer/image cache
+    # behind; that is intentional -- we do not garbage collect blindly.
+    if podman(['image', 'untag', expected, candidate], allowed_exit_codes=(0, 1, 125)).returncode:
+        raise RelayError('Candidate image was replaced', 'resource_conflict')
+    # Postcondition: the candidate reference must no longer resolve to the
+    # expected image.
+    if not podman(['image', 'exists', candidate], allowed_exit_codes=(0, 1)).returncode:
+        remaining = image_identity(
+            podman(['image', 'inspect', '--format', '{{.Id}}', candidate]).stdout.decode().strip(),
+            'candidate image identity',
+        )
+        if remaining == expected:
+            raise RelayError('Candidate image removal did not take effect', 'process_failed')
     return {'removed': True}
 
 
@@ -526,12 +643,7 @@ def handle_image_import(policy, request, stream):
         try:
             process.wait(timeout=IMPORT_LOAD_TIMEOUT_SECONDS)
         except subprocess.TimeoutExpired:
-            _stop_process(process)
-            try:
-                process.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                _kill_process(process)
-                process.wait(timeout=5)
+            _terminate_and_reap(process)
             raise RelayError('Image import timed out', 'process_failed')
         finally:
             ACTIVE_PROCESSES.discard(process)
@@ -564,28 +676,108 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
         return None
 
 
-def handle_health_check(policy, request, _stream):
-    check_fields(request, {'healthUrl', 'versionField'}, 'health_check')
-    health_url = request.get('healthUrl')
+def _validate_health_url(health_url, health_hosts):
     if not isinstance(health_url, str) or not health_url or len(health_url) > 2048:
         raise RelayError('Invalid health URL', 'invalid_request')
     parsed = urlsplit(health_url)
     if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password or parsed.query or parsed.fragment:
         raise RelayError('Invalid health URL', 'invalid_request')
-    if (parsed.hostname or '').strip('[]') not in policy['healthHosts']:
+    if (parsed.hostname or '').strip('[]') not in health_hosts:
         raise RelayError('Health endpoint host is not approved', 'health_host_not_allowed')
-    field = request.get('versionField')
-    if field is not None and (not isinstance(field, str) or not VERSION_FIELD_RE.match(field)):
-        raise RelayError('Invalid version field', 'invalid_request')
+    return parsed
+
+
+def _require_running_expected_image(service, expected):
+    if podman(['container', 'exists', service], allowed_exit_codes=(0, 1)).returncode:
+        raise RelayError('Service container is not present', 'health_failed')
+    running, _, image = podman(['container', 'inspect', '--format', '{{.State.Running}} {{.Image}}',
+        service]).stdout.decode().strip().partition(' ')
+    if running != 'true':
+        raise RelayError('Service container is not running', 'health_failed')
+    if image_identity(image.strip(), 'running image identity') != expected:
+        raise RelayError('Service container is not running the expected image', 'health_failed')
+
+
+def _published_ports(service):
+    raw = podman(['container', 'inspect', '--format', '{{json .NetworkSettings.Ports}}', service]).stdout.decode().strip()
     try:
-        with urllib.request.build_opener(_NoRedirect).open(health_url, timeout=5) as response:
+        ports = json.loads(raw) if raw and raw != 'null' else {}
+    except json.JSONDecodeError:
+        raise RelayError('Container port metadata is invalid', 'health_failed')
+    if not isinstance(ports, dict):
+        raise RelayError('Container port metadata is invalid', 'health_failed')
+    published = set()
+    for bindings in ports.values():
+        if bindings is None:
+            continue
+        if not isinstance(bindings, list):
+            raise RelayError('Container port metadata is invalid', 'health_failed')
+        for binding in bindings:
+            if not isinstance(binding, dict):
+                raise RelayError('Container port metadata is invalid', 'health_failed')
+            host_ip, host_port = binding.get('HostIp') or '', binding.get('HostPort')
+            if isinstance(host_port, str) and host_port.isdigit():
+                published.add((host_ip, int(host_port)))
+    return published
+
+
+def _require_direct_loopback_binding(service, parsed):
+    host = (parsed.hostname or '').strip('[]')
+    if parsed.scheme != 'http' or host not in LOOPBACK_HOSTS:
+        raise RelayError('A direct health URL must use http on a loopback host', 'health_target_not_allowed')
+    if parsed.port is None:
+        raise RelayError('A direct health URL must specify a published port', 'health_target_not_allowed')
+    published = _published_ports(service)
+    reachable = any(port == parsed.port and (host_ip in WILDCARD_HOST_IPS or host_ip in LOOPBACK_HOSTS)
+        for host_ip, port in published)
+    if not reachable:
+        raise RelayError('Health port is not published by this container', 'health_target_not_allowed')
+
+
+def _probe_health(health_url):
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(health_url, timeout=5) as response:
             if response.status != 200:
                 raise RelayError('Health endpoint did not return OK', 'health_failed')
-            body = response.read(MAX_RESPONSE_BYTES + 1)
+            return response.read(MAX_RESPONSE_BYTES + 1)
     except urllib.error.HTTPError:
         raise RelayError('Health endpoint did not return OK', 'health_failed')
     except urllib.error.URLError:
         raise RelayError('Health endpoint was unreachable', 'health_failed')
+
+
+def handle_health_check(policy, request, _stream):
+    check_fields(request, {'project', 'target', 'service', 'expectedImageId', 'healthUrl', 'versionField'}, 'health_check')
+    for required in ('project', 'target', 'service', 'expectedImageId', 'healthUrl'):
+        if required not in request:
+            raise RelayError('Health check metadata is incomplete', 'invalid_request')
+    project, target = project_name(request.get('project')), target_name(request.get('target'))
+    service = resolve_resource_name(policy, project, target, request.get('service'), 'service')
+    expected = image_identity(request.get('expectedImageId'), 'expected image identity')
+    field = request.get('versionField')
+    if field is not None and (not isinstance(field, str) or not VERSION_FIELD_RE.match(field)):
+        raise RelayError('Invalid version field', 'invalid_request')
+    health_url = request.get('healthUrl')
+    parsed = _validate_health_url(health_url, policy['healthHosts'])
+
+    _require_running_expected_image(service, expected)
+
+    approved = policy['healthTargets'].get(f'{project}/{target}')
+    if approved is not None:
+        # A proxy / HTTPS / non-published legacy route: only the exact
+        # operator-approved URL for this project and target is accepted.
+        if health_url != approved:
+            raise RelayError('Health URL is not the approved target for this project', 'health_target_not_allowed')
+    else:
+        # No operator binding: the URL must be a direct loopback probe bound to
+        # one of this exact container's published ports.
+        _require_direct_loopback_binding(service, parsed)
+
+    body = _probe_health(health_url)
+
+    _require_running_expected_image(service, expected)
+
     if len(body) > MAX_RESPONSE_BYTES:
         raise RelayError('Health response was too large', 'health_failed')
     try:

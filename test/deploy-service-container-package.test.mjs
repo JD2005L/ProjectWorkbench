@@ -37,8 +37,24 @@ test('image contains engine, web console and job tools without PW or host runtim
   assert.doesNotMatch(tools, /PW_DEPLOY_REVISION/);
   assert.match(application, /ARG PW_DEPLOY_REVISION/);
   assert.match(application, /COPY deploy\/container\/runtime-relay\.py \.\/runtime-relay\.py/);
+  assert.match(application, /COPY deploy\/container\/runtime-policy\.example\.json \.\/runtime-policy\.example\.json/);
   assert.match(file, /ENTRYPOINT \["node", "\/opt\/pw-deploy\/app\/deployment\/container-service\.js"\]/);
   assert.doesNotMatch(file, /nsenter|--privileged|systemctl|systemd-run|entrypoint\.sh/);
+});
+
+test('runtime policy example separates legacy resource names and exact proxy health targets', async () => {
+  const policy = JSON.parse(await read('runtime-policy.example.json'));
+  assert.deepEqual(Object.keys(policy).sort(), ['healthHosts', 'healthTargets', 'maxImageBytes', 'resourceNames']);
+  assert.ok(Number.isSafeInteger(policy.maxImageBytes) && policy.maxImageBytes > 0);
+  for (const [target, value] of Object.entries(policy.healthTargets)) {
+    assert.match(target, /^[^/]+\/(?:dev|prod)$/);
+    const url = new URL(value);
+    assert.ok(policy.healthHosts.includes(url.hostname));
+    assert.equal(url.username, '');
+    assert.equal(url.password, '');
+    assert.equal(url.search, '');
+    assert.equal(url.hash, '');
+  }
 });
 
 test('Quadlet uses rootless runtime facilities and separate namespace-owned secrets without broad grants', async () => {
@@ -80,6 +96,7 @@ test('the image COPY layout resolves the standalone entrypoint without PW or nod
   await fs.copyFile(path.join(packaging, 'package.json'), path.join(root, 'package.json'));
   await fs.copyFile(path.join(packaging, 'health.mjs'), path.join(root, 'health.mjs'));
   await fs.copyFile(path.join(packaging, 'runtime-relay.py'), path.join(root, 'runtime-relay.py'));
+  await fs.copyFile(path.join(packaging, 'runtime-policy.example.json'), path.join(root, 'runtime-policy.example.json'));
   const { stdout } = await run(process.execPath, ['--input-type=module', '-e',
     'const service=await import("./app/deployment/container-service.js"); if(typeof service.startContainerService!=="function") throw Error("missing entrypoint"); console.log("standalone imports resolved");'],
   { cwd: root, timeout: 15000 });

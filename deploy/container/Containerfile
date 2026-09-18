@@ -66,6 +66,7 @@ COPY app/deployment/ ./app/deployment/
 COPY app/atomic-file.js app/lifecycle-lock.js app/VERSION ./app/
 COPY deploy/container/health.mjs ./health.mjs
 COPY deploy/container/runtime-relay.py ./runtime-relay.py
+COPY deploy/container/runtime-policy.example.json ./runtime-policy.example.json
 RUN mkdir -p /etc/pw-deploy /var/lib/pw-deploy /workspace/source /workspace/home && \
     chmod 0755 /opt/pw-deploy /opt/pw-deploy/app /opt/pw-deploy/app/deployment && \
     chmod 0700 /var/lib/pw-deploy && \

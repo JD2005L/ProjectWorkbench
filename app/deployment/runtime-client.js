@@ -20,8 +20,8 @@ const MUTATING_ACTIONS = new Set(['image_tag', 'image_remove_candidate', 'image_
 
 const KNOWN_ERROR_CODES = new Set([
   'invalid_request', 'action_not_allowed', 'resource_not_allowed', 'resource_conflict',
-  'runtime_policy_invalid', 'health_host_not_allowed', 'health_failed', 'invalid_image',
-  'process_failed', 'privilege_refused',
+  'runtime_policy_invalid', 'health_host_not_allowed', 'health_target_not_allowed', 'health_failed', 'invalid_image',
+  'process_failed', 'privilege_refused', 'cancelled',
 ]);
 
 export function runtimeSshArgv(runtime, sshPath = DEFAULT_SSH_PATH) {
