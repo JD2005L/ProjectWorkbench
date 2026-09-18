@@ -188,12 +188,19 @@ fields or unsafe URLs fail closed; the web console cannot change this policy.
 
 Every health request carries the project, target, service and expected image
 identity. The connector requires that exact image in the running container
-before and after the probe. Direct HTTP loopback probes must use a port published
-by that container. Other routes need the exact approved `healthTargets` URL as
-well as the host allowlist; ordinary direct probes remain enrollment-free.
+before and after the probe. Direct HTTP probes must use literal `127.0.0.1` or
+`::1` and a TCP port published by that container on the same address or an
+applicable same-family wildcard. A UDP mapping or an IPv4-only binding does
+not authorize an IPv6 probe (or vice versa). Ambiguous `localhost` names and
+other routes need the exact approved `healthTargets` URL as well as the host
+allowlist; unambiguous direct probes remain enrollment-free.
 Redirects, URL credentials, queries and fragments are rejected, and inherited
 proxy environment variables are ignored. A `health_target_not_allowed` outcome
 is a policy refusal, not permission to probe a different endpoint.
+The complete HTTP transaction runs in a separately supervised standard-library
+helper with an absolute ten-second budget, including connection, headers and
+body. A per-read socket timeout is not its lifetime guarantee. Cancellation
+terminates and reaps the helper; an unconfirmed reap remains an explicit failure.
 
 Candidate cleanup conditionally untags the exact candidate reference from its
 expected image identity. It never removes an image ID with unrelated aliases
@@ -202,6 +209,8 @@ entry may remain; job cleanup does not perform blind image garbage collection.
 Request framing, upload and helper-output bounds are enforced by the connector,
 independently of the caller. Its `HOME` comes from the runtime account record,
 not an inherited caller environment.
+The canonical OCI pre-write size bound includes the tar writer's final record
+padding, not only entry headers and content.
 
 Existing application user units remain the authority for start/stop and runtime
 mounts/environment. An absent unit is a provisioning error. Do not replace it
