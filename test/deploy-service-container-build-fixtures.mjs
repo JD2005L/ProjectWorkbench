@@ -12,6 +12,7 @@ import {
 } from '../app/deployment/protocol.js';
 import { resolveJobPolicy } from '../app/deployment/policy.js';
 import { deploymentRequest } from './deploy-service-fixtures.mjs';
+import { PrivateBuildObserver } from './deploy-service-build-observer.mjs';
 
 const PODMAN = '/usr/bin/podman';
 const SSH = '/usr/bin/ssh';
@@ -20,7 +21,6 @@ const MAX_FRAME_BYTES = 65_536;
 const IMAGE_ID = /^(?:sha256:)?([a-f0-9]{64})$/;
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const EXTERNAL_ID = /^[a-f0-9]{12,64}$/;
-const LIBPOD_CGROUP = /(?:^|\/)libpod-([a-f0-9]{64})\.scope(?:\/|$)/;
 const MUTATING_RUNTIME_ACTIONS = new Set([
   'image_import', 'image_remove_candidate', 'image_tag', 'service_restart',
 ]);
@@ -209,8 +209,7 @@ export function createContainerBuildFixturePayload({
     fixtureFile('Dockerfile.cancel', [
       `FROM ${baseAlias}`,
       'COPY . /fixture',
-      'RUN cgroup="$(sed -n \'s/^0:://p\' /proc/self/cgroup)" \\',
-      `    && printf '${cancellationMarker} %s\\n' "$cgroup" \\`,
+      `RUN printf '${cancellationMarker}\\n' \\`,
       '    && exec /usr/bin/timeout --signal=TERM --kill-after=2s 90s \\',
       '      /bin/sh -c \'trap "" TERM INT; while :; do /usr/bin/sleep 1; done\'',
       'ENTRYPOINT ["/bin/true"]',
@@ -351,54 +350,9 @@ async function externalContainers(executor, control) {
   });
 }
 
-function cancellationPath(output, marker) {
-  return new RegExp(`(?:^|\\n)${marker} (\\/[^\\r\\n]*)\\r?\\n`).exec(output)?.[1] ?? null;
-}
-
-export function parseBuildCancellationIdentity(output, marker) {
-  const cgroupPath = cancellationPath(output, marker);
-  if (!cgroupPath || !/^\/[A-Za-z0-9_.:@/-]*$/.test(cgroupPath)
-      || cgroupPath.includes('..') || path.posix.normalize(cgroupPath) !== cgroupPath) {
-    throw new DeploymentError(
-      'Build cancellation oracle unavailable: controlled RUN did not expose a safe cgroup-v2 identity',
-      503, 'fixture_oracle_unavailable',
-    );
-  }
-  const id = LIBPOD_CGROUP.exec(cgroupPath)?.[1];
-  if (!id) {
-    throw new DeploymentError(
-      `Build cancellation oracle unavailable: controlled cgroup did not contain a libpod container identity (${cgroupPath})`,
-      503, 'fixture_oracle_unavailable',
-    );
-  }
-  const directory = path.posix.resolve('/sys/fs/cgroup', `.${cgroupPath}`);
-  if (!directory.startsWith('/sys/fs/cgroup/')) {
-    throw new DeploymentError('Build cancellation oracle escaped cgroupfs', 503, 'fixture_oracle_unavailable');
-  }
-  return { id, cgroupPath, directory };
-}
-
-async function cgroupPopulated(identity) {
-  let text;
-  try {
-    text = await fs.readFile(path.join(identity.directory, 'cgroup.events'), 'utf8');
-  } catch (error) {
-    if (error.code === 'ENOENT') return false;
-    const limitation = new DeploymentError(
-      `Build cancellation oracle could not read ${identity.directory}/cgroup.events`,
-      503, 'fixture_oracle_unavailable',
-    );
-    limitation.cause = error;
-    throw limitation;
-  }
-  const match = /^populated ([01])$/m.exec(text);
-  if (!match) {
-    throw new DeploymentError(
-      `Build cancellation oracle returned invalid cgroup.events for ${identity.cgroupPath}`,
-      503, 'fixture_oracle_unavailable',
-    );
-  }
-  return match[1] === '1';
+export function buildCancellationReady(output, marker) {
+  ensure(/^[A-Za-z0-9_]{16,100}$/.test(marker), 'Invalid controlled build nonce');
+  return new RegExp(`(?:^|\\n)${marker}\\r?\\n`).test(output);
 }
 
 async function removeOwnedImage(executor, control, reference, instanceId, jobId) {
@@ -454,6 +408,9 @@ export async function exerciseContainerBuildFixture({
   };
   const executor = new ContainerExecutor(config, {
     spawnProcess: createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientEnvironment),
+  });
+  const observer = new PrivateBuildObserver({
+    storageBase, socketPath, environment: { PATH: '/usr/bin:/bin', ...clientEnvironment },
   });
   const positiveJobId = crypto.randomUUID();
   const cancellationJobId = crypto.randomUUID();
@@ -556,6 +513,7 @@ export async function exerciseContainerBuildFixture({
     ensure(cpIndex >= 0 && buildIndex > cpIndex && removeIndex > buildIndex,
       'Dependency workspace was not copied into the real build before its container was removed');
 
+    const runtimeBaseline = await observer.idle();
     cancellationAbort = new AbortController();
     const cancellationSignal = signal
       ? AbortSignal.any([signal, AbortSignal.timeout(120_000), cancellationAbort.signal])
@@ -575,7 +533,7 @@ export async function exerciseContainerBuildFixture({
           ));
           return;
         }
-        if (cancellationPath(cancellationOutput.text(), cancellationMarker) !== null) markerResolve();
+        if (buildCancellationReady(cancellationOutput.text(), cancellationMarker)) markerResolve();
       },
       onEvent: async () => {},
     };
@@ -603,12 +561,10 @@ export async function exerciseContainerBuildFixture({
         throw new Error('Remote build completed without emitting its controlled RUN marker');
       }),
     ]), 30_000, 'Timed out waiting for the controlled remote-build marker');
-    cancellationIdentityValue = parseBuildCancellationIdentity(cancellationOutput.text(), cancellationMarker);
-    ensure(await cgroupPopulated(cancellationIdentityValue),
-      `Controlled build cgroup ${cancellationIdentityValue.cgroupPath} was not populated before cancellation`);
+    cancellationIdentityValue = await observer.identify(cancellationMarker, runtimeBaseline);
     const externalBeforeAbort = await externalContainers(executor, cleanupControl);
-    ensure(externalBeforeAbort.some(item => item.id === cancellationIdentityValue.id),
-      `Controlled build identity ${cancellationIdentityValue.id} was not visible in the private Podman store`);
+    ensure(externalBeforeAbort.some(item => item.id === cancellationIdentityValue.storageId),
+      `Controlled build identity ${cancellationIdentityValue.storageId} was not visible in the private Podman store`);
     cancellationAbort.abort(new DeploymentError(
       'Synthetic fixture build cancellation', 409, 'cancelled',
     ));
@@ -616,13 +572,11 @@ export async function exerciseContainerBuildFixture({
       'Remote build client did not settle after cancellation');
     ensure(!cancellationOutcome.ok, 'Cancelled remote build unexpectedly succeeded');
     await waitFor(
-      'the controlled build cgroup to stop', 20_000,
-      AbortSignal.timeout(25_000), async () => {
-        return !(await cgroupPopulated(cancellationIdentityValue));
-      },
+      'the controlled OCI init process to stop', 20_000,
+      AbortSignal.timeout(25_000), () => observer.stopped(cancellationIdentityValue),
     ).catch(error => {
       throw new Error(
-        `Remote-build termination could not be proven: cgroup ${cancellationIdentityValue.cgroupPath} remained populated`,
+        `Remote-build termination could not be proven: OCI process ${cancellationIdentityValue.runtimeId} remained active`,
         { cause: error },
       );
     });
@@ -630,11 +584,11 @@ export async function exerciseContainerBuildFixture({
       'the exact controlled Buildah container to leave private storage', 20_000,
       AbortSignal.timeout(25_000), async () => {
         const rows = await externalContainers(executor, cleanupControl);
-        return !rows.some(item => item.id === cancellationIdentityValue.id);
+        return !rows.some(item => item.id === cancellationIdentityValue.storageId);
       },
     ).catch(error => {
       throw new Error(
-        `Remote build stopped, but unlabeled Buildah storage ${cancellationIdentityValue.id} remained; refusing automatic deletion`,
+        `Remote build stopped, but Buildah storage ${cancellationIdentityValue.storageId} remained; refusing automatic deletion`,
         { cause: error },
       );
     });
@@ -653,8 +607,9 @@ export async function exerciseContainerBuildFixture({
       remoteBuildCancellation: {
         jobId: cancellationJobId,
         marker: cancellationMarker,
-        externalContainerId: cancellationIdentityValue.id,
-        cgroupPath: cancellationIdentityValue.cgroupPath,
+        externalContainerId: cancellationIdentityValue.storageId,
+        runtimeId: cancellationIdentityValue.runtimeId,
+        pidNamespace: cancellationIdentityValue.pidNamespace,
         serverWorkStopped: true,
       },
       unproven: [
@@ -704,8 +659,8 @@ export async function exerciseContainerBuildFixture({
     await cleanupAttempt(async () => {
       if (!cancellationIdentityValue) return;
       const rows = await externalContainers(executor, finalCleanupControl);
-      ensure(!rows.some(item => item.id === cancellationIdentityValue.id),
-        `Unlabeled Buildah storage ${cancellationIdentityValue.id} remains; fixture preserved it for parent review`);
+      ensure(!rows.some(item => item.id === cancellationIdentityValue.storageId),
+        `Buildah storage ${cancellationIdentityValue.storageId} remains; fixture preserved it for parent review`);
     });
     await cleanupAttempt(() => removeOwnedImage(
       executor, { ...finalCleanupControl, jobId: cancellationJobId },

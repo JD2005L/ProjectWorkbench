@@ -5,8 +5,9 @@ import { Readable } from 'node:stream';
 import {
   createContainerBuildFixturePayload,
   createFixtureRuntimePeer,
-  parseBuildCancellationIdentity,
+  buildCancellationReady,
 } from './deploy-service-container-build-fixtures.mjs';
+import { bindObservedBuild, parseObservedProcess } from './deploy-service-build-observer.mjs';
 import { snapshotDigest, validateJob } from '../app/deployment/protocol.js';
 import { runtimeRequest } from '../app/deployment/runtime-client.js';
 
@@ -44,22 +45,63 @@ test('container build fixture payload is protocol-valid and fully local', () => 
   assert.match(files.Dockerfile, /generated\/nested\/dependency-proof\.txt/);
   assert.match(files.Dockerfile, /test ! -e \/fixture\/source\/package\.json/);
   assert.match(files['Dockerfile.cancel'], /timeout .*90s/);
-  assert.match(files['Dockerfile.cancel'], /sed -n 's\/\^0::\/\/p' \/proc\/self\/cgroup/);
+  assert.doesNotMatch(files['Dockerfile.cancel'], /\/proc\/self\/cgroup|--pid=host|--privileged/);
 });
 
 test('build cancellation evidence requires a complete emitted line, not a Dockerfile echo', () => {
   const marker = 'PW_BUILD_CANCEL_READY_11111111111141118111111111111111';
-  const id = 'a'.repeat(64);
-  const cgroup = `/user.slice/user-1001.slice/user@1001.service/libpod-${id}.scope`;
-  assert.throws(() => parseBuildCancellationIdentity(`STEP 3: RUN printf '${marker} %s\\n' "$cgroup"\n`, marker),
-    error => error.code === 'fixture_oracle_unavailable');
-  assert.throws(() => parseBuildCancellationIdentity(`${marker} ${cgroup}`, marker),
-    error => error.code === 'fixture_oracle_unavailable');
-  assert.throws(() => parseBuildCancellationIdentity(`${marker} /\n`, marker),
-    error => error.code === 'fixture_oracle_unavailable');
-  assert.deepEqual(parseBuildCancellationIdentity(`${marker} ${cgroup}\n`, marker), {
-    id, cgroupPath: cgroup, directory: `/sys/fs/cgroup${cgroup}`,
+  assert.equal(buildCancellationReady(`STEP 3: RUN printf '${marker}\\n'\n`, marker), false);
+  assert.equal(buildCancellationReady(marker, marker), false);
+  assert.equal(buildCancellationReady(`${marker} /\n`, marker), false);
+  assert.equal(buildCancellationReady(`${marker}\n`, marker), true);
+  assert.equal(buildCancellationReady(`STEP 3\n${marker}\r\n`, marker), true);
+});
+
+test('trusted build observer binds the nonce, private PID namespace, OCI root and exact storage ID', () => {
+  const storageBase = '/srv/containers/pw-contained-fixture-controlled';
+  const marker = 'PW_BUILD_CANCEL_READY_11111111111141118111111111111111';
+  const layer = 'a'.repeat(64);
+  const id = 'b'.repeat(64);
+  const observation = {
+    storageBase, marker,
+    state: { id: 'buildah-buildah12345', status: 'running', pid: 1234, bundle: `${storageBase}/transfer/buildah12345` },
+    specification: {
+      root: { path: `${storageBase}/graph/overlay/${layer}/merged` },
+      process: { args: ['/bin/sh', '-c', `printf '${marker}\\n'; sleep 90`] },
+      linux: { namespaces: [{ type: 'pid' }, { type: 'mount' }] },
+    },
+    containers: [{ id, layer }],
+  };
+  assert.deepEqual(bindObservedBuild(observation), {
+    runtimeId: 'buildah-buildah12345', pid: 1234, bundle: observation.state.bundle,
+    storageId: id, layerId: layer,
   });
+  for (const mutate of [
+    value => { value.state.bundle = '/var/tmp/foreign-buildah12345'; },
+    value => { value.state.status = 'stopped'; },
+    value => { value.state.pid = 0; },
+    value => { value.specification.process.args = ['/bin/sleep', '90']; },
+    value => { value.specification.linux.namespaces = [{ type: 'pid', path: '/proc/1/ns/pid' }]; },
+    value => { value.specification.linux.namespaces = [{ type: 'mount' }]; },
+    value => { value.specification.root.path = `/shared/overlay/${layer}/merged`; },
+    value => { value.containers = []; },
+    value => { value.containers.push({ id: 'c'.repeat(64), layer }); },
+  ]) {
+    const invalid = structuredClone(observation);
+    mutate(invalid);
+    assert.throws(() => bindObservedBuild(invalid), error => error.code === 'fixture_oracle_unavailable');
+  }
+});
+
+test('process observation retains the kernel start time and cannot confuse PID reuse', () => {
+  const fields = Array(30).fill('0');
+  fields[0] = 'S';
+  fields[19] = '123456';
+  const text = `1234 (process with ) space) ${fields.join(' ')}\n`;
+  assert.deepEqual(parseObservedProcess(text, 1234), { pid: 1234, state: 'S', startTime: '123456' });
+  assert.throws(() => parseObservedProcess(text, 5678), error => error.code === 'fixture_oracle_unavailable');
+  fields[19] = '123457';
+  assert.notEqual(parseObservedProcess(`1234 (name) ${fields.join(' ')}`, 1234).startTime, '123456');
 });
 
 test('fixture runtime peer permits only preflight and refuses mutation with framed responses', async () => {
