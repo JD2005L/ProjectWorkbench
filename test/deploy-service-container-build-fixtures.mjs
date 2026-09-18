@@ -262,14 +262,14 @@ function fixtureConfig({ instanceId, socketPath, imageId }) {
   });
 }
 
-function createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientHome) {
+function createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientEnvironment) {
   const expectedPrefix = ['--remote', '--url', `unix://${socketPath}`];
   return (command, args, options) => {
     if (command === PODMAN) {
       ensure(args.length >= 3 && expectedPrefix.every((value, index) => value === args[index]),
         'ContainerExecutor attempted Podman outside the private fixture socket');
       podmanCalls.push([...args.slice(3)]);
-      return spawn(command, args, { ...options, env: { ...options.env, HOME: clientHome } });
+      return spawn(command, args, { ...options, env: { ...options.env, ...clientEnvironment } });
     }
     if (command === SSH) {
       ensure(args.includes('fixture.invalid') && args.at(-1) === 'pw-deploy-runtime',
@@ -447,9 +447,13 @@ export async function exerciseContainerBuildFixture({
   const podmanCalls = [];
   const runtimeRequests = [];
   const fixtureDirectory = path.join(storageBase, `pw-contained-fixture-build-${crypto.randomUUID()}`);
-  const clientHome = path.join(fixtureDirectory, 'client-home');
+  const clientEnvironment = {
+    HOME: path.join(fixtureDirectory, 'client-home'),
+    XDG_RUNTIME_DIR: path.join(fixtureDirectory, 'client-runtime'),
+    TMPDIR: path.join(fixtureDirectory, 'client-tmp'),
+  };
   const executor = new ContainerExecutor(config, {
-    spawnProcess: createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientHome),
+    spawnProcess: createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientEnvironment),
   });
   const positiveJobId = crypto.randomUUID();
   const cancellationJobId = crypto.randomUUID();
@@ -493,8 +497,8 @@ export async function exerciseContainerBuildFixture({
 
   try {
     await fs.mkdir(fixtureDirectory, { mode: 0o700 });
-    // The host's /root is not the packaged controller's namespace-owned home.
-    await fs.mkdir(clientHome, { mode: 0o700 });
+    // Do not consult the host root account's home or registry-auth locations.
+    for (const directory of Object.values(clientEnvironment)) await fs.mkdir(directory, { mode: 0o700 });
     await fs.mkdir(positiveDirectory, { mode: 0o700 });
     await executor.init();
     const builderInfo = JSON.parse((await executor.builderRaw({ ...positiveControl, onOutput: () => {} }, ['info', '--format', 'json'], {
