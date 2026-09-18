@@ -12,6 +12,7 @@ import { snapshotDigest, validateJob } from '../app/deployment/protocol.js';
 
 const PODMAN = '/usr/bin/podman';
 const LIVE = process.env.PW_DEPLOY_LIVE_FIXTURE === '1';
+const BUILD = process.env.PW_DEPLOY_BUILD_FIXTURE === '1';
 const IMAGE_ID = /^(?:sha256:)?([a-f0-9]{64})$/;
 const JOB_ID = '[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}';
 const WORKER_NAME = new RegExp(`^pw-deploy-job-(${JOB_ID})-(dependencies|script|version|smoke)$`);
@@ -467,7 +468,8 @@ test('live fixture payloads remain valid deployment protocol requests', () => {
   assert.deepEqual(payloads.recovery.secrets, {});
 });
 
-test('isolated live container controller proves scripts, deadlines, cancellation, and owned-only recovery', {
+test(BUILD ? 'isolated live builder proves dependency workspace transfer and remote build cancellation'
+  : 'isolated live container controller proves scripts, deadlines, cancellation, and owned-only recovery', {
   skip: !LIVE,
   timeout: 300_000,
 }, async t => {
@@ -510,6 +512,7 @@ test('isolated live container controller proves scripts, deadlines, cancellation
   let privateIdentityVerified = false;
   let serviceProcess;
   let decoyProcess;
+  let preserveBuildResources = false;
 
   const privatePodman = (args, { cleanup = false, ...options } = {}) => {
     if (!privateArgs || !privateEnv) throw new Error('Private Podman paths are not initialized');
@@ -606,7 +609,7 @@ test('isolated live container controller proves scripts, deadlines, cancellation
     const attempt = async operation => {
       try { await operation(); } catch (error) { errors.push(error); }
     };
-    if (privateIdentityVerified) {
+    if (privateIdentityVerified && !preserveBuildResources) {
       let labelledContainers = [];
       await attempt(async () => {
         labelledContainers = await resourceNames('container',
@@ -653,6 +656,7 @@ test('isolated live container controller proves scripts, deadlines, cancellation
       if (serviceProcess) await reap(serviceProcess);
     });
     const childrenStopped = [...processHandles, serviceProcess].filter(Boolean).every(handle => handle.exited());
+    if (preserveBuildResources) t.diagnostic('Build exercise failed; preserving initialized resources for exact parent reconciliation.');
     // Podman's namespace helper can outlive its API process. Preserve initialized
     // runtime/storage state until the parent has reconciled that exact namespace.
     const mayRemoveDirectories = errors.length === 0 && childrenStopped && !privatePodmanTouched;
@@ -776,6 +780,17 @@ test('isolated live container controller proves scripts, deadlines, cancellation
     }
     return unixPing(socketPath, t.signal);
   });
+
+  if (BUILD) {
+    const { exerciseContainerBuildFixture } = await import('./deploy-service-container-build-fixtures.mjs');
+    preserveBuildResources = true;
+    const evidence = await exerciseContainerBuildFixture({
+      socketPath, instanceId, imageId, storageBase, signal: t.signal,
+    });
+    preserveBuildResources = false;
+    t.diagnostic(`PW_DEPLOY_BUILD_EVIDENCE=${JSON.stringify(evidence)}`);
+    return;
+  }
 
   const apiToken = `fixture-api-${crypto.randomBytes(32).toString('base64url')}`;
   const uiToken = `fixture-ui-${crypto.randomBytes(32).toString('base64url')}`;
