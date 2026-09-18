@@ -20,6 +20,25 @@ installer to prepare this service. Native installations remain a separate
 compatibility option described in `deployment-service.md`; there is no automatic
 or silent fallback between the two execution environments.
 
+## Rollout gate
+
+This candidate is not yet approved for live rollout. Standalone console and
+script-worker operation have bounded integration coverage, and the real
+dependency-worker/build/export path reaches an intentionally refused runtime
+import. That refusal is not evidence of deployment or successful activation.
+
+Daemon-side remote-build cancellation remains unaccepted: the current synthetic
+oracle assumes a libpod identity in the build's cgroup path, but the private
+build cgroup namespace exposes `/`. Client exit alone does not prove that the
+builder stopped, and a later stopped runtime does not prove timely cancellation.
+Do not bypass that gate by exposing host namespaces to project jobs. Actual
+runtime import, promotion, health acceptance and rollback also remain outstanding.
+
+Keep PW in LOCAL mode and retain the existing landing-card destination until
+the remaining lifecycle evidence, independent review and operator prerequisites
+below are complete. Account/range/key/proxy/SELinux provisioning and application
+cutover remain deliberate operator actions, not effects of building this image.
+
 ## What remains on the host, and why
 
 | Facility | Purpose and boundary |
