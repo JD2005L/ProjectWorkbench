@@ -66,10 +66,15 @@ test('trusted build observer binds the nonce, private PID namespace, OCI root an
     storageBase, marker,
     state: { id: 'buildah-buildah12345', status: 'running', pid: 1234, bundle: `${storageBase}/transfer/buildah12345` },
     specification: {
-      root: { path: `${storageBase}/graph/overlay/${layer}/merged` },
+      root: { path: `${storageBase}/transfer/buildah12345/mnt/rootfs` },
       process: { args: ['/bin/sh', '-c', `printf '${marker}\\n'; sleep 90`] },
       linux: { namespaces: [{ type: 'pid' }, { type: 'mount' }] },
+      mounts: [{
+        type: 'bind', destination: '/run/.containerenv',
+        source: `${storageBase}/transfer/buildah12345/run/.containerenv`,
+      }],
     },
+    containerEnvironment: `engine="buildah-1.43.1"\nid="${id}"\nrootless=1\n`,
     containers: [{ id, layer }],
   };
   assert.deepEqual(bindObservedBuild(observation), {
@@ -85,7 +90,10 @@ test('trusted build observer binds the nonce, private PID namespace, OCI root an
     value => { value.specification.linux.namespaces = [{ type: 'mount' }]; },
     value => { value.specification.root.path = `/shared/overlay/${layer}/merged`; },
     value => { value.containers = []; },
-    value => { value.containers.push({ id: 'c'.repeat(64), layer }); },
+    value => { value.containers.push({ id, layer: 'c'.repeat(64) }); },
+    value => { value.specification.mounts[0].source = '/shared/.containerenv'; },
+    value => { value.containerEnvironment = `id="${id}"\nrootless=0\n`; },
+    value => { value.containerEnvironment += `id="${'c'.repeat(64)}"\n`; },
   ]) {
     const invalid = structuredClone(observation);
     mutate(invalid);

@@ -41,7 +41,7 @@ export function parseObservedProcess(text, expectedPid) {
   return { pid: expectedPid, state: fields[0], startTime: fields[19] };
 }
 
-export function bindObservedBuild({ state, specification, containers, storageBase, marker }) {
+export function bindObservedBuild({ state, specification, containerEnvironment, containers, storageBase, marker }) {
   requireEvidence(typeof marker === 'string' && /^[A-Za-z0-9_]{16,100}$/.test(marker),
     'Build observer requires its generated nonce');
   requireEvidence(RUNTIME_ID.test(state?.id || '') && state.status === 'running'
@@ -57,19 +57,26 @@ export function bindObservedBuild({ state, specification, containers, storageBas
   const pidNamespaces = specification?.linux?.namespaces?.filter(entry => entry.type === 'pid');
   requireEvidence(pidNamespaces?.length === 1 && !pidNamespaces[0].path,
     'Build observer requires a new private PID namespace');
-  const overlay = path.posix.join(storageBase, 'graph', 'overlay');
   requireEvidence(typeof specification?.root?.path === 'string', 'Build observer received no OCI root');
   const root = path.posix.resolve(state.bundle, specification.root.path);
-  const relative = path.posix.relative(overlay, root).split('/');
-  requireEvidence(relative.length === 2 && STORAGE_ID.test(relative[0]) && relative[1] === 'merged',
-    'Build observer root escaped its private overlay store');
+  requireEvidence(root === path.posix.join(state.bundle, 'mnt', 'rootfs'),
+    'Build observer root escaped its private OCI bundle');
+  const environmentMounts = specification.mounts?.filter(mount => mount.destination === '/run/.containerenv');
+  requireEvidence(environmentMounts?.length === 1 && environmentMounts[0].type === 'bind'
+    && environmentMounts[0].source === path.posix.join(state.bundle, 'run', '.containerenv'),
+  'Build observer cannot bind the runtime-authored identity mount');
+  requireEvidence(typeof containerEnvironment === 'string' && containerEnvironment.length <= 8192
+    && /^engine="buildah-[0-9.]+"$/m.test(containerEnvironment) && /^rootless=1$/m.test(containerEnvironment),
+  'Build observer received no rootless Buildah identity record');
+  const ids = [...containerEnvironment.matchAll(/^id="([a-f0-9]{64})"$/gm)];
+  requireEvidence(ids.length === 1, 'Build observer identity record is ambiguous');
   requireEvidence(Array.isArray(containers), 'Build observer storage catalogue is invalid');
-  const matches = containers.filter(value => value.layer === relative[0]);
-  requireEvidence(matches.length === 1 && STORAGE_ID.test(matches[0].id || ''),
+  const matches = containers.filter(value => value.id === ids[0][1]);
+  requireEvidence(matches.length === 1 && STORAGE_ID.test(matches[0].layer || ''),
     'Build observer cannot uniquely bind OCI root to private Buildah storage');
   return {
     runtimeId: state.id, pid: state.pid, bundle: state.bundle,
-    storageId: matches[0].id, layerId: relative[0],
+    storageId: matches[0].id, layerId: matches[0].layer,
   };
 }
 
@@ -117,7 +124,10 @@ export class PrivateBuildObserver {
       const containers = JSON.parse(await readMetadata(path.posix.join(
         this.storageBase, 'graph', 'overlay-containers', 'containers.json',
       )));
-      const identity = bindObservedBuild({ state, specification, containers, storageBase: this.storageBase, marker });
+      const containerEnvironment = await readMetadata(path.posix.join(state.bundle, 'run', '.containerenv'));
+      const identity = bindObservedBuild({
+        state, specification, containerEnvironment, containers, storageBase: this.storageBase, marker,
+      });
       const proc = parseObservedProcess(await readMetadata(`/proc/${identity.pid}/stat`), identity.pid);
       requireEvidence(!['Z', 'X', 'x'].includes(proc.state), 'Controlled build process exited before observation');
       const namespace = await fs.readlink(`/proc/${identity.pid}/ns/pid`);
