@@ -386,6 +386,20 @@ function livePayloads(instanceId, syntheticSecret) {
       script: cancellationScript,
       versionCommand: '',
     }),
+    deadline: deploymentRequest({
+      requestId: `fixture-deadline-${instanceId}`,
+      project: `${project}Deadline`,
+      target: 'dev',
+      source: source([sourceFile('nested/input.txt', 'deadline\n')]),
+      recipe: { adapter: 'script' },
+      script: [
+        'set -euo pipefail',
+        'trap "" TERM INT',
+        'printf "READY_DEADLINE\\n"',
+        'while :; do /usr/bin/sleep 1; done',
+      ].join('\n'),
+      versionCommand: 'printf "LATE_VERSION_MUST_NOT_RUN\\n"',
+    }),
     recovery: deploymentRequest({
       requestId: `fixture-recovery-${instanceId}`,
       project: `${project}Recovery`,
@@ -442,17 +456,18 @@ for (const mode of ['success', 'receiver failure', 'timeout', 'abort']) {
 test('live fixture payloads remain valid deployment protocol requests', () => {
   const syntheticSecret = 'synthetic-live-fixture-token-0123456789';
   const payloads = livePayloads('11111111-1111-4111-8111-111111111111', syntheticSecret);
-  for (const name of ['success', 'cancellation', 'recovery']) {
+  for (const name of ['success', 'cancellation', 'deadline', 'recovery']) {
     const validated = validateJob(payloads[name]);
     assert.equal(validated.recipe.adapter, 'script');
     assert.equal(validated.target, 'dev');
   }
   assert.deepEqual(payloads.success.secrets, { DEPLOY_TOKEN: syntheticSecret });
   assert.deepEqual(payloads.cancellation.secrets, { DEPLOY_TOKEN: syntheticSecret });
+  assert.deepEqual(payloads.deadline.secrets, {});
   assert.deepEqual(payloads.recovery.secrets, {});
 });
 
-test('isolated live container controller proves script execution, cancellation, and owned-only recovery', {
+test('isolated live container controller proves scripts, deadlines, cancellation, and owned-only recovery', {
   skip: !LIVE,
   timeout: 300_000,
 }, async t => {
@@ -1011,6 +1026,26 @@ test('isolated live container controller proves script execution, cancellation, 
       && (await resourceNames('volume', labels)).length === 0;
   });
   await assertNoJobResources(cancellationJob.id);
+
+  const deadlineJob = await submit(controller, payloads.deadline);
+  await waitForLog(controller, deadlineJob.id, 'READY_DEADLINE');
+  assert.equal(await containerStatus(`pw-deploy-job-${deadlineJob.id}-script`), 'running');
+  const expired = await waitForJob(
+    controller, deadlineJob.id, current => TERMINAL.has(current.state),
+    'the real worker to stop after natural job deadline expiry', 55_000,
+  );
+  assert.equal(expired.state, 'failed');
+  assert.equal(expired.errorCode, 'timeout');
+  assert.equal(expired.version ?? null, null);
+  const deadlineLog = await jobLog(controller, deadlineJob.id);
+  assert.equal(deadlineLog.events.some(event => event.phase === 'reading_version'), false);
+  assert.equal(JSON.stringify(deadlineLog).includes('LATE_VERSION_MUST_NOT_RUN'), false);
+  await wait('deadline-expired worker resource cleanup', 20_000, async () => {
+    const labels = [`io.pw-deploy.instance=${instanceId}`, `io.pw-deploy.job=${deadlineJob.id}`];
+    return (await resourceNames('container', labels)).length === 0
+      && (await resourceNames('volume', labels)).length === 0;
+  });
+  await assertNoJobResources(deadlineJob.id);
 
   const recoveryJob = await submit(controller, payloads.recovery);
   await waitForLog(controller, recoveryJob.id, 'READY_RECOVERY');
