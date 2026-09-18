@@ -299,8 +299,8 @@ function boundedOutput(maximum = 1024 * 1024) {
 }
 
 async function waitFor(description, timeoutMs, signal, probe) {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
+  const deadline = performance.now() + timeoutMs;
+  while (performance.now() < deadline) {
     signal?.throwIfAborted();
     const value = await probe();
     if (value) return value;
@@ -353,6 +353,17 @@ async function externalContainers(executor, control) {
 export function buildCancellationReady(output, marker) {
   ensure(/^[A-Za-z0-9_]{16,100}$/.test(marker), 'Invalid controlled build nonce');
   return new RegExp(`(?:^|\\n)${marker}\\r?\\n`).test(output);
+}
+
+export function cancellationProofDeadline(buildStartedAt, abortAt = performance.now()) {
+  const stopWindowMs = 20_000, guardMs = 90_000, marginMs = 5_000;
+  ensure(Number.isFinite(buildStartedAt) && Number.isFinite(abortAt) && abortAt >= buildStartedAt,
+    'Invalid controlled build observation clock');
+  // The nonce-bound command cannot predate this invocation. Whole invocation
+  // age conservatively bounds guard age even if readiness output was delayed.
+  ensure(abortAt - buildStartedAt + stopWindowMs + marginMs < guardMs,
+    'Independent build guard could overlap the cancellation proof window');
+  return abortAt + stopWindowMs;
 }
 
 async function removeOwnedImage(executor, control, reference, instanceId, jobId) {
@@ -547,6 +558,7 @@ export async function exerciseContainerBuildFixture({
       '--label', `org.opencontainers.image.revision=${request.revision}`,
       '-t', cancellationCandidate,
     ];
+    const buildStartedAt = performance.now();
     const buildPromise = executor.buildFromContainer(
       cancellationControl, cancellationSeed, cancellationBuildArgs,
     );
@@ -563,21 +575,25 @@ export async function exerciseContainerBuildFixture({
     ]), 30_000, 'Timed out waiting for the controlled remote-build marker');
     const externalBeforeAbort = await externalContainers(executor, cleanupControl);
     cancellationIdentityValue = await observer.identify(cancellationMarker, runtimeBaseline, externalBeforeAbort);
+    const cancellationDeadline = cancellationProofDeadline(buildStartedAt);
     cancellationAbort.abort(new DeploymentError(
       'Synthetic fixture build cancellation', 409, 'cancelled',
     ));
-    const cancellationOutcome = await within(cancellationBuildSettled, 20_000,
+    const cancellationOutcome = await within(cancellationBuildSettled, cancellationDeadline - performance.now(),
       'Remote build client did not settle after cancellation');
     ensure(!cancellationOutcome.ok, 'Cancelled remote build unexpectedly succeeded');
+    const remainingStopWindow = cancellationDeadline - performance.now();
+    ensure(remainingStopWindow > 0, 'Client settlement exhausted the absolute cancellation proof window');
     await waitFor(
-      'the controlled OCI init process to stop', 20_000,
-      AbortSignal.timeout(25_000), () => observer.stopped(cancellationIdentityValue),
+      'the controlled OCI init process to stop', remainingStopWindow,
+      AbortSignal.timeout(Math.ceil(remainingStopWindow)), () => observer.stopped(cancellationIdentityValue),
     ).catch(error => {
       throw new Error(
         `Remote-build termination could not be proven: OCI process ${cancellationIdentityValue.runtimeId} remained active`,
         { cause: error },
       );
     });
+    ensure(performance.now() <= cancellationDeadline, 'Backend stop was observed after the cancellation proof deadline');
     await waitFor(
       'the exact controlled Buildah container to leave private storage', 20_000,
       AbortSignal.timeout(25_000), async () => {

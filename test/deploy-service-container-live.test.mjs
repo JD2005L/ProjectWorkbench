@@ -327,14 +327,14 @@ function sourceFile(filePath, contents, executable = false) {
   return { path: filePath, data: Buffer.from(contents).toString('base64'), executable };
 }
 
-function liveControllerConfig(instanceId, imageId) {
+function liveControllerConfig(instanceId, imageId, enablePodman = false) {
   const config = {
     mode: 'container',
     listen: { host: '0.0.0.0', port: 3800 },
     tokenFile: '/run/secrets/pw-deploy-api',
     stateDir: '/var/lib/pw-deploy',
     healthHosts: ['127.0.0.1', '::1'],
-    adapters: ['script', 'podman'],
+    adapters: enablePodman ? ['script', 'podman'] : ['script'],
     maxConcurrent: 1,
     defaultTimeoutSeconds: 30,
     retentionDays: 1,
@@ -360,15 +360,24 @@ function liveControllerConfig(instanceId, imageId) {
       },
     },
   };
+  if (enablePodman) {
+    config.container.builderControl = {
+      host: 'fixture.invalid', port: 22, user: 'fixture-builder',
+      keyFile: '/run/secrets/pw-deploy-builder-key', knownHostsFile: '/etc/pw-deploy/known_hosts',
+    };
+    config.container.builderJobSockets = '/run/pw-deploy-build';
+  }
   validateContainerConfig(config);
   return config;
 }
 
 test('live fixture controller configuration is valid for all enabled adapters', () => {
-  const config = liveControllerConfig('11111111-1111-4111-8111-111111111111', `sha256:${'a'.repeat(64)}`);
+  const config = liveControllerConfig('11111111-1111-4111-8111-111111111111', `sha256:${'a'.repeat(64)}`, true);
   assert.ok(config.adapters.includes('podman'));
   assert.equal(config.container.runtime.host, 'fixture.invalid');
   assert.equal(config.defaultTimeoutSeconds, 30);
+  assert.equal(config.container.builderControl.host, 'fixture.invalid');
+  assert.deepEqual(liveControllerConfig(config.container.instanceId, config.container.workerImage).adapters, ['script']);
 });
 
 function livePayloads(instanceId, syntheticSecret) {
@@ -539,11 +548,12 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   const controllerRefusedName = `${fixtureStem}-controller-missing-cap`;
   const decoyName = `${fixtureStem}-decoy`;
   const configSecret = `${fixtureStem}-config`;
+  const capabilityConfigSecret = `${fixtureStem}-cap-config`;
   const apiSecret = `${fixtureStem}-api`;
   const uiSecret = `${fixtureStem}-ui`;
   const stateVolume = `${fixtureStem}-state`;
   const intendedContainers = new Set([controllerAName, controllerBName, controllerRefusedName, decoyName]);
-  const intendedSecrets = new Set([configSecret, apiSecret, uiSecret]);
+  const intendedSecrets = new Set([configSecret, capabilityConfigSecret, apiSecret, uiSecret]);
   const importedReferences = new Set();
   const processHandles = new Set();
   let storageBase;
@@ -735,6 +745,10 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   await fs.mkdir(graphRoot, { mode: 0o700 });
   const transferTemp = path.join(storageBase, 'transfer');
   await fs.mkdir(transferTemp, { mode: 0o700 });
+  const privateHome = path.join(storageBase, 'home');
+  const privateConfig = path.join(privateHome, '.config');
+  await fs.mkdir(path.join(privateConfig, 'containers'), { recursive: true, mode: 0o700 });
+  await fs.writeFile(path.join(privateConfig, 'containers', 'mounts.conf'), '', { flag: 'wx', mode: 0o600 });
   xdgRuntimeDir = await fs.mkdtemp(`/run/user/${uid}/pwdf-`);
   await fs.chmod(xdgRuntimeDir, 0o700);
   runRoot = path.join(xdgRuntimeDir, 'r');
@@ -750,6 +764,8 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
     `Private Podman tmpdir is too long for safe AF_UNIX use: ${tmpDir}`);
   privateEnv = {
     ...process.env,
+    HOME: privateHome,
+    XDG_CONFIG_HOME: privateConfig,
     XDG_RUNTIME_DIR: xdgRuntimeDir,
     TMPDIR: transferTemp,
     DBUS_SESSION_BUS_ADDRESS: `unix:path=${realBus}`,
@@ -882,6 +898,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   const config = liveControllerConfig(instanceId, imageId);
   for (const [name, value] of [
     [configSecret, `${JSON.stringify(config)}\n`],
+    [capabilityConfigSecret, `${JSON.stringify(liveControllerConfig(instanceId, imageId, true))}\n`],
     [apiSecret, `${apiToken}\n`],
     [uiSecret, `${uiToken}\n`],
   ]) {
@@ -901,7 +918,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   assert.equal(stateLabels?.['io.pw-deploy.instance'], instanceId);
   assert.equal(stateLabels?.['io.pw-deploy.live-fixture'], instanceId);
 
-  const controllerArgs = (name, buildCapability = true) => [
+  const controllerArgs = (name, buildCapability = true, configurationSecret = configSecret) => [
     'create', '--name', name,
     '--label', 'io.pw-deploy.controller=true',
     '--label', `io.pw-deploy.instance=${instanceId}`,
@@ -917,7 +934,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
     '--tmpfs=/tmp:rw,nosuid,nodev,size=512m',
     '--volume', `${stateVolume}:/var/lib/pw-deploy`,
     '--volume', `${socketPath}:/run/pw-deploy/podman.sock:ro`,
-    '--secret', `${configSecret},type=mount,target=/etc/pw-deploy/config.json,uid=0,gid=0,mode=0400`,
+    '--secret', `${configurationSecret},type=mount,target=/etc/pw-deploy/config.json,uid=0,gid=0,mode=0400`,
     '--secret', `${apiSecret},type=mount,target=/run/secrets/pw-deploy-api,uid=0,gid=0,mode=0400`,
     '--secret', `${uiSecret},type=mount,target=/run/secrets/pw-deploy-ui,uid=0,gid=0,mode=0400`,
     '--pull=never',
@@ -1017,7 +1034,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
     assert.deepEqual(await resourceNames('volume', labels), []);
   };
 
-  await privatePodman(controllerArgs(controllerRefusedName, false));
+  await privatePodman(controllerArgs(controllerRefusedName, false, capabilityConfigSecret));
   const refused = await privatePodman(['start', '--attach', controllerRefusedName], {
     allowedExitCodes: [78], timeoutMs: 15_000,
   });

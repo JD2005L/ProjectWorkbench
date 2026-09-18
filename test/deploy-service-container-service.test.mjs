@@ -118,6 +118,8 @@ test('persistent execution identity allows image rotation but not changing execu
     { instanceId: '624637ea-d8d4-41b4-a2b1-b9d615961b2f' },
     { builderSocket: '/run/another/podman.sock' },
     { runtime: { host: 'runtime.example.test', port: 22, user: 'fixture-runtime' } },
+    { builderControl: { host: 'builder.example.test', port: 22, user: 'fixture-builder' },
+      builderJobSockets: '/run/pw-deploy-build' },
   ]) {
     await assert.rejects(bindExecutionIdentity({ ...original, container: { ...original.container, ...change } }),
       error => error.code === 'execution_identity_changed');

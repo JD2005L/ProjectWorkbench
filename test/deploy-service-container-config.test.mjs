@@ -42,13 +42,32 @@ test('container policy rejects mutable images, privilege fields and unbound Podm
 test('runtime connection is explicit, non-root, host-key-pinned and not job editable', () => {
   const runtime = { host: 'runtime.example.test', user: 'app-runtime',
     keyFile: '/run/secrets/runtime-key', knownHostsFile: '/etc/pw-deploy/known_hosts' };
-  const input = { ...policy(), adapters: ['podman'], container: { ...policy().container, runtime } };
+  const input = { ...policy(), adapters: ['podman'], container: {
+    ...policy().container, runtime, builderControl: { ...runtime, user: 'deploy-builder' },
+    builderJobSockets: '/run/pw-deploy-build',
+  } };
   assert.equal(validateContainerConfig(input).container.runtime.port, 22);
   for (const patch of [{ user: 'root' }, { host: '-oProxyCommand=bad' }, { host: 'host\nbad' },
     { keyFile: 'relative' }, { knownHostsFile: '/tmp/../known_hosts' }, { strictHostKeyChecking: false }]) {
     assert.throws(() => validateContainerConfig({ ...input,
       container: { ...input.container, runtime: { ...runtime, ...patch } } }));
   }
+});
+
+test('Podman policy requires separately pinned builder control and bounded private socket paths', () => {
+  const runtime = { host: 'runtime.example.test', user: 'app-runtime',
+    keyFile: '/run/secrets/runtime-key', knownHostsFile: '/etc/pw-deploy/known_hosts' };
+  const value = { ...policy(), adapters: ['podman'],
+    container: { ...policy().container, runtime, builderControl: { ...runtime, user: 'deploy-builder' },
+      builderJobSockets: '/run/pw-deploy-build' } };
+  assert.equal(validateContainerConfig(value).container.builderControl.port, 22);
+  for (const change of [
+    { builderControl: undefined }, { builderJobSockets: undefined },
+    { builderJobSockets: '/run/../other' }, { builderJobSockets: `/run/${'x'.repeat(100)}` },
+    { builderControl: { ...value.container.builderControl, user: 'root' } },
+    { builderControl: { ...value.container.builderControl, command: 'arbitrary-shell' } },
+    { builderControl: { ...value.container.builderControl, host: '-ProxyCommand=bad' } },
+  ]) assert.throws(() => validateContainerConfig({ ...value, container: { ...value.container, ...change } }));
 });
 
 test('console location requires an independent HTTPS origin and a literal path', () => {

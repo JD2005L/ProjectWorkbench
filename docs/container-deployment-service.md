@@ -11,6 +11,8 @@ PW project deployment buttons ---- authenticated API ----+
                                                         |
 Browser ---- HTTPS ---- [engine + console container] ----+--- isolated job containers
                                |                              (same pinned image)
+                               +--- fixed-action builder supervisor
+                               |    per-job API/store + delegated user unit
                                +--- fixed-action runtime connector
                                     existing non-root application units/store
 ```
@@ -27,12 +29,15 @@ script-worker operation have bounded integration coverage, and the real
 dependency-worker/build/export path reaches an intentionally refused runtime
 import. That refusal is not evidence of deployment or successful activation.
 
-Daemon-side remote-build cancellation remains unaccepted: the current synthetic
-oracle assumes a libpod identity in the build's cgroup path, but the private
-build cgroup namespace exposes `/`. Client exit alone does not prove that the
-builder stopped, and a later stopped runtime does not prove timely cancellation.
-Do not bypass that gate by exposing host namespaces to project jobs. Actual
-runtime import, promotion, health acceptance and rollback also remain outstanding.
+The trusted host-fixture observer reproduced a real defect in the original
+shared remote-build path: client cancellation left its nonce-bound OCI RUN
+active for the full twenty-second stop window. The replacement gives each
+Podman job its own supervised API process, cgroup and writable store. Bounded
+real prototypes proved cancellation, independent deadline and bound controller
+loss, but prototypes alone do not approve the integrated connector or full
+deployment lifecycle. Do not expose host namespaces to project jobs to obtain
+that evidence. Actual runtime import, promotion, health acceptance and rollback
+also remain outstanding.
 
 Keep PW in LOCAL mode and retain the existing landing-card destination until
 the remaining lifecycle evidence, independent review and operator prerequisites
@@ -45,6 +50,7 @@ cutover remain deliberate operator actions, not effects of building this image.
 | --- | --- |
 | Existing Podman, systemd/Quadlet and rootless helpers | Container execution and supervision. Use Podman 5.8.2 or a compatible reviewed version, cgroup v2 and valid subordinate-ID allocations. |
 | Dedicated locked, non-sudo builder account and its Unix Podman API | Owns the controller and temporary build resources. Its API grants the whole authority of that account; a `:ro` socket mount does not make the API read-only. Never substitute a rootful daemon or an administrator's broad runtime socket. |
+| Small fixed-action builder connector | Creates and stops private per-job Podman API units using the existing user manager. It has no source/shell endpoint, SDK, web UI or always-on deployment daemon. Private writable stores prevent ambiguous cleanup of shared Buildah records. |
 | Existing runtime account, SSH and the small fixed-action connector | Preserves existing application's user-unit lifecycle, volumes and image store. The connector uses Python's standard library, Podman and systemctl, not a host deployment SDK or an always-on Node daemon. It is not a shell/argv execution endpoint. |
 | Existing TLS reverse proxy and trust configuration | HTTPS for the browser/API; the container port is published only on host loopback. Preserve the site's perimeter and certificate policy. |
 
@@ -104,17 +110,17 @@ dependency installation when worker networking is not ready.
 
 Copy and complete `deploy/container/config.example.json` outside the repository.
 Set a unique stable instance UUID, the reviewed image ID, the public HTTPS
-origin, and the operator-approved runtime connection. The all-zero image ID and
+origin, and the operator-approved builder and runtime connections. The all-zero image ID and
 example host are deliberately non-operational placeholders.
 
 Execution identities, builder socket, SSH destination/key paths, image, adapter
 allowlist and legacy resource bindings are immutable through the web/API
 settings. The state volume binds its execution identity; moving it to a different
-instance, builder socket or runtime destination requires deliberate reconciliation
+instance, builder socket, private socket directory or either connector destination requires deliberate reconciliation
 of existing work, not an automatic restart with different authority.
 
 Mount configuration, machine API credential, console administrator credential,
-runtime SSH key and pinned known-hosts file as Podman secrets with UID/GID 0
+builder/runtime SSH keys and pinned known-hosts file as Podman secrets with UID/GID 0
 and mode 0400 **inside the container user namespace**, as shown in the Quadlet
 example. A root-owned host bind file may appear as the overflow UID inside a
 rootless container; do not weaken the file-owner checks to accept it.
@@ -149,6 +155,72 @@ Bounded job/project/target links survive sign-in, expired sessions and credentia
 retries; an arbitrary external return URL is never accepted.
 It does not depend on PW's login service or PW being running. This is a service
 administrator console, not an additional per-project user directory.
+
+## Supervised builder connector
+
+Podman recipes require both `container.builderControl` and
+`container.builderJobSockets`. A missing connector is an explicit configuration
+failure, not permission to build through the unsupervised shared API.
+`builderControl` uses its own pinned, non-interactive SSH connection and the
+fixed command `pw-deploy-builder`. It accepts bounded control metadata only:
+readiness, create/status, stop and remove for an exact instance/job identity.
+Source, images, scripts and credentials are never control-request arguments.
+
+Provision `deploy/container/builder-relay.py` and the completed
+`builder-policy.example.json` through the same reviewed-release process as the
+runtime connector. The builder policy belongs at
+`/etc/pw-deploy-builder-policy.json`, root-owned and not writable by the builder.
+Install the connector itself at the fixed, root-protected
+`/usr/local/libexec/pw-deploy-builder.py`. Its forced SSH command invokes
+`/usr/bin/python3 -I /usr/local/libexec/pw-deploy-builder.py`; do not forward
+client arguments or environment. The controller's literal
+`pw-deploy-builder` request is the only permitted original SSH command.
+Internal unit/deadline/cleanup entrypoints are not SSH operations.
+The account must be non-sudo with password/interactive access disabled through
+the approved account/key policy; its SSH setup must still permit the fixed
+forced command. Do not substitute an unrestricted SSH login or another account.
+Python, native Podman and the user manager are already host facilities, not
+additional deployment SDKs.
+
+The policy binds the stable instance, builder account, existing controller
+user-unit name, private metadata/work and runtime directories, immutable image
+cache store and maximum lifetime/memory/process limits. Its runtime directory
+must match the Quadlet's dedicated socket-directory bind and fit Unix socket
+path limits. The example uses `%t/pw-deploy-build` on the host and
+`/run/pw-deploy-build` in the controller. Only the controller receives this
+mount; a read-only bind still grants full access to the socket's API.
+
+For each Podman job, a transient delegated user unit owns a separate native
+Podman API process, writable image/container store and private runtime
+directory. The approved shared cache is only an additional read-only image
+store. The bootstrap moves its own process into a supervisor subgroup; every
+worker, image build and smoke container is assigned an explicit child cgroup.
+The unit's whole-cgroup stop, independent runtime deadline and
+`BindsTo`/`After` relationship to the controller cover API-side pull/copy/commit
+work as well as Buildah RUN processes. Project code receives no host cgroup,
+PID namespace, SDK installation or connector authority.
+
+An absolute deadline timer is armed before the API unit starts. Its metadata
+and cancellation marker survive failed or delayed startup, so stopping the
+controller or timing out a client does not authorize a later replay. Each API
+also receives a fresh private HOME/config with an exclusively created, empty
+`mounts.conf`; bootstrap refuses a missing, linked, wrongly owned or nonempty
+override. This prevents Podman's vendor defaults from implicitly mounting host
+subscription/configuration files. It does not alter global host configuration.
+Native API transfer/unpack storage is also bound to an owned mode-0700
+`transfer` directory inside the job's work root through `TMPDIR`. Readiness
+requires Podman's reported `imageCopyTmpDir` to match that exact path; a
+default host temporary directory is refused and cannot escape job cleanup.
+Review existing OCI-hook policy separately before provisioning; no hook override
+or host-permission workaround is implied by this package.
+
+Cancellation must confirm the entire owned backend stopped before removing its
+private store. A CLI exit or API disconnect is not that confirmation. Uncertain
+stop/cleanup retains recovery evidence and blocks further activation. Protected
+cancelled-job metadata prevents a delayed start request from resurrecting an
+already-cancelled job; restart recovery stops/removes rather than replaying.
+The shared SDK cache and other jobs' stores are never pruned. Script/IIS workers
+continue using the existing shared worker pool and their independent guardians.
 
 ## Runtime connector
 
@@ -302,6 +374,9 @@ owned execution has been confirmed stopped; no broad prune is used.
 
 The controller holds an exclusive state lock. Job containers have independent
 hard deadlines, so stopping the controller does not remove their supervision.
+Podman jobs additionally retain an independent whole-API unit deadline and an
+explicit dependency on the controller's user unit; closing a remote build
+client alone is never the stop mechanism.
 Restart recovery identifies only the configured instance's owned job resources,
 stops interrupted work and does not replay it. Unconfirmed cancellation or
 cleanup remains an explicit failure requiring reconciliation.

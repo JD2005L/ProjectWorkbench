@@ -18,6 +18,14 @@
   "container": {
     "instanceId": "11111111-1111-4111-8111-111111111111",
     "builderSocket": "/run/pw-deploy/podman.sock",
+    "builderJobSockets": "/run/pw-deploy-build",
+    "builderControl": {
+      "host": "builder.example.test",
+      "port": 22,
+      "user": "deploy-builder",
+      "keyFile": "/run/secrets/pw-deploy-builder-key",
+      "knownHostsFile": "/etc/pw-deploy/known_hosts"
+    },
     "workerImage": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
     "maxMemoryMiB": 2048,
     "maxPids": 512,

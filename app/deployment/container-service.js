@@ -109,9 +109,14 @@ export async function startContainerService({
 export async function bindExecutionIdentity(config) {
   const file = path.join(config.stateDir, 'execution-identity.json');
   const runtime = config.container.runtime;
+  const builder = config.container.builderControl;
   const fingerprint = crypto.createHash('sha256').update(JSON.stringify({
     instanceId: config.container.instanceId, builderSocket: config.container.builderSocket,
     runtime: runtime ? { host: runtime.host, port: runtime.port, user: runtime.user } : null,
+    ...(builder ? {
+      builder: { host: builder.host, port: builder.port, user: builder.user },
+      builderJobSockets: config.container.builderJobSockets,
+    } : {}),
   })).digest('hex');
   let previous;
   try {

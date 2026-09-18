@@ -20,6 +20,19 @@ function integer(value, minimum, maximum, name) {
   return value;
 }
 
+function connection(value, name) {
+  fields(value, ['host', 'port', 'user', 'keyFile', 'knownHostsFile'], `${name} connection`);
+  const result = { ...value, port: value.port ?? 22 };
+  if (typeof result.host !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(result.host)
+      || result.host.includes('..') || !ACCOUNT.test(result.user || '') || result.user === 'root') {
+    fail(`${name} connection must name an approved non-root account and host`);
+  }
+  integer(result.port, 1, 65535, `${name} SSH port`);
+  absolute(result.keyFile, `${name} SSH key`);
+  absolute(result.knownHostsFile, `${name} SSH host keys`);
+  return result;
+}
+
 export function validateUiLocation({ basePath = '/deploy-service', publicOrigin }) {
   if (typeof basePath !== 'string' || !/^\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(basePath)
       || basePath.length > 160 || /^\/(?:v1|health)(?:\/|$)/.test(basePath)) fail('Invalid console base path');
@@ -52,7 +65,8 @@ export function validateContainerConfig(value) {
   integer(ui.sessionMinutes, 5, 120, 'console session lifetime');
   if (ui.tokenFile === value.tokenFile) fail('Console and machine API credentials must be separate');
 
-  fields(value.container, ['instanceId', 'builderSocket', 'workerImage', 'maxMemoryMiB', 'maxPids', 'runtime'], 'execution policy');
+  fields(value.container, ['instanceId', 'builderSocket', 'workerImage', 'maxMemoryMiB', 'maxPids',
+    'runtime', 'builderControl', 'builderJobSockets'], 'execution policy');
   const container = {
     ...value.container,
     maxMemoryMiB: value.container.maxMemoryMiB ?? 2048,
@@ -64,18 +78,18 @@ export function validateContainerConfig(value) {
   integer(container.maxMemoryMiB, 256, 16384, 'job memory limit');
   integer(container.maxPids, 32, 2048, 'job process limit');
   if (container.runtime !== undefined) {
-    fields(container.runtime, ['host', 'port', 'user', 'keyFile', 'knownHostsFile'], 'runtime connection');
-    const runtime = { ...container.runtime, port: container.runtime.port ?? 22 };
-    if (typeof runtime.host !== 'string' || !/^[A-Za-z0-9](?:[A-Za-z0-9.-]{0,251}[A-Za-z0-9])?$/.test(runtime.host)
-        || runtime.host.includes('..') || !ACCOUNT.test(runtime.user || '') || runtime.user === 'root') {
-      fail('Runtime connection must name an approved non-root account and host');
-    }
-    integer(runtime.port, 1, 65535, 'runtime SSH port');
-    absolute(runtime.keyFile, 'runtime SSH key');
-    absolute(runtime.knownHostsFile, 'runtime SSH host keys');
-    container.runtime = runtime;
+    container.runtime = connection(container.runtime, 'Runtime');
   } else if (common.adapters.includes('podman')) {
     fail('Podman activation requires an explicitly configured runtime connection');
+  }
+  if (container.builderControl !== undefined) {
+    container.builderControl = connection(container.builderControl, 'Builder');
+    absolute(container.builderJobSockets, 'private builder socket directory');
+    if (Buffer.byteLength(`${container.builderJobSockets}/${container.instanceId}/api.sock`) > 107) {
+      fail('Private builder socket path exceeds the Unix socket limit');
+    }
+  } else if (common.adapters.includes('podman') || container.builderJobSockets !== undefined) {
+    fail('Podman builds require an explicitly configured supervised builder connection');
   }
   return { ...value, ...common, ui, container };
 }

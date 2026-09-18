@@ -18,6 +18,7 @@ import { fileURLToPath } from 'node:url';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { ContainerExecutor as ProductionContainerExecutor } from '../app/deployment/container-executor.js';
+import { builderUnitName } from '../app/deployment/builder-client.js';
 import { snapshotDigest } from '../app/deployment/protocol.js';
 import { deploymentRequest, until } from './deploy-service-fixtures.mjs';
 
@@ -54,12 +55,17 @@ function containerConfig(overrides = {}) {
     container: {
       instanceId: '11111111-1111-4111-8111-111111111111',
       builderSocket: '/run/pw-deploy/builder.sock',
+      builderJobSockets: '/run/pw-deploy-build',
       workerImage: `sha256:${'a'.repeat(64)}`,
       maxMemoryMiB: 2048,
       maxPids: 512,
       runtime: {
         host: 'runtime.internal', port: 22, user: 'deploysvc',
         keyFile: '/etc/pw-deploy/runtime.key', knownHostsFile: '/etc/pw-deploy/known_hosts',
+      },
+      builderControl: {
+        host: 'builder.internal', port: 22, user: 'deploy-builder',
+        keyFile: '/etc/pw-deploy/builder.key', knownHostsFile: '/etc/pw-deploy/known_hosts',
       },
       ...containerOverrides,
     },
@@ -201,7 +207,7 @@ function workerReply({ stdout = '', stderr = '', exitCode = 0, onEnvelope, hold 
 // builder-socket handler or the SSH runtime-relay handler based on which
 // fixed binary path container-executor.js invoked, records every call for
 // inspection, and fails closed (never silently succeeds) on anything else.
-function fakeSpawn({ podman, ssh } = {}) {
+function fakeSpawn({ podman, ssh, builderControl } = {}) {
   const calls = [];
   function spawnProcess(command, args, options) {
     calls.push({ command, args: [...args], env: options?.env });
@@ -225,7 +231,9 @@ function fakeSpawn({ podman, ssh } = {}) {
         catch (error) { child._fail(error); return; }
         let value;
         try {
-          const result = await (ssh || defaultSsh)(decoded.request, { extraBytes: decoded.extraBytes, child });
+          const handler = args.at(-1) === 'pw-deploy-builder'
+            ? builderControl || podman?.builderControl || defaultBuilderControl : ssh || defaultSsh;
+          const result = await handler(decoded.request, { extraBytes: decoded.extraBytes, child });
           value = { ok: true, result: result || {} };
         } catch (error) {
           value = { ok: false, code: error.code || 'process_failed', error: error.message || String(error) };
@@ -247,6 +255,10 @@ function defaultPodman(args, child) {
   respond(child, { exitCode: 0 });
 }
 function defaultSsh() { return {}; }
+function defaultBuilderControl(request) {
+  if (request.action === 'builder_probe') return { instanceId: containerConfig().container.instanceId, ready: true };
+  throw new Error(`Unexpected builder control action: ${request.action}`);
+}
 
 function rootlessInfo() { return JSON.stringify({ host: { security: { rootless: true } } }); }
 
@@ -297,6 +309,8 @@ function fakeBuilder({
   const images = new Map();
   const activeWorkers = new Map();
   const seedArchives = [];
+  const controlCalls = [];
+  const stoppedJobs = new Set();
 
   function workerFor(name, container) {
     return workers[name] || (container?.phase && workers[container.phase]) || workers.default || workerReply({ exitCode: 0 });
@@ -429,8 +443,39 @@ function fakeBuilder({
     }
     child._fail(new Error(`fakeBuilder: unhandled podman command ${JSON.stringify(args)}`));
   }
+  podman.builderControl = request => {
+    controlCalls.push(request);
+    const instanceId = containerConfig().container.instanceId;
+    if (request.action === 'builder_probe') return { instanceId, ready: true };
+    const { jobId } = request;
+    const unit = builderUnitName(instanceId, jobId);
+    const owned = value => value.labels['io.pw-deploy.instance'] === instanceId && value.labels['io.pw-deploy.job'] === jobId;
+    if (request.action === 'job_start') {
+      if (stoppedJobs.has(jobId)) throw new Error('A cancelled builder cannot be replayed');
+      return { instanceId, jobId, unit, socketDirectory: jobId, running: true, deadlineAt: request.deadlineAt,
+        cgroupParent: `/user.slice/user-2000.slice/user@2000.service/app.slice/${unit}/payload` };
+    }
+    if (request.action === 'job_stop') {
+      for (const [name, value] of containers) {
+        if (!owned(value)) continue;
+        if (!stopEffective(name, value)) throw new Error('Synthetic backend did not stop');
+        value.status = 'exited';
+        activeWorkers.get(name)?.child._close(null, 'SIGKILL');
+      }
+      stoppedJobs.add(jobId);
+      return { instanceId, jobId, stopped: true };
+    }
+    if (request.action === 'job_remove') {
+      assert.ok(stoppedJobs.has(jobId), 'whole backend must stop before its private store is removed');
+      for (const resources of [containers, volumes, images]) {
+        for (const [name, value] of resources) if (owned(value)) resources.delete(name);
+      }
+      return { instanceId, jobId, stopped: true, removed: true };
+    }
+    throw new Error(`Unexpected builder control action: ${request.action}`);
+  };
   return {
-    podman, containers, volumes, images, activeWorkers, seedArchives,
+    podman, containers, volumes, images, activeWorkers, seedArchives, controlCalls,
   };
 }
 
@@ -480,11 +525,12 @@ test('init() accepts a genuinely rootless builder daemon whose pinned worker ima
   });
   const executor = new ContainerExecutor(config, { spawnProcess });
   await executor.init();
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
   assert.equal(calls[0].command, PODMAN);
   assert.deepEqual(calls[0].args.slice(0, 3), ['--remote', '--url', 'unix:///run/pw-deploy/builder.sock']);
   assert.deepEqual(stripRemote(calls[0].args), ['info', '--format', 'json']);
   assert.deepEqual(stripRemote(calls[1].args), ['image', 'exists', config.container.workerImage]);
+  assert.equal(calls[3].args.at(-1), 'pw-deploy-builder');
 });
 
 test('init() refuses a rootful daemon rather than silently using it', async () => {
@@ -920,7 +966,7 @@ test('podman() builds, transfers and promotes a candidate image when there is no
   const { spawnProcess, calls } = fakeSpawn({ podman: builder.podman, ssh: runtime.ssh });
   const config = containerConfig();
   const executor = new ContainerExecutor(config, { spawnProcess });
-  const control = makeControl({ jobId: 'job-podman-1', policy: { image: 'exampleapp', service: 'exampleapp' } });
+  const control = makeControl({ policy: { image: 'exampleapp', service: 'exampleapp' } });
   const request = podmanRequest({
     recipe: { adapter: 'podman', image: 'exampleapp', service: 'exampleapp', healthUrl: 'http://127.0.0.1:4321/health' },
   });
@@ -934,7 +980,7 @@ test('podman() builds, transfers and promotes a candidate image when there is no
   const buildArgs = stripRemote(buildCall.args);
   const labels = labelsFromArgs(buildArgs);
   assert.equal(labels['io.pw-deploy.instance'], config.container.instanceId);
-  assert.equal(labels['io.pw-deploy.job'], 'job-podman-1');
+  assert.equal(labels['io.pw-deploy.job'], control.jobId);
   assert.equal(labels['org.opencontainers.image.revision'], request.revision);
 
   const smokeCall = calls.find(call => stripRemote(call.args)[0] === 'run');
@@ -942,10 +988,19 @@ test('podman() builds, transfers and promotes a candidate image when there is no
   for (const value of ['--rm', '--pull=never', '--network=none', '--read-only', '--user=1001:1001',
     '--cap-drop=all', '--security-opt=no-new-privileges', '--log-driver=none', '--no-healthcheck',
     '--memory=2048m', '--pids-limit=512', '--entrypoint=/bin/true']) assert.ok(smoke.includes(value), value);
-  assert.equal(smoke[smoke.indexOf('--name') + 1], 'pw-deploy-job-job-podman-1-smoke');
+  assert.equal(smoke[smoke.indexOf('--name') + 1], `pw-deploy-job-${control.jobId}-smoke`);
   assert.equal(labelsFromArgs(smoke)['io.pw-deploy.job'], control.jobId);
   assert.match(smoke.find(value => value.startsWith('--timeout=')), /^--timeout=[1-9][0-9]*$/);
-  assert.equal(smoke.at(-1), executor.candidateTag('exampleapp', 'job-podman-1'));
+  assert.equal(smoke.at(-1), executor.candidateTag('exampleapp', control.jobId));
+  for (const call of calls.filter(call => call.command === PODMAN)) {
+    assert.equal(call.args[2], `unix:///run/pw-deploy-build/${control.jobId}/api.sock`,
+      'Podman jobs must never use the shared worker/cache API');
+    if (['build', 'run', 'create'].includes(stripRemote(call.args)[0])) {
+      assert.ok(call.args.includes(`--cgroup-parent=/user.slice/user-2000.slice/user@2000.service/app.slice/`
+        + `${builderUnitName(config.container.instanceId, control.jobId)}/payload`));
+    }
+  }
+  assert.deepEqual(builder.controlCalls.map(call => call.action), ['job_start', 'job_stop', 'job_remove']);
   const transfer = runtime.calls.find(call => call.action === 'image_import');
   assert.equal(transfer.expectedImageId, `sha256:${'c'.repeat(64)}`);
   assert.equal(transfer.revision, request.revision);
@@ -966,7 +1021,7 @@ test('podman() snapshots the previously running image as a rollback tag before p
   const runtime = fakeRuntimeLifecycle({ initialImage: previousImage });
   const { spawnProcess } = fakeSpawn({ podman: builder.podman, ssh: runtime.ssh });
   const executor = new ContainerExecutor(containerConfig(), { spawnProcess });
-  const control = makeControl({ jobId: 'job-podman-2', policy: { image: 'exampleapp', service: 'exampleapp' } });
+  const control = makeControl({ policy: { image: 'exampleapp', service: 'exampleapp' } });
 
   const result = await executor.deploy(podmanRequest(), control);
   assert.ok(result.version);
@@ -989,7 +1044,7 @@ test('podman() installs dependencies in a separate disposable worker before buil
   const runtime = fakeRuntimeLifecycle({ initialImage: null });
   const { spawnProcess, calls } = fakeSpawn({ podman: builder.podman, ssh: runtime.ssh });
   const executor = new ContainerExecutor(containerConfig(), { spawnProcess });
-  const control = makeControl({ jobId: 'job-podman-lock', policy: { image: 'exampleapp', service: 'exampleapp' } });
+  const control = makeControl({ policy: { image: 'exampleapp', service: 'exampleapp' } });
   const files = [
     { path: 'package.json', data: Buffer.from('{}').toString('base64'), executable: false },
     { path: 'package-lock.json', data: Buffer.from('{}').toString('base64'), executable: false },
@@ -1000,16 +1055,85 @@ test('podman() installs dependencies in a separate disposable worker before buil
 
   assert.equal(depsEnvelopes.length, 1);
   assert.deepEqual(depsEnvelopes[0].argv, ['/usr/bin/npm', 'ci', '--omit=dev', '--no-audit', '--no-fund']);
-  assert.equal(builder.containers.has('pw-deploy-job-job-podman-lock-dependencies'), false,
-    'the dependencies worker must be removed after its build context has been consumed');
+  const dependencyName = `pw-deploy-job-${control.jobId}-dependencies`;
+  assert.equal(builder.containers.has(dependencyName), false,
+    'the dependencies worker must be removed with its stopped private backend');
 
   const cpArgs = calls.map(call => stripRemote(call.args)).find(args => args[0] === 'cp'
-    && args[1] === 'pw-deploy-job-job-podman-lock-dependencies:/workspace/source/.' && args[2] === '-');
+    && args[1] === `${dependencyName}:/workspace/source/.` && args[2] === '-');
   assert.ok(cpArgs, 'expected the build context to stream directly from the dependency container via `podman cp`, never local disk');
-  const commands = calls.map(call => stripRemote(call.args));
-  assert.ok(commands.findIndex(args => args[0] === 'cp' && args[1] === cpArgs[1])
-    < commands.findIndex(args => args[0] === 'rm'
-    && args.at(-1) === 'pw-deploy-job-job-podman-lock-dependencies'));
+  assert.deepEqual(builder.controlCalls.map(call => call.action), ['job_start', 'job_stop', 'job_remove']);
+  assert.equal(calls.some(call => call.command === PODMAN && stripRemote(call.args)[0] === 'rm'), false,
+    'private Buildah/container storage is removed only after whole-backend stop');
+});
+
+for (const dependencies of [false, true]) {
+  test(`Podman cancellation stops the private backend, not only ${dependencies ? 'the copy/build pipeline' : 'the build client'}`, async () => {
+    const builder = fakeBuilder(), runtime = fakeRuntimeLifecycle();
+    const controller = new AbortController();
+    const control = makeControl({ signal: controller.signal, policy: { image: 'exampleapp', service: 'exampleapp' } });
+    let backendRunning = false, buildChild;
+    const { spawnProcess } = fakeSpawn({
+      podman: (args, child) => {
+        if (args[0] !== 'build') return builder.podman(args, child);
+        backendRunning = true;
+        buildChild = child;
+        child.stdin.resume();
+      },
+      builderControl: request => {
+        const result = builder.podman.builderControl(request);
+        if (request.action === 'job_stop') {
+          backendRunning = false;
+          buildChild?._close(125);
+        }
+        return result;
+      },
+      ssh: runtime.ssh,
+    });
+    const files = dependencies ? [
+      { path: 'package.json', executable: false, data: Buffer.from('{}').toString('base64') },
+      { path: 'package-lock.json', executable: false, data: Buffer.from('{}').toString('base64') },
+    ] : undefined;
+    const request = podmanRequest(files ? { source: { files, sha256: snapshotDigest(files) } } : {});
+    const executor = new ContainerExecutor(containerConfig(), { spawnProcess });
+    const deploying = executor.deploy(request, control);
+    const failed = assert.rejects(deploying, error => error.code === 'cancelled');
+    await until(() => backendRunning);
+    controller.abort(Object.assign(new Error('Synthetic build cancellation'), { code: 'cancelled' }));
+    await failed;
+    assert.equal(backendRunning, false);
+    assert.deepEqual(builder.controlCalls.map(call => call.action), ['job_start', 'job_stop', 'job_remove']);
+    assert.equal(runtime.calls.some(call => ['image_import', 'image_tag', 'service_restart'].includes(call.action)), false);
+  });
+}
+
+test('uncertain private backend termination defers all store cleanup and runtime activation', async () => {
+  const builder = fakeBuilder(), runtime = fakeRuntimeLifecycle(), controller = new AbortController();
+  const control = makeControl({ signal: controller.signal, policy: { image: 'exampleapp', service: 'exampleapp' } });
+  let started = false, removed = false;
+  const { spawnProcess } = fakeSpawn({
+    podman: (args, child) => {
+      if (args[0] !== 'build') return builder.podman(args, child);
+      started = true;
+      child.stdin.resume();
+    },
+    builderControl: request => {
+      if (request.action === 'job_stop') throw Object.assign(new Error('Synthetic unconfirmed stop'), { code: 'process_failed' });
+      if (request.action === 'job_remove') removed = true;
+      return builder.podman.builderControl(request);
+    },
+    ssh: runtime.ssh,
+  });
+  const executor = new ContainerExecutor(containerConfig(), { spawnProcess });
+  const deploying = executor.deploy(podmanRequest(), control);
+  const failed = assert.rejects(deploying, error => error.code === 'cancellation_failed');
+  await until(() => started);
+  controller.abort(Object.assign(new Error('Synthetic build cancellation'), { code: 'cancelled' }));
+  await failed;
+  assert.equal(removed, false);
+  assert.equal(executor.builds.has(control.jobId), true);
+  assert.ok(control._events.includes('cleanup_deferred'));
+  assert.equal(runtime.calls.some(call => ['image_import', 'image_tag', 'service_restart'].includes(call.action)), false);
 });
 
 test('podman() restores the previous image when activation fails to become healthy, then rethrows the original error', async () => {
@@ -1026,7 +1150,7 @@ test('podman() restores the previous image when activation fails to become healt
   });
   const { spawnProcess } = fakeSpawn({ podman: builder.podman, ssh: runtime.ssh });
   const executor = new ContainerExecutor(containerConfig(), { spawnProcess });
-  const control = makeControl({ jobId: 'job-podman-rollback', policy: { image: 'exampleapp', service: 'exampleapp' } });
+  const control = makeControl({ policy: { image: 'exampleapp', service: 'exampleapp' } });
 
   await assert.rejects(() => executor.deploy(podmanRequest(), control), error => {
     assert.equal(error.code, 'process_failed');
@@ -1051,7 +1175,7 @@ test('podman() surfaces cancellation_failed when even the rollback cannot be con
   });
   const { spawnProcess } = fakeSpawn({ podman: builder.podman, ssh: runtime.ssh });
   const executor = new ContainerExecutor(containerConfig(), { spawnProcess });
-  const control = makeControl({ jobId: 'job-podman-rollback-fail', policy: { image: 'exampleapp', service: 'exampleapp' } });
+  const control = makeControl({ policy: { image: 'exampleapp', service: 'exampleapp' } });
 
   await assert.rejects(() => executor.deploy(podmanRequest(), control), error => {
     assert.equal(error.code, 'cancellation_failed');
@@ -1059,6 +1183,32 @@ test('podman() surfaces cancellation_failed when even the rollback cannot be con
   });
   assert.ok(control._events.includes('rollback_failed'),
     'a rollback that cannot be confirmed must be reported explicitly, never silently treated as success');
+  assert.deepEqual(builder.controlCalls.map(call => call.action), ['job_start', 'job_stop'],
+    'deferred destructive cleanup must not leave the completed backend running');
+  assert.ok(control._events.includes('cleanup_deferred'));
+});
+
+test('a completed image cannot be promoted when whole-backend stop is unconfirmed', async () => {
+  const builder = fakeBuilder(), runtime = fakeRuntimeLifecycle(), journal = new MemoryCandidateJournal();
+  const control = makeControl({ policy: { image: 'exampleapp', service: 'exampleapp' } });
+  let stopped = false;
+  const { spawnProcess } = fakeSpawn({
+    podman: builder.podman, ssh: runtime.ssh,
+    builderControl: request => {
+      if (request.action === 'job_stop') {
+        stopped = true;
+        throw Object.assign(new Error('Synthetic post-transfer stop refusal'), { code: 'process_failed' });
+      }
+      return builder.podman.builderControl(request);
+    },
+  });
+  const executor = new ContainerExecutor(containerConfig(), { spawnProcess, candidateJournal: journal });
+  await assert.rejects(executor.deploy(podmanRequest(), control), error => error.code === 'cancellation_failed');
+  assert.equal(stopped, true);
+  assert.deepEqual(runtime.calls.map(call => call.action), ['service_preflight', 'image_import']);
+  assert.equal(builder.controlCalls.some(call => call.action === 'job_remove'), false);
+  assert.equal(journal.values.size, 1, 'the imported but unpromoted candidate must remain recoverable');
+  assert.ok(control._events.includes('cleanup_deferred'));
 });
 
 test("transferImage() refuses a runtime relay response with a malformed image identity", async () => {
@@ -1220,7 +1370,7 @@ test('an exact-name foreign candidate image survives a failed deployment', async
   assert.equal(builder.images.get(candidate), foreign);
   assert.equal(calls.some(call => stripRemote(call.args)[0] === 'build'), false);
   assert.equal(calls.some(call => stripRemote(call.args).slice(0, 2).join(' ') === 'image rm'), false);
-  assert.equal(runtime.calls.length, 0);
+  assert.deepEqual(runtime.calls.map(call => call.action), ['service_preflight']);
 });
 
 test('a fresh executor recovers an interrupted runtime import from its durable candidate checkpoint', async () => {

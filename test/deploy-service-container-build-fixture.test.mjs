@@ -6,6 +6,7 @@ import {
   createContainerBuildFixturePayload,
   createFixtureRuntimePeer,
   buildCancellationReady,
+  cancellationProofDeadline,
 } from './deploy-service-container-build-fixtures.mjs';
 import { bindObservedBuild, parseObservedProcess } from './deploy-service-build-observer.mjs';
 import { snapshotDigest, validateJob } from '../app/deployment/protocol.js';
@@ -55,6 +56,14 @@ test('build cancellation evidence requires a complete emitted line, not a Docker
   assert.equal(buildCancellationReady(`${marker} /\n`, marker), false);
   assert.equal(buildCancellationReady(`${marker}\n`, marker), true);
   assert.equal(buildCancellationReady(`STEP 3\n${marker}\r\n`, marker), true);
+});
+
+test('cancellation uses one absolute stop budget strictly before the independent guard can act', () => {
+  assert.equal(cancellationProofDeadline(1000, 2000), 22000);
+  assert.equal(cancellationProofDeadline(0, 60000), 80000);
+  for (const values of [[0, 65000], [0, 70000], [0, 90000], [2000, 1000], [NaN, 0], [0, Infinity]]) {
+    assert.throws(() => cancellationProofDeadline(...values));
+  }
 });
 
 test('trusted build observer binds the nonce, private PID namespace, OCI root and exact storage ID', () => {

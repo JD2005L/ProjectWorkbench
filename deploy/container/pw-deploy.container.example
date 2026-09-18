@@ -9,10 +9,12 @@ ContainerName=pw-deploy
 PublishPort=127.0.0.1:3800:3800
 Volume=pw-deploy-state:/var/lib/pw-deploy
 Volume=%t/podman/podman.sock:/run/pw-deploy/podman.sock:ro
+Volume=%t/pw-deploy-build:/run/pw-deploy-build:ro
 Secret=pw-deploy-config,type=mount,target=/etc/pw-deploy/config.json,uid=0,gid=0,mode=0400
 Secret=pw-deploy-api,type=mount,target=/run/secrets/pw-deploy-api,uid=0,gid=0,mode=0400
 Secret=pw-deploy-ui,type=mount,target=/run/secrets/pw-deploy-ui,uid=0,gid=0,mode=0400
 Secret=pw-deploy-runtime-key,type=mount,target=/run/secrets/pw-deploy-runtime-key,uid=0,gid=0,mode=0400
+Secret=pw-deploy-builder-key,type=mount,target=/run/secrets/pw-deploy-builder-key,uid=0,gid=0,mode=0400
 Secret=pw-deploy-known-hosts,type=mount,target=/etc/pw-deploy/known_hosts,uid=0,gid=0,mode=0400
 ReadOnly=true
 NoNewPrivileges=true

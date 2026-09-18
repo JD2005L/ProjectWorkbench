@@ -45,6 +45,8 @@ test('container example config uses separate mounted credentials, pinned image a
   assert.equal(config.listen.host, '0.0.0.0');
   assert.notEqual(config.tokenFile, config.ui.tokenFile);
   assert.equal(config.container.runtime.user, 'app-runtime');
+  assert.equal(config.container.builderControl.user, 'deploy-builder');
+  assert.equal(config.container.builderJobSockets, '/run/pw-deploy-build');
   assert.equal(config.defaults.maxConcurrent, 1);
   assert.match(config.container.workerImage, /^sha256:[a-f0-9]{64}$/);
 });
@@ -64,6 +66,8 @@ test('image contains engine, web console and job tools without PW or host runtim
   assert.match(application, /ARG PW_DEPLOY_REVISION/);
   assert.match(application, /COPY deploy\/container\/runtime-relay\.py \.\/runtime-relay\.py/);
   assert.match(application, /COPY deploy\/container\/runtime-policy\.example\.json \.\/runtime-policy\.example\.json/);
+  assert.match(application, /COPY deploy\/container\/builder-relay\.py \.\/builder-relay\.py/);
+  assert.match(application, /COPY deploy\/container\/builder-policy\.example\.json \.\/builder-policy\.example\.json/);
   assert.match(file, /ENTRYPOINT \["node", "\/opt\/pw-deploy\/app\/deployment\/container-service\.js"\]/);
   assert.doesNotMatch(file, /nsenter|--privileged|systemctl|systemd-run|entrypoint\.sh/);
 });
@@ -92,12 +96,14 @@ test('Quadlet uses rootless runtime facilities and separate namespace-owned secr
     assert.ok(container.some(entry => `${entry.key}=${entry.value}` === line), line);
   }
   assertControllerCapabilities(file);
-  assert.equal(container.filter(entry => entry.key === 'Secret' && /uid=0,gid=0,mode=0400$/.test(entry.value)).length, 5);
+  assert.equal(container.filter(entry => entry.key === 'Secret' && /uid=0,gid=0,mode=0400$/.test(entry.value)).length, 6);
   assert.ok(entries.some(entry => entry.section === 'Install'
     && entry.key === 'WantedBy' && entry.value === 'default.target'));
   assert.doesNotMatch(file, /SecurityLabelDisable|Privileged=|Network=host|Pid=host|\/run\/podman\/podman\.sock|CapDrop=/);
   assert.ok(container.some(entry => entry.key === 'Volume'
     && entry.value === '%t/podman/podman.sock:/run/pw-deploy/podman.sock:ro'));
+  assert.ok(container.some(entry => entry.key === 'Volume'
+    && entry.value === '%t/pw-deploy-build:/run/pw-deploy-build:ro'));
 });
 
 test('Quadlet capability contract rejects comments, misplaced directives and additional grants', async () => {
@@ -145,6 +151,8 @@ test('the image COPY layout resolves the standalone entrypoint without PW or nod
   await fs.copyFile(path.join(packaging, 'health.mjs'), path.join(root, 'health.mjs'));
   await fs.copyFile(path.join(packaging, 'runtime-relay.py'), path.join(root, 'runtime-relay.py'));
   await fs.copyFile(path.join(packaging, 'runtime-policy.example.json'), path.join(root, 'runtime-policy.example.json'));
+  await fs.copyFile(path.join(packaging, 'builder-relay.py'), path.join(root, 'builder-relay.py'));
+  await fs.copyFile(path.join(packaging, 'builder-policy.example.json'), path.join(root, 'builder-policy.example.json'));
   const { stdout } = await run(process.execPath, ['--input-type=module', '-e',
     'const service=await import("./app/deployment/container-service.js"); if(typeof service.startContainerService!=="function") throw Error("missing entrypoint"); console.log("standalone imports resolved");'],
   { cwd: root, timeout: 15000 });

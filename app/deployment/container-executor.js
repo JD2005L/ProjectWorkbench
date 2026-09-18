@@ -4,8 +4,10 @@
 // version command) runs inside a disposable, per-job worker container built
 // from the same immutable, pinned image this controller itself ships in -
 // never in this process and never on the host. This controller only talks
-// to its own dedicated rootless Podman builder socket (in --remote mode)
-// and, to promote a build onto the existing target unit, to the fixed
+// to rootless Podman sockets (in --remote mode). Podman-adapter jobs have
+// private API/store leases supervised by a fixed-action builder connector;
+// the shared socket is only the immutable cache and script/IIS worker pool.
+// Promotion onto the existing target unit uses the fixed
 // runtime-relay connector over a pinned SSH invocation (see
 // runtime-client.js and deploy/container/runtime-relay.py). It never
 // touches the runtime host's filesystem, IIS, SQL or directory services
@@ -25,6 +27,7 @@ import {
 } from './container-process.js';
 import { runtimeRequest, nextRuntimeRequestId } from './runtime-client.js';
 import { RuntimeCandidateJournal, validateRuntimeCandidate } from './container-journal.js';
+import { SupervisedBuilder } from './builder-client.js';
 
 const PODMAN = '/usr/bin/podman';
 const WORKER_ENTRYPOINT = '/opt/pw-deploy/app/deployment/container-worker.js';
@@ -102,10 +105,11 @@ export class ContainerExecutor {
     this.spawnProcess = spawnProcess;
     this.now = now;
     this.candidateJournal = candidateJournal;
+    this.builds = new SupervisedBuilder(config, { spawnProcess, now });
   }
 
-  podmanRemoteArgs(args) {
-    return ['--remote', '--url', `unix://${this.config.container.builderSocket}`, ...args];
+  podmanRemoteArgs(args, control) {
+    return ['--remote', '--url', `unix://${this.builds.socket(control)}`, ...args];
   }
 
   volumeName(jobId) {
@@ -175,20 +179,28 @@ export class ContainerExecutor {
     if (labels?.['io.pw-deploy.worker'] !== 'true' || labels?.['io.pw-deploy.api-version'] !== '1') {
       throw new DeploymentError('The pinned image is not a compatible deployment worker', 503, 'worker_image_unavailable');
     }
+    if (this.config.adapters.includes('podman')) await this.builds.probe(AbortSignal.timeout(30000));
   }
 
   // -- low-level builder helpers ---------------------------------------------
 
   async builderRaw(control, args, options = {}) {
     control.signal.throwIfAborted();
-    return runProcess(PODMAN, this.podmanRemoteArgs(args), {
-      env: MINIMAL_ENV,
-      signal: control.signal,
-      spawnProcess: this.spawnProcess,
-      onStdout: text => control.onOutput(text),
-      onStderr: text => control.onOutput(text),
-      ...options,
-    });
+    const supervised = control.builderJob || this.builds.has(control.jobId);
+    try {
+      return await runProcess(PODMAN, this.podmanRemoteArgs(args, control), {
+        env: MINIMAL_ENV,
+        signal: control.signal,
+        spawnProcess: this.spawnProcess,
+        onStdout: text => control.onOutput(text),
+        onStderr: text => control.onOutput(text),
+        ...options,
+        ...(supervised ? { onAbort: () => this.builds.stop(control.jobId) } : {}),
+      });
+    } catch (error) {
+      if (supervised) await this.builds.stop(control.jobId);
+      throw error;
+    }
   }
 
   async exists(control, args) {
@@ -226,6 +238,10 @@ export class ContainerExecutor {
   }
 
   async stopContainer(control, name) {
+    if (control.builderJob || this.builds.has(control.jobId)) {
+      await this.builds.stop(control.jobId);
+      return;
+    }
     // This most commonly runs as a direct reaction to control.signal having
     // just been aborted (see startWorker's onAbort handler below), so it
     // must not perform its own podman calls against that same signal: every
@@ -253,6 +269,9 @@ export class ContainerExecutor {
   }
 
   async removeContainer(control, name) {
+    // Private job stores are removed as a unit only after their complete
+    // backend cgroup is stopped, including external Buildah containers.
+    if (control.builderJob || this.builds.has(control.jobId)) return;
     // Same reasoning as stopContainer: this frequently tears down a phase
     // container from runPhase's own finally block immediately after a
     // cancellation, so its own direct calls need an independent deadline too.
@@ -274,6 +293,7 @@ export class ContainerExecutor {
   async createWorkerContainer(control, phase, volumeName) {
     const name = this.containerName(control.jobId, phase);
     await this.builderRaw(control, ['create', '--name', name, ...this.labelArgs(control.jobId, phase),
+      ...this.builds.cgroupArgs(control),
       '--interactive', '--read-only', '--user=0:0',
       '--cap-drop=all', '--cap-add=SETUID', '--cap-add=SETGID', '--cap-add=CHOWN', '--cap-add=KILL', '--cap-add=SETPCAP',
       '--security-opt=no-new-privileges',
@@ -360,7 +380,8 @@ export class ContainerExecutor {
 
   async buildFromTar(control, tarBuffer, buildArgs) {
     control.signal.throwIfAborted();
-    await this.builderRaw(control, ['build', ...buildArgs, '-'], {
+    this.builds.lease(control.jobId);
+    await this.builderRaw(control, ['build', ...buildArgs, ...this.builds.cgroupArgs(control), '-'], {
       input: tarBuffer, timeoutMs: this.remainingDeadlineMs(control),
     });
   }
@@ -374,23 +395,29 @@ export class ContainerExecutor {
   // context rooted at ".".
   async buildFromContainer(control, sourceContainerName, buildArgs) {
     control.signal.throwIfAborted();
-    const copy = spawnChild(PODMAN, this.podmanRemoteArgs(['cp', `${sourceContainerName}:/workspace/source/.`, '-']), {
+    this.builds.lease(control.jobId);
+    const copy = spawnChild(PODMAN, this.podmanRemoteArgs(['cp', `${sourceContainerName}:/workspace/source/.`, '-'], control), {
       env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
     });
     copy.stdin.end();
-    const build = spawnChild(PODMAN, this.podmanRemoteArgs(['build', ...buildArgs, '-']), {
+    const build = spawnChild(PODMAN, this.podmanRemoteArgs(['build', ...buildArgs, ...this.builds.cgroupArgs(control), '-'], control), {
       env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
     });
-    await pipeProcesses(copy, build, {
-      signal: control.signal,
-      timeoutMs: this.remainingDeadlineMs(control),
-      maxBytes: MAX_BUILD_CONTEXT_BYTES,
-      onProducerStderr: text => control.onOutput(text),
-      onConsumerStderr: text => control.onOutput(text),
-      onConsumerStdout: text => control.onOutput(text),
-      producerFailure: () => new DeploymentError('Could not read the isolated workspace', 502, 'artifact_transfer_failed'),
-      consumerFailure: () => new DeploymentError('Deployment step failed', 502, 'step_failed'),
-    });
+    try {
+      await pipeProcesses(copy, build, {
+        signal: control.signal,
+        timeoutMs: this.remainingDeadlineMs(control),
+        maxBytes: MAX_BUILD_CONTEXT_BYTES,
+        onProducerStderr: text => control.onOutput(text),
+        onConsumerStderr: text => control.onOutput(text),
+        onConsumerStdout: text => control.onOutput(text),
+        producerFailure: () => new DeploymentError('Could not read the isolated workspace', 502, 'artifact_transfer_failed'),
+        consumerFailure: () => new DeploymentError('Deployment step failed', 502, 'step_failed'),
+      });
+    } catch (error) {
+      await this.builds.stop(control.jobId);
+      throw error;
+    }
   }
 
   // Streams `podman save --format=oci-archive` straight into the runtime
@@ -416,7 +443,7 @@ export class ContainerExecutor {
       try { control.onOutput(text); } catch (error) { scope.abort(error); }
     };
     try {
-      save = spawnChild(PODMAN, this.podmanRemoteArgs(['save', '--format=oci-archive', candidateTag]), {
+      save = spawnChild(PODMAN, this.podmanRemoteArgs(['save', '--format=oci-archive', candidateTag], control), {
         env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
       });
       const observed = observeProcess(save);
@@ -448,6 +475,7 @@ export class ContainerExecutor {
       scope.abort(error);
       save?.stdout.destroy();
       const [reaped, requested] = await Promise.allSettled([terminateAndReap([save]), exchange]);
+      if (control.builderJob || this.builds.has(control.jobId)) await this.builds.stop(control.jobId);
       if (reaped.status === 'rejected') throw reaped.reason;
       if (requested.status === 'rejected' && requested.reason?.code === 'cancellation_failed') throw requested.reason;
       throw error;
@@ -523,14 +551,12 @@ export class ContainerExecutor {
   // a rollback tag -> promote + restart the EXISTING unit -> confirm
   // active/running-image/health -> bounded rollback on failure.
   async podman(request, control) {
+    control = { ...control, builderJob: true };
     const { service, image } = control.policy;
     const candidate = this.candidateTag(image, control.jobId);
     const dockerfilePath = request.recipe.dockerfile || 'Dockerfile';
     const files = withVersionStamp(request);
     const hasLockfile = files.some(file => file.path === 'package-lock.json');
-    if (await this.exists(control, ['image', 'exists', candidate])) {
-      throw new DeploymentError('Deployment candidate image already exists', 409, 'resource_conflict');
-    }
     const buildArgs = ['--pull=missing', '--force-rm',
       `--memory=${this.config.container.maxMemoryMiB}m`, `--memory-swap=${this.config.container.maxMemoryMiB}m`,
       '-f', dockerfilePath, ...this.labelArgs(control.jobId),
@@ -545,6 +571,10 @@ export class ContainerExecutor {
     }, { signal: control.signal, spawnProcess: this.spawnProcess });
     if (preflight.loadState !== 'loaded') {
       throw new DeploymentError('Target service unit is not provisioned', 409, 'service_not_provisioned');
+    }
+    await this.builds.start(control);
+    if (await this.exists(control, ['image', 'exists', candidate])) {
+      throw new DeploymentError('Deployment candidate image already exists', 409, 'resource_conflict');
     }
 
     if (hasLockfile) {
@@ -577,6 +607,7 @@ export class ContainerExecutor {
     try {
       await this.builderRaw(control, [
         'run', '--rm', '--name', smokeName, ...this.labelArgs(control.jobId, 'smoke'),
+        ...this.builds.cgroupArgs(control),
         '--pull=never', '--network=none', '--read-only', '--user=1001:1001',
         '--cap-drop=all', '--security-opt=no-new-privileges', '--log-driver=none',
         `--memory=${this.config.container.maxMemoryMiB}m`, `--memory-swap=${this.config.container.maxMemoryMiB}m`,
@@ -588,6 +619,7 @@ export class ContainerExecutor {
 
     await control.onEvent('transferring_image');
     const imageId = await this.transferImage(control, candidate, request, image, expectedImageId);
+    await this.builds.stop(control.jobId);
 
     let previousImage;
     const status = await runtimeRequest(this.config.container.runtime, {
@@ -704,6 +736,11 @@ export class ContainerExecutor {
   // only) the runtime-side candidate tag. No broad prune: only exact,
   // job-labelled/named resources are ever touched.
   async cleanupJobResources(request, control) {
+    if (request.recipe.adapter === 'podman') {
+      if (this.builds.has(control.jobId)) await this.builds.remove(control.jobId, control.signal);
+      await this.cleanupRuntimeCandidate({ ...request, id: control.jobId }, control.jobDirectory, control.signal);
+      return;
+    }
     const volumeName = this.volumeName(control.jobId);
     for (const phase of ['dependencies', 'script', 'version', 'smoke']) {
       await this.removeContainer(control, this.containerName(control.jobId, phase));
@@ -734,7 +771,10 @@ export class ContainerExecutor {
   async deploy(request, control) {
     control.signal.throwIfAborted();
     await control.onEvent('preparing_source');
-    const jobControl = { ...control, deadlineAt: this.now() + control.policy.timeoutSeconds * 1000 };
+    const jobControl = {
+      ...control, builderJob: request.recipe.adapter === 'podman',
+      deadlineAt: this.now() + control.policy.timeoutSeconds * 1000,
+    };
     let originalError;
     try {
       if (request.recipe.adapter === 'podman') return await this.podman(request, jobControl);
@@ -745,7 +785,11 @@ export class ContainerExecutor {
     } finally {
       const interrupted = originalError?.code === 'interrupted' || control.signal.reason?.code === 'interrupted';
       if (originalError?.code === 'cancellation_failed' || interrupted) {
-        await control.onEvent('cleanup_deferred');
+        try {
+          if (jobControl.builderJob && this.builds.has(control.jobId)) await this.builds.stop(control.jobId);
+        } finally {
+          await control.onEvent('cleanup_deferred');
+        }
       } else {
         let cleanupError;
         try {
@@ -777,6 +821,12 @@ export class ContainerExecutor {
   async recover(job, directory) {
     if (!JOB_ID.test(job.id)) throw new DeploymentError('Invalid recovery identity', 503, 'invalid_state');
     const control = { jobId: job.id, signal: AbortSignal.timeout(60000), onOutput: () => {} };
+    if (job.adapter === 'podman') {
+      await this.builds.remove(job.id, control.signal);
+      await this.cleanupRuntimeCandidate(job, directory, control.signal);
+      await this.cleanup(directory);
+      return;
+    }
     const filters = [`label=io.pw-deploy.instance=${this.config.container.instanceId}`, `label=io.pw-deploy.job=${job.id}`]
       .flatMap(value => ['--filter', value]);
     const names = new Set(['dependencies', 'script', 'version', 'smoke'].map(phase => this.containerName(job.id, phase)));
@@ -813,7 +863,6 @@ export class ContainerExecutor {
       await this.builderRaw(control, ['image', 'rm', '--no-prune', tag]);
     }
 
-    if (job.adapter === 'podman') await this.cleanupRuntimeCandidate(job, directory, control.signal);
     await this.cleanup(directory);
   }
 
