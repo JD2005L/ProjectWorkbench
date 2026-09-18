@@ -9,6 +9,7 @@ import { spawn } from 'node:child_process';
 import { setTimeout as sleep } from 'node:timers/promises';
 import { deploymentRequest } from './deploy-service-fixtures.mjs';
 import { snapshotDigest, validateJob } from '../app/deployment/protocol.js';
+import { validateContainerConfig } from '../app/deployment/container-config.js';
 
 const PODMAN = '/usr/bin/podman';
 const LIVE = process.env.PW_DEPLOY_LIVE_FIXTURE === '1';
@@ -325,6 +326,50 @@ function source(files) {
 function sourceFile(filePath, contents, executable = false) {
   return { path: filePath, data: Buffer.from(contents).toString('base64'), executable };
 }
+
+function liveControllerConfig(instanceId, imageId) {
+  const config = {
+    mode: 'container',
+    listen: { host: '0.0.0.0', port: 3800 },
+    tokenFile: '/run/secrets/pw-deploy-api',
+    stateDir: '/var/lib/pw-deploy',
+    healthHosts: ['127.0.0.1', '::1'],
+    adapters: ['script', 'podman'],
+    maxConcurrent: 1,
+    defaultTimeoutSeconds: 30,
+    retentionDays: 1,
+    resourceNames: {},
+    ui: {
+      basePath: '/deploy-service',
+      publicOrigin: 'https://fixture.example.test',
+      tokenFile: '/run/secrets/pw-deploy-ui',
+      sessionMinutes: 30,
+    },
+    container: {
+      instanceId,
+      builderSocket: '/run/pw-deploy/podman.sock',
+      workerImage: imageId,
+      maxMemoryMiB: 512,
+      maxPids: 128,
+      runtime: {
+        host: 'fixture.invalid',
+        port: 22,
+        user: 'fixture-runtime',
+        keyFile: '/run/secrets/pw-deploy-runtime-key',
+        knownHostsFile: '/etc/pw-deploy/known_hosts',
+      },
+    },
+  };
+  validateContainerConfig(config);
+  return config;
+}
+
+test('live fixture controller configuration is valid for all enabled adapters', () => {
+  const config = liveControllerConfig('11111111-1111-4111-8111-111111111111', `sha256:${'a'.repeat(64)}`);
+  assert.ok(config.adapters.includes('podman'));
+  assert.equal(config.container.runtime.host, 'fixture.invalid');
+  assert.equal(config.defaultTimeoutSeconds, 30);
+});
 
 function livePayloads(instanceId, syntheticSecret) {
   const project = `ContainedFixture${instanceId.replaceAll('-', '').slice(0, 12)}`;
@@ -834,31 +879,7 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
   const apiToken = `fixture-api-${crypto.randomBytes(32).toString('base64url')}`;
   const uiToken = `fixture-ui-${crypto.randomBytes(32).toString('base64url')}`;
   const syntheticSecret = `fixture-job-${crypto.randomBytes(32).toString('base64url')}`;
-  const config = {
-    mode: 'container',
-    listen: { host: '0.0.0.0', port: 3800 },
-    tokenFile: '/run/secrets/pw-deploy-api',
-    stateDir: '/var/lib/pw-deploy',
-    healthHosts: ['127.0.0.1', '::1'],
-    adapters: ['script', 'podman'],
-    maxConcurrent: 1,
-    defaultTimeoutSeconds: 30,
-    retentionDays: 1,
-    resourceNames: {},
-    ui: {
-      basePath: '/deploy-service',
-      publicOrigin: 'https://fixture.example.test',
-      tokenFile: '/run/secrets/pw-deploy-ui',
-      sessionMinutes: 30,
-    },
-    container: {
-      instanceId,
-      builderSocket: '/run/pw-deploy/podman.sock',
-      workerImage: imageId,
-      maxMemoryMiB: 512,
-      maxPids: 128,
-    },
-  };
+  const config = liveControllerConfig(instanceId, imageId);
   for (const [name, value] of [
     [configSecret, `${JSON.stringify(config)}\n`],
     [apiSecret, `${apiToken}\n`],
@@ -998,9 +1019,9 @@ test(BUILD ? 'isolated live builder proves dependency workspace transfer and rem
 
   await privatePodman(controllerArgs(controllerRefusedName, false));
   const refused = await privatePodman(['start', '--attach', controllerRefusedName], {
-    allowedExitCodes: [1], timeoutMs: 15_000,
+    allowedExitCodes: [78], timeoutMs: 15_000,
   });
-  assert.match(refused.stderr, /Podman builds require SYS_CHROOT inside the rootless controller container/);
+  assert.match(refused.stderr, /Contained deployment service failed \(container_build_capability_missing\)/);
   assert.equal(await containerStatus(controllerRefusedName), 'exited');
   await stopAndRemoveContainer(controllerRefusedName);
 
