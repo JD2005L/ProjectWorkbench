@@ -607,7 +607,9 @@ export async function exerciseContainerBuildFixture({
         marker: cancellationMarker,
         externalContainerId: cancellationIdentityValue.storageId,
         runtimeId: cancellationIdentityValue.runtimeId,
-        pidNamespace: cancellationIdentityValue.pidNamespace,
+        pid: cancellationIdentityValue.pid,
+        pidStartTime: cancellationIdentityValue.startTime,
+        privatePidNamespaceRequested: cancellationIdentityValue.privatePidNamespaceRequested,
         serverWorkStopped: true,
       },
       unproven: [

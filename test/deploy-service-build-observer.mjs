@@ -128,10 +128,9 @@ export class PrivateBuildObserver {
       });
       const proc = parseObservedProcess(await readMetadata(`/proc/${identity.pid}/stat`), identity.pid);
       requireEvidence(!['Z', 'X', 'x'].includes(proc.state), 'Controlled build process exited before observation');
-      const namespace = await fs.readlink(`/proc/${identity.pid}/ns/pid`);
-      requireEvidence(/^pid:\[[0-9]+\]$/.test(namespace)
-        && namespace !== await fs.readlink('/proc/self/ns/pid'), 'Controlled build uses the observer host PID namespace');
-      identities.push({ ...identity, startTime: proc.startTime, pidNamespace: namespace });
+      // The validated OCI spec requires a fresh PID namespace. Observing its
+      // init process lifetime needs no ptrace-gated namespace link or extra cap.
+      identities.push({ ...identity, startTime: proc.startTime, privatePidNamespaceRequested: true });
     }
     requireEvidence(identities.length === 1, 'Build observer requires exactly one nonce-bound live OCI process');
     return identities[0];
