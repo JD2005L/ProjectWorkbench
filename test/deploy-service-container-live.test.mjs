@@ -660,6 +660,9 @@ test('isolated live container controller proves script execution, cancellation, 
     XDG_RUNTIME_DIR: xdgRuntimeDir,
     TMPDIR: transferTemp,
     DBUS_SESSION_BUS_ADDRESS: `unix:path=${realBus}`,
+    // Podman's generated healthcheck units omit custom store arguments. Run the
+    // real image healthcheck explicitly in this isolated store instead.
+    DISABLE_HC_SYSTEMD: 'true',
   };
   privateArgs = ['--remote=false', '--root', graphRoot, '--runroot', runRoot, '--tmpdir', tmpDir];
   console.log(`PW_DEPLOY_FIXTURE_RESOURCES=${JSON.stringify({ instanceId, storageBase, xdgRuntimeDir, graphRoot, runRoot, tmpDir, socketPath })}`);
@@ -838,6 +841,7 @@ test('isolated live container controller proves script execution, cancellation, 
         throw error;
       }
     });
+    await privatePodman(['healthcheck', 'run', name], { timeoutMs: 15_000 });
     return { name, baseUrl, processHandle };
   };
   const request = async (baseUrl, route, {
