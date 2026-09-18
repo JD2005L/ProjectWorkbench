@@ -47,7 +47,7 @@ function relayInfo(m) {
     HostConfig: { Privileged: false, ReadonlyRootfs: true, NetworkMode: 'none',
       PidMode: 'private', IpcMode: 'private', UTSMode: 'private', CgroupMode: 'private',
       CapAdd: [], SecurityOpt: ['no-new-privileges'], PortBindings: {} },
-    NetworkSettings: { Ports: {} },
+    NetworkSettings: { Ports: { '3800/tcp': null } },
     Mounts: [
       [l.socket, '/run/pw-fixture/podman.sock'],
       [l.bus, `/run/user/${m.uid}/bus`],
@@ -155,6 +155,9 @@ test('relay inspect validation refuses host authority and unconfirmed exec sessi
     i => { i.HostConfig.NetworkMode = 'host'; }, i => { i.HostConfig.ReadonlyRootfs = false; },
     i => { i.HostConfig.CapAdd = ['CAP_SYS_ADMIN']; }, i => { i.HostConfig.SecurityOpt = []; },
     i => { i.HostConfig.PortBindings = { '18080/tcp': [{ HostPort: '18080' }] }; },
+    i => { i.NetworkSettings.Ports = { '3800/tcp': [{ HostIp: '0.0.0.0', HostPort: '3800' }] }; },
+    i => { i.NetworkSettings.Ports = { '3800/tcp': [] }; },
+    i => { i.NetworkSettings.Ports = { 'invalid-port': null }; },
     i => { i.Config.Entrypoint = ['/bin/sh']; },
     i => { i.Config.Healthcheck = { Test: ['CMD', 'automatic-unreviewed-helper'] }; },
     i => { i.ExecIDs = ['outstanding-exec']; },

@@ -291,7 +291,13 @@ function assertConstrainedContainer(info, imageId, user = '1001:1001') {
   assert.ok(info.HostConfig.SecurityOpt?.includes('no-new-privileges'), 'no-new-privileges required');
   assert.deepEqual(info.Config.Healthcheck?.Test ?? ['NONE'], ['NONE'], 'automatic image healthchecks must be disabled');
   assert.deepEqual(info.HostConfig.PortBindings ?? {}, {}, 'no published ports');
-  assert.deepEqual(info.NetworkSettings?.Ports ?? {}, {}, 'no actual published ports');
+  const ports = info.NetworkSettings?.Ports ?? {};
+  assert.ok(typeof ports === 'object' && !Array.isArray(ports), 'port metadata must be an object');
+  for (const [port, bindings] of Object.entries(ports)) {
+    assert.match(port, /^[1-9][0-9]{0,4}\/(?:tcp|udp|sctp)$/);
+    assert.ok(Number(port.split('/')[0]) <= 65535);
+    assert.equal(bindings, null, 'exposed image ports must have no host binding');
+  }
 }
 
 export function assertRuntimeRelayContainer(info, metadata) {
