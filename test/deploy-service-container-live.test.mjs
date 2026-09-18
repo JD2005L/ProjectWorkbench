@@ -183,6 +183,34 @@ function parseJson(text, description) {
   }
 }
 
+function isPendingStartupTransport(error) {
+  return ['AbortError', 'TimeoutError'].includes(error.name)
+    || ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET'].includes(error.cause?.code);
+}
+
+test('live fixture tolerates a forwarding socket closing before controller readiness', { timeout: 5000 }, async t => {
+  const server = http.createServer(request => request.socket.destroy());
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  await assert.rejects(fetch(`http://127.0.0.1:${server.address().port}/health`, {
+    signal: AbortSignal.timeout(2000),
+  }), error => {
+    assert.equal(error.cause?.code, 'UND_ERR_SOCKET');
+    assert.equal(isPendingStartupTransport(error), true);
+    return true;
+  });
+  assert.equal(isPendingStartupTransport(new Error('Controller failed')), false);
+  assert.equal(isPendingStartupTransport(new TypeError('fetch failed', {
+    cause: { code: 'CERT_HAS_EXPIRED' },
+  })), false);
+});
+
 async function streamImage(sourceImage, privateArgs, privateEnv, signal, {
   spawnProcess = spawn, timeoutMs = 120_000, ownedProcesses,
 } = {}) {
@@ -836,9 +864,9 @@ test('isolated live container controller proves script execution, cancellation, 
         await response.arrayBuffer();
         return response.status === 200;
       } catch (error) {
-        if (['AbortError', 'TimeoutError'].includes(error.name)
-            || ['ECONNREFUSED', 'ECONNRESET'].includes(error.cause?.code)) return false;
-        throw error;
+        if (t.signal.aborted) throw t.signal.reason;
+        if (isPendingStartupTransport(error)) return false;
+        throw new Error(`Controller health transport failed (${error.name}, ${error.cause?.code || 'no code'})`, { cause: error });
       }
     });
     await privatePodman(['healthcheck', 'run', name], { timeoutMs: 15_000 });
