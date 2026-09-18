@@ -583,17 +583,29 @@ elif mode == "home":
   env = relay.runtime_environment()
   print(json.dumps({"home": env["HOME"], "expected": pwd.getpwuid(os.getuid()).pw_dir}))
 elif mode == "reap_escalates":
-  # A helper that ignores SIGTERM must still be escalated to SIGKILL and reaped.
+  import select, signal
   relay.REAP_WAIT_SECONDS = 1
   child = subprocess.Popen(
-    [sys.executable, "-c", "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);time.sleep(60)"],
-    start_new_session=True)
+    [sys.executable, "-c", "import signal,time;signal.signal(signal.SIGTERM,signal.SIG_IGN);print('ready',flush=True);time.sleep(60)"],
+    stdout=subprocess.PIPE, start_new_session=True)
   relay.ACTIVE_PROCESSES.add(child)
-  start = time.monotonic()
-  relay._terminate_and_reap(child)
-  elapsed = time.monotonic() - start
-  relay.ACTIVE_PROCESSES.discard(child)
-  print(json.dumps({"returncode": child.returncode, "alive": child.poll() is None, "elapsed": elapsed}))
+  try:
+    # Sending TERM before the child installs its handler only proves default termination.
+    if not select.select([child.stdout], [], [], 3)[0]:
+      raise RuntimeError("Signal-ignoring helper did not become ready")
+    assert os.read(child.stdout.fileno(), 6) == b"ready\n"
+    start = time.monotonic()
+    relay._terminate_and_reap(child)
+    elapsed = time.monotonic() - start
+    result = {"returncode": child.returncode, "alive": child.poll() is None,
+              "elapsed": elapsed, "sigkill": child.returncode == -signal.SIGKILL}
+  finally:
+    if child.poll() is None:
+      child.kill()
+    child.wait(timeout=5)
+    child.stdout.close()
+    relay.ACTIVE_PROCESSES.discard(child)
+  print(json.dumps(result))
 elif mode == "reap_unconfirmed":
   # If even a post-SIGKILL wait cannot confirm the process is gone, the cleanup
   # must surface an error rather than silently returning success-shaped.
@@ -624,16 +636,18 @@ elif mode == "cancel_retains_tracking":
     process = captured.get("process")
     out = {"raised": True, "code": error.code, "tracked": process in relay.ACTIVE_PROCESSES}
     if process is not None:
-      try:
-        process.kill(); process.wait(timeout=5)
-      except Exception:
-        pass
+      if process.poll() is None:
+        process.kill()
+      process.wait(timeout=5)
+      process.stdout.close()
       relay.ACTIVE_PROCESSES.discard(process)
   print(json.dumps(out))
 `;
 
 async function runCommandAttempt(mode) {
-  const { stdout } = await execFileAsync(PYTHON, ['-c', RUN_COMMAND_HARNESS, mode, RELAY_PATH]);
+  const { stdout } = await execFileAsync(PYTHON, ['-c', RUN_COMMAND_HARNESS, mode, RELAY_PATH], {
+    timeout: 10_000, maxBuffer: 1024 * 1024,
+  });
   return JSON.parse(stdout);
 }
 
@@ -658,7 +672,7 @@ test('a SIGTERM-ignoring helper is escalated to SIGKILL and confirmed reaped (PO
   const value = await runCommandAttempt('reap_escalates');
   assert.equal(value.alive, false, 'helper must be reaped');
   assert.notEqual(value.returncode, null, 'reap must be confirmed');
-  assert.ok(value.returncode < 0, `helper should be killed by a signal, got ${value.returncode}`);
+  assert.equal(value.sigkill, true, `helper must be killed by SIGKILL, got ${value.returncode}`);
   assert.ok(value.elapsed >= 0.9, `SIGTERM window should be honored before escalation, got ${value.elapsed}`);
 });
 
