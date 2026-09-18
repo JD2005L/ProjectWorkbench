@@ -262,14 +262,14 @@ function fixtureConfig({ instanceId, socketPath, imageId }) {
   });
 }
 
-function createSpawnProcess(socketPath, podmanCalls, runtimeRequests) {
+function createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientHome) {
   const expectedPrefix = ['--remote', '--url', `unix://${socketPath}`];
   return (command, args, options) => {
     if (command === PODMAN) {
       ensure(args.length >= 3 && expectedPrefix.every((value, index) => value === args[index]),
         'ContainerExecutor attempted Podman outside the private fixture socket');
       podmanCalls.push([...args.slice(3)]);
-      return spawn(command, args, options);
+      return spawn(command, args, { ...options, env: { ...options.env, HOME: clientHome } });
     }
     if (command === SSH) {
       ensure(args.includes('fixture.invalid') && args.at(-1) === 'pw-deploy-runtime',
@@ -446,10 +446,11 @@ export async function exerciseContainerBuildFixture({
   const config = fixtureConfig({ instanceId, socketPath, imageId });
   const podmanCalls = [];
   const runtimeRequests = [];
-  const executor = new ContainerExecutor(config, {
-    spawnProcess: createSpawnProcess(socketPath, podmanCalls, runtimeRequests),
-  });
   const fixtureDirectory = path.join(storageBase, `pw-contained-fixture-build-${crypto.randomUUID()}`);
+  const clientHome = path.join(fixtureDirectory, 'client-home');
+  const executor = new ContainerExecutor(config, {
+    spawnProcess: createSpawnProcess(socketPath, podmanCalls, runtimeRequests, clientHome),
+  });
   const positiveJobId = crypto.randomUUID();
   const cancellationJobId = crypto.randomUUID();
   const positiveDirectory = path.join(fixtureDirectory, positiveJobId);
@@ -492,6 +493,8 @@ export async function exerciseContainerBuildFixture({
 
   try {
     await fs.mkdir(fixtureDirectory, { mode: 0o700 });
+    // The host's /root is not the packaged controller's namespace-owned home.
+    await fs.mkdir(clientHome, { mode: 0o700 });
     await fs.mkdir(positiveDirectory, { mode: 0o700 });
     await executor.init();
     const builderInfo = JSON.parse((await executor.builderRaw({ ...positiveControl, onOutput: () => {} }, ['info', '--format', 'json'], {
