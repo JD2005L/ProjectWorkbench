@@ -4,7 +4,9 @@ import { DeploymentEngine } from '../app/deployment/engine.js';
 import { DeploymentError, validateJob, validateRecipe } from '../app/deployment/protocol.js';
 import { validateSettings, validateTargetSettings, resolveJobPolicy } from '../app/deployment/policy.js';
 import { lineRedactor } from '../app/deployment/output.js';
-import { deploymentConfig, deploymentRequest, MemoryJobStore, until } from './deploy-service-fixtures.mjs';
+import { deploymentConfig, deploymentRequest, MemoryJobStore, until, builderStartupDiagnostic } from './deploy-service-fixtures.mjs';
+import { SupervisedBuilder } from '../app/deployment/builder-client.js';
+import { attachRelayStartupFailure, builderStartupFailure } from '../app/deployment/builder-diagnostics.js';
 
 async function fixture(t, deploy, config = deploymentConfig(), store = new MemoryJobStore()) {
   const fatal = [];
@@ -95,6 +97,100 @@ test('failure stores an operational code, never private command output or except
   assert.equal(JSON.stringify(store.jobs.get(job.id)).includes('fixture-secret'), false);
   assert.equal(JSON.stringify(engine.logs(job.id)).includes('fixture-secret'), false);
   assert.equal(engine.version(job.project, job.target).version, null);
+});
+
+test('fatal startup retains primary and repeated cleanup diagnostics before controller shutdown completes', async () => {
+  const instanceId = '11111111-1111-4111-8111-111111111111';
+  const builder = new SupervisedBuilder({ container: { instanceId, maxMemoryMiB: 2048, maxPids: 512 } });
+  let safetyStops = 0;
+  builder.request = async (action, jobId) => {
+    if (action === 'job_start') {
+      const error = new DeploymentError('PRIVATE_ORIGINAL', 502, 'process_failed');
+      attachRelayStartupFailure(error, builderStartupDiagnostic(jobId, instanceId).relay, jobId);
+      throw error;
+    }
+    assert.equal(action, 'job_stop');
+    safetyStops++;
+    throw new DeploymentError('PRIVATE_STOP', 502, 'resource_not_allowed');
+  };
+  const store = new MemoryJobStore(), fatal = [];
+  let closing;
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store,
+    executor: { async deploy(request, control) {
+      try { await builder.start(control); }
+      finally { await builder.stop(control.jobId); }
+    } },
+    onFatal(error) {
+      fatal.push(error);
+      closing = engine.close();
+    },
+  });
+  await engine.init();
+  const admitted = await engine.submit(deploymentRequest());
+  await until(() => closing);
+  await closing;
+  const retained = store.jobs.get(admitted.id);
+  assert.equal(safetyStops, 2);
+  assert.equal(fatal.length, 1);
+  assert.equal(fatal[0].code, 'cancellation_failed');
+  assert.equal(retained.state, 'failed');
+  assert.equal(retained.errorCode, 'cancellation_failed');
+  assert.equal(retained.version, null);
+  assert.equal(retained.builderStartupFailure.relay.primary.rule, 'api_peer');
+  assert.equal(retained.builderStartupFailure.relay.cleanup.failure.rule, 'manager_incomplete');
+  assert.deepEqual(retained.builderStartupFailure.cleanup.map(item => item.outcome), ['failed', 'failed']);
+  assert.equal(JSON.stringify(retained).includes('PRIVATE_'), false);
+});
+
+test('terminal diagnostic journal I/O failure occurs after safety stop and carries the original fixed failure', async () => {
+  const instanceId = '11111111-1111-4111-8111-111111111111';
+  const builder = new SupervisedBuilder({ container: { instanceId, maxMemoryMiB: 2048, maxPids: 512 } });
+  let safetyStops = 0;
+  builder.request = async (action, jobId) => {
+    if (action === 'job_start') {
+      const error = new DeploymentError('PRIVATE_ORIGINAL', 502, 'process_failed');
+      attachRelayStartupFailure(error, builderStartupDiagnostic(jobId, instanceId).relay, jobId);
+      throw error;
+    }
+    assert.equal(action, 'job_stop');
+    safetyStops++;
+    throw new DeploymentError('PRIVATE_STOP', 502, 'process_failed');
+  };
+  const store = new MemoryJobStore(), save = store.saveJob.bind(store), fatal = [];
+  const io = Object.assign(new Error('PRIVATE_JOURNAL_PATH'), { code: 'EIO', errno: -5 });
+  let attempted;
+  store.saveJob = async job => {
+    if (job.phase === 'failed') {
+      assert.equal(safetyStops, 1);
+      attempted = structuredClone(job);
+      throw io;
+    }
+    return save(job);
+  };
+  let closing;
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store, executor: { deploy: (request, control) => builder.start(control) },
+    onFatal(error) {
+      fatal.push(error);
+      closing = engine.close().then(() => ({ ok: true }), error => ({ ok: false, error }));
+    },
+  });
+  await engine.init();
+  const admitted = await engine.submit(deploymentRequest());
+  await until(() => closing);
+  const outcome = await closing;
+  assert.deepEqual(outcome, { ok: false, error: io });
+  assert.equal(fatal[0].code, 'cancellation_failed');
+  const diagnostic = builderStartupFailure(io);
+  assert.equal(diagnostic.relay.primary.rule, 'api_peer');
+  assert.equal(diagnostic.cleanup[0].outcome, 'failed');
+  assert.deepEqual(diagnostic.recordingFailure,
+    { stage: 'journal_write', code: 'io_error', rule: 'io_error', errno: 5 });
+  assert.equal(JSON.stringify(diagnostic).includes('PRIVATE_'), false);
+  assert.equal(attempted.errorCode, 'cancellation_failed');
+  assert.notEqual(store.jobs.get(admitted.id).state, 'succeeded');
+  assert.equal(store.jobs.get(admitted.id).finishedAt, undefined);
 });
 
 test('worker restart interrupts unfinished jobs without replaying or retaining their credentials', async t => {
@@ -366,4 +462,86 @@ test('a journal failure cannot release a queued deployment into an unsupervised 
   assert.equal(engine.stopping, true);
   assert.equal(fatal.length, 1);
   assert.equal(starts, 1);
+});
+
+test('shutdown aborts running jobs even when recording a queued interruption fails', async t => {
+  const store = new MemoryJobStore(), save = store.saveJob.bind(store);
+  let failingId, control, aborted = false;
+  store.saveJob = async job => {
+    if (job.id === failingId && job.phase === 'interrupted') throw new Error('Synthetic shutdown journal failure');
+    return save(job);
+  };
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store,
+    executor: { deploy: (_request, value) => new Promise((_resolve, reject) => {
+      control = value;
+      control.signal.addEventListener('abort', () => {
+        aborted = true;
+        reject(control.signal.reason);
+      }, { once: true });
+    }) },
+  });
+  await engine.init();
+  t.after(async () => {
+    store.saveJob = save;
+    for (const active of engine.active.values()) active.controller.abort(new Error('Fixture cleanup'));
+    await Promise.allSettled([...engine.active.values()].map(active => active.promise));
+  });
+  await engine.submit(deploymentRequest());
+  await until(() => control);
+  failingId = (await engine.submit(deploymentRequest({ requestId: 'fixture-shutdown-queued' }))).id;
+  await assert.rejects(engine.close(), /shutdown journal failure/);
+  assert.equal(aborted, true);
+  assert.equal(engine.active.size, 0);
+  assert.equal(engine.requests.size, 0);
+});
+
+test('shutdown waits for admitted submissions before interrupting the final queue', async () => {
+  const store = new MemoryJobStore(), save = store.saveJob.bind(store);
+  let admit, entered, starts = 0, closed = false;
+  const admission = new Promise(resolve => { admit = resolve; });
+  const ready = new Promise(resolve => { entered = resolve; });
+  store.saveJob = async job => {
+    if (job.phase === 'queued') { entered(); await admission; }
+    return save(job);
+  };
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store, executor: { deploy: async () => { starts++; } },
+  });
+  await engine.init();
+  const submitted = engine.submit(deploymentRequest());
+  await ready;
+  const stopping = engine.close().then(() => { closed = true; });
+  await new Promise(resolve => setImmediate(resolve));
+  const closedBeforeAdmission = closed;
+  admit();
+  const job = await submitted;
+  await stopping;
+  assert.equal(closedBeforeAdmission, false);
+  assert.equal(starts, 0);
+  assert.equal(engine.queue.length, 0);
+  assert.equal(engine.requests.size, 0);
+  assert.equal(store.jobs.get(job.id).state, 'interrupted');
+});
+
+test('retention never erases the only recovery checkpoint for unresolved cleanup', async t => {
+  let current = new Date('2026-01-01T00:00:00.000Z');
+  const store = new MemoryJobStore();
+  const engine = new DeploymentEngine({
+    config: deploymentConfig(), store, now: () => current,
+    executor: { deploy: async (_request, control) => {
+      await control.onEvent('cleanup_failed');
+      throw new Error('Synthetic unresolved cleanup');
+    } },
+  });
+  await engine.init();
+  t.after(() => engine.close());
+  const submitted = await engine.submit(deploymentRequest());
+  await until(() => engine.get(submitted.id).finishedAt);
+  current = new Date('2026-02-01T00:00:00.000Z');
+  await engine.prune();
+  assert.equal(store.jobs.has(submitted.id), true);
+  await engine.event(engine.get(submitted.id), 'recovery_complete');
+  await engine.prune();
+  assert.equal(store.jobs.has(submitted.id), false);
 });

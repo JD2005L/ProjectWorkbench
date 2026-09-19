@@ -5,6 +5,24 @@ import { DeploymentError, fields, record, validateEndpoint } from './protocol.js
 
 export const DEFAULT_DEPLOYMENT_SETTINGS = Object.freeze({ backend: 'local', endpoint: '', credential: '' });
 
+export function validateConsoleUrl(value) {
+  if (typeof value !== 'string' || value.length > 2048 || /[\0-\x20\x7f\\%]/.test(value)) {
+    throw new DeploymentError('The service console URL must be a public HTTPS URL.');
+  }
+  if (value === '') return '';
+  let url;
+  try { url = new URL(value); }
+  catch (error) {
+    if (error instanceof TypeError) throw new DeploymentError('The service console URL must be a public HTTPS URL.');
+    throw error;
+  }
+  if (url.protocol !== 'https:' || url.username || url.password || url.search || url.hash
+      || url.pathname.includes('%') || /\/\.{1,2}(?:\/|$)/.test(value)) {
+    throw new DeploymentError('The service console URL cannot contain credentials, query parameters or traversal.');
+  }
+  return `${url.origin}${url.pathname.replace(/\/$/, '')}`;
+}
+
 function settingsError(message = 'Workbench settings are unreadable. Deployment is disabled until an administrator repairs them.') {
   return new DeploymentError(message, 503, 'deployment_settings_invalid');
 }
@@ -21,12 +39,17 @@ export function savedDeploymentSettings(settings) {
   if (!Object.hasOwn(settings, 'deployment')) return { ...DEFAULT_DEPLOYMENT_SETTINGS };
   const value = settings.deployment;
   try {
-    fields(value, ['backend', 'endpoint', 'credential'], 'deployment settings');
+    fields(value, ['backend', 'endpoint', 'credential', 'consoleUrl'], 'deployment settings');
     if (!['local', 'external'].includes(value.backend)) throw settingsError();
     if (value.endpoint !== undefined && typeof value.endpoint !== 'string') throw settingsError();
     if (value.credential !== undefined && (typeof value.credential !== 'string'
         || (value.credential && !/^enc:[A-Za-z0-9+/]+={0,2}$/.test(value.credential)))) throw settingsError();
     const result = { ...DEFAULT_DEPLOYMENT_SETTINGS, ...value };
+    if (value.consoleUrl !== undefined) {
+      const consoleUrl = validateConsoleUrl(value.consoleUrl);
+      if (consoleUrl) result.consoleUrl = consoleUrl;
+      else delete result.consoleUrl;
+    }
     if (result.endpoint) validateEndpoint(result.endpoint);
     if (result.backend === 'external' && !result.endpoint) throw settingsError('Saved external deployment has no endpoint. An administrator must repair the saved configuration.');
     return result;
@@ -41,7 +64,8 @@ export function savedDeploymentSettings(settings) {
 
 export function publicDeploymentSettings(settings) {
   const value = savedDeploymentSettings(settings);
-  return { backend: value.backend, endpoint: value.endpoint, hasCredential: !!value.credential };
+  return { backend: value.backend, endpoint: value.endpoint, hasCredential: !!value.credential,
+    ...(value.consoleUrl ? { consoleUrl: value.consoleUrl } : {}) };
 }
 
 export function publicWorkbenchSettings(settings) {
@@ -100,7 +124,7 @@ export function createWorkbenchSettingsStore({
   }
 
   async function applyDraft(current, draft, { persist = false } = {}) {
-    fields(draft, persist ? ['backend', 'endpoint', 'token', 'clearToken'] : ['endpoint', 'token'], 'deployment settings update');
+    fields(draft, persist ? ['backend', 'endpoint', 'token', 'clearToken', 'consoleUrl'] : ['endpoint', 'token'], 'deployment settings update');
     const next = { ...savedDeploymentSettings(current) };
     if (persist && Object.hasOwn(draft, 'backend')) {
       if (!['local', 'external'].includes(draft.backend)) throw new DeploymentError('Execution backend must be local or external.');
@@ -110,6 +134,11 @@ export function createWorkbenchSettingsStore({
       if (typeof draft.endpoint !== 'string') throw new DeploymentError('Deployment endpoint must be text.');
       next.endpoint = draft.endpoint.trim();
       if (next.endpoint) next.endpoint = validateEndpoint(next.endpoint).endpoint;
+    }
+    if (persist && Object.hasOwn(draft, 'consoleUrl')) {
+      const consoleUrl = validateConsoleUrl(typeof draft.consoleUrl === 'string' ? draft.consoleUrl.trim() : draft.consoleUrl);
+      if (consoleUrl) next.consoleUrl = consoleUrl;
+      else delete next.consoleUrl;
     }
     if (Object.hasOwn(draft, 'clearToken') && typeof draft.clearToken !== 'boolean') throw new DeploymentError('clearToken must be boolean.');
     if (Object.hasOwn(draft, 'token') && typeof draft.token !== 'string') throw new DeploymentError('Deployment credential must be text.');

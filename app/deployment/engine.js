@@ -5,6 +5,9 @@ import {
 } from './protocol.js';
 import { resolveJobPolicy, validateSettings, validateTargetSettings } from './policy.js';
 import { lineRedactor } from './output.js';
+import {
+  attachBuilderStartupFailure, builderStartupFailure, describeBuilderFailure, validateBuilderStartupFailure,
+} from './builder-diagnostics.js';
 
 function fingerprint(request) {
   return crypto.createHash('sha256').update(JSON.stringify({
@@ -21,6 +24,11 @@ export function deploymentVersion(value) {
     throw new DeploymentError('Deployment returned an invalid version', 502, 'invalid_version');
   }
   return value;
+}
+
+function needsRecovery(job) {
+  return job.phase !== 'recovery_complete' && (job.errorCode === 'cancellation_failed'
+    || job.events.some(event => ['cleanup_deferred', 'cleanup_failed'].includes(event.phase)));
 }
 
 export class DeploymentEngine {
@@ -60,9 +68,7 @@ export class DeploymentEngine {
       this.jobs.set(job.id, job);
       this.idempotency.set(job.requestId, job.id);
       const terminal = TERMINAL_STATES.has(job.state);
-      const cleanupPending = job.phase !== 'recovery_complete' && (job.errorCode === 'cancellation_failed'
-        || job.events.some(event => ['cleanup_deferred', 'cleanup_failed'].includes(event.phase)));
-      if (terminal && cleanupPending) {
+      if (terminal && needsRecovery(job)) {
         if (!this.executor.recover) throw new DeploymentError('Executor cannot recover deferred cleanup', 503, 'recovery_unavailable');
         await this.executor.recover(job, this.store.jobDirectory(job.id));
         await this.event(job, 'recovery_complete');
@@ -274,6 +280,10 @@ export class DeploymentEngine {
       }
       completedVersion = version;
     } catch (error) {
+      const diagnostic = builderStartupFailure(error);
+      if (diagnostic) {
+        job.builderStartupFailure = validateBuilderStartupFailure(diagnostic, job.id, this.config.container?.instanceId);
+      }
       const reason = error?.code === 'cancellation_failed' ? error
         : controller.signal.aborted ? controller.signal.reason : error;
       const code = reason instanceof DeploymentError ? reason.code : 'execution_failed';
@@ -289,7 +299,14 @@ export class DeploymentEngine {
     job.finalizing = true;
     const completed = { ...job, events: [...job.events], state: outcome, version: completedVersion,
       errorCode, finishedAt: this.now().toISOString(), completionOrder: ++this.completionOrder };
-    await this.event(completed, outcome, { code: errorCode });
+    try { await this.event(completed, outcome, { code: errorCode }); }
+    catch (error) {
+      if (completed.builderStartupFailure) {
+        const diagnostic = { ...completed.builderStartupFailure, recordingFailure: describeBuilderFailure(error, 'journal_write') };
+        attachBuilderStartupFailure(error, diagnostic);
+      }
+      throw error;
+    }
     Object.assign(job, completed);
     this.live.delete(job.id);
     this.live.set(job.id, ring);
@@ -320,7 +337,7 @@ export class DeploymentEngine {
   async prune() {
     const cutoff = this.now().getTime() - this.settings.retentionDays * 86400000;
     for (const job of [...this.jobs.values()]) {
-      if (this.active.has(job.id) || !TERMINAL_STATES.has(job.state)
+      if (this.active.has(job.id) || !TERMINAL_STATES.has(job.state) || needsRecovery(job)
           || !job.finishedAt || Date.parse(job.finishedAt) >= cutoff) continue;
       await this.store.removeJob(job.id);
       this.jobs.delete(job.id);
@@ -329,20 +346,34 @@ export class DeploymentEngine {
     }
   }
 
-  async close() {
-    this.stopping = true;
-    for (const id of [...this.queue]) {
-      const job = this.get(id);
-      job.state = 'interrupted';
-      job.errorCode = 'service_stopping';
-      job.finishedAt = this.now().toISOString();
-      await this.event(job, 'interrupted', { code: 'service_stopping' });
-      this.requests.delete(id);
-    }
-    this.queue = [];
-    for (const active of this.active.values()) {
-      active.controller.abort(new DeploymentError('Deployment worker is stopping', 503, 'interrupted'));
-    }
-    await Promise.all([...this.active.values()].map(active => active.promise));
+  close() {
+    if (this.closing) return this.closing;
+    this.closing = (async () => {
+      this.stopping = true;
+      const running = [...this.active.values()];
+      for (const active of running) {
+        active.controller.abort(new DeploymentError('Deployment worker is stopping', 503, 'interrupted'));
+      }
+      // Drain admissions before taking the final queue; persistence failures
+      // must never prevent already-running workers from receiving cancellation.
+      await Promise.all([this.submissions, this.settingsWrites]);
+      const queued = this.queue;
+      this.queue = [];
+      const outcomes = await Promise.allSettled([
+        ...running.map(active => active.promise),
+        ...queued.map(async id => {
+          const job = this.get(id);
+          job.state = 'interrupted';
+          job.errorCode = 'service_stopping';
+          job.finishedAt = this.now().toISOString();
+          this.requests.delete(id);
+          await this.event(job, 'interrupted', { code: 'service_stopping' });
+        }),
+      ]);
+      const errors = outcomes.filter(result => result.status === 'rejected').map(result => result.reason);
+      if (errors.length === 1) throw errors[0];
+      if (errors.length) throw new AggregateError(errors, 'Deployment shutdown could not confirm cleanup');
+    })();
+    return this.closing;
   }
 }

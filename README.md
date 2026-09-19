@@ -56,6 +56,15 @@ After the installer finishes, open the URL it printed and you'll land on the wel
 
 ## Features
 
+### Independent deployment service
+
+The optional external deployment backend packages its engine, authenticated web
+console and job tools as a separate rootless Podman service. PW submits jobs and
+enforces project access as an API client; its LOCAL backend remains the default.
+See [Contained deployment service](docs/container-deployment-service.md) for
+packaging, the minimum necessary host runtime connection and human-run cutover
+gates. Updating PW does not install or activate that service.
+
 ### Per-project browser terminals
 Every project gets its own `ttyd` + persistent `tmux` session backed by Claude Code. The terminal page keeps a tab strip across multiple `tmux` windows so you can run several Claude conversations or build watchers in parallel inside one project.
 

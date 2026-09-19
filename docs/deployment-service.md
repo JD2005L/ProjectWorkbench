@@ -1,5 +1,11 @@
 # Shared host deployment service
 
+> **Legacy native package.** The current contained rollout direction packages
+> engine, administration UI and job tools as an independent Podman service;
+> see `docs/container-deployment-service.md` in the source repository. Do not
+> install this native broker or its host SDK prerequisites for that rollout.
+> This document remains the compatibility reference for native installations.
+
 The optional **EXTERNAL** deployment backend runs as a native host Node.js
 service, independently of the PW process/container. PW remains the authenticated
 UI for submitting jobs, viewing logs, cancelling work, and administering the

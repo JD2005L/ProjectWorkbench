@@ -9,13 +9,13 @@ import { JobStore } from './store.js';
 import { DeploymentEngine } from './engine.js';
 import { HostExecutor } from './executor.js';
 
-function reply(response, status, body) {
+export function reply(response, status, body) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store',
     'X-Content-Type-Options': 'nosniff' });
   response.end(JSON.stringify(body));
 }
 
-async function jsonBody(request, maxBytes = 65536) {
+export async function jsonBody(request, maxBytes = 65536) {
   if (!String(request.headers['content-type'] || '').toLowerCase().startsWith('application/json')) {
     throw new DeploymentError('JSON request content is required', 415, 'invalid_content_type');
   }
@@ -34,18 +34,69 @@ async function jsonBody(request, maxBytes = 65536) {
   catch { throw new DeploymentError('Request is not valid JSON'); }
 }
 
-export function createDeploymentServer({ engine, token }) {
+const sourceUploads = new WeakMap();
+
+export async function dispatchDeploymentApi({ engine, request, response, url }) {
+  const method = request.method;
+  let parts;
+  try { parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent); }
+  catch { throw new DeploymentError('Invalid API path'); }
+  if (parts[0] !== 'v1') throw new DeploymentError('Deployment endpoint not found', 404, 'not_found');
+  if (parts.length === 2 && parts[1] === 'health' && method === 'GET') {
+    reply(response, 200, { ok: true, service: SERVICE_NAME, apiVersion: API_VERSION,
+      ready: !engine.stopping, running: engine.active.size, queued: engine.queue.length });
+  } else if (parts.length === 2 && parts[1] === 'jobs' && method === 'POST') {
+    const count = sourceUploads.get(engine) || 0;
+    if (count >= 2) throw new DeploymentError('Source transfer capacity is busy', 429, 'queue_full');
+    sourceUploads.set(engine, count + 1);
+    try {
+      const job = await engine.submit(await jsonBody(request, MAX_REQUEST_BYTES));
+      reply(response, 202, { ok: true, job });
+    } finally { sourceUploads.set(engine, sourceUploads.get(engine) - 1); }
+  } else if (parts.length === 2 && parts[1] === 'jobs' && method === 'GET') {
+    const jobs = engine.list({
+      project: url.searchParams.get('project') || undefined,
+      target: url.searchParams.get('target') || undefined,
+      limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50,
+    });
+    reply(response, 200, { ok: true, jobs });
+  } else if (parts.length === 3 && parts[1] === 'jobs' && method === 'GET') {
+    reply(response, 200, { ok: true, job: publicJob(engine.get(parts[2])) });
+  } else if (parts.length === 4 && parts[1] === 'jobs' && parts[3] === 'log' && method === 'GET') {
+    reply(response, 200, { ok: true, ...engine.logs(parts[2], Number(url.searchParams.get('after') || 0)) });
+  } else if (parts.length === 4 && parts[1] === 'jobs' && parts[3] === 'cancel' && method === 'POST') {
+    fields(await jsonBody(request), [], 'cancellation');
+    reply(response, 200, { ok: true, job: await engine.cancel(parts[2]) });
+  } else if (parts.length === 4 && parts[1] === 'version' && method === 'GET') {
+    reply(response, 200, { ok: true, ...engine.version(parts[2], parts[3]) });
+  } else if (parts.length === 2 && parts[1] === 'targets' && method === 'GET') {
+    reply(response, 200, { ok: true, targets: engine.targetList() });
+  } else if (parts.length === 4 && parts[1] === 'targets' && method === 'PUT') {
+    const target = await engine.updateTarget(parts[2], parts[3], await jsonBody(request));
+    reply(response, 200, { ok: true, target });
+  } else if (parts.length === 2 && parts[1] === 'settings' && method === 'GET') {
+    reply(response, 200, { ok: true, ...engine.settings });
+  } else if (parts.length === 2 && parts[1] === 'settings' && method === 'PUT') {
+    reply(response, 200, { ok: true, ...await engine.updateSettings(await jsonBody(request)) });
+  } else throw new DeploymentError('Deployment endpoint not found', 404, 'not_found');
+}
+
+export function createDeploymentServer({ engine, token, web, publicHealthPath = '/health' }) {
   if (typeof token !== 'string' || token.length < 32 || token.length > 512) throw new Error('Invalid service credential');
+  if (web !== undefined && typeof web !== 'function') throw new Error('Invalid deployment web handler');
+  if (typeof publicHealthPath !== 'string' || !/^\/[A-Za-z0-9_-]+(?:\/[A-Za-z0-9_-]+)*$/.test(publicHealthPath)) {
+    throw new Error('Invalid public health path');
+  }
   const tokenHash = crypto.createHash('sha256').update(token).digest();
-  let uploads = 0;
   const server = http.createServer({ maxHeaderSize: 16384 }, async (request, response) => {
     try {
       const url = new URL(request.url, 'http://localhost');
       const method = request.method;
-      if ((method === 'GET' || method === 'HEAD') && url.pathname === '/health') {
+      if ((method === 'GET' || method === 'HEAD') && ['/health', publicHealthPath].includes(url.pathname)) {
         reply(response, engine.stopping ? 503 : 200, { ok: !engine.stopping, service: SERVICE_NAME, apiVersion: API_VERSION });
         return;
       }
+      if (web && await web(request, response)) return;
       const authorization = String(request.headers.authorization || '');
       const supplied = authorization.startsWith('Bearer ') ? authorization.slice(7) : '';
       if (!supplied || supplied.length > 512
@@ -54,46 +105,7 @@ export function createDeploymentServer({ engine, token }) {
         reply(response, 401, { ok: false, error: 'Deployment service authentication required', code: 'unauthorized' });
         return;
       }
-      let parts;
-      try { parts = url.pathname.split('/').filter(Boolean).map(decodeURIComponent); }
-      catch { throw new DeploymentError('Invalid API path'); }
-      if (parts[0] !== 'v1') throw new DeploymentError('Deployment endpoint not found', 404, 'not_found');
-      if (parts.length === 2 && parts[1] === 'health' && method === 'GET') {
-        reply(response, 200, { ok: true, service: SERVICE_NAME, apiVersion: API_VERSION,
-          ready: !engine.stopping, running: engine.active.size, queued: engine.queue.length });
-      } else if (parts.length === 2 && parts[1] === 'jobs' && method === 'POST') {
-        if (uploads >= 2) throw new DeploymentError('Source transfer capacity is busy', 429, 'queue_full');
-        uploads++;
-        try {
-          const job = await engine.submit(await jsonBody(request, MAX_REQUEST_BYTES));
-          reply(response, 202, { ok: true, job });
-        } finally { uploads--; }
-      } else if (parts.length === 2 && parts[1] === 'jobs' && method === 'GET') {
-        const jobs = engine.list({
-          project: url.searchParams.get('project') || undefined,
-          target: url.searchParams.get('target') || undefined,
-          limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : 50,
-        });
-        reply(response, 200, { ok: true, jobs });
-      } else if (parts.length === 3 && parts[1] === 'jobs' && method === 'GET') {
-        reply(response, 200, { ok: true, job: publicJob(engine.get(parts[2])) });
-      } else if (parts.length === 4 && parts[1] === 'jobs' && parts[3] === 'log' && method === 'GET') {
-        reply(response, 200, { ok: true, ...engine.logs(parts[2], Number(url.searchParams.get('after') || 0)) });
-      } else if (parts.length === 4 && parts[1] === 'jobs' && parts[3] === 'cancel' && method === 'POST') {
-        fields(await jsonBody(request), [], 'cancellation');
-        reply(response, 200, { ok: true, job: await engine.cancel(parts[2]) });
-      } else if (parts.length === 4 && parts[1] === 'version' && method === 'GET') {
-        reply(response, 200, { ok: true, ...engine.version(parts[2], parts[3]) });
-      } else if (parts.length === 2 && parts[1] === 'targets' && method === 'GET') {
-        reply(response, 200, { ok: true, targets: engine.targetList() });
-      } else if (parts.length === 4 && parts[1] === 'targets' && method === 'PUT') {
-        const target = await engine.updateTarget(parts[2], parts[3], await jsonBody(request));
-        reply(response, 200, { ok: true, target });
-      } else if (parts.length === 2 && parts[1] === 'settings' && method === 'GET') {
-        reply(response, 200, { ok: true, ...engine.settings });
-      } else if (parts.length === 2 && parts[1] === 'settings' && method === 'PUT') {
-        reply(response, 200, { ok: true, ...await engine.updateSettings(await jsonBody(request)) });
-      } else throw new DeploymentError('Deployment endpoint not found', 404, 'not_found');
+      await dispatchDeploymentApi({ engine, request, response, url });
     } catch (error) {
       request.resume();
       if (!response.headersSent && !response.destroyed) {

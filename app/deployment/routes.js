@@ -1,4 +1,4 @@
-import { DeploymentError, fields, projectName, targetName, TERMINAL_STATES } from './protocol.js';
+import { DeploymentError, fields, projectName, targetName, TERMINAL_STATES, consoleSelectorQuery } from './protocol.js';
 import { publicDeploymentSettings } from './settings.js';
 import { deploymentFailure, requireDeploymentOrigin } from './pw.js';
 import { renderDeploymentPage } from './ui.js';
@@ -40,7 +40,18 @@ export function mountDeploymentRoutes(app, {
   // This is deliberately JSON even without a login, and reveals no endpoint,
   // queue, target, account, or credential details.
   if (publicHealth) app.get(`${api}/health`, (_req, res) => sendDeploymentHealth(service, res));
+  app.get(`${base}/deploy-service/connection`, requireAdmin, route(async (_req, res) => {
+    res.type('html').send(renderDeploymentPage({ base, admin: true, connectionOnly: true }));
+  }));
   app.get(`${base}/deploy-service`, requireAuth, route(async (req, res) => {
+    if (req.user.role === 'admin') {
+      const { consoleUrl } = publicDeploymentSettings(await service.settingsStore.load());
+      if (consoleUrl) {
+        const destination = new URL(consoleUrl);
+        destination.search = consoleSelectorQuery(req.query);
+        return res.redirect(303, destination.href);
+      }
+    }
     res.type('html').send(renderDeploymentPage({ base, admin: req.user.role === 'admin', projects: await visible(req) }));
   }));
   app.get(`${api}/backend`, requireAdmin, route(async (_req, res) => {

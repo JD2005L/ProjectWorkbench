@@ -30,7 +30,7 @@ export function validateTargetSettings(value, previous = {}) {
   return result;
 }
 
-function validateResourceNames(value = {}) {
+export function validateResourceNames(value = {}) {
   if (!record(value) || Object.keys(value).length > 1000) fail('Invalid resource name bindings');
   const entries = Object.entries(value);
   const reserved = new Set();
@@ -43,6 +43,20 @@ function validateResourceNames(value = {}) {
     reserved.add(name);
   }
   return Object.fromEntries(entries);
+}
+
+export function validateServicePolicy(value) {
+  const healthHosts = value.healthHosts || ['127.0.0.1', '::1'];
+  if (!Array.isArray(healthHosts) || !healthHosts.length || healthHosts.length > 32
+      || healthHosts.some(host => typeof host !== 'string' || !/^[A-Za-z0-9.:[\]-]{1,253}$/.test(host))) {
+    fail('Invalid health host allowlist');
+  }
+  const adapters = value.adapters || ADAPTERS;
+  if (!Array.isArray(adapters) || !adapters.length || adapters.some(adapter => !ADAPTERS.includes(adapter))) fail('Invalid adapter allowlist');
+  const resourceNames = validateResourceNames(value.resourceNames);
+  const defaults = validateSettings(Object.fromEntries(
+    ['maxConcurrent', 'defaultTimeoutSeconds', 'retentionDays'].filter(key => value[key] !== undefined).map(key => [key, value[key]])));
+  return { healthHosts, adapters, resourceNames, defaults };
 }
 
 export function validateHostConfig(value) {
@@ -68,17 +82,7 @@ export function validateHostConfig(value) {
   }
   const unitName = value.unitName || 'pw-deploy.service';
   if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,100}\.service$/.test(unitName)) fail('Invalid supervisor unit name');
-  const healthHosts = value.healthHosts || ['127.0.0.1', '::1'];
-  if (!Array.isArray(healthHosts) || !healthHosts.length || healthHosts.length > 32
-      || healthHosts.some(host => typeof host !== 'string' || !/^[A-Za-z0-9.:[\]-]{1,253}$/.test(host))) {
-    fail('Invalid health host allowlist');
-  }
-  const adapters = value.adapters || ADAPTERS;
-  if (!Array.isArray(adapters) || !adapters.length || adapters.some(adapter => !ADAPTERS.includes(adapter))) fail('Invalid adapter allowlist');
-  const resourceNames = validateResourceNames(value.resourceNames);
-  const settings = validateSettings(Object.fromEntries(
-    ['maxConcurrent', 'defaultTimeoutSeconds', 'retentionDays'].filter(key => value[key] !== undefined).map(key => [key, value[key]])));
-  return { ...value, unitName, healthHosts, adapters, resourceNames, defaults: settings };
+  return { ...value, unitName, ...validateServicePolicy(value) };
 }
 
 export async function readProtectedFile(file, { secret = false } = {}) {
