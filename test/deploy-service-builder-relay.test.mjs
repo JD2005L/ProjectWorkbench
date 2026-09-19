@@ -103,7 +103,7 @@ def loaded(value, active=True):
     result.update(LoadState="loaded", ActiveState="active" if active else "inactive",
         SubState="running" if active else "dead", Description=r.description(value),
         ControlGroup=r.expected_cgroup(value), MainPID="4321" if active else "0",
-        Transient="yes", Type="exec", KillMode="control-group", Delegate="yes",
+        Transient="yes", Type="notify", NotifyAccess="all", KillMode="control-group", Delegate="yes",
         MemoryMax=str(value["memoryMiB"] * 1048576), TasksMax=str(value["pids"]),
         BindsTo=P["controllerUnit"], After=P["controllerUnit"],
         TimeoutStopUSec="3s", RuntimeMaxUSec="1min", StandardOutput="null", StandardError="null",
@@ -299,7 +299,8 @@ api = r.api_argv(value)
 assert value["unit"] == "pw-deploy-build-64b475cfeaf947838b0b5c2418434c21-123e4567-e89b-42d3-a456-426614174000.service"
 assert "--unit=" + value["unit"] in argv
 assert "--unit=" + value["unit"][:-8] + "-deadline.service" in deadline
-assert "--property=Type=exec" in argv
+assert "--property=Type=notify" in argv
+assert "--property=NotifyAccess=all" in argv
 assert "--property=Slice=app.slice" in argv
 assert "--property=Delegate=yes" in argv
 assert "--property=KillMode=control-group" in argv
@@ -547,6 +548,8 @@ with patch.object(r.os, "O_NOFOLLOW", 0, create=True), patch.object(r.os, "O_CLO
      patch.object(r.os, "mkdir", side_effect=lambda name, *a, **k: events.append(["mkdir", name])), \
      patch.object(r.os, "open", return_value=11), patch.object(r.os, "close"), \
      patch.object(r.os, "write", side_effect=write), patch.object(r.os, "umask"), \
+     patch.dict(r.os.environ, {"NOTIFY_SOCKET":"/run/user/1001/systemd/notify"}, clear=True), \
+     patch.object(r.os, "stat", return_value=types.SimpleNamespace(st_mode=stat.S_IFSOCK|0o700,st_uid=1001)), \
      patch.object(r.os, "execve", side_effect=lambda binary, argv, env: events.append(["exec", binary, argv, env])):
     r.bootstrap(value, A, store)
 assert events[0] == ["private-mounts-validated"]
@@ -558,6 +561,7 @@ assert events[5][3]["XDG_RUNTIME_DIR"] == r.runtime_path(value)
 assert events[5][3]["HOME"] == r.job_home(value) != A.pw_dir
 assert events[5][3]["XDG_CONFIG_HOME"] == r.job_home(value) + "/.config"
 assert events[5][3]["TMPDIR"] == r.transfer_path(value)
+assert events[5][3]["NOTIFY_SOCKET"] == "/run/user/1001/systemd/notify"
 current["path"] = "/wrong-unit"
 error(lambda: r.bootstrap(value, A, store), "privilege_refused")
 store.cancelled_value = True
@@ -568,6 +572,53 @@ error(lambda: r.bootstrap(value, A, store), "cancelled")
 print(json.dumps({"events": events[:5]}))
 `);
   assert.equal(result.events.length, 5);
+});
+
+test('API environment forwards only the approved user manager notification socket', async () => {
+  const result = await fixture(`
+value = record()
+state = {"mode":stat.S_IFSOCK|0o700,"uid":1001}
+@contextlib.contextmanager
+def directory(path, uid, **kwargs):
+    assert path == "/run/user/1001/systemd" and uid == 1001
+    yield 10
+r.directory = directory
+def socket_info(path, **kwargs):
+    assert path == "notify" and kwargs == {"dir_fd":10,"follow_symlinks":False}
+    return types.SimpleNamespace(st_mode=state["mode"],st_uid=state["uid"])
+with patch.object(r.os,"stat",side_effect=socket_info), \
+     patch.dict(r.os.environ,{"NOTIFY_SOCKET":"/run/user/1001/systemd/notify","UNTRUSTED":"not-forwarded"},clear=True):
+    env = r.api_environment(value,A)
+    assert env["NOTIFY_SOCKET"] == "/run/user/1001/systemd/notify" and "UNTRUSTED" not in env
+    assert env["HOME"] == r.job_home(value) and env["TMPDIR"] == r.transfer_path(value)
+    for invalid in ("", "/run/systemd/notify", "/run/user/1002/systemd/notify",
+                    "@/foreign/notify", "/run/user/1001/systemd/../notify"):
+        r.os.environ["NOTIFY_SOCKET"] = invalid
+        error(lambda:r.api_environment(value,A),"resource_not_allowed")
+    del r.os.environ["NOTIFY_SOCKET"]
+    error(lambda:r.api_environment(value,A),"resource_not_allowed")
+    r.os.environ["NOTIFY_SOCKET"] = "/run/user/1001/systemd/notify"
+    for field,invalid in (("mode",stat.S_IFREG|0o700),("mode",stat.S_IFLNK|0o777),("uid",1002)):
+        old = state[field]; state[field] = invalid
+        error(lambda:r.api_environment(value,A),"resource_not_allowed")
+        state[field] = old
+print(json.dumps({"refused":9,"notificationBound":True}))
+`);
+  assert.deepEqual(result, { refused: 9, notificationBound: true });
+});
+
+test('unit ownership requires the notify profile while preserving legacy exec cleanup', async () => {
+  const result = await fixture(`
+value = record()
+props = loaded(value)
+assert r.owned_unit(value,props)
+assert r.owned_unit(value,{**props,"Type":"exec","NotifyAccess":"none"})
+for kind,access in (("notify","none"),("notify","main"),("notify","exec"),
+                    ("exec","all"),("exec","main"),("simple","all")):
+    error(lambda:r.owned_unit(value,{**props,"Type":kind,"NotifyAccess":access}),"resource_not_allowed")
+print(json.dumps({"refused":6,"legacyCleanup":True}))
+`);
+  assert.deepEqual(result, { refused: 6, legacyCleanup: true });
 });
 
 test('portable start model arms the deadline before launching and returns only the fixed protocol', async () => {

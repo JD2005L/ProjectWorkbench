@@ -60,7 +60,7 @@ POLICY_FIELDS = {
 ACTIONS = {'builder_probe', 'job_start', 'job_status', 'job_stop', 'job_remove'}
 UNIT_PROPERTIES = (
     'Id', 'LoadState', 'ActiveState', 'SubState', 'Description', 'ControlGroup',
-    'MainPID', 'Transient', 'Type', 'KillMode', 'Delegate', 'MemoryMax',
+    'MainPID', 'Transient', 'Type', 'NotifyAccess', 'KillMode', 'Delegate', 'MemoryMax',
     'TasksMax', 'BindsTo', 'After', 'TimeoutStopUSec', 'RuntimeMaxUSec',
     'StandardOutput', 'StandardError', 'ExecStart', 'Job',
 )
@@ -875,7 +875,8 @@ def owned_unit(record, properties):
             ('active', 'activating', 'deactivating', 'inactive', 'failed'),
             'Owned unit process state is incomplete')
     require(properties['ControlGroup'] in ('', expected_cgroup(record)) and
-            properties['Type'] == 'exec' and properties['KillMode'] == 'control-group' and
+            (properties['Type'], properties['NotifyAccess']) in (('notify', 'all'), ('exec', 'none')) and
+            properties['KillMode'] == 'control-group' and
             properties['Delegate'] == 'yes' and properties['MemoryMax'] == str(record['memoryMiB'] * 1048576) and
             properties['TasksMax'] == str(record['pids']) and
             record['policy']['controllerUnit'] in properties['BindsTo'].split() and
@@ -960,7 +961,7 @@ def service_argv(record, now_ms=None):
     remaining = record['deadlineAt'] - now_ms
     require(remaining > 0, 'Job deadline has elapsed', 'cancelled')
     properties = [
-        'Type=exec', 'Slice=app.slice', 'Delegate=yes', 'KillMode=control-group',
+        'Type=notify', 'NotifyAccess=all', 'Slice=app.slice', 'Delegate=yes', 'KillMode=control-group',
         'TimeoutStartSec=10s', 'TimeoutStopSec=3s', 'RuntimeMaxSec={:.3f}s'.format(remaining / 1000),
         'MemoryMax=' + str(record['memoryMiB'] * 1048576), 'TasksMax=' + str(record['pids']),
         'NoNewPrivileges=no', 'Restart=no', 'StandardOutput=null', 'StandardError=null',
@@ -1265,6 +1266,25 @@ def load_internal(path, nonce, cleanup=False):
     return record, account
 
 
+def api_environment(record, account):
+    env = runtime_environment(account)
+    env['HOME'] = job_home(record)
+    env['XDG_CONFIG_HOME'] = job_home(record) + '/.config'
+    env['XDG_RUNTIME_DIR'] = runtime_path(record)
+    env['TMPDIR'] = transfer_path(record)
+    notify_directory = '/run/user/{}/systemd'.format(record['uid'])
+    notify_socket = notify_directory + '/notify'
+    require(os.environ.get('NOTIFY_SOCKET') == notify_socket,
+            'User manager notification socket does not match', 'resource_not_allowed')
+    with directory(notify_directory, record['uid']) as fd:
+        info = os.stat('notify', dir_fd=fd, follow_symlinks=False)
+        require(stat.S_ISSOCK(info.st_mode) and info.st_uid == record['uid'],
+                'User manager notification socket is unsafe', 'resource_not_allowed')
+    # Rootless Podman reports its re-executed server's MAINPID and READY here.
+    env['NOTIFY_SOCKET'] = notify_socket
+    return env
+
+
 def bootstrap(record, account, store):
     check_cancelled()
     require(record['phase'] == 'launching' and not store.cancelled() and time.time() * 1000 < record['deadlineAt'],
@@ -1293,11 +1313,7 @@ def bootstrap(record, account, store):
     require(process_cgroup('self') == expected_cgroup(record) + '/supervisor', 'Supervisor cgroup move failed')
     require(not store.cancelled() and time.time() * 1000 < record['deadlineAt'], 'Job entry was cancelled or expired', 'cancelled')
     check_cancelled()
-    env = runtime_environment(account)
-    env['HOME'] = job_home(record)
-    env['XDG_CONFIG_HOME'] = job_home(record) + '/.config'
-    env['XDG_RUNTIME_DIR'] = runtime_path(record)
-    env['TMPDIR'] = transfer_path(record)
+    env = api_environment(record, account)
     os.umask(0o077)
     os.execve(PODMAN_BIN, api_argv(record), env)
 

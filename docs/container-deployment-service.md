@@ -211,6 +211,13 @@ Podman API process, writable image/container store and private runtime
 directory. The approved shared cache is only an additional read-only image
 store. The bootstrap moves its own process into a supervisor subgroup; every
 worker, image build and smoke container is assigned an explicit child cgroup.
+The API unit uses `Type=notify` and `NotifyAccess=all`: rootless Podman may
+re-execute a child server, which reports `MAINPID` and `READY` to systemd.
+Bootstrap forwards only the approved account's owned
+`/run/user/<uid>/systemd/notify` socket. Readiness still requires the Unix socket
+peer to equal systemd's actual `MainPID`; it does not accept arbitrary same-user
+or descendant processes. Legacy `Type=exec` units remain eligible for guarded
+stop/recovery, but new units wait for the server's notification.
 The unit's whole-cgroup stop, independent runtime deadline and
 `BindsTo`/`After` relationship to the controller cover API-side pull/copy/commit
 work as well as Buildah RUN processes. Project code receives no host cgroup,
