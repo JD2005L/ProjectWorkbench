@@ -105,6 +105,24 @@ def loaded(value, active=True):
         ExecStart="{ path=/usr/bin/python3 ; argv[]=" + " ".join([r.PYTHON_BIN, "-I", r.RELAY_BIN,
             "--unit-entry", r.metadata_path(value), value["nonce"]]) + " ; ignore_errors=no ; }")
     return result
+def absent_properties(value):
+    result = unloaded(value)
+    result.update(SubState="dead", Description=value["unit"], Transient="no", Type="simple",
+        KillMode="control-group", Delegate="no", MemoryMax="infinity", TasksMax="infinity",
+        TimeoutStopUSec="1min 30s", RuntimeMaxUSec="infinity",
+        StandardOutput="journal", StandardError="inherit")
+    del result["ExecStart"]
+    return result
+def raw_unit_query(unit, response, returncode=0, properties=r.UNIT_PROPERTIES):
+    if isinstance(response, dict):
+        response = "".join(key + "=" + value + "\n" for key, value in response.items()).encode()
+    def control(env, *args, **kwargs):
+        assert env == {}
+        assert args == ("show", unit, "--property=" + ",".join(properties))
+        assert kwargs == {"ignore_cancel": True}
+        calls.append(list(args))
+        return subprocess.CompletedProcess(args, returncode, response)
+    r.systemctl = control
 def lifecycle():
     store = Store()
     kernel = {"unit": None, "populated": False, "timer": False}
@@ -335,6 +353,173 @@ for uid in (0,-1):
 print(json.dumps({"refused":len(invalid_units)+7}))
 `);
   assert.equal(result.refused, 11);
+});
+
+test('raw systemd absent-unit output preserves omitted ExecStart and still proves the whole cgroup stopped', async () => {
+  const result = await fixture(`
+value = record(); value["phase"] = "launching"
+kernel_reads = []
+def empty(candidate):
+    assert candidate is value
+    kernel_reads.append(r.expected_cgroup(candidate))
+    return False
+r.cgroup_populated = empty
+for returncode in (0, 1, 4):
+    for settled, observed in ((True, False), (False, True)):
+        value.update(launchSettled=settled, observedUnit=observed)
+        for explicit_empty in (False, True):
+            props = absent_properties(value)
+            if explicit_empty:
+                props.update(ExecStart="", Job="0")
+            before = copy.deepcopy(props)
+            raw_unit_query(value["unit"], props, returncode)
+            decoded = r.show_unit({}, value["unit"])
+            assert decoded == before and props == before
+            assert ("ExecStart" in decoded) == explicit_empty
+            assert r.prove_stopped(value, {}) is True
+assert len(kernel_reads) == 12
+assert all(path == r.expected_cgroup(value) for path in kernel_reads)
+assert all(call[0] == "show" for call in calls)
+print(json.dumps({"proofs": len(kernel_reads)}))
+`);
+  assert.equal(result.proofs, 12);
+});
+
+test('raw systemd property parsing refuses every other omission and malformed response', async () => {
+  const result = await fixture(String.raw`
+value = record()
+props = absent_properties(value)
+failures = []
+for key in props:
+    missing = {name: text for name, text in props.items() if name != key}
+    raw_unit_query(value["unit"], missing)
+    failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+    assert failure["message"] == "User manager did not return complete unit properties"
+    failures.append(failure)
+for state in ("loaded", "masked", "error", "", "not_found", "not-found "):
+    raw_unit_query(value["unit"], {**props, "LoadState": state})
+    failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+    assert failure["message"] == "User manager did not return complete unit properties"
+    failures.append(failure)
+body = "".join(key + "=" + text + "\n" for key,text in props.items()).encode()
+for suffix in (b"LoadState=not-found\n", b"ExecStart=\nExecStart=\n", b"ExecStartEx=\n",
+               b"MainPID\n", b"\n", b"=0\n"):
+    raw_unit_query(value["unit"], body + suffix)
+    failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+    assert failure["message"] == "User manager returned unexpected properties"
+    failures.append(failure)
+raw_unit_query(value["unit"], b"\xff")
+failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+assert failure["message"] == "User manager returned invalid property data"
+failures.append(failure)
+raw_unit_query(value["unit"], b"")
+failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+assert failure["message"] == "User manager did not return complete unit properties"
+failures.append(failure)
+print(json.dumps({"refused": len(failures), "required": len(props)}))
+`);
+  assert.equal(result.refused, result.required + 14);
+});
+
+test('raw systemd exit codes and loaded-unit ownership remain strict', async () => {
+  const result = await fixture(`
+value = record(); value.update(phase="launching", launchSettled=True)
+props = loaded(value, False)
+r.cgroup_populated = lambda candidate: False
+raw_unit_query(value["unit"], props)
+assert r.prove_stopped(value, {}) is True
+for returncode in (1, 4):
+    for state in ("loaded", "error", ""):
+        raw_unit_query(value["unit"], {**props, "LoadState": state}, returncode)
+        failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+        assert failure["message"] == "User manager query failed"
+for returncode in (-9, 2, 3, 5):
+    raw_unit_query(value["unit"], absent_properties(value), returncode)
+    failure = error(lambda:r.show_unit({},value["unit"]), "process_failed")
+    assert failure["message"] == "User manager could not be queried"
+for returncode in (0, 1, 4):
+    raw_unit_query(value["unit"], {key:text for key,text in props.items() if key != "ExecStart"}, returncode)
+    failure = error(lambda:r.prove_stopped(value,{}), "process_failed")
+    assert failure["message"] == "User manager did not return complete unit properties"
+changes = [
+ {"Id":"foreign.service"}, {"Description":"foreign"}, {"Transient":"no"},
+ {"ControlGroup":"/foreign"}, {"Type":"simple"}, {"KillMode":"process"}, {"Delegate":"no"},
+ {"MemoryMax":"infinity"}, {"TasksMax":"infinity"}, {"BindsTo":""}, {"After":""},
+ {"StandardOutput":"journal"}, {"StandardError":"journal"}, {"TimeoutStopUSec":"90s"},
+ {"RuntimeMaxUSec":"infinity"}, {"ExecStart":""}, {"ExecStart":"/bin/true"},
+]
+for change in changes:
+    raw_unit_query(value["unit"], {**props, **change})
+    error(lambda:r.prove_stopped(value,{}), "resource_not_allowed")
+assert all(call[0] == "show" for call in calls)
+print(json.dumps({"loadedGuards":len(changes), "exitAndPresenceGuards":13}))
+`);
+  assert.deepEqual(result, { loadedGuards: 17, exitAndPresenceGuards: 13 });
+});
+
+test('raw systemd absent-unit omission cannot bypass launch, identity, state or population guards', async () => {
+  const result = await fixture(`
+value = record(); value.update(phase="launching", launchSettled=True)
+props = absent_properties(value)
+kernel_reads = []
+def empty(candidate):
+    kernel_reads.append(candidate["unit"])
+    return False
+r.cgroup_populated = empty
+raw_unit_query(value["unit"], {**props, "Id":"foreign.service"})
+failure = error(lambda:r.prove_stopped(value,{}), "resource_not_allowed")
+assert failure["message"] == "Unit identity does not match"
+changes = [
+ {"ActiveState":"active"}, {"ActiveState":"activating"}, {"ActiveState":"failed"},
+ {"MainPID":"4321"}, {"MainPID":"-1"}, {"MainPID":""}, {"MainPID":"null"}, {"MainPID":"00"},
+ {"ControlGroup":r.expected_cgroup(value)}, {"ControlGroup":"/foreign"},
+ {"Job":"17"}, {"Job":"17 /org/freedesktop/systemd1/job/17"},
+]
+for change in changes:
+    raw_unit_query(value["unit"], {**props, **change})
+    failure = error(lambda:r.prove_stopped(value,{}), "process_failed")
+    assert failure["message"] == "Unloaded unit state is uncertain"
+value.update(launchSettled=False, observedUnit=False)
+raw_unit_query(value["unit"], props)
+failure = error(lambda:r.prove_stopped(value,{}), "process_failed")
+assert failure["message"] == "Start transaction is unresolved; an unloaded unit is not stop proof"
+assert not kernel_reads
+value["launchSettled"] = True
+r.cgroup_populated = lambda candidate: True
+failure = error(lambda:r.prove_stopped(value,{}), "process_failed")
+assert failure["message"] == "Owned cgroup still contains processes"
+print(json.dumps({"refused":len(changes)+3}))
+`);
+  assert.equal(result.refused, 15);
+});
+
+test('raw systemd deadline and custom property queries never inherit the ExecStart omission exception', async () => {
+  const result = await fixture(`
+value = record()
+timer = r.deadline_unit(value)[:-8] + ".timer"
+properties = ("Id","LoadState","ActiveState","Description","Transient","Unit")
+props = {"Id":timer, "LoadState":"loaded", "ActiveState":"active",
+         "Description":r.description(value,True), "Transient":"yes", "Unit":r.deadline_unit(value)}
+raw_unit_query(timer, props, properties=properties)
+r.check_deadline_timer(value,{})
+failures = []
+for state in ("loaded", "not-found"):
+    for key in props:
+        missing = {name:text for name,text in {**props,"LoadState":state}.items() if name != key}
+        raw_unit_query(timer, missing, properties=properties)
+        failure = error(lambda:r.check_deadline_timer(value,{}), "process_failed")
+        assert failure["message"] == "User manager did not return complete unit properties"
+        failures.append(failure)
+raw_unit_query(timer, {**props,"ExecStart":""}, properties=properties)
+failure = error(lambda:r.check_deadline_timer(value,{}), "process_failed")
+assert failure["message"] == "User manager returned unexpected properties"
+custom = ("Id","LoadState","ExecStart")
+raw_unit_query(value["unit"], {"Id":value["unit"],"LoadState":"not-found"}, properties=custom)
+failure = error(lambda:r.show_unit({},value["unit"],custom), "process_failed")
+assert failure["message"] == "User manager did not return complete unit properties"
+print(json.dumps({"requiredFieldRefusals":len(failures), "customRefused":True}))
+`);
+  assert.deepEqual(result, { requiredFieldRefusals: 12, customRefused: true });
 });
 
 test('portable bootstrap model moves to supervisor before exec and creates the payload subgroup', async () => {

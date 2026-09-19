@@ -437,7 +437,11 @@ def show_unit(env, unit, properties=UNIT_PROPERTIES):
         key, sep, value = line.partition('=')
         require(sep and key in properties and key not in values, 'User manager returned unexpected properties')
         values[key] = value
-    require(set(values) == set(properties), 'User manager did not return complete unit properties')
+    missing = set(properties) - values.keys()
+    # systemctl prints no line for an unloaded unit's empty ExecStart array.
+    require(not missing or (properties == UNIT_PROPERTIES and values.get('LoadState') == 'not-found'
+                            and missing == {'ExecStart'}),
+            'User manager did not return complete unit properties')
     if result.returncode:
         require(values.get('LoadState') == 'not-found', 'User manager query failed')
     return values
