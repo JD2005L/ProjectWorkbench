@@ -138,6 +138,18 @@ test('a supervised job cannot use the shared API before start or after confirmed
   assert.throws(() => builder.socket(job), error => error.code === 'builder_unavailable');
 });
 
+test('image builds use a dedicated leaf below the owned payload cgroup', async () => {
+  const fake = transport(handler), builder = new SupervisedBuilder(config, { ...fake, now: () => 5000 });
+  const job = control({ builderJob: true });
+  assert.deepEqual(builder.cgroupArgs({}, { build: true }), []);
+  assert.throws(() => builder.cgroupArgs(job, { build: true }), error => error.code === 'builder_unavailable');
+  await builder.start(job);
+  assert.deepEqual(builder.cgroupArgs(job), [`--cgroup-parent=${cgroup}`]);
+  assert.deepEqual(builder.cgroupArgs(job, { build: true }), [`--cgroup-parent=${cgroup}/build`]);
+  await builder.stop(jobId);
+  assert.throws(() => builder.cgroupArgs(job, { build: true }), error => error.code === 'builder_unavailable');
+});
+
 test('expired jobs are rejected without opening a connector or reserving a backend', async () => {
   const fake = transport(handler), builder = new SupervisedBuilder(config, { ...fake, now: () => 5000 });
   await assert.rejects(builder.start(control({ deadlineAt: 4999 })), error => error.code === 'timeout');

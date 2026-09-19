@@ -381,7 +381,7 @@ export class ContainerExecutor {
   async buildFromTar(control, tarBuffer, buildArgs) {
     control.signal.throwIfAborted();
     this.builds.lease(control.jobId);
-    await this.builderRaw(control, ['build', ...buildArgs, ...this.builds.cgroupArgs(control), '-'], {
+    await this.builderRaw(control, ['build', ...buildArgs, ...this.builds.cgroupArgs(control, { build: true }), '-'], {
       input: tarBuffer, timeoutMs: this.remainingDeadlineMs(control),
     });
   }
@@ -400,7 +400,7 @@ export class ContainerExecutor {
       env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
     });
     copy.stdin.end();
-    const build = spawnChild(PODMAN, this.podmanRemoteArgs(['build', ...buildArgs, ...this.builds.cgroupArgs(control), '-'], control), {
+    const build = spawnChild(PODMAN, this.podmanRemoteArgs(['build', ...buildArgs, ...this.builds.cgroupArgs(control, { build: true }), '-'], control), {
       env: MINIMAL_ENV, spawnProcess: this.spawnProcess,
     });
     try {

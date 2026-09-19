@@ -211,6 +211,10 @@ Podman API process, writable image/container store and private runtime
 directory. The approved shared cache is only an additional read-only image
 store. The bootstrap moves its own process into a supervisor subgroup; every
 worker, image build and smoke container is assigned an explicit child cgroup.
+Podman workers use the unit's `payload` cgroup as their parent; Buildah RUN
+processes use a separate `payload/build` leaf. This avoids cgroup v2's
+no-internal-process rule after a dependency worker enables subtree controllers
+on `payload`, while keeping both execution paths under the same owned unit.
 The API unit uses `Type=notify` and `NotifyAccess=all`: rootless Podman may
 re-execute a child server, which reports `MAINPID` and `READY` to systemd.
 Bootstrap forwards only the approved account's owned

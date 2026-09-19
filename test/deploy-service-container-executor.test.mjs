@@ -996,8 +996,10 @@ test('podman() builds, transfers and promotes a candidate image when there is no
     assert.equal(call.args[2], `unix:///run/pw-deploy-build/${control.jobId}/api.sock`,
       'Podman jobs must never use the shared worker/cache API');
     if (['build', 'run', 'create'].includes(stripRemote(call.args)[0])) {
-      assert.ok(call.args.includes(`--cgroup-parent=/user.slice/user-2000.slice/user@2000.service/app.slice/`
-        + `${builderUnitName(config.container.instanceId, control.jobId)}/payload`));
+      const leaf = stripRemote(call.args)[0] === 'build' ? '/build' : '';
+      assert.deepEqual(call.args.filter(arg => arg.startsWith('--cgroup-parent=')),
+        [`--cgroup-parent=/user.slice/user-2000.slice/user@2000.service/app.slice/`
+          + `${builderUnitName(config.container.instanceId, control.jobId)}/payload${leaf}`]);
     }
   }
   assert.deepEqual(builder.controlCalls.map(call => call.action), ['job_start', 'job_stop', 'job_remove']);
@@ -1062,6 +1064,14 @@ test('podman() installs dependencies in a separate disposable worker before buil
   const cpArgs = calls.map(call => stripRemote(call.args)).find(args => args[0] === 'cp'
     && args[1] === `${dependencyName}:/workspace/source/.` && args[2] === '-');
   assert.ok(cpArgs, 'expected the build context to stream directly from the dependency container via `podman cp`, never local disk');
+  const payload = `/user.slice/user-2000.slice/user@2000.service/app.slice/`
+    + `${builderUnitName(executor.config.container.instanceId, control.jobId)}/payload`;
+  const buildArgs = calls.map(call => stripRemote(call.args)).find(args => args[0] === 'build');
+  assert.deepEqual(buildArgs.filter(arg => arg.startsWith('--cgroup-parent=')), [`--cgroup-parent=${payload}/build`],
+    'Buildah RUN must not join the payload parent after the dependency container enabled its subtree controllers');
+  for (const call of calls.filter(call => call.command === PODMAN && ['create', 'run'].includes(stripRemote(call.args)[0]))) {
+    assert.deepEqual(call.args.filter(arg => arg.startsWith('--cgroup-parent=')), [`--cgroup-parent=${payload}`]);
+  }
   assert.deepEqual(builder.controlCalls.map(call => call.action), ['job_start', 'job_stop', 'job_remove']);
   assert.equal(calls.some(call => call.command === PODMAN && stripRemote(call.args)[0] === 'rm'), false,
     'private Buildah/container storage is removed only after whole-backend stop');

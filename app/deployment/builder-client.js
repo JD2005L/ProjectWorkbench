@@ -138,9 +138,12 @@ export class SupervisedBuilder {
     return this.config.container.builderSocket;
   }
 
-  cgroupArgs(control) {
+  cgroupArgs(control, { build = false } = {}) {
     if (!control?.builderJob && !this.has(control?.jobId)) return [];
-    return [`--cgroup-parent=${this.lease(control.jobId).cgroupParent}`];
+    // Buildah puts RUN processes directly in this path; Podman run creates
+    // children and enables subtree controllers, making their parent non-leaf.
+    const parent = this.lease(control.jobId).cgroupParent;
+    return [`--cgroup-parent=${parent}${build ? '/build' : ''}`];
   }
 
   async stop(jobId) {
