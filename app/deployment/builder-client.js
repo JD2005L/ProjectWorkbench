@@ -1,6 +1,10 @@
 import path from 'node:path';
 import { DeploymentError } from './protocol.js';
 import { connectorRequest, connectorSshArgv, nextConnectorRequestId } from './connector-client.js';
+import {
+  attachBuilderStartupFailure, describeBuilderFailure, exchangeStartupFailure,
+  relayStartupFailure, validateRelayStartupFailure,
+} from './builder-diagnostics.js';
 
 const UUID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 
@@ -101,7 +105,22 @@ export class SupervisedBuilder {
       control.signal.throwIfAborted();
       return state.lease;
     } catch (error) {
+      if (!error || (typeof error !== 'object' && typeof error !== 'function')) {
+        error = new DeploymentError('Private builder startup failed', 503, 'execution_failed');
+      }
+      let relay = relayStartupFailure(error);
+      if (relay) {
+        try { relay = validateRelayStartupFailure(relay, control.jobId, this.config.container.instanceId); }
+        catch (invalid) { error = invalid; relay = null; }
+      }
+      state.startupFailure = {
+        version: 1, instanceId: this.config.container.instanceId, jobId: control.jobId,
+        primary: describeBuilderFailure(error, 'client_start'),
+        relay: relay ?? null, exchange: exchangeStartupFailure(error) ?? null,
+        cleanup: [], recordingFailure: null,
+      };
       await this.stop(control.jobId);
+      attachBuilderStartupFailure(error, state.startupFailure);
       throw error;
     }
   }
@@ -137,15 +156,25 @@ export class SupervisedBuilder {
       try {
         await this.request('job_stop', jobId, {}, AbortSignal.timeout(30000));
         state.stopped = true;
+        if (state.startupFailure) this.recordStartupStop(state, { outcome: 'stopped', failure: null });
       } catch (error) {
         const failure = new DeploymentError('Could not confirm the isolated build backend stopped', 503, 'cancellation_failed');
         failure.cause = error;
+        if (state.startupFailure) {
+          this.recordStartupStop(state, { outcome: 'failed', failure: describeBuilderFailure(error, 'client_stop') });
+          attachBuilderStartupFailure(failure, state.startupFailure);
+        }
         throw failure;
       }
     })();
     state.stopping = stopping;
     try { await stopping; }
     finally { if (state.stopping === stopping) delete state.stopping; }
+  }
+
+  recordStartupStop(state, outcome) {
+    // Preserve the first stop outcome and the latest retry without an unbounded audit.
+    state.startupFailure.cleanup.splice(1, state.startupFailure.cleanup.length > 1 ? 1 : 0, outcome);
   }
 
   async remove(jobId, signal = AbortSignal.timeout(30000)) {

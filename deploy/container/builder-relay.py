@@ -65,12 +65,70 @@ UNIT_PROPERTIES = (
     'StandardOutput', 'StandardError', 'ExecStart', 'Job',
 )
 TERMINATED = False
+STARTUP_DIAGNOSTIC_FILE = 'startup-failure.json'
+STARTUP_STAGES = {
+    'prepare_paths', 'persist_prepared', 'deadline_create', 'deadline_verify',
+    'launch_parameters', 'persist_launch', 'launch', 'persist_launch_result',
+    'launch_result', 'startup_deadline', 'unit_query', 'unit_ownership',
+    'persist_observation', 'unit_state', 'api_readiness', 'persist_ready',
+}
+STARTUP_CLEANUP_STAGES = {'pending', 'cancel', 'stop', 'persist_stopped'}
+DIAGNOSTIC_CODES = {
+    'invalid_request', 'action_not_allowed', 'resource_not_allowed', 'resource_conflict',
+    'runtime_policy_invalid', 'process_failed', 'privilege_refused', 'cancelled', 'os_error',
+}
+DIAGNOSTIC_RULES = {
+    'Builder connector was cancelled': 'cancelled',
+    'Helper deadline exceeded; manager outcome must be reconciled': 'helper_deadline',
+    'Helper output exceeded its limit; manager outcome must be reconciled': 'helper_output',
+    'Helper did not exit; manager outcome must be reconciled': 'helper_exit',
+    'Helper could not be reaped; resources are retained': 'helper_unreaped',
+    'User manager could not be queried': 'manager_query',
+    'User manager returned invalid property data': 'manager_encoding',
+    'User manager returned unexpected properties': 'manager_properties',
+    'User manager did not return complete unit properties': 'manager_incomplete',
+    'User manager query failed': 'manager_exit',
+    'Unit identity does not match': 'unit_identity',
+    'Unloaded unit state is uncertain': 'unit_absence',
+    'Refusing a non-owned unit': 'unit_owner',
+    'Reserved job unexpectedly has a unit': 'unit_reserved',
+    'Owned unit process state is incomplete': 'unit_process',
+    'Owned unit confinement properties do not match': 'unit_confinement',
+    'Owned unit entrypoint does not match': 'unit_entrypoint',
+    'Unrecognized manager duration': 'unit_duration',
+    'Start transaction is unresolved; an unloaded unit is not stop proof': 'launch_unresolved',
+    'Owned unit has not finished stopping': 'unit_stopping',
+    'Owned cgroup still contains processes': 'cgroup_populated',
+    'User manager refused the owned unit stop': 'stop_refused',
+    'Owned unit stop could not be confirmed; resources are retained': 'stop_unconfirmed',
+    'Private API unit could not be started': 'launch_failed',
+    'Private API unit disappeared': 'unit_disappeared',
+    'Private API unit stopped during startup': 'unit_stopped',
+    'Private API readiness timed out': 'api_timeout',
+    'API unit is not running': 'api_state',
+    'Owned API process disappeared': 'api_gone',
+    'Kernel process identity is incomplete': 'api_identity',
+    'Bootstrap process escaped its delegated cgroup': 'bootstrap_cgroup',
+    'API process escaped its supervisor cgroup': 'api_cgroup',
+    'API executable or storage options do not match': 'api_command',
+    'API socket has unsafe ownership or mode': 'api_socket',
+    'API socket peer does not match the owned unit': 'api_peer',
+    'API readiness response timed out': 'api_response_timeout',
+    'API readiness response exceeded its limit': 'api_response_size',
+    'API readiness did not return bounded HTTP/1.0 JSON': 'api_http',
+    'API did not return its host/store identity': 'api_info',
+    'API store or rootless cgroup identity does not match': 'api_store',
+    'API process changed during readiness': 'api_pid_changed',
+    'Metadata write failed': 'metadata_write',
+}
+DIAGNOSTIC_RULE_NAMES = set(DIAGNOSTIC_RULES.values()) | {'relay_refusal', 'os_error'}
 
 
 class RelayError(Exception):
     def __init__(self, message, code='process_failed'):
         super().__init__(message)
         self.code = code
+        self.rule = DIAGNOSTIC_RULES.get(message, 'relay_refusal') if isinstance(message, str) else 'relay_refusal'
 
 
 class CommandUncertain(RelayError):
@@ -92,6 +150,54 @@ def fail(message, code='process_failed'):
 def require(condition, message, code='process_failed'):
     if not condition:
         fail(message, code)
+
+
+def diagnostic_failure(stage, error):
+    code = error.code if isinstance(error, RelayError) else 'os_error'
+    rule = error.rule if isinstance(error, RelayError) else 'os_error'
+    number = error.errno if isinstance(error, OSError) else None
+    return {
+        'stage': stage,
+        'code': code if isinstance(code, str) and code in DIAGNOSTIC_CODES else 'process_failed',
+        'rule': rule if isinstance(rule, str) and rule in DIAGNOSTIC_RULE_NAMES else 'relay_refusal',
+        'errno': number if type(number) is int and 0 < number <= 4095 else None,
+    }
+
+
+def validate_startup_failure(value, policy, job_id):
+    def check(condition):
+        require(condition, 'Invalid startup failure diagnostic', 'resource_not_allowed')
+
+    def failure(item, stages):
+        check(isinstance(item, dict) and set(item) == {'stage', 'code', 'rule', 'errno'})
+        check(isinstance(item['stage'], str) and item['stage'] in stages and
+              isinstance(item['code'], str) and item['code'] in DIAGNOSTIC_CODES and
+              isinstance(item['rule'], str) and item['rule'] in DIAGNOSTIC_RULE_NAMES)
+        check(item['errno'] is None or (type(item['errno']) is int and 0 < item['errno'] <= 4095))
+
+    check(isinstance(value, dict) and set(value) == {
+        'version', 'instanceId', 'jobId', 'primary', 'cleanup', 'recordingErrors'})
+    check(type(value['version']) is int and value['version'] == 1 and
+          value['instanceId'] == policy['instanceId'] and value['jobId'] == job_id)
+    failure(value['primary'], STARTUP_STAGES)
+    cleanup = value['cleanup']
+    check(isinstance(cleanup, dict) and set(cleanup) == {'stage', 'outcome', 'failure'})
+    check(isinstance(cleanup['stage'], str) and cleanup['stage'] in STARTUP_CLEANUP_STAGES)
+    check(cleanup['outcome'] in ('pending', 'stopped', 'failed'))
+    if cleanup['outcome'] == 'failed':
+        check(cleanup['stage'] != 'pending')
+        failure(cleanup['failure'], {cleanup['stage']})
+    else:
+        check(cleanup['failure'] is None and cleanup['stage'] ==
+              ('pending' if cleanup['outcome'] == 'pending' else 'persist_stopped'))
+    check(isinstance(value['recordingErrors'], list) and len(value['recordingErrors']) <= 2)
+    seen = set()
+    for item in value['recordingErrors']:
+        failure(item, {'diagnostic_initial', 'diagnostic_final'})
+        check(item['stage'] not in seen)
+        seen.add(item['stage'])
+    check(len(json.dumps(value, separators=(',', ':'), allow_nan=False).encode('utf-8')) <= 4096)
+    return value
 
 
 def check_cancelled():
@@ -597,6 +703,19 @@ class JobStore:
         with directory(self.path, self.account.pw_uid, private=True) as fd:
             write_json_at(fd, 'job.json', record)
 
+    def save_startup_failure(self, value, initial=False):
+        validate_startup_failure(value, self.policy, self.job_id)
+        with directory(self.path, self.account.pw_uid, private=True) as fd:
+            try:
+                previous = read_json_at(fd, STARTUP_DIAGNOSTIC_FILE, self.account.pw_uid)
+            except FileNotFoundError:
+                previous = None
+            if previous is not None:
+                validate_startup_failure(previous, self.policy, self.job_id)
+                require(not initial and previous['primary'] == value['primary'],
+                        'Startup diagnostic identity changed', 'resource_conflict')
+            write_json_at(fd, STARTUP_DIAGNOSTIC_FILE, value)
+
     def cancel(self):
         with directory(self.path, self.account.pw_uid, private=True) as fd:
             try:
@@ -975,52 +1094,98 @@ def start_job(policy, account, env, request, store):
         for key in ('deadlineAt', 'memoryMiB', 'pids'):
             record[key] = request[key]
         store.save(record)
+        stage = 'prepare_paths'
         try:
             store.prepare_paths(record)
             record['phase'] = 'prepared'
+            stage = 'persist_prepared'
             store.save(record)
             require(not store.cancelled(), 'Job was cancelled', 'cancelled')
             check_cancelled()
+            stage = 'deadline_create'
             result = run_command(deadline_argv(record), env)
             require(result.returncode == 0, 'Independent deadline timer could not be created')
+            stage = 'deadline_verify'
             check_deadline_timer(record, env)
             require(not store.cancelled(), 'Job was cancelled', 'cancelled')
+            stage = 'launch_parameters'
             argv = service_argv(record)
             record['phase'] = 'launching'
+            stage = 'persist_launch'
             store.save(record)
+            stage = 'launch'
             result = run_command(argv, env)
             record['launchSettled'] = True
+            stage = 'persist_launch_result'
             store.save(record)
+            stage = 'launch_result'
             require(result.returncode == 0, 'Private API unit could not be started')
             end = min(time.monotonic() + START_TIMEOUT_SECONDS,
                       time.monotonic() + max(0, (record['deadlineAt'] - time.time() * 1000) / 1000))
             while True:
+                stage = 'startup_deadline'
                 check_cancelled()
                 require(not store.cancelled() and time.time() * 1000 < record['deadlineAt'], 'Job was cancelled or expired', 'cancelled')
+                stage = 'unit_query'
                 properties = show_unit(env, record['unit'])
+                stage = 'unit_ownership'
                 require(owned_unit(record, properties), 'Private API unit disappeared')
                 record['observedUnit'] = True
+                stage = 'persist_observation'
                 store.save(record)
+                stage = 'unit_state'
                 require(properties['ActiveState'] not in ('failed', 'inactive', 'deactivating'), 'Private API unit stopped during startup')
+                stage = 'api_readiness'
                 try:
                     api_identity = api_ready(record, properties)
                     break
                 except (NotReady, FileNotFoundError, ConnectionRefusedError, socket.timeout):
                     require(time.monotonic() < end, 'Private API readiness timed out')
                     time.sleep(0.05)
+            stage = 'startup_deadline'
             require(not store.cancelled() and time.time() * 1000 < record['deadlineAt'], 'Job was cancelled or expired', 'cancelled')
             record['apiIdentity'] = api_identity
             record['phase'] = 'running'
+            stage = 'persist_ready'
             store.save(record)
             return {'instanceId': policy['instanceId'], 'jobId': record['jobId'], 'unit': record['unit'],
                     'socketDirectory': record['jobId'], 'cgroupParent': expected_cgroup(record) + '/payload',
                     'deadlineAt': record['deadlineAt'], 'running': True}
-        except (RelayError, OSError):
-            store.cancel()
-            stop_owned(record, env)
-            record['phase'] = 'stopped'
-            store.save(record)
-            raise
+        except (RelayError, OSError) as primary:
+            diagnostic = {
+                'version': 1, 'instanceId': policy['instanceId'], 'jobId': record['jobId'],
+                'primary': diagnostic_failure(stage, primary),
+                'cleanup': {'stage': 'pending', 'outcome': 'pending', 'failure': None},
+                'recordingErrors': [],
+            }
+            try:
+                store.save_startup_failure(diagnostic, initial=True)
+            except (RelayError, OSError) as recording_error:
+                diagnostic['recordingErrors'].append(diagnostic_failure('diagnostic_initial', recording_error))
+            selected = primary
+            cleanup_stage = 'cancel'
+            try:
+                store.cancel()
+                cleanup_stage = 'stop'
+                stop_owned(record, env)
+                cleanup_stage = 'persist_stopped'
+                record['phase'] = 'stopped'
+                store.save(record)
+                diagnostic['cleanup'] = {'stage': cleanup_stage, 'outcome': 'stopped', 'failure': None}
+            except (RelayError, OSError) as cleanup_error:
+                selected = cleanup_error
+                diagnostic['cleanup'] = {
+                    'stage': cleanup_stage, 'outcome': 'failed',
+                    'failure': diagnostic_failure(cleanup_stage, cleanup_error),
+                }
+            try:
+                store.save_startup_failure(diagnostic)
+            except (RelayError, OSError) as recording_error:
+                diagnostic['recordingErrors'].append(diagnostic_failure('diagnostic_final', recording_error))
+            selected.startup_failure = diagnostic
+            if selected is primary:
+                raise
+            raise selected from primary
 
 
 def status_job(policy, env, store):
@@ -1391,8 +1556,12 @@ def main():
         response = {'ok': True, 'result': dispatch(policy, account, runtime_environment(account), read_request(sys.stdin.buffer))}
     except RelayError as error:
         response = {'ok': False, 'code': error.code, 'error': str(error)}
+        if hasattr(error, 'startup_failure'):
+            response.update(error='Private builder startup failed', startupFailure=error.startup_failure)
     except OSError as error:
         response = {'ok': False, 'code': 'process_failed', 'error': 'Builder OS operation failed (errno {})'.format(error.errno)}
+        if hasattr(error, 'startup_failure'):
+            response.update(error='Private builder startup failed', startupFailure=error.startup_failure)
     if internal:
         # Units use null output; local invocations receive only a bounded error,
         # never helper output, build logs or source.

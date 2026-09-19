@@ -5,6 +5,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { JobStore } from '../app/deployment/store.js';
+import { publicJob } from '../app/deployment/protocol.js';
+import { builderStartupDiagnostic } from './deploy-service-fixtures.mjs';
 
 const POSIX = process.platform !== 'win32';
 const parent = path.dirname(fileURLToPath(import.meta.url));
@@ -85,4 +87,62 @@ test('corruption and retention path traversal cannot be mistaken for an empty jo
   await assert.rejects(store.removeJob('../outside'));
   await store.removeJob(entry.id);
   assert.deepEqual(await store.loadJobs(), []);
+});
+
+test('portable job serialization preserves bounded startup diagnostics privately and accepts old records', async t => {
+  const store = new JobStore(path.join(parent, 'unused-diagnostic-model'));
+  const old = job(), current = job();
+  current.builderStartupFailure = builderStartupDiagnostic(current.id);
+  current.rawError = 'PRIVATE_EXCEPTION';
+  current.secrets = { VALUE: 'PRIVATE_SECRET' };
+  const written = new Map();
+  store.writeJob = async (directory, content) => {
+    written.set(path.join(directory, 'job.json'), content);
+  };
+  await store.saveJob(old);
+  await store.saveJob(current);
+  const retained = JSON.parse(written.get(path.join(store.jobDirectory(current.id), 'job.json')));
+  assert.deepEqual(retained.builderStartupFailure, current.builderStartupFailure);
+  assert.equal(Object.hasOwn(publicJob(retained), 'builderStartupFailure'), false);
+  assert.equal(JSON.stringify([...written.values()]).includes('PRIVATE_'), false);
+  const descriptor = Object.getOwnPropertyDescriptor(process, 'getuid');
+  Object.defineProperty(process, 'getuid', { configurable: true, value: () => 1001 });
+  t.after(() => {
+    if (descriptor) Object.defineProperty(process, 'getuid', descriptor);
+    else delete process.getuid;
+  });
+  const directory = { isDirectory: () => true, isSymbolicLink: () => false, uid: 1001, mode: 0o711 };
+  t.mock.method(fs, 'readdir', async () => [old, current].map(item => ({
+    ...directory, name: item.id,
+  })));
+  t.mock.method(fs, 'lstat', async file => written.has(file)
+    ? { isFile: () => true, isSymbolicLink: () => false, uid: 1001, mode: 0o600, size: written.get(file).length }
+    : directory);
+  t.mock.method(fs, 'readFile', async file => written.get(file));
+  const loaded = await store.loadJobs();
+  assert.equal(Object.hasOwn(loaded[0], 'builderStartupFailure'), false);
+  assert.deepEqual(loaded[1].builderStartupFailure, current.builderStartupFailure);
+  let removed;
+  t.mock.method(fs, 'rm', async (file, options) => { removed = { file, options }; });
+  await store.removeJob(current.id);
+  assert.deepEqual(removed, { file: store.jobDirectory(current.id), options: { recursive: true } });
+});
+
+test('invalid startup diagnostic fields cannot reach a serialized job or become recovery authority', async () => {
+  const store = new JobStore(path.join(parent, 'unused-diagnostic-model'));
+  const current = job();
+  let writes = 0;
+  store.writeJob = async () => { writes++; };
+  const good = builderStartupDiagnostic(current.id);
+  for (const builderStartupFailure of [
+    { ...good, stack: 'PRIVATE_STACK' },
+    { ...good, jobId: good.instanceId },
+    { ...good, primary: { ...good.primary, code: 'PRIVATE_CODE' } },
+    { ...good, primary: { ...good.primary, rule: 'PRIVATE_RULE' } },
+    { ...good, cleanup: [...good.cleanup, ...good.cleanup, ...good.cleanup] },
+  ]) {
+    assert.throws(() => store.saveJob({ ...current, builderStartupFailure }),
+      error => error.code === 'builder_protocol_error');
+  }
+  assert.equal(writes, 0);
 });

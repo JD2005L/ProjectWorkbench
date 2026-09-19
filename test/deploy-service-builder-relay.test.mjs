@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import fs from 'node:fs/promises';
 import { builderRequest } from '../app/deployment/builder-client.js';
+import { relayStartupFailure, validateRelayStartupFailure } from '../app/deployment/builder-diagnostics.js';
 
 // These are portable Python command/kernel/filesystem models, not evidence
 // that a real Linux user manager, Podman API, cgroup or namespace is confined.
@@ -65,6 +66,7 @@ class Store:
         self.value = None
         self.cancelled_value = False
         self.saves = []
+        self.diagnostics = []
         self.prepared = False
         self.locked_value = False
     @contextlib.contextmanager
@@ -80,6 +82,9 @@ class Store:
         r.validate_record(value, P, JOB)
         self.value = copy.deepcopy(value)
         self.saves.append(copy.deepcopy(value))
+    def save_startup_failure(self, value, initial=False):
+        r.validate_startup_failure(value, P, JOB)
+        self.diagnostics.append(copy.deepcopy(value))
     def cancelled(self): return self.cancelled_value
     def cancel(self):
         calls.append(["cancel"])
@@ -581,6 +586,170 @@ print(json.dumps(reply))
 `);
   assert.equal(result.running, true);
   assert.equal(Object.keys(result).length, 7);
+});
+
+test('startup diagnostics preserve the primary rule and distinct cleanup error without private data', async () => {
+  const result = await fixture(`
+store, kernel = lifecycle()
+primary = r.RelayError("API socket peer does not match the owned unit", "resource_not_allowed")
+cleanup = OSError(13, "PRIVATE_EXCEPTION /private/config argv=PRIVATE_ARGV")
+def ready(*args): raise primary
+def stop(*args): raise cleanup
+r.api_ready, r.stop_owned = ready, stop
+try: r.start_job(P,A,{},REQUEST,store)
+except OSError as exc:
+    assert exc is cleanup and exc.__cause__ is primary
+    diagnostic = exc.startup_failure
+else: raise AssertionError("Expected startup and cleanup failure")
+assert store.cancelled_value and store.value["phase"] == "launching"
+assert store.value["observedUnit"] and store.value["apiIdentity"] is None
+assert diagnostic["primary"] == {"stage":"api_readiness","code":"resource_not_allowed","rule":"api_peer","errno":None}
+assert diagnostic["cleanup"] == {"stage":"stop","outcome":"failed",
+    "failure":{"stage":"stop","code":"os_error","rule":"os_error","errno":13}}
+assert diagnostic["recordingErrors"] == []
+assert store.diagnostics[0]["cleanup"]["outcome"] == "pending"
+assert store.diagnostics[-1] == diagnostic
+text = json.dumps(diagnostic)
+for private in ("PRIVATE_EXCEPTION","PRIVATE_ARGV","/private/config",store.value["nonce"]):
+    assert private not in text
+assert set(store.value) == r.RECORD_FIELDS
+print(json.dumps({"primary":diagnostic["primary"],"cleanup":diagnostic["cleanup"]["outcome"]}))
+`);
+  assert.equal(result.primary.rule, 'api_peer');
+  assert.equal(result.cleanup, 'failed');
+});
+
+test('startup diagnostics retain an OS errno while confirmed cleanup still propagates the original failure', async () => {
+  const result = await fixture(`
+store, kernel = lifecycle()
+primary = OSError(28, "PRIVATE_EXCEPTION", "/private/source")
+def prepare(*args): raise primary
+store.prepare_paths = prepare
+try: r.start_job(P,A,{},REQUEST,store)
+except OSError as exc:
+    assert exc is primary
+    diagnostic = exc.startup_failure
+else: raise AssertionError("Expected original failure")
+assert store.cancelled_value and store.value["phase"] == "stopped"
+assert diagnostic["primary"] == {"stage":"prepare_paths","code":"os_error","rule":"os_error","errno":28}
+assert diagnostic["cleanup"] == {"stage":"persist_stopped","outcome":"stopped","failure":None}
+assert "PRIVATE_EXCEPTION" not in json.dumps(diagnostic) and "/private/source" not in json.dumps(diagnostic)
+assert store.diagnostics[-1] == diagnostic
+print(json.dumps({"originalPreserved":True,"cleanup":diagnostic["cleanup"]["outcome"]}))
+`);
+  assert.deepEqual(result, { originalPreserved: true, cleanup: 'stopped' });
+});
+
+test('startup diagnostic I/O failures never skip cancellation or stop and remain explicitly reported', async () => {
+  const result = await fixture(`
+original_stop = r.stop_owned
+cases = []
+for failed_writes in ({"diagnostic_initial"},{"diagnostic_final"},{"diagnostic_initial","diagnostic_final"}):
+    for stop_fails in (False, True):
+        store, kernel = lifecycle()
+        order = []
+        primary = r.RelayError("PRIVATE_PRIMARY raw argv/env/config", "resource_not_allowed")
+        cleanup = r.RelayError("User manager refused the owned unit stop")
+        def ready(*args): raise primary
+        r.api_ready = ready
+        saved = store.save_startup_failure
+        def diagnostic_write(value, initial=False):
+            stage = "diagnostic_initial" if initial else "diagnostic_final"
+            order.append(stage)
+            if stage in failed_writes: raise OSError(28, "PRIVATE_IO", "/private/diagnostic")
+            saved(value, initial)
+        store.save_startup_failure = diagnostic_write
+        cancel = store.cancel
+        def cancelled():
+            order.append("cancel")
+            cancel()
+        store.cancel = cancelled
+        def stop(*args):
+            order.append("stop")
+            if stop_fails: raise cleanup
+            return original_stop(*args)
+        r.stop_owned = stop
+        try: r.start_job(P,A,{},REQUEST,store)
+        except r.RelayError as exc:
+            assert exc is (cleanup if stop_fails else primary)
+            diagnostic = exc.startup_failure
+        else: raise AssertionError("Diagnostics cannot turn a failure into success")
+        assert order == ["diagnostic_initial","cancel","stop","diagnostic_final"]
+        assert {item["stage"] for item in diagnostic["recordingErrors"]} == failed_writes
+        assert all(item["code"] == "os_error" and item["errno"] == 28 for item in diagnostic["recordingErrors"])
+        assert diagnostic["primary"]["rule"] == "relay_refusal"
+        assert diagnostic["cleanup"]["outcome"] == ("failed" if stop_fails else "stopped")
+        assert store.value["phase"] == ("launching" if stop_fails else "stopped")
+        assert store.cancelled_value and "PRIVATE_" not in json.dumps(diagnostic)
+        if "diagnostic_final" in failed_writes and store.diagnostics:
+            assert store.diagnostics[-1]["cleanup"]["outcome"] == "pending"
+        if "diagnostic_final" not in failed_writes:
+            assert store.diagnostics[-1] == diagnostic
+        cases.append(True)
+print(json.dumps({"cases":len(cases)}))
+`);
+  assert.equal(result.cases, 6);
+});
+
+test('startup diagnostic schemas reject arbitrary data and never change the authority of old job records', async () => {
+  const result = await fixture(`
+store, kernel = lifecycle()
+def ready(*args): r.fail("API socket peer does not match the owned unit","resource_not_allowed")
+r.api_ready = ready
+error(lambda:r.start_job(P,A,{},REQUEST,store),"resource_not_allowed")
+diagnostic = store.diagnostics[-1]
+changes = [
+ {"message":"PRIVATE_SECRET"}, {"version":True}, {"jobId":P["instanceId"]}, {"instanceId":JOB},
+ {"primary":{**diagnostic["primary"],"stage":"PRIVATE_STAGE"}},
+ {"primary":{**diagnostic["primary"],"code":"PRIVATE_CODE"}},
+ {"primary":{**diagnostic["primary"],"rule":"PRIVATE_RULE"}},
+ {"primary":{**diagnostic["primary"],"errno":True}},
+ {"primary":{**diagnostic["primary"],"errno":4096}},
+ {"primary":{**diagnostic["primary"],"path":"/private"}},
+ {"cleanup":{"stage":"stop","outcome":"stopped","failure":None}},
+ {"cleanup":{"stage":"stop","outcome":"failed","failure":None}},
+ {"recordingErrors":[diagnostic["primary"]]*3},
+]
+for change in changes:
+    error(lambda change=change:r.validate_startup_failure({**diagnostic,**change},P,JOB),"resource_not_allowed")
+assert r.validate_record(store.value,P,JOB) == store.value
+assert set(store.value) == r.RECORD_FIELDS
+r.cgroup_populated = lambda *args,**kwargs:True
+error(lambda:r.prove_stopped(store.value,{}),"process_failed")
+print(json.dumps({"refused":len(changes),"oldSchemaUnchanged":True}))
+`);
+  assert.deepEqual(result, { refused: 13, oldSchemaUnchanged: true });
+});
+
+test('startup diagnostic persistence uses the protected job directory and refuses replacing another primary', async () => {
+  const result = await fixture(`
+store, kernel = lifecycle()
+def ready(*args): r.fail("API socket peer does not match the owned unit","resource_not_allowed")
+r.api_ready = ready
+error(lambda:r.start_job(P,A,{},REQUEST,store),"resource_not_allowed")
+diagnostic = store.diagnostics[-1]
+real = r.JobStore(P,A,JOB)
+seen = []
+@contextlib.contextmanager
+def directory(path,uid,private=False,**kwargs):
+    assert path == real.path and uid == A.pw_uid and private
+    yield 17
+r.directory = directory
+def absent(*args): raise FileNotFoundError()
+r.read_json_at = absent
+r.write_json_at = lambda fd,name,value:seen.append((fd,name,copy.deepcopy(value)))
+real.save_startup_failure(diagnostic, initial=True)
+assert seen == [(17,r.STARTUP_DIAGNOSTIC_FILE,diagnostic)]
+r.read_json_at = lambda fd,name,uid:copy.deepcopy(diagnostic)
+error(lambda:real.save_startup_failure(diagnostic,initial=True),"resource_conflict")
+foreign = copy.deepcopy(diagnostic)
+foreign["primary"]["rule"] = "api_store"
+r.read_json_at = lambda fd,name,uid:foreign
+error(lambda:real.save_startup_failure(diagnostic),"resource_conflict")
+assert len(seen) == 1
+print(json.dumps({"protected":True,"oldPrimaryRetained":True}))
+`);
+  assert.deepEqual(result, { protected: true, oldPrimaryRetained: true });
 });
 
 test('cancel-before-start retains a tombstone and blocks replay, including after removal', async () => {
@@ -1503,4 +1672,70 @@ assert errors.getvalue()=="resource_conflict: Synthetic internal failure\\n"
 print(json.dumps({"internalFailure":True}))
 `);
   assert.equal(result.internalFailure, true);
+});
+
+test('actual Python startup diagnostics survive real Node framing with fixed enums and explicit recording failure', async () => {
+  const result = await fixture(`
+store, kernel = lifecycle()
+primary = r.RelayError("API socket peer does not match the owned unit","resource_not_allowed")
+cleanup = r.RelayError("User manager did not return complete unit properties")
+def ready(*args): raise primary
+def stop(*args): raise cleanup
+r.api_ready, r.stop_owned = ready, stop
+save = store.save_startup_failure
+def write(value, initial=False):
+    if not initial: raise OSError(28,"PRIVATE_IO","/private/path")
+    save(value,initial)
+store.save_startup_failure = write
+try: r.start_job(P,A,{},REQUEST,store)
+except r.RelayError as exc: failure = exc
+else: raise AssertionError("Expected failure")
+output = io.BytesIO()
+def dispatch(*args): raise failure
+r.load_policy=lambda:P
+r.identity=lambda policy:A
+r.read_request=lambda stream:REQUEST
+r.dispatch=dispatch
+with patch.object(r.sys,"platform","linux"), \
+     patch.dict(r.__dict__,{"pwd":object(),"fcntl":object()}), \
+     patch.object(r.sys,"argv",["builder"]), \
+     patch.object(r.sys,"stdout",types.SimpleNamespace(buffer=output)), \
+     patch.object(r.sys,"stdin",types.SimpleNamespace(buffer=io.BytesIO())), \
+     patch.object(r.signal,"signal"),patch.dict(r.os.environ,{},clear=True), \
+     patch.object(r.os,"getuid",return_value=1001,create=True), \
+     patch.object(r.os,"geteuid",return_value=1001,create=True):
+    status=r.main()
+text=output.getvalue().decode()
+assert "PRIVATE_IO" not in text and "/private/path" not in text and store.value["nonce"] not in text
+print(json.dumps({"status":status,"frame":text,"jobId":JOB,"instanceId":P["instanceId"],
+    "stages":sorted(r.STARTUP_STAGES),"codes":sorted(r.DIAGNOSTIC_CODES),"rules":sorted(r.DIAGNOSTIC_RULE_NAMES)}))
+`);
+  const connection = {
+    host: 'fixture.invalid', port: 22, user: 'builder',
+    keyFile: '/fixture/key', knownHostsFile: '/fixture/known-hosts',
+  };
+  let diagnostic;
+  await assert.rejects(builderRequest(connection, { action: 'job_start', requestId: 'fixture', jobId: result.jobId }, {
+    timeoutMs: 5000,
+    spawnProcess(command, args, options) {
+      assert.equal(command, '/usr/bin/ssh');
+      assert.equal(args.at(-1), 'pw-deploy-builder');
+      return spawn(process.execPath, ['-e',
+        'process.stdin.resume();process.stdin.on("end",()=>{process.stdout.write(process.argv[1]);process.exitCode=Number(process.argv[2]);});',
+        result.frame, String(result.status)], options);
+    },
+  }), error => {
+    diagnostic = relayStartupFailure(error);
+    return error.code === 'process_failed' && error.message === 'Private builder startup failed';
+  });
+  assert.equal(diagnostic.primary.rule, 'api_peer');
+  assert.equal(diagnostic.cleanup.failure.rule, 'manager_incomplete');
+  assert.deepEqual(diagnostic.recordingErrors,
+    [{ stage: 'diagnostic_final', code: 'os_error', rule: 'os_error', errno: 28 }]);
+  for (const [key, values] of [['stage', result.stages], ['code', result.codes], ['rule', result.rules]]) {
+    for (const value of values) {
+      validateRelayStartupFailure({ ...diagnostic, primary: { ...diagnostic.primary, [key]: value } },
+        result.jobId, result.instanceId);
+    }
+  }
 });

@@ -2,6 +2,7 @@
 // exchange. Only the runtime connector accepts an appended OCI byte stream.
 import { DeploymentError } from './protocol.js';
 import { spawnChild, pipeBounded, terminateTransfer, observeProcess, processDeadline } from './container-process.js';
+import { attachRelayStartupFailure, attachExchangeStartupFailure, carryStartupFailure } from './builder-diagnostics.js';
 
 const HEADER_BYTES = 10;
 const MAX_REQUEST_FRAME_BYTES = 65536;
@@ -157,11 +158,16 @@ export async function connectorRequest(kind, runtime, request, {
     if (!value || typeof value !== 'object' || Array.isArray(value) || typeof value.ok !== 'boolean') {
       throw new DeploymentError(`${spec.name} relay returned an invalid response`, 502, `${kind}_protocol_error`);
     }
+    if (value.startupFailure !== undefined && (kind !== 'builder' || request.action !== 'job_start' || value.ok)) {
+      throw new DeploymentError('Unexpected builder startup diagnostic', 502, `${kind}_protocol_error`);
+    }
     if (!value.ok) {
       const code = typeof value.code === 'string' && KNOWN_ERROR_CODES.has(value.code) ? value.code : `${kind}_protocol_error`;
       const message = typeof value.error === 'string' && value.error.length > 0 && value.error.length <= 500
         ? value.error : `${spec.name} connector refused the request`;
-      throw new DeploymentError(message, 502, code);
+      const failure = new DeploymentError(message, 502, code);
+      if (value.startupFailure !== undefined) attachRelayStartupFailure(failure, value.startupFailure, request.jobId);
+      throw failure;
     }
     if (!value.result || typeof value.result !== 'object' || Array.isArray(value.result)) {
       throw new DeploymentError(`${spec.name} relay returned an invalid result`, 502, `${kind}_protocol_error`);
@@ -171,10 +177,22 @@ export async function connectorRequest(kind, runtime, request, {
     scope?.abort(error);
     ociStream?.destroy();
     child?.stdin.destroy();
-    if (child) await terminateTransfer([child], upload, terminationOptions);
-    if (state?.error) throw new DeploymentError(`${spec.name} connector could not start`, 503, `${kind}_unavailable`);
+    if (child) {
+      try { await terminateTransfer([child], upload, terminationOptions); }
+      catch (cleanupError) {
+        if (kind === 'builder' && request?.action === 'job_start') attachExchangeStartupFailure(cleanupError, error);
+        throw cleanupError;
+      }
+    }
+    if (state?.error) {
+      const failure = new DeploymentError(`${spec.name} connector could not start`, 503, `${kind}_unavailable`);
+      carryStartupFailure(failure, error);
+      throw failure;
+    }
     if (error?.code === 'ERR_STREAM_PREMATURE_CLOSE' || error?.code === 'EPIPE') {
-      throw new DeploymentError(`${spec.name} connector closed before image transfer completed`, 502, `${kind}_protocol_error`);
+      const failure = new DeploymentError(`${spec.name} connector closed before image transfer completed`, 502, `${kind}_protocol_error`);
+      carryStartupFailure(failure, error);
+      throw failure;
     }
     throw error;
   } finally {

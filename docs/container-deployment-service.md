@@ -238,6 +238,19 @@ already-cancelled job; restart recovery stops/removes rather than replaying.
 The shared SDK cache and other jobs' stores are never pruned. Script/IIS workers
 continue using the existing shared worker pool and their independent guardians.
 
+Failed private-builder startup retains a protected `startup-failure.json` beside
+the job's existing builder metadata. It separates the initiating stage, refusal
+rule/code and errno from the cancellation/stop outcome and diagnostic-write
+errors. Only fixed identifiers and bounded diagnostic values are retained, never
+exception text, commands, environment values, nonces or process output.
+
+The controller carries these details through transport and stop failures into
+the private job journal's `builderStartupFailure`; public job responses do not
+expose them. Diagnostic-write failure is reported without skipping the existing
+safety cancellation/stop sequence. These records are evidence only: they do not
+authorize cleanup or replay, replace whole-cgroup stop proof, or change the
+fail-closed handling of an unconfirmed stop. Older journals remain readable.
+
 ## Runtime connector
 
 Use the supplied `deploy/container/runtime-relay.py` and

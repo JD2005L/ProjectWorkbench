@@ -5,6 +5,9 @@ import {
 } from './protocol.js';
 import { resolveJobPolicy, validateSettings, validateTargetSettings } from './policy.js';
 import { lineRedactor } from './output.js';
+import {
+  attachBuilderStartupFailure, builderStartupFailure, describeBuilderFailure, validateBuilderStartupFailure,
+} from './builder-diagnostics.js';
 
 function fingerprint(request) {
   return crypto.createHash('sha256').update(JSON.stringify({
@@ -277,6 +280,10 @@ export class DeploymentEngine {
       }
       completedVersion = version;
     } catch (error) {
+      const diagnostic = builderStartupFailure(error);
+      if (diagnostic) {
+        job.builderStartupFailure = validateBuilderStartupFailure(diagnostic, job.id, this.config.container?.instanceId);
+      }
       const reason = error?.code === 'cancellation_failed' ? error
         : controller.signal.aborted ? controller.signal.reason : error;
       const code = reason instanceof DeploymentError ? reason.code : 'execution_failed';
@@ -292,7 +299,14 @@ export class DeploymentEngine {
     job.finalizing = true;
     const completed = { ...job, events: [...job.events], state: outcome, version: completedVersion,
       errorCode, finishedAt: this.now().toISOString(), completionOrder: ++this.completionOrder };
-    await this.event(completed, outcome, { code: errorCode });
+    try { await this.event(completed, outcome, { code: errorCode }); }
+    catch (error) {
+      if (completed.builderStartupFailure) {
+        const diagnostic = { ...completed.builderStartupFailure, recordingFailure: describeBuilderFailure(error, 'journal_write') };
+        attachBuilderStartupFailure(error, diagnostic);
+      }
+      throw error;
+    }
     Object.assign(job, completed);
     this.live.delete(job.id);
     this.live.set(job.id, ring);
