@@ -155,3 +155,38 @@ test('the wake route is the terminal\'s own authorization, and the cockpit asks 
   assert.match(server, /const w=\(windows\|\|\[\]\)\.find\(x=>x\.active&&x\.hibernated\)/,
     'and only ever ask for the window the user is actually looking at');
 });
+
+test('a wake helper that cannot be run is reported, not raised as a 500', { timeout: 120000 }, async () => {
+  // The helper used to be named by an absolute install path, which exists on a host install and
+  // never in a container image — so on a container deployment every wake spawned a path that was
+  // not there. ENOENT's code is the string 'ENOENT', not 1, so it escaped the refusal guard and
+  // surfaced as a 500 carrying a raw spawn error: nothing the cockpit could say to anyone, and the
+  // cause buried in the server log. Resolution now covers both layouts (shipped-helpers.test.mjs);
+  // this pins the other half — that a helper which genuinely cannot be run still ANSWERS.
+  await withCockpit(async ({ base, name, sock }) => {
+    const session = `pw_${name}`;
+    const firstId = (await tmux(sock, ['list-windows', '-t', session, '-F', '#{window_id}'])).split('\n')[0].trim();
+    await tmux(sock, ['set-option', '-w', '-t', firstId, '@pw_claude_sid', SID]);
+    await tmux(sock, ['set-option', '-w', '-t', firstId, '@pw_claude_hib_win', firstId]);
+
+    const res = await fetch(`${base}/api/term/${encodeURIComponent(name)}/windows/0/wake`, { method: 'POST' });
+    assert.equal(res.status, 200, 'a missing helper is an answer, not a server fault');
+    const body = await res.json();
+    assert.equal(body.ok, true);
+    assert.equal(body.woke, false, 'and it may never claim a resume it did not perform');
+    assert.match(body.reason, /could not be run/, 'the reason has to say what went wrong');
+    assert.match(body.reason, /no-such-wake-helper/, 'and name the path it tried');
+  }, { prefix: 'pw-hibmissing-', env: { PW_CLAUDE_WAKE_BIN: '/usr/local/bin/no-such-wake-helper' } });
+});
+
+test('the wake helper is run as the account that owns the sessions, never as root', () => {
+  // The dashboard is root in host mode. tmuxOwned is what drops to the terminal account for a
+  // tmux-adjacent tool; routing the wake anywhere else would hand a root shell a keystroke path
+  // into someone's pane.
+  const server = fs.readFileSync(path.join(REPO, 'app', 'server.js'), 'utf8');
+  assert.match(server, /await tmuxOwned\(CLAUDE_WAKE_HELPER,/, 'the wake must go through tmuxOwned');
+  const fn = server.slice(server.indexOf('function tmuxOwned('), server.indexOf('function parseTmuxWindows('));
+  assert.match(fn, /DEPLOY_MODE === 'container'/, 'container runs it directly, in the one account that exists there');
+  assert.match(fn, /execFileAsync\('sudo',\['-u',hostTerminalUser\(process\.env\),file,\.\.\.args\]/,
+    'host mode must drop privilege to the resolved terminal user, by argv, with no shell');
+});
