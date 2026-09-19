@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url';
 import {
   normalizePwBase, patchDashboard, updateDashboard, validateDashboardPath,
 } from '../deploy/service/dashboard-card.mjs';
+import { atomicFile } from '../deploy/service/safe-files.mjs';
 
 const SERVICE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'deploy', 'service');
 const existingCard = "{name:'Existing service',desc:'Existing description',url:'/existing',healthUrl:'/existing/health',tags:['Existing']}";
@@ -145,6 +146,50 @@ test('file update is atomic/idempotent, preserves owner/mode, and creates only a
   assert.equal(fs.readFileSync(file, 'utf8'), edited);
   assert.equal(fs.statSync(file).mtimeMs, after.mtimeMs);
   assert.equal(fs.statSync(first.backupFile).mtimeMs, backupTime);
+});
+
+test('a public dashboard directory permits a private backup without relaxing either mode', async t => {
+  const { root, file, policy } = fixture(t);
+  fs.chmodSync(root, 0o755);
+  const originalMode = fs.statSync(root).mode & 0o777;
+  const result = await updateDashboard(file, { policy });
+  assert.equal(fs.statSync(root).mode & 0o777, originalMode);
+  assert.equal(fs.readFileSync(result.backupFile, 'utf8'), page);
+  assert.equal(fs.readFileSync(file, 'utf8'), patchDashboard(page).page);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(result.backupFile).mode & 0o777, 0o600);
+    fs.chmodSync(result.backupFile, 0o644);
+    await assert.rejects(updateDashboard(file, { policy, rollback: true }), /too permissive/);
+    assert.equal(fs.readFileSync(file, 'utf8'), patchDashboard(page).page);
+  }
+});
+
+test('writable dashboard directories remain refused before a backup is created', {
+  skip: process.platform === 'win32',
+}, async t => {
+  const { root, file, policy } = fixture(t);
+  fs.chmodSync(root, 0o777);
+  await assert.rejects(updateDashboard(file, { policy }), /too permissive/);
+  assert.equal(fs.readFileSync(file, 'utf8'), page);
+  assert.deepEqual(fs.readdirSync(root), ['index.html']);
+});
+
+test('the existing-backup path preserves an atomically prepared private copy', async t => {
+  const { root, file, policy } = fixture(t);
+  fs.chmodSync(root, 0o755);
+  const backup = `${file}.pw-deploy-service.bak`;
+  const options = { mode: 0o600, uid: policy.owner, gid: process.getgid?.() ?? 0, policy };
+  await atomicFile(backup, page, options);
+  await assert.rejects(atomicFile(backup, 'must not overwrite the backup', options), /File changed/);
+  const original = fs.statSync(backup);
+  await updateDashboard(file, { policy });
+  assert.equal(fs.readFileSync(backup, 'utf8'), page);
+  assert.equal(fs.statSync(backup).mtimeMs, original.mtimeMs);
+  assert.equal(fs.readFileSync(file, 'utf8'), patchDashboard(page).page);
+  if (process.platform !== 'win32') {
+    assert.equal(fs.statSync(root).mode & 0o777, 0o755);
+    assert.equal(fs.statSync(backup).mode & 0o777, 0o600);
+  }
 });
 
 test('check and unexpected-format refusal never create a backup or change the static page', async t => {
