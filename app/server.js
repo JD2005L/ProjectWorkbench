@@ -1,6 +1,7 @@
 import express from 'express';
 import fs from 'fs/promises';
 import fsSync from 'fs';
+import { resolveShippedHelper } from './shipped-helpers.js';
 import path from 'path';
 import crypto from 'crypto';
 import { execFile, spawn } from 'child_process';
@@ -570,16 +571,17 @@ async function sendBoxFile(res, p, box, rawName, { attachment = false } = {}){
 // never reaches a command line. See app/user-credentials.js for the full note.
 const CREDENTIAL_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), 'credential-writer.mjs');
 
-// scripts/ is a sibling of app/ in every deployment (both mounted under the same
-// install root). Used to reclaim workspace ownership after a runAsRoot deploy — see
-// reclaimWorkspaceOwnership().
-const FIX_OWNERSHIP_HELPER = path.join(path.dirname(new URL(import.meta.url).pathname), '..', 'scripts', 'pw-fix-workspace-ownership');
-
-// scripts/pw-claude-wake, installed on PATH by install.sh. The dashboard runs the SAME script the
-// tmux hooks run rather than reimplementing the wake: every gate that decides whether pressing
-// Enter into a pane is safe — markers naming the window, a live placeholder holding the terminal's
-// foreground, a client attached, the window on screen — lives there once. See its header.
-const CLAUDE_WAKE_HELPER = process.env.PW_CLAUDE_WAKE_BIN || '/usr/local/bin/pw-claude-wake';
+// Scripts this repository ships, located the same way for both install layouts — see
+// app/shipped-helpers.js for why naming one location is what broke each of these in turn.
+const APP_DIR = path.dirname(new URL(import.meta.url).pathname);
+// Reclaims workspace ownership after a runAsRoot deploy — see reclaimWorkspaceOwnership().
+const FIX_OWNERSHIP_HELPER = resolveShippedHelper('pw-fix-workspace-ownership', { appDir: APP_DIR });
+// The dashboard runs the SAME script the tmux wake hooks run rather than reimplementing the wake:
+// every gate that decides whether pressing Enter into a pane is safe — markers naming the window, a
+// live placeholder holding the terminal's foreground, a client attached, the window on screen —
+// lives there once. See its header. PW_CLAUDE_WAKE_BIN stays a test hook, like PW_TTYD_BIN: with
+// both layouts resolved it is no longer how a deployment points at its own copy.
+const CLAUDE_WAKE_HELPER = process.env.PW_CLAUDE_WAKE_BIN || resolveShippedHelper('pw-claude-wake', { appDir: APP_DIR });
 
 // A runAsRoot deploy slot runs its script as root by design (podman/systemctl/host
 // paths it genuinely needs — see deployExec). But anything that script writes INTO
@@ -3668,9 +3670,12 @@ app.post(BASE + '/api/term/:project/windows/:index/wake', requireTerminalAccess,
   const { stdout } = await tmuxOwned(CLAUDE_WAKE_HELPER, [socketPath, w.windowId, '--requested'], { timeout: 15000 });
   woke = true; reason = String(stdout || '').trim();
  } catch(e){
-  // Exit 1 is the script's honest "I did nothing, and here is why"; anything else is a real fault.
-  if(e?.code !== 1) throw e;
-  reason = String(e.stdout || '').trim() || 'the window could not be resumed';
+  // Exit 1 is the script's honest "I did nothing, and here is why". A helper that cannot be run at
+  // all is the same answer to the caller — no resume happened — so it is reported, not raised: a
+  // 500 gives the cockpit nothing to say and buries the cause in the server log.
+  if(e?.code !== 1 && e?.code !== 'ENOENT' && e?.code !== 'EACCES') throw e;
+  reason = String(e.stdout || '').trim()
+   || (e.code === 1 ? 'the window could not be resumed' : `the wake helper could not be run (${e.code} at ${CLAUDE_WAKE_HELPER})`);
  }
  await audit('terminal_wake', { project: p.name, window: index, woke, reason }, req);
  res.json({ok:true,woke,reason,windows:await listTmuxWindows(p.name)});
