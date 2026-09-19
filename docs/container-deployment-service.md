@@ -181,6 +181,12 @@ Install the connector itself at the fixed, root-protected
 client arguments or environment. The controller's literal
 `pw-deploy-builder` request is the only permitted original SSH command.
 Internal unit/deadline/cleanup entrypoints are not SSH operations.
+SSH/PAM may supply `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` for the
+approved account. The connector accepts them only when they exactly match
+`/run/user/<approved-uid>` and `unix:path=/run/user/<approved-uid>/bus`, then
+reconstructs its command environment. Alternate user buses, transports and
+other D-Bus overrides remain refused; do not strip PAM settings or change
+account privileges to make readiness pass.
 The account must be non-sudo with password/interactive access disabled through
 the approved account/key policy; its SSH setup must still permit the fixed
 forced command. Do not substitute an unrestricted SSH login or another account.

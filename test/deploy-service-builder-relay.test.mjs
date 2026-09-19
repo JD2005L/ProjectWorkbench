@@ -229,7 +229,7 @@ test('caller overrides, SSH internal modes and policy path overrides are refused
   const result = await fixture(`
 for key in ("PODMAN_HOST", "CONTAINER_HOST", "CONTAINERS_STORAGE_CONF", "STORAGE_DRIVER",
             "BUILDAH_ISOLATION", "LD_PRELOAD", "PYTHONPATH", "SYSTEMD_BUS_ADDRESS",
-            "DBUS_SESSION_BUS_ADDRESS", "XDG_CONFIG_HOME"):
+            "DBUS_SYSTEM_BUS_ADDRESS", "DBUS_STARTER_ADDRESS", "XDG_CONFIG_HOME"):
     error(lambda key=key: r.check_environment({key: "untrusted"}), "privilege_refused")
 r.check_environment({"SSH_ORIGINAL_COMMAND": "pw-deploy-builder", "XDG_RUNTIME_DIR": "/run/user/1001"})
 error(lambda: r.check_environment({"SSH_ORIGINAL_COMMAND": "pw-deploy-builder --unit-entry"}), "action_not_allowed")
@@ -953,6 +953,63 @@ assert reply["code"]=="privilege_refused"
 print(json.dumps({"framed":True}))
 `);
   assert.equal(result.framed, true);
+});
+
+test('public SSH accepts only the approved PAM session bus address', async () => {
+  const result = await fixture(`
+r.sys.platform = "linux"
+r.fcntl = object()
+r.pwd = types.SimpleNamespace(getpwnam=lambda user: A)
+r.load_policy = lambda: P
+request = {"requestId": "pam-fixture", "action": "builder_probe"}
+body = json.dumps(request).encode()
+frame = str(len(body)).zfill(10).encode() + body
+base = {"HOME": A.pw_dir, "USER": A.pw_name, "LOGNAME": A.pw_name,
+        "SSH_ORIGINAL_COMMAND": "pw-deploy-builder", "SSH_CONNECTION": "fixture",
+        "XDG_RUNTIME_DIR": "/run/user/1001", "XDG_SESSION_ID": "fixture",
+        "XDG_SESSION_TYPE": "tty", "XDG_SESSION_CLASS": "user"}
+def dispatched(policy, account, environment, value):
+    assert policy == P and account == A and value == request
+    assert environment["DBUS_SESSION_BUS_ADDRESS"] == "unix:path=/run/user/1001/bus"
+    calls.append("dispatch")
+    return {"instanceId": P["instanceId"], "ready": True}
+r.dispatch = dispatched
+def invoke(address):
+    environment = dict(base)
+    if address is not None:
+        environment["DBUS_SESSION_BUS_ADDRESS"] = address
+    output = io.BytesIO()
+    incoming = io.BytesIO(frame)
+    with patch.object(r.sys, "argv", ["builder"]), \\
+         patch.object(r.sys, "stdout", types.SimpleNamespace(buffer=output)), \\
+         patch.object(r.sys, "stdin", types.SimpleNamespace(buffer=incoming)), \\
+         patch.object(r.signal, "signal"), patch.dict(r.os.environ, environment, clear=True), \\
+         patch.object(r.os, "getuid", return_value=1001, create=True), \\
+         patch.object(r.os, "geteuid", return_value=1001, create=True), \\
+         patch.object(r.os, "getgid", return_value=1001, create=True), \\
+         patch.object(r.os, "getegid", return_value=1001, create=True):
+        assert r.main() == 0
+    data = output.getvalue()
+    assert int(data[:10]) == len(data[10:])
+    return json.loads(data[10:]), incoming.tell()
+for address in (None, "unix:path=/run/user/1001/bus"):
+    reply, consumed = invoke(address)
+    assert reply == {"ok": True, "result": {"instanceId": P["instanceId"], "ready": True}}, reply
+    assert consumed == len(frame)
+bad = ["", "unix:path=/run/user/0/bus", "unix:path=/run/user/1002/bus",
+       "unix:path=/tmp/bus", "tcp:host=127.0.0.1,port=1234",
+       "unix:abstract=/run/user/1001/bus",
+       "unix:path=/run/user/1001/bus;unix:path=/tmp/bus",
+       "unix:path=/run/user/1001/bus,guid=untrusted"]
+for address in bad:
+    reply, consumed = invoke(address)
+    assert reply["ok"] is False and reply["code"] == "privilege_refused", reply
+    assert consumed == 0
+assert calls == ["dispatch", "dispatch"], calls
+print(json.dumps({"accepted": 2, "refusedBeforeDispatch": len(bad)}))
+`);
+  assert.equal(result.accepted, 2);
+  assert.equal(result.refusedBeforeDispatch, 8);
 });
 
 test('deeply nested JSON cannot crash the public frame parser', async () => {

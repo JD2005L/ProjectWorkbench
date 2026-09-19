@@ -236,7 +236,8 @@ def check_environment(environment):
                  'LD_', 'PYTHON', 'SYSTEMD_', 'DBUS_', 'XDG_', 'PW_DEPLOY_BUILDER_')
     for key in environment:
         if key.startswith(forbidden) and key not in ('XDG_RUNTIME_DIR', 'XDG_SESSION_ID',
-                                                    'XDG_SESSION_TYPE', 'XDG_SESSION_CLASS'):
+                                                    'XDG_SESSION_TYPE', 'XDG_SESSION_CLASS',
+                                                    'DBUS_SESSION_BUS_ADDRESS'):
             fail('Caller environment override is not allowed: ' + key, 'privilege_refused')
     if 'SSH_ORIGINAL_COMMAND' in environment:
         require(environment['SSH_ORIGINAL_COMMAND'] == 'pw-deploy-builder',
@@ -1377,7 +1378,8 @@ def main():
                 'Root or changed effective identity is refused', 'privilege_refused')
         policy = load_policy()
         account = identity(policy)
-        for key, expected in (('HOME', account.pw_dir), ('USER', account.pw_name), ('LOGNAME', account.pw_name)):
+        for key, expected in (('HOME', account.pw_dir), ('USER', account.pw_name), ('LOGNAME', account.pw_name),
+                              ('DBUS_SESSION_BUS_ADDRESS', 'unix:path=/run/user/' + str(account.pw_uid) + '/bus')):
             require(key not in os.environ or os.environ[key] == expected,
                     'Caller identity environment override is refused: ' + key, 'privilege_refused')
         xdg = os.environ.get('XDG_RUNTIME_DIR')
