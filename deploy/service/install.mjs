@@ -17,7 +17,7 @@ const MANAGED = '# Managed by Project Workbench deployment service installer.';
 const ACCOUNT = /^[A-Za-z_][A-Za-z0-9_.-]{0,30}$/;
 export const PAYLOAD = Object.freeze([
   'app/atomic-file.js',
-  ...['service', 'protocol', 'policy', 'store', 'engine', 'executor', 'step', 'output']
+  ...['service', 'protocol', 'policy', 'store', 'engine', 'executor', 'step', 'output', 'builder-diagnostics']
     .map(name => `app/deployment/${name}.js`),
   ...['install.sh', 'install.mjs', 'safe-files.mjs', 'dashboard-card.mjs', 'inventory.mjs',
     'config.example.json', 'pw-deploy.service.in'].map(name => `deploy/service/${name}`),
