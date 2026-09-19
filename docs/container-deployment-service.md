@@ -201,6 +201,11 @@ path limits. The example uses `%t/pw-deploy-build` on the host and
 `/run/pw-deploy-build` in the controller. Only the controller receives this
 mount; a read-only bind still grants full access to the socket's API.
 
+Readiness follows the approved account's standard cgroup path, including the
+literal `@` in `user@<uid>.service`. Canonical absolute paths, no-follow directory
+walking, approved ownership and non-writable parents are still required; do not
+rename cgroups or loosen filesystem permissions to make readiness pass.
+
 For each Podman job, a transient delegated user unit owns a separate native
 Podman API process, writable image/container store and private runtime
 directory. The approved shared cache is only an additional read-only image

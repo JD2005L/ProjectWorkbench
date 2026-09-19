@@ -822,31 +822,65 @@ print(json.dumps({"polls":len(count)}))
   assert.ok(result.polls >= 3);
 });
 
-test('probe accepts activating controller with a real MainPID but never starts it', async () => {
+test('probe accepts systemd template cgroups for an activating controller without starting it', async () => {
   const result = await fixture(`
 real = importlib.util.module_from_spec(spec); spec.loader.exec_module(real)
 real.trusted_executable = lambda path: calls.append(["trusted",path])
-@contextlib.contextmanager
-def directory(*args,**kwargs): yield 10
-real.directory = directory
-real.process_cgroup = lambda pid:r.user_cgroup(1001)+"/app.slice/"+P["controllerUnit"]
+manager = real.CGROUP_ROOT + real.user_cgroup(A.pw_uid)
+assert manager.endswith("/user@1001.service")
+opened = {}
+private = {P["stateDir"],P["runtimeDir"],"/run/user/1001"}
+owned = private | {P["imageStore"],manager}
+unsafe = {"path":None,"uid":1002,"mode":0o755}
+def open_fixture(name, flags, dir_fd=None):
+    assert flags & real.os.O_NOFOLLOW
+    path = name if dir_fd is None else opened[dir_fd].rstrip("/")+"/"+name
+    fd = len(opened)+10
+    opened[fd] = path
+    return fd
+def info(fd):
+    path = opened[fd]
+    uid = A.pw_uid if path in owned else 0
+    mode = 0o700 if path in private else 0o755
+    if path == unsafe["path"]: uid,mode = unsafe["uid"],unsafe["mode"]
+    return types.SimpleNamespace(st_uid=uid,st_mode=stat.S_IFDIR|mode)
+real.process_cgroup = lambda pid:real.user_cgroup(A.pw_uid)+"/app.slice/"+P["controllerUnit"]
 controller = {"Id":P["controllerUnit"],"LoadState":"loaded","ActiveState":"activating","MainPID":"10",
-              "ControlGroup":r.user_cgroup(1001)+"/app.slice/"+P["controllerUnit"]}
+              "ControlGroup":real.user_cgroup(A.pw_uid)+"/app.slice/"+P["controllerUnit"]}
 real.show_unit = lambda *args:controller
 real.systemctl = forbidden
-with patch.object(real.os,"O_NOFOLLOW",0,create=True),patch.object(real.os,"O_CLOEXEC",0,create=True), \
+real.run_command = forbidden
+real.JobStore = forbidden
+request = {"requestId":"probe_1","action":"builder_probe"}
+def probe(): return real.dispatch(P,A,{},request)
+def refused(code):
+    try: probe()
+    except real.RelayError as exc: assert exc.code == code, (exc.code,str(exc))
+    else: raise AssertionError("Unsafe prerequisite accepted")
+with patch.object(real.os,"O_DIRECTORY",0x10000,create=True), \
+     patch.object(real.os,"O_NOFOLLOW",0x20000,create=True), \
+     patch.object(real.os,"O_CLOEXEC",0x40000,create=True), \
      patch.object(real.os,"stat",return_value=types.SimpleNamespace(st_mode=stat.S_IFSOCK|0o600,st_uid=1001)), \
-     patch.object(real.os,"open",return_value=11),patch.object(real.os,"close"), \
+     patch.object(real.os,"open",side_effect=open_fixture),patch.object(real.os,"close"), \
+     patch.object(real.os,"fstat",side_effect=info), \
      patch.object(real.os,"read",return_value=b"memory pids cpu"):
-    real.prerequisites(P,A,{})
+    assert probe() == {"instanceId":P["instanceId"],"ready":True}
+    assert manager+"/cgroup.controllers" in opened.values()
+    unsafe["path"] = manager
+    refused("resource_not_allowed")
+    unsafe["uid"],unsafe["mode"] = A.pw_uid,0o775
+    refused("resource_not_allowed")
+    unsafe["path"] = None
     controller["MainPID"]="0"
-    try: real.prerequisites(P,A,{})
-    except real.RelayError as exc: assert exc.code=="runtime_policy_invalid"
-    else: raise AssertionError("Absent controller accepted")
+    refused("runtime_policy_invalid")
 assert all(call[0]=="trusted" for call in calls)
-print(json.dumps({"readOnly":True}))
+for path in (manager+"/../other", manager+"//child", manager+"/./child", manager+"\\n"):
+    error(lambda path=path:r.safe_path(path,"cgroup","resource_not_allowed"),"resource_not_allowed")
+print(json.dumps({"readOnly":True,"realDirectoryWalk":True,"unsafeCases":7}))
 `);
   assert.equal(result.readOnly, true);
+  assert.equal(result.realDirectoryWalk, true);
+  assert.equal(result.unsafeCases, 7);
 });
 
 test('directory deletion unlinks internal image symlinks without following them and preserves marker until last', async () => {

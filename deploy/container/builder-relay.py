@@ -52,7 +52,7 @@ NONCE_RE = re.compile(r'[0-9a-f]{64}\Z')
 REQUEST_ID_RE = re.compile(r'[A-Za-z0-9_-]{1,100}\Z')
 UNIT_RE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]{0,119}\.service\Z')
 USER_RE = re.compile(r'[a-z_][a-z0-9_-]{0,31}\Z')
-PATH_RE = re.compile(r'/[A-Za-z0-9_./-]+\Z')
+PATH_RE = re.compile(r'/[A-Za-z0-9_./@-]+\Z')
 POLICY_FIELDS = {
     'apiVersion', 'instanceId', 'user', 'controllerUnit', 'stateDir',
     'runtimeDir', 'imageStore', 'maxLifetimeSeconds', 'maxMemoryMiB', 'maxPids',
