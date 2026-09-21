@@ -112,19 +112,40 @@ on, every grandfathered session refused to open a new tab at all
 ### Tab colours
 
 The cockpit colours each tab by whose account it runs on, and names them in the
-tooltip. An **uncoloured** tab is the shared box login.
+tooltip. An **uncoloured** tab is the shared box login; a coloured one is somebody's.
 
-Colours are assigned in `workbench.json`, so a team can agree what means whom:
+**Whose colour is whose** is written down in two places, because a mapping nobody can
+look up is not a mapping:
 
-```json
-{ "userTabColors": { "james.levac": "orange", "kevin.charlebois": "yellow" } }
-```
+* **Settings → Users** shows each person's swatch and colour name beside their username
+  — that table is the legend;
+* **`/me`** shows a person their own colour, and is where they change it.
 
-Valid names are the palette in `app/user-colors.js` (`orange`, `yellow`, `violet`,
-`green`, `pink`, `blue`, `teal`, `lime`, `red`, `sky`). Anyone unmapped gets a
-stable colour hashed from their username, drawn from the colours nobody has claimed.
-The mapping is resolved on every poll, so changing it repaints the strip without
-recycling any terminal. It is also settable through `POST /api/setup/state` (admin).
+**Choosing.** Every user always has a colour — a new one is assigned automatically, so
+no tab is ever colourless — and the assignment can be overridden:
+
+* a person picks their own on `/me` (`POST /api/me/tab-color`);
+* an admin picks it for them in the Add/Edit user form (`tabColor` on the user record).
+
+A colour already held by somebody else is **refused**, naming them, and shown as taken
+in the picker: two people in one colour undoes the only thing the colour is for.
+Choosing **Automatic** hands it back to the assignment.
+
+Resolution order, and why each layer exists:
+
+1. **the person's own stored choice** (`tabColor` on their record) — deliberate, and it
+   travels with the record through a rename or a delete;
+2. **the operator map** in `workbench.json` (`userTabColors`) — how this was configured
+   before there was a UI, kept working rather than silently discarded;
+3. **a stable hash** of the username, drawn only from colours nobody has claimed in 1 or
+   2, so a new teammate is never colourless and never collides with an agreed colour.
+
+Palette: `orange`, `yellow`, `violet`, `green`, `pink`, `blue`, `teal`, `lime`, `red`,
+`sky` (`app/user-colors.js`). With more people than colours, later arrivals share a
+hashed colour — an explicit choice always wins over a hashed one.
+
+The mapping is resolved on every poll, so a change repaints the strip within seconds
+without recycling any terminal.
 
 ### Prerequisites for Copilot specifically
 
@@ -252,11 +273,22 @@ The care is all in what it refuses to label, because a wrong name is worse than 
 
 | Situation | What happens |
 |---|---|
-| session's stamped fingerprint matches what its owner resolves to today | every **unlabelled** window is labelled with that owner |
+| the pane's start command names a credential directory | labelled with **that** person — the strongest evidence there is, and it survives a rotated token or a reassigned owner |
+| no credential directory in the pane, but the session's stamp matches its owner | labelled with the owner (the weaker, fallback rule) |
 | a window already carries a label | left alone — with per-launcher credentials a session legitimately holds several identities, and the owner is not all of them |
-| stamp is stale (panes are on older credentials) | **skipped and named**, with "recycle to migrate" — the current owner's name would be a guess |
-| owner no longer resolves, or the stamp cannot be read | skipped and named |
+| neither: no credential directory **and** a stamp that does not match | **skipped and named**, with "recycle to migrate" — nothing establishes whose account those panes spend |
+| owner cannot be resolved, or the stamp cannot be read | skipped and named |
 | project has no `primaryUser`, or the feature is off | skipped: there is no per-person identity to record |
+
+**Why the pane, not the fingerprint.** The fingerprint is
+`sha256(username \0 configDir \0 ghToken)`, so *clearing or rotating a token changes it* —
+and every session stamped with the old one stops matching, even though those panes plainly
+still run on that person's directory. That happened here: clearing one user's GitHub
+token made the backfill skip all of their projects as stale. A hash cannot tell "the
+token changed" from "the owner was reassigned", but the pane's own start command can: it
+carries `CLAUDE_CONFIG_DIR=<base>/<encoded-username>/claude`, which names the person
+directly. The encoding is reversible by design (see `encodeUserName`), and the decoded
+name is checked against the current roster before it is used.
 
 It is idempotent — a second run reports everything as already labelled — so it is safe
 to press again after recycling something.
@@ -295,7 +327,7 @@ Concretely:
 | Git/Copilot actions attributed to the right person | yes |
 | Secrets hidden from a *remote* user with no terminal | yes |
 | Secrets hidden from another user **who has a terminal on this box** | **no** |
-| A tab's colour prevents someone typing into another person's tab | **no** — the tmux session is shared; the colour is awareness, not a fence |
+| A tab's colour prevents someone typing into another person's tab | **no** — the colour is awareness. A client-side guard discourages it (below), but it is not a boundary |
 | Root compromise from a terminal | no — see below |
 
 Real cross-user isolation would require one OS account per person, which is a
@@ -305,6 +337,33 @@ scope the tokens accordingly.
 
 What the feature *must* not do is turn that shared-UID situation into a **root**
 compromise, which is what the next section is about.
+
+### Read-only in somebody else's tab
+
+The tab strip is shared by everyone in a project, so typing into a teammate's tab spends
+their seat and lands in their agent's conversation — by accident, easily. A guard in
+`app/terminal-preload.js` (the script nginx injects into every terminal page) drops
+keystrokes and pastes while the active tab belongs to somebody else, and shows a bar
+naming whose it is.
+
+**It is a guardrail, not a boundary, and the difference is structural rather than
+laziness.** tmux can make a whole *client* read-only (`attach -r`) but has no per-window
+notion of writability, so a per-tab rule can only live client-side — where devtools
+steps around it. `tmux attach` from a shell steps around everything, which is already
+true of every pane here, because they all run as one OS account.
+
+It **fails open**: an unreadable window list, an unresolved identity, an anonymous
+session, or no `fetch` at all leaves everything writable. A guardrail that locks someone
+out of their own terminal because a poll failed is worse than the mistake it prevents.
+Resize, pause and ttyd's handshake are never gated — only input — because blocking those
+breaks the terminal instead of making it read-only.
+
+Two things it does not change: an unlabelled tab (the shared login, or a session that
+predates labels) belongs to nobody and stays writable; and multiple clients attached to
+one tmux session still share the same active window, so two people in a project move
+each other's tab selection. Giving each person their own tmux session per project would
+fix both and make the lock enforceable server-side — that is the real design if
+enforcement is ever wanted, and it is a much larger change.
 
 ## How the credential tree is written (and why root never touches it)
 

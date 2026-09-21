@@ -531,6 +531,74 @@ test('the self token routes are self-scoped and reject junk', { timeout: 120000 
   }, { env: { PW_PER_USER_CLAUDE: 'true' } });
 });
 
+test('a colour can be chosen, is refused when taken, and is visible to an admin', { timeout: 120000 }, async () => {
+  // "How do we know whose colour is whose" needs the mapping written down where people
+  // look, and "can we choose" needs a colour to be settable without editing a root-owned
+  // config file. Both are checked here against a real instance.
+  await withCockpit(async ({ base, dir }) => {
+    await seedUsers(dir);
+    const kev = await login(base, 'kevin.charlebois');
+    const admin = await login(base, 'james.levac');
+    const setColor = (cookie, color) => fetch(`${base}/api/me/tab-color`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ color }),
+    }).then((r) => r.json().then((j) => ({ status: r.status, ...j })));
+
+    // A new user always HAS a colour (assigned), and the admin table reports it.
+    let users = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).json();
+    const before = users.users.find((u) => u.username === 'kevin.charlebois');
+    assert.equal(before.tabColor, '', 'nothing chosen yet');
+    assert.ok(before.tabColorName, 'but a colour is assigned, so no tab is ever colourless');
+    assert.match(before.tabColorCss, /^#[0-9a-f]{6}$/, 'and the table can draw it');
+    assert.ok(users.palette.length >= 6, 'the palette is offered for a picker');
+
+    assert.equal((await setColor(kev, 'yellow')).ok, true, 'a person can choose their own');
+    users = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).json();
+    const after = users.users.find((u) => u.username === 'kevin.charlebois');
+    assert.equal(after.tabColor, 'yellow', 'the choice is stored on their record');
+    assert.equal(after.tabColorName, 'yellow');
+    assert.equal(users.colorClaims.yellow, 'kevin.charlebois', 'and is published as a claim');
+
+    // Two people in one colour would undo the only thing the colour is for.
+    const clash = await setColor(admin, 'yellow');
+    assert.equal(clash.ok, false);
+    assert.equal(clash.status, 409);
+    assert.match(clash.error, /already kevin\.charlebois/);
+
+    // An admin can set somebody else's, and is refused the same way.
+    const patch = (body) => fetch(`${base}/api/users/kevin.charlebois`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json', cookie: admin }, body: JSON.stringify(body),
+    }).then((r) => r.json().then((j) => ({ status: r.status, ...j })));
+    assert.equal((await patch({ tabColor: 'violet' })).ok, true);
+    assert.equal((await patch({ tabColor: 'chartreuse' })).ok, false, 'a colour outside the palette is rejected');
+
+    // Handing it back to automatic is possible, and does not leave them colourless.
+    assert.equal((await setColor(kev, '')).ok, true);
+    users = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).json();
+    const auto = users.users.find((u) => u.username === 'kevin.charlebois');
+    assert.equal(auto.tabColor, '', 'no choice stored');
+    assert.ok(auto.tabColorName, 'but still a colour');
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('a chosen colour reaches the cockpit tab strip', { timeout: 120000 }, async () => {
+  // The point of choosing is what the tabs look like, so the choice is followed all the
+  // way to the window list the strip renders from.
+  await withCockpit(async ({ base, name, dir }) => {
+    await seedUsers(dir);
+    setPrimaryUser(dir, name, 'james.levac');
+    const cookie = await login(base, 'kevin.charlebois');
+    await fetch(`${base}/api/me/tab-color`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ color: 'teal' }),
+    });
+    const made = await (await fetch(`${base}/api/term/${encodeURIComponent(name)}/windows`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ name: 'kev-tab' }),
+    })).json();
+    const tab = made.windows.find((w) => w.name === 'kev-tab');
+    assert.equal(tab.credUser, 'kevin.charlebois');
+    assert.equal(tab.credColor, '#2dd4bf', 'the tab is drawn in the colour they chose');
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
 // ---------------------------------------------------------------------------
 // The UI must stop describing the shared identity as a person's login
 // ---------------------------------------------------------------------------

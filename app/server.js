@@ -17,7 +17,7 @@ import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName } from './user-credentials.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
 import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv, selectExpiredBoxFiles } from './workspace-file.js';
@@ -32,7 +32,7 @@ import { makeCredentialLockDomain } from './credential-domain-lock.js';
 import { assertTmuxOwner } from './tmux-owner-gate.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
-import { normalizeUserTabColors, resolveUserTabColor, userTabColorCss } from './user-colors.js';
+import { normalizeUserTabColors, resolveUserTabColor, userTabColorCss, mergeUserTabColors, userTabColorClaims, userTabPaletteList, normalizeUserTabColorChoice } from './user-colors.js';
 import { classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, resolveCliAuthCell } from './cli-auth-status.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
@@ -1922,19 +1922,36 @@ async function withCredColors(windows){
   : w));
 }
 // The cockpit polls the window list every 2s per open tab strip, so the mapping is
-// read from workbench.json at most once per TTL rather than once per poll. A read
-// failure keeps serving the last good mapping: a colour is awareness, and losing it
-// must never be able to fail the window list the tab strip is built from.
+// resolved at most once per TTL rather than once per poll. A read failure keeps serving
+// the last good mapping: a colour is awareness, and losing it must never be able to fail
+// the window list the tab strip is built from.
+//
+// Both sources are consulted (see mergeUserTabColors): each person's own stored choice,
+// then the operator map in workbench.json, then a stable hash of whatever is unclaimed.
 let credColorCache = { at:0, map:{} };
 async function userTabColorMap(){
  const now = Date.now();
  if(credColorCache.at && now - credColorCache.at < 10000) return credColorCache.map;
  let map = credColorCache.map;
- try { map = normalizeUserTabColors((await loadWorkbenchSettings()).userTabColors); }
- catch(e){ console.warn(`[per-user-claude] could not read the tab colour mapping, keeping the previous one: ${e?.message || e}`); }
+ try {
+  const [users, settings] = await Promise.all([loadUsers(), loadWorkbenchSettings().catch(()=> ({}))]);
+  map = mergeUserTabColors(users, settings.userTabColors);
+ } catch(e){ console.warn(`[per-user-claude] could not read the tab colour mapping, keeping the previous one: ${e?.message || e}`); }
  credColorCache = { at: now, map };
  return map;
 }
+// A deliberate choice is refused when it would duplicate somebody else's, because two
+// people sharing a colour undoes the only thing the colour is for. Returns the other
+// person's name, or null when the colour is free. '' (automatic) never conflicts.
+function tabColorClaimedBy(users, settings, username, color){
+ if(!color) return null;
+ const claims = userTabColorClaims(users, settings?.userTabColors);
+ const holder = claims[color];
+ return holder && holder !== username ? holder : null;
+}
+// Resolving a colour invalidates nothing on its own, but a CHANGE has to be visible
+// without waiting out the poll memo.
+function invalidateTabColorCache(){ credColorCache = { at:0, map:{} }; }
 
 async function tmuxWindowDetails(project){
  const fmt = '#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}';
@@ -4178,40 +4195,94 @@ app.post(BASE + '/api/setup/state', requireAdmin, async (req,res)=>{ try {
 //
 // Upgrading is therefore additive: it fills in blanks it can prove, and reports the rest.
 async function listWindowIdentities(sess){
- const { stdout } = await tmux(['list-windows','-t',sess,'-F','#{window_id}|#{window_name}|#{@pw_cred_user}']);
- return String(stdout || '').split('\n').filter(Boolean).map(line => {
-  const [id, ...rest] = line.split('|');
-  // The window NAME may contain the separator, so the label is read from the END.
-  const user = rest.length ? rest[rest.length - 1] : '';
-  return { id, user: (user || '').trim() };
- }).filter(w => w.id);
+ // pane_start_command is the argv tmux recorded when the pane was created, and for a
+ // per-user pane that argv contains CLAUDE_CONFIG_DIR=<base>/<encoded-username>/claude.
+ // That NAMES the person the pane actually runs as — which is better evidence than any
+ // hash comparison, and it is the same evidence for a session created years ago.
+ const { stdout } = await tmux(['list-panes','-s','-t',sess,'-F','#{window_id}|#{@pw_cred_user}|#{pane_start_command}']);
+ const byWindow = new Map();
+ for(const line of String(stdout || '').split('\n').filter(Boolean)){
+  const [id, user, ...cmdParts] = line.split('|');
+  if(!id) continue;
+  const prev = byWindow.get(id) || { id, user:'', paneUser:'' };
+  byWindow.set(id, {
+   id,
+   user: prev.user || (user || '').trim(),
+   // First pane that names somebody wins; a window's panes are created together.
+   paneUser: prev.paneUser || usernameFromPaneCommand(cmdParts.join('|')),
+  });
+ }
+ return [...byWindow.values()];
+}
+// Whose credential directory does this pane's start command point at?
+//
+// '' when it names none (the shared box login) or names a directory outside the
+// credential base, or one whose segment is not our own encoding, or a user who no longer
+// exists — each of those is "cannot tell", and cannot tell must never become a label.
+function usernameFromPaneCommand(cmd){
+ const m = /CLAUDE_CONFIG_DIR=(\S+)/.exec(String(cmd || ''));
+ if(!m) return '';
+ const dir = m[1];
+ const prefix = USER_CRED_BASE.endsWith('/') ? USER_CRED_BASE : USER_CRED_BASE + '/';
+ if(!dir.startsWith(prefix)) return '';
+ const segment = dir.slice(prefix.length).split('/')[0];
+ if(!segment || !isEncodedUserName(segment)) return '';
+ const decoded = decodeUserName(segment);
+ if(!decoded) return '';
+ // Whether that person still exists is the caller's check; this reads the path only.
+ return decoded;
 }
 async function backfillSessionIdentityLabels(){
  const projects = await loadProjects();
+ const roster = new Set((await loadUsers()).map(u => u.username));
  const results = [];
  for(const p of projects){
   const sess = tmuxSession(p.name);
   try { await tmux(['has-session','-t',sess]); } catch { results.push({ project:p.name, status:'no-session' }); continue; }
   const stamped = await readSessionCredKey(sess);
   if(!stamped.ok){ results.push({ project:p.name, status:'unverifiable', detail:stamped.error }); continue; }
-  let owner;
+  let owner = null;
   try { owner = await projectCredentialOwner(p); }
-  catch(e){ results.push({ project:p.name, status:'owner-unresolved', detail:e?.message || String(e) }); continue; }
-  if(!owner){ results.push({ project:p.name, status:'shared' }); continue; }
-  const desired = credentialFingerprint({ username: owner.username, configDir: userClaudeDir(owner.username), ghToken: owner.ghToken });
-  if(stamped.key !== desired){ results.push({ project:p.name, status:'stale', owner:owner.username }); continue; }
-  let labelled = 0, kept = 0;
+  catch(e){ /* the pane may still name somebody; an unresolvable OWNER is not fatal now */
+   results.push({ project:p.name, status:'owner-unresolved', detail:e?.message || String(e) });
+   continue;
+  }
+  // The owner-fingerprint match is the FALLBACK, for panes whose start command was not
+  // recorded (a restored session, or one whose pane was replaced). It is strictly weaker
+  // evidence, so it is only consulted when the pane itself says nothing.
+  const ownerKey = owner
+   ? credentialFingerprint({ username: owner.username, configDir: userClaudeDir(owner.username), ghToken: owner.ghToken })
+   : CREDENTIALS_OFF;
+  const ownerVouched = !!owner && stamped.key === ownerKey;
+  let labelled = 0, kept = 0, skipped = 0;
   try {
    for(const w of await listWindowIdentities(sess)){
     if(w.user){ kept += 1; continue; }
-    await stampWindowCredIdentity(w.id, desired, owner.username);
+    // Whose credential dir the pane was GIVEN — the strong evidence, and the only kind
+    // that survives a rotated token or a reassigned primaryUser.
+    const fromPane = w.paneUser && roster.has(w.paneUser) ? w.paneUser : '';
+    const who = fromPane || (ownerVouched ? owner.username : '');
+    if(!who){ skipped += 1; continue; }
+    // The stamped key must describe the identity being written. For a pane-derived
+    // label of somebody who is not the project owner (or whose token has since
+    // changed) that key is not recomputable here — the token may be gone — so the
+    // session's existing stamp is left in place and only the NAME is recorded. The
+    // name is what the strip renders; the key is what a recycle reconciles.
+    await stampWindowCredIdentity(w.id, who === owner?.username ? ownerKey : stamped.key, who);
     labelled += 1;
    }
   } catch(e){
-   results.push({ project:p.name, status:'partial', owner:owner.username, labelled, kept, detail:e?.message || String(e) });
+   results.push({ project:p.name, status:'partial', owner:owner?.username || '', labelled, kept, detail:e?.message || String(e) });
    continue;
   }
-  results.push({ project:p.name, status:'labelled', owner:owner.username, labelled, kept });
+  if(!labelled && !kept && skipped){
+   // Nothing could be established: no pane named anybody and the session's stamp does
+   // not match its owner. That is the case a deliberate recycle exists for.
+   results.push({ project:p.name, status:'stale', owner:owner?.username || '', skipped });
+   continue;
+  }
+  if(!labelled && !kept && !skipped){ results.push({ project:p.name, status:'shared' }); continue; }
+  results.push({ project:p.name, status:'labelled', owner:owner?.username || '', labelled, kept, skipped });
  }
  return results;
 }
@@ -4337,7 +4408,7 @@ const mePageCss = `.meWrap{max-width:860px;margin:0 auto;padding:26px 20px 60px;
 .meBack:hover{text-decoration:underline}`;
 
 const mePageScript = (base) => `<script>(function(){
-const list=document.getElementById('meClis'),tokBox=document.getElementById('meTokBox'),st=document.getElementById('meStatus');
+const list=document.getElementById('meClis'),tokBox=document.getElementById('meTokBox'),colorBox=document.getElementById('meColorBox'),st=document.getElementById('meStatus');
 const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 function setStatus(t,bad){st.textContent=t||'';st.classList.toggle('err',!!bad)}
 function pill(tone,text){return '<span class="mePill '+(tone||'')+'">'+esc(text)+'</span>'}
@@ -4367,6 +4438,34 @@ function render(s){
   const w=document.createElement('p');w.className='meWhy';w.textContent=c.auth.detail;row.appendChild(w);
   list.appendChild(row);
  }
+ /* My own colour: what my tabs are marked with in every cockpit, and the mapping
+    nobody could otherwise look up. Claimed colours are shown as taken rather than
+    silently refused on save. */
+ const col=s.color;
+ colorBox.innerHTML='<h2>My tab colour</h2><p class="meNote">Terminal tabs running on your account are marked with this in the cockpit, so it is visible whose seat a tab is spending. '
+  +(col.chosen?'You chose <b>'+esc(col.name)+'</b>.':'You were assigned <b>'+esc(col.name)+'</b> automatically \u2014 pick one to make it yours.')+'</p><div class="cPick" id="meColorPick"></div>';
+ const pick=document.getElementById('meColorPick');
+ function renderPick(sel){
+  pick.innerHTML='';
+  const auto=document.createElement('button');auto.type='button';auto.className='auto'+(sel?'':' sel');
+  auto.textContent='Automatic';auto.onclick=()=>save('');pick.appendChild(auto);
+  for(const c of col.palette){
+   const b=document.createElement('button');b.type='button';b.style.background=c.css;
+   const holder=col.claims[c.name];const taken=holder&&holder!==s.username;
+   b.className=(c.name===sel?'sel':'')+(taken?' taken':'');
+   b.title=taken?(c.name+' \u2014 already held by '+holder):c.name;
+   if(!taken)b.onclick=()=>save(c.name);
+   pick.appendChild(b);
+  }
+ }
+ async function save(color){
+  setStatus('Saving\u2026');
+  try{const r=await fetch('${base}/api/me/tab-color',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({color})});const j=await r.json();
+   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+   setStatus(color?('Your tabs are now '+color+'.'):'Your colour is automatic again.');load()}
+  catch(e){setStatus(e.message||String(e),true)}
+ }
+ renderPick(col.chosen);
  const g=s.github;
  tokBox.innerHTML='<h2>My GitHub token</h2><p class="meNote">Used for your git pushes, and it is also what authenticates Copilot — a stored token takes precedence over any Copilot sign-in. It is stored encrypted and is never shown back to you or to anyone else.</p>'
   +'<div class="meTok"><span>'+(g.hasToken?pill(g.kind==='classic'||g.kind==='unreadable'?'bad':'ok','stored · '+g.kind):pill('','none stored'))+'</span>'
@@ -4395,7 +4494,7 @@ app.get(BASE + '/me', requireAuth, async (req,res)=>{
  ]);
  const back = await lastProjectForUser(req.user.username).catch(()=> '');
  const backLink = back ? `<a class="meBack" href="${BASE}/term/${encodeURIComponent(back)}/">← back to ${esc(back)}</a>` : `<a class="meBack" href="${BASE}/">← back to the dashboard</a>`;
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>My CLI sign-ins — Workbench</title><style>${designTokensCss}${landingCss}${mePageCss}${statusBarCss}</style></head><body class="landing"><div class="meWrap">${backLink}<div class="meHead"><h1>My CLI sign-ins</h1><span class="meWho">signed in as <b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></div><p class="meLead">Which assistants this workbench offers is set by an administrator. <b>Being signed in to one is yours</b> — these are your own credentials, kept in your own configuration directory, and used by the terminals you open.</p><div class="meCard"><div id="meClis"></div></div><div class="meCard" id="meTokBox"></div><div class="meStatus" id="meStatus"></div></div>${mePageScript(BASE)}${statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE })}</body></html>`);
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>My CLI sign-ins — Workbench</title><style>${designTokensCss}${landingCss}${mePageCss}${statusBarCss}${colorPickCss}</style></head><body class="landing"><div class="meWrap">${backLink}<div class="meHead"><h1>My CLI sign-ins</h1><span class="meWho">signed in as <b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></div><p class="meLead">Which assistants this workbench offers is set by an administrator. <b>Being signed in to one is yours</b> — these are your own credentials, kept in your own configuration directory, and used by the terminals you open.</p><div class="meCard"><div id="meClis"></div></div><div class="meCard" id="meColorBox"></div><div class="meCard" id="meTokBox"></div><div class="meStatus" id="meStatus"></div></div>${mePageScript(BASE)}${statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE })}</body></html>`);
 });
 
 // CLI statuses, memoised briefly.
@@ -4461,9 +4560,10 @@ async function userCliState(user, clis){
 // parameter, so this cannot be used to enumerate anybody else's credentials.
 app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
  if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
- const [clis, users] = await Promise.all([offeredClis(), loadUsers()]);
+ const [clis, users, settings] = await Promise.all([offeredClis(), loadUsers(), loadWorkbenchSettings().catch(()=> ({}))]);
  const me = users.find(u => u.username === req.user.username) || { username: req.user.username };
  const { cells } = await userCliState(me, clis);
+ const colorMap = mergeUserTabColors(users, settings.userTabColors);
  // Only the fields a person needs in order to decide what to do — never authCmd/pkg,
  // which stay internal (the same trimming getCliStatuses already does).
  const out = clis.map(c => ({ ...c, auth: cells[c.key] }));
@@ -4473,8 +4573,43 @@ app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
   // The KIND of their own token, never the token. Knowing it is a classic PAT is the
   // difference between "sign in again" and "this can never work until it is replaced".
   github: { hasToken: !!me.ghToken, kind: me.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(me.ghToken)); } catch { return 'unreadable'; } })() : 'none' },
+  // chosen is '' when the colour was assigned automatically; name/css is what it is.
+  color: {
+   chosen: me.tabColor || '',
+   name: resolveUserTabColor(me.username, colorMap),
+   css: userTabColorCss(resolveUserTabColor(me.username, colorMap)),
+   palette: userTabPaletteList(),
+   claims: userTabColorClaims(users, settings.userTabColors),
+  },
   clis: out,
  });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Choose MY OWN tab colour.
+//
+// Self-service for the same reason the rest of this page is: a colour is how a team
+// refers to each other's terminals, and the person whose tabs they are is the obvious
+// one to pick it. Refused when somebody else already holds it — two people in one
+// colour undoes the only thing it is for — and '' hands the choice back to the
+// automatic assignment.
+app.post(BASE + '/api/me/tab-color', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const color = normalizeUserTabColorChoice(req.body?.color);
+ if(color === null) return res.status(400).json({ok:false,error:'Unknown tab colour'});
+ const result = await credentialDomain.withLocks(['lifecycle'], async () => {
+  const users = await loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  if(!u) return { failure: { status:404, error:'Your user record no longer exists.' } };
+  const holder = tabColorClaimedBy(users, await loadWorkbenchSettings().catch(()=> ({})), u.username, color);
+  if(holder) return { failure: { status:409, error:`"${color}" is already ${holder}'s colour. Pick another.` } };
+  if(color) u.tabColor = color; else delete u.tabColor;
+  await saveUsers(users);
+  return { color };
+ });
+ if(result.failure) return res.status(result.failure.status).json({ok:false,error:result.failure.error});
+ invalidateTabColorCache();
+ await audit('self_tab_color_set', { color: result.color || 'automatic' }, req);
+ res.json({ ok:true, color: result.color });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 // Replace or clear MY OWN stored GitHub token.
@@ -4595,6 +4730,16 @@ function statusBarHtml({ claudeVersion, updateStamp, user, enforce }){
  const enforceTag = enforce ? '<span class="sb-tag warn">enforce</span>' : '<span class="sb-tag">soft</span>';
  return `<footer id="pwStatusBar"><span class="sb-item sb-version">Release: <b>${esc(RELEASE_VERSION)}</b></span><span class="sb-sep">·</span><span class="sb-item">Claude Code: <b>${esc(claudeVersion)}</b></span><span class="sb-sep">·</span><span class="sb-item">Last update check: <b>${esc(updateStamp)}</b></span><span class="sb-sep">·</span><span class="sb-item">Auth: ${enforceTag}</span><span class="sb-grow"></span>${u}</footer>`;
 }
+/* The colour picker, shared by Settings -> Users and a person's own page: the palette as
+   swatches plus an explicit automatic option. A native select cannot show a colour, and a
+   colour you cannot see is not a choice. Defined once because two copies of the same
+   control drifting apart is how one of them ends up lying. */
+const colorPickCss = `.cPick{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:.3rem}
+.cPick button{width:22px;height:22px;border-radius:6px;border:2px solid transparent;cursor:pointer;padding:0}
+.cPick button.sel{border-color:#e5e7eb;box-shadow:0 0 0 2px rgba(148,163,184,.35)}
+.cPick button.taken{opacity:.35;cursor:not-allowed}
+.cPick .auto{width:auto;height:22px;padding:0 .5rem;background:#1f2937;border:2px solid #334155;color:#cbd5e1;font:inherit;font-size:.74rem;border-radius:6px}
+.cPick .auto.sel{border-color:#e5e7eb}`;
 const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);border-top:1px solid #1f2937;color:#94a3b8;font:12px system-ui,-apple-system,Segoe UI,sans-serif;padding:5px 14px;display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);z-index:50;overflow:hidden;white-space:nowrap}#pwStatusBar b{color:#e5e7eb;font-weight:600}#pwStatusBar .sb-sep{opacity:.45}#pwStatusBar .sb-grow{flex:1}#pwStatusBar .sb-tag{padding:1px 7px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:11px;border:1px solid #334155}#pwStatusBar .sb-tag.warn{color:#fde68a;border-color:#854d0e;background:#3b2e0a}#pwStatusBar .sb-version{white-space:nowrap}#pwStatusBar a.sb-user{color:inherit;text-decoration:none;border-bottom:1px dotted #475569}#pwStatusBar a.sb-user:hover{color:#e5e7eb;border-bottom-color:#94a3b8}body{padding-bottom:32px}body.pw-cockpit{padding-bottom:0}body.pw-cockpit #shell{height:calc(100% - 32px)}`;
 
 // ============================================================================
@@ -4604,6 +4749,10 @@ const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fi
 const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.tok-row{padding:.55rem 0;border-bottom:1px solid #1f2937}.tok-row:last-child{border-bottom:0}.tok-row.revoked{opacity:.55}.tok-tag{font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;background:#7f1d1d;color:#fecaca;border-radius:3px;padding:1px 5px;vertical-align:middle}.tok-new{margin:.6rem 0;padding:.6rem .7rem;border:1px solid #a16207;border-radius:6px;background:#1c1917}.tok-new pre{margin:.35rem 0;padding:.45rem .5rem;background:#0b0f19;border-radius:4px;overflow-x:auto;font-size:.8rem;color:#fde68a;user-select:all}#tokScopes{border:1px solid #334155;border-radius:6px;padding:.4rem .6rem;margin:.5rem 0}#tokScopes legend{padding:0 .3rem;font-size:.8rem;color:#94a3b8}#tokScopes label{display:block;font-weight:400;margin:.2rem 0}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}
 /* An action that lives INSIDE a status cell. A block button next to a pill doubled the
    row height and read as the point of the cell, when the status is the point. */
+/* The colour a person's terminal tabs are drawn in, shown next to their name. This IS
+   the legend: the mapping is only useful if it is written down somewhere people look. */
+.uSwatch{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:.45rem;vertical-align:baseline;border:1px solid rgba(255,255,255,.25)}
+.uColorName{color:#64748b;font-size:.72rem;margin-left:.4rem}
 .cellAct{background:none;border:0;padding:0;margin-left:.45rem;color:#7dd3fc;font:inherit;font-size:.74rem;cursor:pointer;text-decoration:underline dotted;white-space:nowrap}
 .cellAct:hover{color:#bae6fd;text-decoration-style:solid}
 .cellAct:disabled{opacity:.5;cursor:not-allowed;text-decoration:none}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}/* display:flex above outranks the UA [hidden] rule, so a hidden field stays visible unless this re-asserts it — the same trap as .tabMenu vs .projLinks[hidden]. */.t-grid label[hidden]{display:none}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-agentrow{display:flex;align-items:center;gap:.6rem;margin:.5rem 0 .2rem;font-size:.85rem;color:#cbd5e1}.t-agentrow label{display:flex;align-items:center;gap:.35rem}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
@@ -4618,7 +4767,7 @@ let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BA
    than a second round trip or an injected template value: the sign-in means is
    self-service, so the table has to know which row is yours. */
 function uColspan(){return 6+PW_CLIS.length+${DEPLOY_CENTRE ? '1' : '0'}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
 /* A stored token was previously write-only from this table: an empty field meant "keep
@@ -4635,6 +4784,27 @@ function tokenCellHtml(u){
   :'Stored encrypted; used for their git pushes and, if the type allows, for Copilot.';
  return '<td><span class="role-pill" style="'+style+'" title="'+esc(title)+'">'+esc(u.tokenKind)+'</span>'
   +'<button class="cellAct" data-cleartok="'+esc(u.username)+'" title="Remove this stored token. Needed when Copilot refuses its type, because a stored token overrides any sign-in.">clear</button></td>'
+}
+/* The colour picker, shared by the Add and Edit forms. PW_CLAIMS names who already holds
+   each colour so a duplicate cannot be chosen by accident — the server refuses it too,
+   but a disabled swatch explains itself better than an error does. */
+let PW_PALETTE=[],PW_CLAIMS={};
+function renderColorPick(el,selected,username){
+ el.innerHTML='';
+ const auto=document.createElement('button');auto.type='button';auto.className='auto'+(selected?'':' sel');
+ auto.textContent='Automatic';auto.title='Pick a stable colour from whatever nobody has chosen';
+ auto.onclick=()=>{el.dataset.color='';renderColorPick(el,'',username)};
+ el.appendChild(auto);
+ for(const c of PW_PALETTE){
+  const b=document.createElement('button');b.type='button';b.style.background=c.css;
+  const holder=PW_CLAIMS[c.name];
+  const taken=holder&&holder!==username;
+  b.className=(c.name===selected?'sel':'')+(taken?' taken':'');
+  b.title=taken?(c.name+' — already held by '+holder):c.name;
+  if(!taken)b.onclick=()=>{el.dataset.color=c.name;renderColorPick(el,c.name,username)};
+  el.appendChild(b);
+ }
+ el.dataset.color=selected||'';
 }
 /* One column per CLI the workbench offers, one cell per person per CLI. The cell is
    resolved on the SERVER (resolveCliAuthCell) so this table and each person's own
@@ -4663,7 +4833,7 @@ function cliCellHtml(u,cli){
   : '';
  return '<td>'+pill+act+'</td>';
 }
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th>'+PW_CLIS.map(c=>'<th>'+esc(c.label.replace(/ CLI$/,''))+'</th>').join('')+'<th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+PW_CLIS.map(c=>cliCellHtml(u,c)).join('')+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th>'+PW_CLIS.map(c=>'<th>'+esc(c.label.replace(/ CLI$/,''))+'</th>').join('')+'<th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td>'+(u.tabColorCss?'<span class="uSwatch" style="background:'+esc(u.tabColorCss)+'" title="'+esc(u.tabColorName+(u.tabColor?' (chosen)':' (assigned automatically)'))+'"></span>':'')+'<b>'+esc(u.username)+'</b>'+(u.tabColorName?'<span class="uColorName">'+esc(u.tabColorName)+(u.tabColor?'':' · auto')+'</span>':'')+'</td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+PW_CLIS.map(c=>cliCellHtml(u,c)).join('')+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
 uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.cleartok){
  if(!confirm('Clear the stored GitHub token for "'+t.dataset.cleartok+'"?\\n\\nA Copilot sign-in can then take effect for them, but git pushes from projects they own will have no credential until a new token is stored.'))return;
  t.disabled=true;setStatus(uStatus,'Clearing…');
@@ -4682,15 +4852,15 @@ uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.cleartok
  }catch(err){setStatus(uStatus,err.message||String(err),true)}finally{t.disabled=false}
 }else if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
 // --- User modal (used for both Add and Edit) ---
-const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
+const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');const umColor=document.getElementById('umColor');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
 function renderProjList(selected){if(!pwProjects.length){umProjList.innerHTML='<span class="empty">No projects in <code>projects.json</code> yet — add one from the dashboard\\'s Manage page first.</span>';return}const sel=new Set(Array.isArray(selected)?selected:[]);umProjList.innerHTML=pwProjects.map(p=>'<label><input type="checkbox" value="'+esc(p)+'"'+(sel.has(p)?' checked':'')+'>'+esc(p)+'</label>').join('')}
 function syncStarDisabled(){umProjList.classList.toggle('disabled',umProjStar.checked)}
 umProjStar.addEventListener('change',syncStarDisabled);
-function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';umGhToken.value='';umGhToken.placeholder=user?.hasToken?'(stored — leave blank to keep)':'ghp_… (optional)';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
+function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';umGhToken.value='';umGhToken.placeholder=user?.hasToken?'(stored — leave blank to keep)':'ghp_… (optional)';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}renderColorPick(umColor,user?.tabColor||'',user?.username||'');setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
 function umCloseFn(){umBackdrop.classList.add('hidden')}
 umCancel.addEventListener('click',umCloseFn);umClose.addEventListener('click',umCloseFn);umBackdrop.addEventListener('click',e=>{if(e.target===umBackdrop)umCloseFn()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!umBackdrop.classList.contains('hidden'))umCloseFn()});
 uAddBtn.addEventListener('click',()=>{if(!pwProjects.length){loadProjectList().then(()=>umOpen('add',null))}else{umOpen('add',null)}});
-umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects};const ghToken=umGhToken.value.trim();if(ghToken)body.ghToken=ghToken;${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();" : ''}if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={};if(ghToken)patchBody.ghToken=ghToken;if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
+umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects,tabColor:umColor.dataset.color||''};const ghToken=umGhToken.value.trim();if(ghToken)body.ghToken=ghToken;${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();" : ''}if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={tabColor:umColor.dataset.color||''};if(ghToken)patchBody.ghToken=ghToken;if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
 loadProjectList();loadUsers();
 // --- CLIs + Environment + System tabs (reuse existing /api/setup/* endpoints) ---
 const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('${BASE}/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';
@@ -4800,7 +4970,7 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}${colorPickCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
 <section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed.${PER_USER_CLAUDE ? ' There is a column per installed assistant showing whether <b>that person</b> has signed in to it — hover a cell for what it means and what to do. A sign-in runs in a terminal carrying the signer\'s own credentials, so the <b>sign in</b> action appears on your own row only, and only when something is outstanding; each person can also reach their own from the <b>' + esc('/me') + '</b> page linked by their name in the status bar.' : ''}</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
 <section id="tab-clis"><h2>${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</h2><p class="lead" id="cliLead">Install or update each assistant, then sign in. Credentials land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card" id="sharedAuthCard"><h3>Shared identity terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
@@ -4827,7 +4997,7 @@ ${renderDeploymentSettings(BASE)}
 </div></section><section id="tab-tokens"><h2>API tokens</h2><p class="lead">Bearer credentials for the machine API, so a script or an agent on another machine can register a project without an interactive sign-in. A token carries only the scopes you grant it &mdash; it is <b>not</b> an admin session and cannot reach user management, permission modes, or CLI installs.</p><div class="s-card"><h3>Create a token</h3><label>Label<input id="tokLabel" placeholder="e.g. laptop-copilot" maxlength="80"></label><fieldset id="tokScopes"><legend>Scopes</legend></fieldset><button class="button" id="tokCreate" type="button">Create token</button><div id="tokNew" class="tok-new" hidden><p><b>Copy this now &mdash; it is shown once and cannot be retrieved again.</b></p><pre id="tokNewVal"></pre><button class="button secondary tiny" id="tokCopy" type="button">Copy</button></div><div id="tokStatus" class="muted"></div></div><div class="s-card"><h3>Existing tokens</h3><p class="muted">Revoking disables a token immediately; the record is kept so the audit trail outlives it. Sensitive events are logged to <code>/var/log/project-workbench/audit.log</code>.</p><div id="tokList" class="muted">loading&hellip;</div></div></section><section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button>${PER_USER_CLAUDE ? ' <button class="button secondary" id="healLabelsBtn" type="button">Label existing terminals</button>' : ''}<pre class="heal-out" id="healOut"></pre>${PER_USER_CLAUDE ? '<p class="muted" style="margin-top:.6rem">A terminal opened before per-person identity existed runs on good credentials but never recorded whose, so its tabs show uncoloured. Labelling writes that record in place &mdash; it is a tmux option, so nothing running is disturbed. Only sessions whose stamped credentials still match their owner are labelled; anything that cannot be proven is skipped and named.</p>' : ''}</div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
-<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
+<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label><label>Terminal tab colour <span class="muted">(how their tabs are marked in the cockpit)</span><div class="cPick" id="umColor"></div></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
 ${wizardModalHtml}${wizardScript}${settingsScript}${deploymentSettingsScript(BASE)}${footer}</body></html>`);
 });
 
@@ -5024,6 +5194,12 @@ app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
   // One column per CLI this workbench offers, and one resolved cell per user per CLI,
   // so the table reads as "who is signed in to what" rather than as two special cases.
   const clis = await offeredClis();
+  // The colour each person's tabs actually get, resolved the same way the cockpit
+  // resolves it, plus the palette and who holds what — which together are the answer to
+  // "whose colour is whose", and the data a picker needs.
+  const settings = await loadWorkbenchSettings().catch(()=> ({}));
+  const colorMap = mergeUserTabColors(users, settings.userTabColors);
+  const claims = userTabColorClaims(users, settings.userTabColors);
   const out = await Promise.all(users.map(async u => {
    const state = await userCliState(u, clis);
    return {
@@ -5035,11 +5211,15 @@ app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
    // The KIND of their token, never the token. A classic PAT is the difference between
    // "sign in" and "this can never work until it is replaced", so an admin has to see it.
    tokenKind: u.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(u.ghToken)); } catch { return 'unreadable'; } })() : 'none',
+   // tabColor is what they CHOSE ('' = automatic); tabColorName/Css is what they GET.
+   tabColor: u.tabColor || '',
+   tabColorName: resolveUserTabColor(u.username, colorMap),
+   tabColorCss: userTabColorCss(resolveUserTabColor(u.username, colorMap)),
    };
   }));
   // `me` drives the self-service sign-in buttons. Empty for the implicit admin of an
   // auth-disabled instance: it is a placeholder, not one of these people.
-  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, users: out });
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, palette: userTabPaletteList(), colorClaims: claims, users: out });
  }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
@@ -5052,6 +5232,16 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   const ghToken = typeof req.body?.ghToken === 'string' ? req.body.ghToken.trim() : '';
   const deployPassword = DEPLOY_CENTRE && typeof req.body?.deployPassword === 'string' ? req.body.deployPassword.trim() : '';
   if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
+  // '' means "assign one automatically" — the normal case, and what every user created
+  // before this existed has. A new user therefore always HAS a colour; choosing is how
+  // you override the one they were given.
+  const tabColor = normalizeUserTabColorChoice(req.body?.tabColor);
+  if(tabColor === null) return res.status(400).json({ ok:false, error:'Unknown tab colour' });
+  if(tabColor){
+   const [existing, settings] = await Promise.all([loadUsers(), loadWorkbenchSettings().catch(()=> ({}))]);
+   const holder = tabColorClaimedBy(existing, settings, username, tabColor);
+   if(holder) return res.status(409).json({ ok:false, error:`"${tabColor}" is already ${holder}'s colour. Pick another.` });
+  }
   if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
   if(AUTH_MODE !== 'ldap' && password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   let projects;
@@ -5063,6 +5253,9 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   const now = new Date().toISOString();
   const id = 'u-' + crypto.randomBytes(6).toString('base64url');
   const rec = { id, username, role, projects, createdAt: now, lastLoginAt: null };
+  // Only stored when chosen: an absent tabColor is what "automatic" looks like on disk,
+  // so it stays automatic if the palette or the roster changes later.
+  if(tabColor) rec.tabColor = tabColor;
   if(passwordHash) rec.passwordHash = passwordHash;
   if(ghToken) rec.ghToken = encrypt(ghToken);
   if(deployPassword) rec.deployPassword = encrypt(deployPassword);
@@ -5080,6 +5273,7 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
    return { ok:true };
   });
   if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  if(tabColor) invalidateTabColorCache();
   await audit('user_create', { username, role, projects, hasToken: !!ghToken }, req);
   res.json({ ok:true, user: safeUserShape(rec) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
@@ -5127,6 +5321,8 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
   const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
   const newToken = req.body?.ghToken !== undefined ? String(req.body.ghToken || '').trim() : undefined;
+  const newTabColor = req.body?.tabColor !== undefined ? normalizeUserTabColorChoice(req.body.tabColor) : undefined;
+  if(newTabColor === null) return res.status(400).json({ ok:false, error:'Unknown tab colour' });
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
 
   // The ENTIRE operation — validating, mutating users.json, repointing
@@ -5171,6 +5367,13 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
    if(newRole !== undefined) u.role = newRole;
    if(newProjects !== undefined) u.projects = projectsResolved;
    if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
+   if(newTabColor !== undefined){
+    // Refused rather than silently shared: two people in one colour undoes the only
+    // thing the colour is for.
+    const holder = tabColorClaimedBy(users, await loadWorkbenchSettings().catch(()=> ({})), u.username, newTabColor);
+    if(holder) return { failure: { status:409, error:`"${newTabColor}" is already ${holder}'s colour. Pick another, or clear theirs first.` } };
+    if(newTabColor) u.tabColor = newTabColor; else delete u.tabColor;
+   }
    if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
    if(isNewRename){
     // Chain from any UNFINISHED prior rename's original fromUsername (and
@@ -5221,6 +5424,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   });
 
   if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  if(req.body?.tabColor !== undefined) invalidateTabColorCache();
   await audit('user_update', { target, before: result.before, after: { username: result.after.username, role: result.after.role, projects: result.after.projects, hasToken: !!result.after.ghToken }, pendingCredentialSync: result.pending }, req);
   res.json({ ok:true, user: safeUserShape(result.after) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }

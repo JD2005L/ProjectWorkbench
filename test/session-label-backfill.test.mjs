@@ -10,8 +10,10 @@
 // technical but epistemic — writing a name that is not true — so this file is mostly
 // about what the backfill REFUSES to label:
 //
-//   * a session whose stamped fingerprint no longer matches what its owner resolves to
-//     (its panes are on older credentials; the current owner's name would be wrong);
+//   * a window where nothing establishes whose account it spends: the pane carries no
+//     credential directory AND the session's stamp does not match its owner. (A stamp
+//     that merely drifted — a rotated token — is NOT that case: the pane still names
+//     the person, which is the stronger evidence and the one that is used.);
 //   * a window that already carries a label (with per-launcher credentials a session
 //     legitimately holds several identities, and the project owner is not all of them);
 //   * anything it cannot read or resolve at all.
@@ -124,20 +126,54 @@ test('a label that is already there is never overwritten', { timeout: 120000 }, 
   }, { env: { PW_PER_USER_CLAUDE: 'true' } });
 });
 
-test('a session on older credentials is SKIPPED and named, not mislabelled', { timeout: 120000 }, async () => {
+test('a rotated or cleared token no longer blocks the label: the PANE names the person', { timeout: 120000 }, async () => {
+  // Observed for real: clearing Kevin's GitHub token changed his credential fingerprint,
+  // so every session stamped with the old one stopped matching and the backfill skipped
+  // his projects as stale — even though those panes plainly run on HIS config directory.
+  // The pane's start command carries CLAUDE_CONFIG_DIR=<base>/<encoded user>/claude,
+  // which names the person directly and survives anything that changes the hash.
   await withCockpit(async ({ base, name, sock, dir }) => {
     await seed(dir, name);
     const cookie = await login(base, OWNER);
     const sess = `pw_${name}`;
     assert.equal((await (await fetch(`${base}/api/term/${encodeURIComponent(name)}/recycle`, { method: 'POST', headers: { cookie } })).json()).ok, true);
     await stripLabels(sock, sess);
-    // Its panes are on credentials that no longer match the owner's fingerprint — the
-    // exact state a pre-flag session is in. The owner's name would be a guess.
-    await tmux(sock, ['set-option', '-t', sess, '@pw_cred_key', 'deadbeefdeadbeef']);
+
+    // Rotate the owner's token behind the session's back — exactly what "Clear" does.
+    const users = JSON.parse(fs.readFileSync(path.join(dir, 'users.json'), 'utf8'));
+    for (const u of users.users) if (u.username === OWNER) delete u.ghToken;
+    fs.writeFileSync(path.join(dir, 'users.json'), JSON.stringify(users, null, 2));
 
     const out = await backfill(base, cookie);
     const mine = out.results.find((r) => r.project === name);
-    assert.equal(mine.status, 'stale');
+    assert.equal(mine.status, 'labelled', `the pane still names its owner: ${JSON.stringify(mine)}`);
+    const got = await labels(sock, sess);
+    assert.ok(got.every((l) => l.endsWith(`=${OWNER}`)), `every window labelled from the pane: ${got.join(' ')}`);
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('a window that names NOBODY, in a session whose stamp does not vouch, is skipped', { timeout: 120000 }, async () => {
+  // The skip case is narrower than it was, and this is what is left of it: the pane
+  // carries no credential directory (the shared box login, or a pane created without
+  // one) AND the session's stamp does not match its owner. Nothing establishes whose
+  // account that pane spends, and "cannot tell" must never become a label — a recycle
+  // is the deliberate remedy.
+  await withCockpit(async ({ base, name, sock, dir }) => {
+    await seed(dir, name);
+    const cookie = await login(base, OWNER);
+    const sess = `pw_${name}`;
+    assert.equal((await (await fetch(`${base}/api/term/${encodeURIComponent(name)}/recycle`, { method: 'POST', headers: { cookie } })).json()).ok, true);
+
+    // A plain window: no CLAUDE_CONFIG_DIR in its start command, so the pane names
+    // nobody. Then corrupt the session stamp so the owner cannot vouch for it either.
+    await tmux(sock, ['kill-session', '-t', sess]);
+    await tmux(sock, ['new-session', '-d', '-s', sess, 'sleep 300']);
+    await tmux(sock, ['set-option', '-t', sess, '@pw_cred_key', 'deadbeefdeadbeef']);
+    await stripLabels(sock, sess);
+
+    const out = await backfill(base, cookie);
+    const mine = out.results.find((r) => r.project === name);
+    assert.equal(mine.status, 'stale', JSON.stringify(mine));
     assert.match(out.message, /recycle to migrate/, 'the operator is told what the remedy is');
     assert.ok((await labels(sock, sess)).every((l) => l.endsWith('=')), 'and nothing was labelled');
   }, { env: { PW_PER_USER_CLAUDE: 'true' } });

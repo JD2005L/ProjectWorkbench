@@ -3219,3 +3219,107 @@ creation — so a pre-upgrade terminal keeps using the shared `~/.copilot` until
 label stays accurate about whose ACCOUNT the tab spends (`GH_TOKEN` + `CLAUDE_CONFIG_DIR` are
 per-user in those panes); only Copilot's session/history storage is still pooled. Documented
 rather than hidden.
+
+---
+
+## GOA — 2026-09-21 (5) — tab colours: a visible legend, and a choosable colour
+
+Two gaps GOA found by using it: nothing said whose colour was whose, and choosing one meant
+hand-editing a root-owned `workbench.json`.
+
+- **`tabColor` on the user record** is now the primary source. It travels with the record
+  through a rename or a delete, which the `workbench.json` map never did.
+- Resolution: **own choice → operator map (`workbench.json.userTabColors`) → stable hash of
+  the unclaimed colours.** The operator map is deliberately still honoured — it is how this
+  was configured before there was a UI, and dropping it would silently change colours a team
+  had already agreed on. `mergeUserTabColors()` folds both into one map so the hash cannot
+  land on a claimed colour.
+- **The legend is Settings → Users**: a swatch and colour name beside every username. `/me`
+  shows a person their own and is where they change it.
+- **Choosing**: admins in the Add/Edit form, people themselves via `POST /api/me/tab-color`.
+  A colour someone else holds is REFUSED (409, naming them) and shown as taken in the picker
+  — two people in one colour undoes the only thing the colour is for. Only EXPLICIT claims
+  block: a hashed colour steps aside for a deliberate choice rather than blocking it.
+- Every user always has a colour (assigned when unset), so no tab is ever colourless, and
+  "Automatic" hands the choice back.
+
+The picker CSS is defined once (`colorPickCss`) and included by both pages rather than
+duplicated — two copies of one control drifting apart is how one of them starts lying.
+
+Small thing worth knowing for anyone editing these pages: a **backtick** in a client-side
+comment ends the server's template literal, and a **typographic apostrophe** trips the
+"ASCII string delimiters" guard. Both bit this change; both are caught by the
+compile-every-inline-script tests.
+
+---
+
+## GOA — 2026-09-21 (6) — read-only in somebody else's tab (client-side guardrail)
+
+GOA asked whether a session can be locked to the person it belongs to, readable by others but
+not typeable. **tmux cannot express that**: `attach -r` makes a whole CLIENT read-only and
+there is no per-window notion of writability (`client_readonly` is a client property; no
+window option exists). Verified against tmux 3.3a rather than assumed.
+
+So the options were: a client-side guard (accident prevention), per-person tmux sessions per
+project with `attach -r` for other people's (real enforcement at the web layer, but it touches
+ttyd, nginx routing, the tab strip, hibernation, save/restore and scheduled tasks), or nothing.
+**GOA chose the client-side guard**, knowing what it is and is not.
+
+Implemented in `app/terminal-preload.js` — the script nginx `sub_filter`s into every ttyd page
+— in front of the websocket, which is the only chokepoint that covers keystrokes, paste, IME
+and xterm's own handlers in one place:
+
+- INPUT frames (`'0'`-prefixed, `0x30` as bytes) are dropped while the ACTIVE window's
+  `@pw_cred_user` is somebody else. Resize, pause and ttyd's handshake keep flowing — gating
+  those would break the terminal instead of making it read-only.
+- `__pwSendToTerminal` (the file drawer and paste path) writes straight to the native send, so
+  it is gated separately rather than assumed to pass through `ws.send`.
+- A red bar names whose tab it is and what to do instead. A swallowed keystroke with no
+  explanation reads as a broken terminal.
+- **It FAILS OPEN** — unreadable window list, unresolved identity, anonymous session, or no
+  `fetch` at all leaves everything writable. A guardrail that locks someone out of their own
+  terminal on a failed poll is worse than the accident it prevents. Pinned in
+  `test/terminal-readonly-guard.test.mjs`.
+
+**Not a security boundary, and the code says so:** devtools bypasses it, and `tmux attach` from
+a shell bypasses everything — which is already true of every pane here, since they all run as
+one OS account. Also unchanged: multiple clients attached to one session share the same active
+window, so two people in a project still move each other's tab selection. Per-person sessions
+would fix both; that remains the real design if enforcement is ever wanted.
+
+---
+
+## GOA — 2026-09-21 (7) — the backfill now labels from the PANE, not from a hash comparison
+
+GOA asked why one user's projects did not heal when the others did. Cause, confirmed from
+disk: **clearing that user's GitHub token changed their credential fingerprint**
+(`sha256(username \0 configDir \0 ghToken)`), so every session stamped with the old one
+stopped matching its owner and the backfill skipped them as stale — correctly by its own rule,
+and uselessly in practice, because those panes plainly still run on that person's directory.
+
+A hash cannot distinguish "the token rotated" from "the primaryUser was reassigned". The pane
+can: `pane_start_command` carries `CLAUDE_CONFIG_DIR=<PW_USER_CRED_BASE>/<encoded>/claude`,
+which NAMES the person. `encodeUserName` is injective and reversible by design, so the segment
+decodes unambiguously; the decoded name is then checked against the current roster.
+
+So the order of evidence is now: **the pane's own credential directory first**, the
+owner-fingerprint match only as a fallback for panes whose start command was never recorded
+(a restored session). This is strictly better in the case the old strictness existed to
+protect: with a reassigned owner, the pane names the PREVIOUS owner — which is true — instead
+of being skipped or labelled with the new one. The skip case narrows to "no credential
+directory in the pane AND a stamp that does not vouch", which is a real "cannot tell".
+
+Note on trust: a start command is what tmux recorded at pane creation, so it is authoritative
+for what the pane was GIVEN. Anyone with a shell could create a pane with a crafted
+`CLAUDE_CONFIG_DIR` — and could equally just type in any tab — so this is attribution, same
+as everything else here, not a boundary.
+
+Pinned in `test/session-label-backfill.test.mjs`: the owner's token is cleared behind a live
+session's back and the label still lands; and the narrowed skip case (a pane with no
+credential dir plus a corrupt stamp) still refuses.
+
+**Also fixed here:** the read-only guard was fetching `/api/auth/check` for the viewer's
+identity — that is the nginx `auth_request` subrequest, which answers 200/401 with no identity
+in the body. The right route is `/api/auth/me`. It survived review because the test's fetch
+stub answered the same wrong URL, written from the same wrong assumption; the stub now THROWS
+on any URL it does not recognise, so a wrong endpoint fails the test instead of passing it.

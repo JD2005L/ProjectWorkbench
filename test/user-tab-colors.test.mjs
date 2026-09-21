@@ -15,6 +15,10 @@ import {
   normalizeUserTabColors,
   resolveUserTabColor,
   userTabColorCss,
+  mergeUserTabColors,
+  userTabColorClaims,
+  userTabPaletteList,
+  normalizeUserTabColorChoice,
 } from '../app/user-colors.js';
 
 test('an explicit mapping is honoured exactly', () => {
@@ -85,4 +89,58 @@ test('the palette is all real hex colours and has no duplicates', () => {
   const values = Object.values(USER_TAB_PALETTE);
   for (const v of values) assert.match(v, /^#[0-9a-f]{6}$/, `${v} must be a hex colour`);
   assert.equal(new Set(values).size, values.length, 'two names for one colour cannot be told apart');
+});
+
+// ---------------------------------------------------------------------------
+// Where a colour comes from, once people can choose
+// ---------------------------------------------------------------------------
+
+test('a person\'s own choice beats the operator map, which beats the hash', () => {
+  const records = [{ username: 'james.levac', tabColor: 'violet' }, { username: 'kevin.charlebois' }];
+  const operator = { 'james.levac': 'orange', 'kevin.charlebois': 'yellow' };
+  const map = mergeUserTabColors(records, operator);
+  assert.equal(map['james.levac'], 'violet', 'their own choice wins');
+  assert.equal(map['kevin.charlebois'], 'yellow', 'the operator map still applies where nobody chose');
+  // And the hash draws only from what is left, so a third person cannot land on either.
+  const third = resolveUserTabColor('someone.new', map);
+  assert.ok(!['violet', 'yellow'].includes(third), `hashed colour must avoid claimed ones, got ${third}`);
+});
+
+test('the operator map keeps working for users who never chose', () => {
+  // It is how this was configured before there was any UI. Dropping it would silently
+  // change the colours a team had already agreed on.
+  const map = mergeUserTabColors([{ username: 'james.levac' }], { 'james.levac': 'orange' });
+  assert.equal(map['james.levac'], 'orange');
+});
+
+test('claims name who holds each colour, and only EXPLICIT choices count', () => {
+  const claims = userTabColorClaims(
+    [{ username: 'james.levac', tabColor: 'orange' }, { username: 'no.choice' }],
+    { 'kevin.charlebois': 'yellow' },
+  );
+  assert.equal(claims.orange, 'james.levac');
+  assert.equal(claims.yellow, 'kevin.charlebois', 'an operator assignment is a claim too');
+  // A hashed colour is not a claim: it moves aside the moment somebody picks it
+  // deliberately, so it must not block that pick.
+  const hashed = resolveUserTabColor('no.choice', {});
+  assert.notEqual(claims[hashed], 'no.choice');
+});
+
+test('a choice is a palette name or explicitly automatic; anything else is rejected', () => {
+  assert.equal(normalizeUserTabColorChoice('Orange '), 'orange');
+  assert.equal(normalizeUserTabColorChoice(''), '', 'empty means automatic, which is valid');
+  assert.equal(normalizeUserTabColorChoice(null), '');
+  // null is the rejection signal, deliberately distinct from '' — storing an unknown
+  // colour would render a tab with no colour at all and look like a bug.
+  assert.equal(normalizeUserTabColorChoice('chartreuse'), null);
+  assert.equal(normalizeUserTabColorChoice('toString'), null);
+});
+
+test('the palette is exposed with its CSS, because a colour you cannot see is not a choice', () => {
+  const list = userTabPaletteList();
+  assert.equal(list.length, USER_TAB_COLOR_NAMES.length);
+  for (const entry of list) {
+    assert.equal(entry.css, USER_TAB_PALETTE[entry.name]);
+    assert.match(entry.css, /^#[0-9a-f]{6}$/);
+  }
 });
