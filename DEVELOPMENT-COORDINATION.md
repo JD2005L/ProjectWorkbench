@@ -3501,3 +3501,25 @@ and running gh as root against it would be the same confused deputy in a differe
 
 The device flow from the previous entry stays as the fallback for a box without gh, and the
 modal picks the gh route whenever the tool is present.
+
+## GOA — 2026-09-21 (11) — an action is only offered where it applies
+
+Small, and the same complaint as (3): a control shown against a state it does not apply to
+makes the reader doubt what the state actually is. There, a "sign in" button sat beside
+"signed in". Here, the Git-token column offered **connect** next to a token that was already
+connected, and **clear** was already conditional.
+
+So in the Users table, connect now appears only on a row with nothing stored, and clear only
+on a row with something to clear. The two are never both present, which is not a loss of
+capability: replacing a credential is clear-then-connect anyway, because a stored token
+*overrides* any sign-in and therefore has to go first regardless. The pill and the GitHub
+login continue to carry the state.
+
+The person's own `/me` page keeps a re-authorisation path, because a credential can expire or
+be revoked and that is a thing you do to yourself — but with a token stored it demotes to a
+quiet link ("Re-authorise with GitHub") rather than the page's main call to action. Same
+`needsSignIn` shape already used for the CLI cells on that page.
+
+Pinned in `test/per-user-cli-signin.test.mjs`: the test splits `tokenCellHtml` at its two
+branches and asserts each control appears in exactly one of them, so re-adding a
+context-free button fails rather than reviewing as harmless.

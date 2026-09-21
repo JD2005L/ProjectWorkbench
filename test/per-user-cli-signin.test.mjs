@@ -630,6 +630,15 @@ test('a stored token can be CLEARED from the Users table', () => {
   // overrides any sign-in. The server already accepted ghToken:''; the control did not
   // exist.
   assert.match(SRC, /data-cleartok=/, 'the table needs a clear control');
+  // Each action appears only where it is the relevant one: clear only with a token to
+  // clear, connect only with nothing connected. An action offered against a state it
+  // does not apply to is the same defect as the sign-in button beside "signed in".
+  const cell = SRC.slice(SRC.indexOf('function tokenCellHtml(u){'), SRC.indexOf('function renderUsers(', SRC.indexOf('function tokenCellHtml(u){')));
+  const [noToken, hasToken] = [cell.slice(0, cell.indexOf('const bad=')), cell.slice(cell.indexOf('const bad='))];
+  assert.match(noToken, /data-ghoauth=/, 'with nothing stored, connect is the relevant action');
+  assert.doesNotMatch(noToken, /data-cleartok=/, 'and there is nothing to clear');
+  assert.match(hasToken, /data-cleartok=/, 'with a token stored, clear is the relevant action');
+  assert.doesNotMatch(hasToken, /data-ghoauth=/, 'and connect would offer a connection that exists');
   assert.match(SRC, /JSON\.stringify\(\{ghToken:''\}\)/, 'clearing sends the empty token the server already understands');
   assert.match(SRC, /git pushes from projects they own will have no credential/,
     'and the confirmation must state the consequence');

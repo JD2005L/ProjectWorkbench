@@ -4543,7 +4543,11 @@ function render(s){
   +(g.hasToken?'<button class="meBtn secondary" id="meTokClear" type="button">Clear</button>':'')+'</div>'
   +'<p class="meNote">Clearing it lets a Copilot sign-in take effect, but your git pushes from projects you own will have no credential until you store a new one.</p>'
   +(g.login?'<p class="meNote">Authorised as GitHub user <b>'+esc(g.login)+'</b>.</p>':'')
-  +((g.cli||g.oauth)?'<div class="meTok"><button class="meBtn" id="meGhStart" type="button">'+(g.cli?'Sign in with the GitHub CLI':'Authorise with GitHub')+'</button><span class="meNote">Recommended: an authorisation grants what it grants, instead of a hand-made token that pushes but Copilot refuses, or the reverse.</span></div><div id="meGhStep"></div>':'<p class="meNote">Neither the GitHub CLI nor an OAuth app is available here, so pasting a token is the only option. An administrator can install gh.</p>');
+  /* Same rule as the Users table: an action is offered when it is the relevant one.
+     With nothing stored, authorising is the thing to do and gets a button. With a token
+     already stored, re-authorising is still legitimate on your OWN page — a credential
+     can expire or be revoked — so it stays, as a quiet link rather than the main call. */
+  +((g.cli||g.oauth)?'<div class="meTok"><button class="meBtn'+(g.hasToken?' link':'')+'" id="meGhStart" type="button">'+(g.hasToken?'Re-authorise with GitHub':(g.cli?'Sign in with the GitHub CLI':'Authorise with GitHub'))+'</button><span class="meNote">'+(g.hasToken?'Replaces the stored token with a fresh authorisation.':'Recommended: an authorisation grants what it grants, instead of a hand-made token that pushes but Copilot refuses, or the reverse.')+'</span></div><div id="meGhStep"></div>':'<p class="meNote">Neither the GitHub CLI nor an OAuth app is available here, so pasting a token is the only option. An administrator can install gh.</p>');
  const ghStartBtn=document.getElementById('meGhStart');
  if(ghStartBtn){
   const step=document.getElementById('meGhStep');
@@ -5061,10 +5065,13 @@ function tokenCellHtml(u){
  const title=u.tokenKind==='classic'?'A classic personal access token. Fine for git, but Copilot CLI refuses this type — and it overrides any Copilot sign-in.'
   :u.tokenKind==='unreadable'?'This stored token could not be decrypted. Replace it.'
   :'Stored encrypted; used for their git pushes and, if the type allows, for Copilot.';
+ /* Only CLEAR here: there is already a credential, so "connect" would be offering to
+    make a connection that exists. Replacing one is clear-then-connect, which is also
+    what the underlying behaviour requires — a stored token overrides any sign-in, so it
+    has to go first regardless. */
  return '<td><span class="role-pill" style="'+style+'" title="'+esc(title)+'">'+esc(u.tokenKind)+'</span>'
   +(u.ghLogin?'<span class="uColorName" title="The GitHub account this token was authorised as">'+esc(u.ghLogin)+'</span>':'')
-  +'<button class="cellAct" data-ghoauth="'+esc(u.username)+'" title="Authorise GitHub through GitHub itself, instead of pasting a token">connect</button>'
-  +'<button class="cellAct" data-cleartok="'+esc(u.username)+'" title="Remove this stored token. Needed when Copilot refuses its type, because a stored token overrides any sign-in.">clear</button></td>'
+  +'<button class="cellAct" data-cleartok="'+esc(u.username)+'" title="Remove this stored token, so a fresh GitHub authorisation can be made. Also the fix when Copilot refuses the token type, because a stored token overrides any sign-in.">clear</button></td>'
 }
 /* GitHub authorisation, per person, in a modal.
    Device flow: the dashboard gets a code, the PERSON types it into github.com in their own
