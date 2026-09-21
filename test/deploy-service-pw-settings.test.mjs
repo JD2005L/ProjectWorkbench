@@ -6,6 +6,7 @@ import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { makeSecretCrypto } from '../app/secret-crypto.js';
 import { createWorkbenchSettingsStore, publicWorkbenchSettings, publicDeploymentSettings, validateConsoleUrl } from '../app/deployment/settings.js';
+import { createDeploymentService } from '../app/deployment/pw.js';
 
 const TOKEN = 'synthetic-service-credential-0123456789';
 const endpoint = 'https://deploy.example.test';
@@ -102,6 +103,26 @@ test('settings: draft connection supports current and replacement endpoints with
   assert.equal(f.raw, before);
   await assert.rejects(f.store.connection({ endpoint: 'http://remote.example.test' }), /HTTPS/);
   assert.equal(f.raw, before);
+});
+
+test('settings: PW client preserves an empty connection-test draft separately from slot backend selection', async t => {
+  const f = await fixture(t);
+  await f.store.updateDeployment({ backend: 'local', endpoint, token: TOKEN });
+  const before = f.raw;
+  class Client {
+    constructor(connection) { this.connection = connection; }
+  }
+  const service = createDeploymentService({ settingsStore: f.store, Client });
+  assert.equal(await service.client(), null);
+  await assert.rejects(service.requiredClient(), error => error.code === 'deployment_local');
+  const draft = await service.client({});
+  assert.ok(draft instanceof Client);
+  assert.deepEqual(draft.connection, { endpoint, token: TOKEN });
+  const selected = await service.requiredClient({ forceExternal: true });
+  assert.deepEqual(selected.connection, draft.connection);
+  await assert.rejects(service.client({ forceExternal: true }), /Unknown/);
+  assert.equal(f.raw, before);
+  assert.equal(await service.client(), null);
 });
 
 test('settings: malformed saved external mode, missing credentials, and invalid ciphertext fail closed', async t => {

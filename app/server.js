@@ -1399,7 +1399,7 @@ async function effectiveDeployBackend(state){
 }
 async function deploymentClientForBackend(backend){
  if(backend !== 'external') return null;
- const client = await deploymentService.client({ forceExternal:true });
+ const client = await deploymentService.client(undefined, { forceExternal:true });
  if(!client) throw new DeploymentError('External deployment is not configured for this slot.', 409, 'deployment_local');
  return client;
 }

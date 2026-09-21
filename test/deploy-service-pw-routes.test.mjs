@@ -404,7 +404,7 @@ test('PW slot backend: an explicit external transport failure never runs the loc
     config: { demo: { dev: { script: 'must not run', backend: 'external' } } },
     deploymentService: {
       backend: async () => 'local',
-      client: async ({ forceExternal } = {}) => {
+      client: async (_draft, { forceExternal } = {}) => {
         assert.equal(forceExternal, true);
         throw new DeploymentError('External deployment refused.', 503, 'deployment_unreachable');
       },

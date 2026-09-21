@@ -58,15 +58,14 @@ export function buildDeploymentJob({
 }
 
 export function createDeploymentService({ settingsStore, snapshot, Client = DeploymentClient }) {
-  async function client(options = {}) {
-    const { forceExternal = false, ...draft } = options;
+  async function client(draft, { forceExternal = false } = {}) {
     const connection = forceExternal
       ? await (settingsStore.externalConnection ? settingsStore.externalConnection() : settingsStore.connection({}))
-      : await settingsStore.connection(Object.keys(draft).length ? draft : undefined);
+      : await settingsStore.connection(draft);
     return connection ? new Client(connection) : null;
   }
   async function requiredClient({ forceExternal = false } = {}) {
-    const value = await client({ forceExternal });
+    const value = await client(undefined, { forceExternal });
     if (!value) throw new DeploymentError('External deployment is not selected. Use Settings > Deployment or the slot execution backend to select it.', 409, 'deployment_local');
     return value;
   }
