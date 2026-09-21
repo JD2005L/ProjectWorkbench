@@ -168,3 +168,19 @@ test('the advertised scope list contains no admin-equivalent scope', { timeout: 
     assert.deepEqual(listed.scopes, [SCOPE]);
   });
 });
+
+test('the users table can always reach its last column', { timeout: 60000 }, async () => {
+  // Measured in a real browser at release 1.26.0921.2045: below ~1400px the row was wider than its
+  // card and the Delete button sat past the right edge with no way to reach it — at 1280px, an
+  // ordinary laptop width. A CLI column per assistant is what pushed it over. Two causes, both
+  // pinned here: nothing scrolled, and the short status pills wrapped onto three lines each, which
+  // widened the columns for no gain.
+  await withDashboard(async ({ base }) => {
+    const html = await (await fetch(`${base}/settings`)).text();
+    assert.match(html, /<div class="utable-wrap"[^>]*><table class="utable"/,
+      'the table must sit in a container that can scroll to its last column');
+    assert.match(html, /\.utable-wrap\{overflow-x:auto/, 'and that container must actually scroll');
+    assert.match(html, /\.utable \.role-pill\{display:inline-block;white-space:nowrap;/,
+      'a two-word status must not stack into three lines and widen the column that caused this');
+  });
+});
