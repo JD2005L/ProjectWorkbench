@@ -2,6 +2,7 @@
 # Install the GitHub CLI so it SURVIVES a container recreation.
 #
 #   sudo bash /opt/project-workbench/workspaces/ProjectWorkbench/deploy/install-gh.sh [version]
+#   bash  .../deploy/install-gh.sh --where          # print the destination, change nothing
 #
 # WHY THIS EXISTS, given the Containerfile already installs gh (since 5ec4bf0,
 # 2026-09-09): the running image predates that layer — everything in its
@@ -11,10 +12,15 @@
 # story behind "gh isn't installed" recurring: the recipe was right and the artifact
 # was in a place that does not last.
 #
-# So this installs into /opt/npm-global/bin, which is a REAL FILESYSTEM on the host
-# (rootvg-srvlv) bind-mounted into the containers and already first on the panes' PATH.
-# It is the same place sqlcmd lives for the same reason. Recreating a container does not
-# touch it.
+# So this installs into the directory the containers see as /opt/npm-global — a real
+# filesystem on the host, bind-mounted in, already first on the panes' PATH, and the same
+# place sqlcmd lives for the same reason. Recreating a container does not touch it.
+#
+# THE PATH IS DIFFERENT DEPENDING ON WHERE YOU STAND, which is what made the first
+# version of this script abort on the host: inside a container it is /opt/npm-global/bin,
+# while on the host the same bytes are at /opt/project-workbench/persistent/npm-global/bin.
+# Rather than hardcode a second guess, this asks podman what the mount actually is and
+# only falls back to the documented host path if no container is running.
 #
 # Belt and braces on purpose: the Containerfile layer stays, so a rebuilt image also
 # has gh in /usr/local/bin. Whichever exists, PATH finds one — /opt/npm-global/bin wins
@@ -25,17 +31,56 @@
 # "not installed" in a confusing way later.
 set -uo pipefail
 
-DEST_DIR=${PW_GH_DEST:-/opt/npm-global/bin}
 FALLBACK_VERSION=2.63.2
+# Where the containers see it, and where the host keeps it. Both are consulted; neither
+# is assumed.
+IN_CONTAINER_DIR=/opt/npm-global
+HOST_DIR_DEFAULT=/opt/project-workbench/persistent/npm-global
 
 die(){ printf '\n[gh] ABORT: %s\n' "$*" >&2; exit 1; }
 say(){ printf '[gh] %s\n' "$*"; }
 hr(){  printf '\n[gh] ---- %s ----\n' "$*"; }
 
-[ "$(id -u)" -eq 0 ] || die "must run as root (sudo bash $0)"
-[ -d "$DEST_DIR" ] || die "$DEST_DIR does not exist.
-  That path is the persistent mount shared with the containers. If it has moved, pass
-  the right one: PW_GH_DEST=/somewhere/bin sudo bash $0"
+# Ask podman where a container's /opt/npm-global comes from. Self-correcting: if the
+# mount is ever moved, this follows it instead of needing this script edited.
+resolve_from_podman(){
+  command -v podman >/dev/null 2>&1 || return 1
+  local c src
+  for c in pw-tmux project-workbench; do
+    src=$(podman inspect "$c" --format \
+      '{{range .Mounts}}{{if eq .Destination "/opt/npm-global"}}{{.Source}}{{end}}{{end}}' 2>/dev/null)
+    if [ -n "$src" ] && [ -d "$src" ]; then printf '%s' "$src"; return 0; fi
+  done
+  return 1
+}
+
+resolve_dest(){
+  # 1. An explicit override always wins.
+  if [ -n "${PW_GH_DEST:-}" ]; then printf '%s' "$PW_GH_DEST"; return 0; fi
+  # 2. Running inside a container, where the mount is already visible.
+  if [ -d "$IN_CONTAINER_DIR" ]; then printf '%s/bin' "$IN_CONTAINER_DIR"; return 0; fi
+  # 3. On the host: ask podman rather than guess.
+  local src
+  if src=$(resolve_from_podman); then printf '%s/bin' "$src"; return 0; fi
+  # 4. The documented host path, if it is there.
+  if [ -d "$HOST_DIR_DEFAULT" ]; then printf '%s/bin' "$HOST_DIR_DEFAULT"; return 0; fi
+  return 1
+}
+
+DEST_DIR=$(resolve_dest) || die "could not find the persistent npm-global mount.
+  Looked for: $IN_CONTAINER_DIR (inside a container), the /opt/npm-global mount source of
+  the pw-tmux or project-workbench containers, and $HOST_DIR_DEFAULT.
+  If it lives somewhere else: PW_GH_DEST=/that/path/bin sudo bash $0"
+
+if [ "${1:-}" = "--where" ]; then
+  printf '%s\n' "$DEST_DIR"
+  exit 0
+fi
+
+[ "$(id -u)" -eq 0 ] || die "must run as root (sudo bash $0)
+  destination would be: $DEST_DIR"
+# The bin/ level may legitimately be absent on a fresh host even when the mount is there.
+[ -d "$DEST_DIR" ] || mkdir -p "$DEST_DIR" || die "could not create $DEST_DIR"
 # A tmpfs or an overlay upper layer would defeat the entire point of this script.
 FSTYPE=$(stat -f -c %T "$DEST_DIR" 2>/dev/null || echo unknown)
 case "$FSTYPE" in
@@ -92,7 +137,7 @@ say "installed: $DEST_DIR/gh"
 # ------------------------------------------------------------------- verify ---
 hr "verification"
 "$DEST_DIR/gh" --version || die "the installed binary does not run"
-say "on PATH as: $(command -v gh || echo '(not on THIS shell PATH — panes use /opt/npm-global/bin first)')"
+say "on PATH in this shell as: $(command -v gh || echo '(not on THIS shell PATH — the containers see it as /opt/npm-global/bin, which is first on a pane PATH)')"
 
 cat <<EOF
 
@@ -101,7 +146,8 @@ cat <<EOF
 Two things worth knowing:
 
   * A pane's PATH is fixed when the pane is created, but the DIRECTORY is already on it
-    (/opt/npm-global/bin is first), so existing terminals pick this up with no restart.
+    (the containers see it as /opt/npm-global/bin, first on PATH), so existing terminals
+    pick this up with no restart.
   * This does NOT authenticate anything. gh needs a token for private repos: either
     GH_TOKEN in the environment (per-user credentials already export one) or
     \`gh auth login\`, which is what the Users page will drive.

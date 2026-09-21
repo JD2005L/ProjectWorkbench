@@ -32,14 +32,31 @@ test('the image still installs gh, and still fails the build rather than shippin
 });
 
 test('the installer targets a filesystem that SURVIVES a container recreation', () => {
-  // The whole point. /opt/npm-global is a real host filesystem bind-mounted into the
+  // The whole point. That directory is a real host filesystem bind-mounted into the
   // containers — the same reason sqlcmd has lived there across every recreate — and it
   // is already first on a pane's PATH.
-  assert.match(INSTALLER, /PW_GH_DEST:-\/opt\/npm-global\/bin/, 'default destination must be the persistent mount');
+  assert.match(INSTALLER, /IN_CONTAINER_DIR=\/opt\/npm-global/);
+  assert.match(INSTALLER, /HOST_DIR_DEFAULT=\/opt\/project-workbench\/persistent\/npm-global/);
   // And it refuses the mistake it exists to prevent, rather than trusting the operator
   // to pass the right path.
   assert.match(INSTALLER, /tmpfs\|overlay\|overlayfs/, 'an ephemeral filesystem must be refused');
   assert.match(INSTALLER, /does NOT survive a container recreation/);
+});
+
+test('the destination is RESOLVED, not assumed — the first version aborted on the host', () => {
+  // The same bytes are /opt/npm-global/bin inside a container and
+  // /opt/project-workbench/persistent/npm-global/bin on the host, and the first version of
+  // this script only knew the former, so it aborted the moment it was run where it was
+  // meant to be run. Asking podman for the mount source is what makes it self-correcting
+  // if the mount ever moves.
+  assert.match(INSTALLER, /podman inspect "\$c"/, 'it must ask podman where the mount comes from');
+  assert.match(INSTALLER, /eq \.Destination "\/opt\/npm-global"/);
+  assert.match(INSTALLER, /for c in pw-tmux project-workbench/, 'either container answers');
+  // Ordered: an explicit override, then the container view, then podman, then the
+  // documented host path — and a clear failure naming all of them if none apply.
+  assert.match(INSTALLER, /could not find the persistent npm-global mount/);
+  // And a way to see the answer without changing anything or needing root.
+  assert.match(INSTALLER, /--where/);
 });
 
 test('the download is verified, so a truncated or tampered fetch fails closed', () => {

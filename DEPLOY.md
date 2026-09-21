@@ -114,9 +114,12 @@ recreated. Both have happened here. Install it where it survives:
 sudo bash /opt/project-workbench/workspaces/ProjectWorkbench/deploy/install-gh.sh
 ```
 
-That targets `/opt/npm-global/bin` — a host filesystem bind-mounted into the containers,
-already first on a pane's PATH — verifies the download against GitHub's published SHA-256,
-and refuses an ephemeral destination. Settings → System & Updates → Readiness checklist has
+It resolves the destination rather than assuming it: the same directory is
+`/opt/npm-global/bin` seen from inside a container and
+`/opt/project-workbench/persistent/npm-global/bin` on the host, so it asks podman for the
+mount source and falls back to the documented host path. `--where` prints the answer
+without changing anything or needing root. It verifies the download against GitHub's
+published SHA-256 and refuses an ephemeral (tmpfs/overlay) destination. Settings → System & Updates → Readiness checklist has
 a line for `gh`, so if it ever goes missing the dashboard says so instead of an agent
 discovering it mid-task.
 
