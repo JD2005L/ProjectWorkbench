@@ -22,3 +22,38 @@ export function resolveProjectCredentialOwner({ perUserEnabled, project, users, 
   const ghToken = u.ghToken ? (decrypt(u.ghToken) || '') : '';
   return { username: u.username, ghToken };
 }
+
+// Who owns the credentials for a terminal a PERSON just launched, and what is
+// their token?
+//
+// Per-launcher mode (PW_PER_LAUNCHER_CLAUDE) answers a different question from
+// resolveProjectCredentialOwner above: not "whose project is this" but "whose
+// seat is about to be spent". A project is shared by everyone granted access to
+// it, so keying a tab's Claude login / GitHub token to the project's primaryUser
+// bills every teammate's work to the owner's seat. Keying it to the person who
+// clicked "+" bills it to them.
+//
+// Returns `null` — meaning "no launcher identity, use the project owner" — for
+// the cases where there is legitimately no person to attribute to:
+//   * per-launcher mode is off;
+//   * no username was supplied (a scheduled task, the boot reattach, a bot);
+//   * the username does not resolve to a user record. That is the IMPLICIT_ADMIN
+//     of an unauthenticated instance, not a failure: falling back to the project
+//     owner keeps today's behaviour, which is NOT the silent shared-login swap
+//     resolveProjectCredentialOwner exists to prevent.
+//
+// A token that fails to decrypt still THROWS (via decrypt), because a corrupt
+// stored secret is a real fault and must not quietly become "no token".
+//
+// A launcher with no stored ghToken is NOT an error: they get their own config
+// dir with no GH_TOKEN, so Claude/Copilot ask them to sign in rather than
+// inheriting someone else's seat.
+export function resolveLauncherCredentialOwner({ perLauncherEnabled, username, users, decrypt }) {
+  if (!perLauncherEnabled) return null;
+  const name = String(username || '').trim();
+  if (!name) return null;
+  const u = (users || []).find((x) => x.username === name);
+  if (!u) return null;
+  const ghToken = u.ghToken ? (decrypt(u.ghToken) || '') : '';
+  return { username: u.username, ghToken };
+}

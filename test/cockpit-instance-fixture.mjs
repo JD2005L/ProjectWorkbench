@@ -52,6 +52,12 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = 
     PW_SESSIONS_PATH: path.join(dir, 'sessions.json'),
     PW_WORKSPACES: path.join(dir, 'workspaces'),
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'),
+    // Isolate the workbench settings file for the same reason every other state path
+    // here is isolated (see the note on workbenchSettingsPath in app/server.js): left
+    // unset, a fixture instance reads the REAL /etc/project-workbench/workbench.json,
+    // so these tests depend on production settings — and fail outright wherever that
+    // file is root-only, which is how it ships.
+    PW_WORKBENCH_SETTINGS: path.join(dir, 'workbench.json'),
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
     PW_API_TOKENS_PATH: path.join(dir, 'api-tokens.json'),
     PW_AUDIT_LOG: path.join(dir, 'audit.log'),

@@ -9,7 +9,8 @@
 //
 // Protocol: one JSON job object on stdin, one JSON result object on stdout.
 //
-//   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…,"sharedSettings":…}
+//   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…,
+//          "sharedSettings":…,"sharedClaudeMd":…,"sharedCopilotHome":…}
 //         {"action":"prune","base":…,"keep":[…]}
 //         {"action":"status","base":…,"username":…}
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
@@ -92,6 +93,12 @@ async function main() {
         ghToken: job.ghToken || '',
         sharedClaudeJson: job.sharedClaudeJson || '',
         sharedSettings: job.sharedSettings || '',
+        // This helper ENUMERATES the job's fields rather than spreading it, so a
+        // new seed input added to applyCredentialJob must be added here too or it
+        // silently arrives empty in the dropped-privilege path (which is the path
+        // that runs in production) while working fine in-process.
+        sharedClaudeMd: job.sharedClaudeMd || '',
+        sharedCopilotHome: job.sharedCopilotHome || '',
       });
     process.stdout.write(JSON.stringify({ ok: true, result }));
   } catch (e) {

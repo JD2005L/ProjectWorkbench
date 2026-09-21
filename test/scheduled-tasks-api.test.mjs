@@ -242,7 +242,10 @@ test('newTmuxWindow sends its command to the index it just created, not to a nam
   const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
   const start = src.indexOf('async function newTmuxWindow(');
   const body = src.slice(start, src.indexOf('\nasync function requireProject(', start));
-  assert.match(body, /'-P','-F','#\{window_index\}'/, 'new-window no longer reports the created index');
+  // The format also carries #{window_id} now, because the per-window credential stamp
+  // must be addressed by ID (indexes shift as windows close, and a stamp landing on a
+  // neighbour would mislabel two tabs at once). The INDEX is still what send-keys uses.
+  assert.match(body, /'-P','-F','#\{window_index\}\|#\{window_id\}'/, 'new-window no longer reports the created index');
   assert.match(body, /send-keys','-t',`\$\{sess\}:\$\{idx \|\| safeName\}`/, 'the command is still targeted by name, which is ambiguous once duplicated');
 });
 

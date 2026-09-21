@@ -19,8 +19,15 @@ that project's terminal launches with the owner's private credential context:
   performs the owner's normal OAuth login (`claude /login`) into that dir; it
   then persists. Team MCP servers (teamkb/pulse/skillhub, etc.) are seeded into
   the dir from the shared `~/.claude.json` so they keep working per-user.
-- **Copilot** — the owner's stored GitHub token is injected as `GH_TOKEN`
-  (Copilot authenticates via the GitHub CLI), so Copilot runs as that user.
+- **Copilot** — the owner's stored GitHub token is injected as `GH_TOKEN`, which
+  Copilot CLI documents as taking precedence over any stored credential, so
+  inference is billed to that user's Copilot seat. `COPILOT_HOME` is pointed at
+  the owner's own Copilot dir (`$PW_USER_CRED_BASE/<user>/copilot`) as well:
+  Copilot keeps its sessions, history, skills **and any `copilot /login`** in one
+  directory, so without that every user would still share `~/.copilot`. The dir is
+  seeded with the shared `copilot-instructions.md` and `mcp-config.json`, and
+  deliberately NOT with `config.json` or the session store — those are the
+  per-person state the split exists to separate.
 
 If the feature is off, or the project intentionally has no `primaryUser`, the
 terminal falls back to the shared login — nothing breaks. But if the feature is
@@ -57,6 +64,85 @@ Then, per owner (one time): open a project you own and run `claude` — complete
 the login in the browser. The **Settings → Users & Roles** table shows a
 **Claude** column: `✓ signed in` once you've done it, `not yet` until then.
 
+## Per-launcher mode: whose seat does a *tab* spend?
+
+Per-user credentials alone key a terminal to the project's `primaryUser`. On a
+project two people share, that means **every** teammate's Claude and Copilot work
+runs on the owner's login: one person's rate limit gates the whole team, and the
+audit trail names the wrong person.
+
+`PW_PER_LAUNCHER_CLAUDE=true` (the default once `PW_PER_USER_CLAUDE` is on) keys a
+cockpit tab to **the person who opened it**. Kevin clicks "+ → GitHub Copilot CLI"
+in a project James owns, and that tab gets Kevin's config dirs and Kevin's token.
+
+What stays keyed to the project owner, because no person asked for it:
+
+| Pane | Identity |
+|---|---|
+| a tab opened from the cockpit's "+" menu | the signed-in user who clicked |
+| the session's base window / preset tabs | the project owner |
+| the boot reattach, `scripts/project-terminal-start` (host mode) | the project owner |
+| a scheduled task, PVIKPBot, anything automated | the project owner |
+
+So the **base tab of an existing project keeps running on the owner's seat** —
+per-launcher mode does not retroactively re-key a live pane (a pane's environment
+is fixed by tmux at creation). Open a new tab to get your own.
+
+**Git pushes are not re-keyed.** A repository's push credential is a property of the
+repository, not of a tab: `syncProjectCredentials` pins the project's remote to the
+OWNER's token (see [git authentication](git-authentication.md)), and that is unchanged.
+What a launcher's tab gets is their own `GH_TOKEN` in the pane environment — which is
+what `gh` and Copilot read. So on a shared project, inference is attributed to whoever
+is typing while commits still push as the project's owner.
+
+### One session, several identities — recorded, not refused
+
+Because tabs are windows in one shared tmux session, a project's strip can now hold
+two people's identities at once. Each window is stamped at creation with
+`@pw_cred_user` (who) and `@pw_cred_key` (the credential fingerprint), read back to
+confirm the write landed; a window whose identity cannot be recorded is **closed**
+rather than handed over unlabelled.
+
+This replaces the older rule, which refused to add a window unless it matched the
+session's fingerprint. That rule was right while a session could only have one
+identity, and it had a visible side effect: once `PW_PER_USER_CLAUDE` was switched
+on, every grandfathered session refused to open a new tab at all
+(*"existing session credentials are stale … recycle required"*).
+
+### Tab colours
+
+The cockpit colours each tab by whose account it runs on, and names them in the
+tooltip. An **uncoloured** tab is the shared box login.
+
+Colours are assigned in `workbench.json`, so a team can agree what means whom:
+
+```json
+{ "userTabColors": { "james.levac": "orange", "kevin.charlebois": "yellow" } }
+```
+
+Valid names are the palette in `app/user-colors.js` (`orange`, `yellow`, `violet`,
+`green`, `pink`, `blue`, `teal`, `lime`, `red`, `sky`). Anyone unmapped gets a
+stable colour hashed from their username, drawn from the colours nobody has claimed.
+The mapping is resolved on every poll, so changing it repaints the strip without
+recycling any terminal. It is also settable through `POST /api/setup/state` (admin).
+
+### Prerequisites for Copilot specifically
+
+Each person needs their own Copilot seat, and a token Copilot CLI will actually
+accept. Per `copilot login --help`, that means a **fine-grained PAT with the
+"Copilot Requests" permission**, a Copilot CLI OAuth token, or a `gh` OAuth token
+(`gho_`). **Classic `ghp_` PATs are not supported** — one will authenticate `git`
+perfectly well and then fail for inference, which looks like a broken tab rather
+than a token problem.
+
+The trap: `copilot login` is **not** a way around a token Copilot rejects. The
+`GH_TOKEN` this feature exports into the pane takes PRECEDENCE over any stored
+credential (Copilot CLI documents that order), so a stored login is ignored while an
+unusable `GH_TOKEN` is present. Either give the person a token Copilot accepts, or
+clear their stored GitHub token so no `GH_TOKEN` is exported and `copilot login` in
+their own `COPILOT_HOME` takes effect. Clearing it does not break pushes — those use
+the repository's own pinned credential, not `GH_TOKEN`.
+
 ## Threat model: what this feature is and is not
 
 > **Per-user credentials give per-user _attribution_, not cross-user _isolation_.**
@@ -77,6 +163,7 @@ Concretely:
 | Git/Copilot actions attributed to the right person | yes |
 | Secrets hidden from a *remote* user with no terminal | yes |
 | Secrets hidden from another user **who has a terminal on this box** | **no** |
+| A tab's colour prevents someone typing into another person's tab | **no** — the tmux session is shared; the colour is awareness, not a fence |
 | Root compromise from a terminal | no — see below |
 
 Real cross-user isolation would require one OS account per person, which is a

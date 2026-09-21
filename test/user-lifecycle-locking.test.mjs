@@ -675,12 +675,21 @@ test('REGRESSION: a tmux control-plane failure while stamping a FRESH session fa
   }
 });
 
-// Item 2 (round 5): newTmuxWindow() / POST /api/term/:project/windows must
-// verify the LIVE session's stamped fingerprint before adding a window to
-// it — not just resolve today's credentials — or a stale/mismatched session
-// silently gets a new pane under a DIFFERENT identity than the rest of the
-// session (mixed-attribution panes).
-test('REGRESSION: POST /api/term/:project/windows refuses to add a window to a session whose stamped fingerprint no longer matches', { timeout: 30000 }, async () => {
+// Item 2 (round 5), REVISED 2026-09-21 when per-launcher credentials landed.
+//
+// The original requirement was that newTmuxWindow() / POST /api/term/:project/windows
+// REFUSE to add a window to a session whose stamped fingerprint no longer matches,
+// because the new pane would otherwise run under a different identity than its
+// siblings with nothing recording which (mixed-attribution panes).
+//
+// Per-launcher credentials make several identities in one session the INTENDED state
+// — that is the whole feature — so the requirement moved rather than being dropped:
+// the window is created, and it RECORDS the identity it was created with. What is
+// still refused is a pane whose identity cannot be recorded (newTmuxWindow kills it)
+// and an identity that cannot be resolved (credentialContext throws). And the
+// session's own stale stamp is deliberately left alone, so credentialsStale() keeps
+// flagging the drift for a deliberate recycle instead of it vanishing silently.
+test('a window added to a session with a mismatched stamp is created AND records its own identity', { timeout: 30000 }, async () => {
   const port = 3934;
   const tmuxSock = 'pw-lifelock-' + crypto.randomBytes(4).toString('hex');
   const inst = makeInstance(port, { PW_PER_USER_CLAUDE: 'true', PW_DEPLOY_MODE: 'container', PW_TMUX_SOCKET: tmuxSock });
@@ -706,11 +715,22 @@ test('REGRESSION: POST /api/term/:project/windows refuses to add a window to a s
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name: 'extra' }),
       });
       const body = await res.json();
-      assert.equal(body.ok, false, 'must refuse to add a window to a session stamped with a mismatched fingerprint');
-      assert.match(body.error || '', /stale|fingerprint/i);
+      assert.equal(body.ok, true, `a mismatched session stamp must no longer block a new tab: ${JSON.stringify(body)}`);
 
       const after = await (await fetch(`${base}/api/term/demo/windows`)).json();
-      assert.equal(after.windows.length, before.windows.length, 'no window may have been created despite the refusal');
+      assert.equal(after.windows.length, before.windows.length + 1, 'the window must really have been created');
+      const extra = after.windows.find((w) => w.name === 'extra');
+      // This request has no signed-in person behind it (the instance runs with auth
+      // off, so req.user is the implicit admin), which is exactly the case that must
+      // take the PROJECT OWNER rather than inventing a launcher identity.
+      assert.equal(extra.credUser, 'alice', 'the new window must record whose credentials it was created with');
+      const stamped = (await execFileAsync('tmux', ['-L', tmuxSock, 'show-options', '-w', '-t', `pw_demo:${extra.index}`, '-v', '@pw_cred_user'])).stdout.trim();
+      assert.equal(stamped, 'alice', 'the label must be on the window itself, not just in the API response');
+
+      // The session's corrupted stamp is NOT quietly repaired: drift has to stay
+      // visible so an operator migrates it deliberately (POST .../recycle).
+      const sessionStamp = (await execFileAsync('tmux', ['-L', tmuxSock, 'show-options', '-t', 'pw_demo', '-v', '@pw_cred_key'])).stdout.trim();
+      assert.equal(sessionStamp, 'deadbeefdeadbeef', 'adding a window must not re-stamp the session and hide the drift');
     });
   } finally {
     await execFileAsync('tmux', ['-L', tmuxSock, 'kill-server']).catch(() => {});

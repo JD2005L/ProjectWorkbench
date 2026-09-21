@@ -3020,3 +3020,70 @@ If PVI2 (host mode) enables per-user, mirror this grandfather behaviour there, o
 accept that host-mode requires a recycle before a stale session will attach. The
 credential-RESOLUTION contract (fail-closed on resolution failure) is unchanged and
 still identical across both entrypoints.
+
+---
+
+## GOA — 2026-09-21 — per-LAUNCHER credentials: a tab runs on the account of whoever opened it
+
+FYI for PVE, with one host-mode item that needs PVI's call.
+
+**Problem.** Per-user credentials key a terminal to the project's `primaryUser`, so on a
+project two people share, every teammate's Claude and Copilot work runs on the OWNER's
+login. On GOA that meant one person's Copilot seat and rate limit gating the whole team
+(reported on AITDataHub), and an audit trail naming the wrong person.
+
+**Change on `main`.** `PW_PER_LAUNCHER_CLAUDE` (default `true` once `PW_PER_USER_CLAUDE`
+is on; `false` pins the old behaviour without a revert):
+
+- `credentialContext(project, launcher)` resolves the LAUNCHER first
+  (`resolveLauncherCredentialOwner`, new in `app/project-owner.js`) and falls back to the
+  project owner when there is no person — the base session, the boot reattach, scheduled
+  tasks, bots. `POST /api/term/:project/windows` passes `req.user?.username`.
+- A launcher that does not resolve to a user record returns `null` (→ project owner), NOT
+  a throw: that is an unauthenticated instance's implicit admin, not a fault. Resolution
+  FAILURE (corrupt token, dangling `primaryUser`) still fails closed with no shared
+  fallback — AC1 unchanged.
+- **`COPILOT_HOME`** now rides alongside `CLAUDE_CONFIG_DIR` in every per-user pane. Copilot
+  CLI keeps sessions, history, skills and any `copilot /login` in ONE directory, so per-user
+  tokens alone still left everyone sharing `~/.copilot`. Seeded fill-only with
+  `copilot-instructions.md` + `mcp-config.json`; per-person state deliberately not copied.
+- **`CLAUDE.md` is now seeded** into each per-user config dir. It was not, and that silently
+  removed this workbench's standing agent guardrails from every per-user session (repaired by
+  hand on 2026-09-14). Per-launcher mode materializes a dir per PERSON, which multiplies that
+  gap, so it is fixed rather than documented.
+
+**Invariant that CHANGED — please review deliberately.** `newTmuxWindow` no longer requires a
+new window to match the session's credential fingerprint. That rule was the guard against
+unlabelled mixed-attribution panes, and it was correct while a session could hold only one
+identity; per-launcher mode makes the mix the point. The guard MOVED rather than disappeared:
+every window is stamped at creation with `@pw_cred_user` + `@pw_cred_key`, read back to confirm
+the write landed, and a window whose identity cannot be recorded is killed rather than handed
+over unlabelled. The cockpit colours each tab by that stamp (`userTabColors` in
+`workbench.json`; uncoloured = shared box login). Pinned by
+`test/per-launcher-credentials.test.mjs`; the superseded assertion in
+`test/per-user-stale-grandfather.test.mjs` was updated in the same commit, with both halves
+asserted so the two tests cannot disagree about which rule is in force.
+
+Side effect worth knowing: this also fixes the "+ tab" failure on grandfathered sessions
+(`existing session credentials are stale … recycle required`), which was the same rule firing.
+
+**PVI item (host mode).** `scripts/project-terminal-start` +
+`project-terminal-credentials.mjs` now carry `COPILOT_HOME` for parity — the script type-checks
+`copilotHome` as OPTIONAL (string or absent) so a newer script still works against an older
+helper, which is the state a partial deploy leaves behind. Per-LAUNCHER keying is deliberately
+NOT in the host-mode path: that pane is the project's, created by systemd with no person behind
+it, so the project owner remains the correct identity there. If PVI2 wants per-launcher panes in
+host mode, the launcher has to come from somewhere the unit does not have today — worth a
+disposition rather than an assumption.
+
+**Left alone on purpose.** `app/orchestrator/lane-credentials.js` stays owner-keyed and gets no
+`COPILOT_HOME`: a lane is the project's automation, not a person's tab, and it already omits
+`sharedSettings` for the same reason. Flagged rather than changed so it reads as a decision.
+
+**Known cosmetic gap.** `scripts/pw-tmux-save` does not capture `@pw_cred_user`, so a window
+recreated by a restore comes back UNCOLOURED (its pane env, and therefore its actual identity, is
+whatever the restore gave it). Left alone deliberately rather than changing the manifest format
+while session persistence is parked — flagging it so it is a known gap and not a surprise.
+
+**Not isolation, unchanged.** Every pane still runs as one OS account. A colour is awareness:
+the tmux session is shared, so it does not stop anyone typing into anyone else's tab.
