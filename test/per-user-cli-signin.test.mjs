@@ -397,6 +397,10 @@ test('SECURITY: the Copilot column decrypts a token to classify it and still nev
   // That is the only reason it is decrypted, and the classification is the only thing
   // allowed out — so the response is checked as RAW TEXT, not as a parsed object with
   // known keys, which is what would miss a token riding along in an unexpected field.
+  // clis: these assert how a stored credential is CLASSIFIED for a CLI, and the dashboard only
+  // classifies what it can see installed (getCliVersion runs `<bin> --version`). Without the
+  // stubs every cell collapses to 'not installed' on a machine without the GitHub Copilot CLI,
+  // which is exactly how these passed for their author and failed on CI.
   await withCockpit(async ({ base, dir }) => {
     await seedUsers(dir, { ghToken: 'ghp_CLASSIC_NOT_SUPPORTED' });
     setEnabledClis(dir, ['claude', 'copilot']);
@@ -415,7 +419,7 @@ test('SECURITY: the Copilot column decrypts a token to classify it and still nev
     assert.equal(kevin.tokenKind, 'classic', 'the TYPE is what an admin needs in order to act');
     assert.equal(kevin.hasToken, true, 'and the existing has-a-token boolean is unchanged');
     assert.equal(body.me, 'james.levac', 'the viewer is named so the table can offer self-service sign-in');
-  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+  }, { clis: ['claude', 'copilot'], env: { PW_PER_USER_CLAUDE: 'true' } });
 });
 
 test('a developer has a page of their own, reachable without Settings', { timeout: 120000 }, async () => {
@@ -440,7 +444,7 @@ test('a developer has a page of their own, reachable without Settings', { timeou
     // Never the token itself, on the page or in the API.
     const raw = JSON.stringify(st);
     assert.equal(raw.includes('ghp_CLASSIC_NOT_SUPPORTED'), false);
-  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+  }, { clis: ['claude', 'copilot'], env: { PW_PER_USER_CLAUDE: 'true' } });
 });
 
 test('REGRESSION: every inline script on the rendered /me page compiles', { timeout: 120000 }, async () => {
@@ -510,7 +514,7 @@ test('a person can escape the Copilot dead end themselves: clear, then sign in',
     assert.equal(set.github.kind, 'fine-grained');
     const final = await (await fetch(`${base}/api/me/cli-status`, { headers: { cookie } })).json();
     assert.equal(final.clis.find((c) => c.key === 'copilot').auth.tone, 'ok');
-  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+  }, { clis: ['claude', 'copilot'], env: { PW_PER_USER_CLAUDE: 'true' } });
 });
 
 test('the self token routes are self-scoped and reject junk', { timeout: 120000 }, async () => {
