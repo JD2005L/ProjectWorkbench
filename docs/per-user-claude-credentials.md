@@ -193,13 +193,22 @@ The **Git token** column now shows the token's *type* rather than a bare tick, a
 there" — so a token could never be removed, which mattered because clearing is the only
 fix when Copilot refuses the type.
 
-### The sign-in means is self-service, wherever it appears
+### The sign-in means is self-service, and appears only when something is owed
 
 A sign-in runs in a terminal, and a terminal carries the credentials of whoever opened
-it. So the **Sign in** button only appears on **your own row**: pressing it for someone
-else would create the tab on *your* credentials and sign *you* in again. It also only
-appears where a login would actually take effect — never where a stored token would
-override it, because that is a loop that cannot succeed.
+it. So the **sign in** action only appears on **your own row**: pressing it for someone
+else would create the tab on *your* credentials and sign *you* in again.
+
+It also only appears when there is an action outstanding — `needsSignIn`, not merely
+"a login would work". A control beside a cell that already reads *signed in* makes a
+reader doubt the status, so a signed-in row shows the status alone. Re-authenticating
+something that already works (an expired or revoked credential still reads as signed in
+on disk) is available from your own `/me` page, where it is not sitting in a list of
+everybody else's states. And it never appears where a stored token would override the
+login, because that is a loop that cannot succeed.
+
+Both in-cell actions — **sign in** and the token's **clear** — are compact inline links
+rather than buttons, so a status column reads as a status column.
 
 For everyone else's rows, the admin's lever is the token: replace it, or clear it so the
 person can sign in.

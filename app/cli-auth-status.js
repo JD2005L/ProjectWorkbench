@@ -118,9 +118,21 @@ export function copilotLoginWouldTakeEffect(state) {
  * with the problem reads another.
  *
  * `tone` is a presentation hint only ('ok' | 'bad' | 'warn' | ''), never a decision.
- * `canSelfSignIn` is the real gate: it is true only when THIS person running the CLI's
- * login would actually change something, which is not the same as "not signed in" —
- * see copilotLoginWouldTakeEffect.
+ *
+ * Two different booleans, because a table and a personal page want different answers:
+ *
+ *   needsSignIn    there is nothing usable in place yet, so signing in is an ACTION
+ *                  SOMEBODY OWES. This is what a status table offers a control for —
+ *                  a "Sign in" button beside a cell that already reads "signed in" is
+ *                  noise at best and makes the reader doubt the status at worst.
+ *   canSelfSignIn  a login by this person would take effect. Broader: it includes
+ *                  re-authenticating something already signed in, which is a real need
+ *                  (an expired or revoked credential still reads as "signed in" on
+ *                  disk) but belongs on that person's own page, not in a row of
+ *                  everybody's statuses.
+ *
+ * Neither is ever true where a stored token would override the login — see
+ * copilotLoginWouldTakeEffect.
  */
 export function resolveCliAuthCell({
   cli,
@@ -132,17 +144,17 @@ export function resolveCliAuthCell({
   copilotOverridesLogin = false,
 } = {}) {
   if (!installed) {
-    return { tone: 'warn', label: 'not installed', canSelfSignIn: false,
+    return { tone: 'warn', label: 'not installed', canSelfSignIn: false, needsSignIn: false,
       detail: 'This assistant is not installed on the workbench yet, so there is nothing to sign in to. An administrator installs it from Settings → CLIs.' };
   }
   if (!perUserEnabled) {
     // The shared box login IS everyone's login in this mode, so a per-person answer
     // would be a fiction. Say which mode is in force instead.
-    return { tone: '', label: 'shared login', canSelfSignIn: false,
+    return { tone: '', label: 'shared login', canSelfSignIn: false, needsSignIn: false,
       detail: 'This workbench runs every terminal on one shared login, so there is no personal sign-in. An administrator signs that identity in from Settings → CLIs.' };
   }
   if (!userAuthSupported) {
-    return { tone: '', label: 'not personal yet', canSelfSignIn: false,
+    return { tone: '', label: 'not personal yet', canSelfSignIn: false, needsSignIn: false,
       detail: 'This assistant has no per-user configuration directory on this workbench, so a sign-in would be written to the shared one instead of to this person.' };
   }
   if (cli === 'copilot') {
@@ -165,13 +177,16 @@ export function resolveCliAuthCell({
     const overridden = copilotOverridesLogin
       ? ' Their own sign-in exists but is being ignored, because the stored token takes precedence.'
       : '';
-    return { ...cell, detail: cell.detail + overridden, canSelfSignIn: verdict.ok };
+    // Signed in already counts as "nothing owed": re-authenticating is possible
+    // (canSelfSignIn) but is not an outstanding action to advertise in a table.
+    return { ...cell, detail: cell.detail + overridden, canSelfSignIn: verdict.ok,
+      needsSignIn: verdict.ok && copilotState === COPILOT_AUTH_STATES.none };
   }
   // Every other per-user CLI is a plain "has this person logged in" — Claude today,
   // and anything later that gains a per-user config dir.
   return claudeSignedIn
-    ? { tone: 'ok', label: 'signed in', canSelfSignIn: true,
+    ? { tone: 'ok', label: 'signed in', canSelfSignIn: true, needsSignIn: false,
       detail: 'Their own login is stored in their own configuration directory, and the terminals they open use it.' }
-    : { tone: '', label: 'not signed in', canSelfSignIn: true,
+    : { tone: '', label: 'not signed in', canSelfSignIn: true, needsSignIn: true,
       detail: 'They have not signed in yet. Opening a tab for this assistant asks them, and the login is then kept for them alone.' };
 }

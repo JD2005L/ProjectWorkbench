@@ -95,6 +95,30 @@ test('a sign-in is only offered when it could actually take effect', () => {
   assert.match(copilotLoginWouldTakeEffect(COPILOT_AUTH_STATES.tokenRejected).reason, /Copilot Requests|clear it/);
 });
 
+test('an action is offered only where one is OWED, not merely possible', () => {
+  // The distinction the Users table needs: a signed-in row has nothing outstanding, so
+  // it gets no control, while re-authenticating remains possible from a person's own
+  // page. Conflating the two put a "Sign in" button next to "signed in".
+  const claude = (signedIn) => resolveCliAuthCell({ cli: 'claude', perUserEnabled: true, userAuthSupported: true, claudeSignedIn: signedIn });
+  assert.equal(claude(false).needsSignIn, true, 'not signed in is an outstanding action');
+  assert.equal(claude(true).needsSignIn, false, 'signed in owes nothing');
+  assert.equal(claude(true).canSelfSignIn, true, 'but re-authenticating is still possible');
+
+  const copilot = (state) => resolveCliAuthCell({ cli: 'copilot', perUserEnabled: true, userAuthSupported: true, copilotState: state });
+  assert.equal(copilot(COPILOT_AUTH_STATES.none).needsSignIn, true);
+  assert.equal(copilot(COPILOT_AUTH_STATES.signedIn).needsSignIn, false);
+  assert.equal(copilot(COPILOT_AUTH_STATES.viaToken).needsSignIn, false, 'a working token owes nothing either');
+  assert.equal(copilot(COPILOT_AUTH_STATES.tokenRejected).needsSignIn, false,
+    'and a refused token needs the TOKEN fixed, not a sign-in that cannot take effect');
+
+  // Nothing owed where there is no per-person identity to sign in at all.
+  for (const cell of [
+    resolveCliAuthCell({ cli: 'claude', perUserEnabled: true, userAuthSupported: true, installed: false }),
+    resolveCliAuthCell({ cli: 'claude', perUserEnabled: false, userAuthSupported: true }),
+    resolveCliAuthCell({ cli: 'codex', perUserEnabled: true, userAuthSupported: false }),
+  ]) assert.equal(cell.needsSignIn, false);
+});
+
 test('one person + one CLI resolves to one cell, and the same one for both surfaces', () => {
   // The admin table and a person's own page render from THIS function, so a
   // disagreement between them is impossible by construction rather than by review.
@@ -547,8 +571,11 @@ test("the sign-in means sits in each CLI's cell, on your own row, where it would
   const start = SRC.indexOf('function cliCellHtml(u,cli){');
   assert.notEqual(start, -1, 'the per-CLI cell renderer must exist');
   const body = SRC.slice(start, SRC.indexOf('function renderUsers(', start));
-  assert.match(body, /const mine=u\.username===PW_ME/, 'the button is gated on the row being yours');
-  assert.match(body, /mine&&cell\.canSelfSignIn/, 'and on the sign-in being able to take effect');
+  assert.match(body, /const mine=u\.username===PW_ME/, 'the action is gated on the row being yours');
+  // needsSignIn, NOT canSelfSignIn: an action offered beside a cell that already reads
+  // "signed in" makes the reader doubt the status. Re-authenticating lives on /me.
+  assert.match(body, /mine&&cell\.needsSignIn/, 'and on an action actually being owed');
+  assert.doesNotMatch(body, /canSelfSignIn/, 'the table must not offer a redundant re-sign-in');
   // One column per offered CLI, rather than two hardcoded ones.
   assert.match(SRC, /PW_CLIS\.map\(c=>cliCellHtml\(u,c\)\)/, 'every offered CLI gets a cell per user');
 });
