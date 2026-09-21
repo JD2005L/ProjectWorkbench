@@ -17,7 +17,8 @@ import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken } from './user-credentials.js';
+import { ghLoginCommand, GH_DEFAULT_SCOPES } from './gh-cli.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
 import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv, selectExpiredBoxFiles } from './workspace-file.js';
@@ -877,7 +878,14 @@ async function credentialContext(project, launcher = ''){
    // sessions, history, skills and any stored login in one directory: per-user tokens
    // without it still leave every user sharing $HOME/.copilot. The token itself never
    // travels here — it is exported by the 0600 rcfile below, never as an argv token.
-   tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir, ...(cred.copilotHome ? ['COPILOT_HOME=' + cred.copilotHome] : [])],
+   tokens: [
+    'CLAUDE_CONFIG_DIR=' + cred.configDir,
+    ...(cred.copilotHome ? ['COPILOT_HOME=' + cred.copilotHome] : []),
+    // GH_CONFIG_DIR makes `gh` in this pane that PERSON's gh: their login, their
+    // hosts.yml. Without it, one shared file would be overwritten by whoever logged in
+    // last, and PW could not tell whose token it was reading back.
+    ...(cred.ghConfigDir ? ['GH_CONFIG_DIR=' + cred.ghConfigDir] : []),
+   ],
    shellArgs: cred.envFile ? ['--noprofile','--rcfile',cred.envFile] : DEFAULT_SHELL_ARGS,
    key: cred.fingerprint,
    username: owner.username,
@@ -4479,7 +4487,7 @@ function render(s){
   +(g.hasToken?'<button class="meBtn secondary" id="meTokClear" type="button">Clear</button>':'')+'</div>'
   +'<p class="meNote">Clearing it lets a Copilot sign-in take effect, but your git pushes from projects you own will have no credential until you store a new one.</p>'
   +(g.login?'<p class="meNote">Authorised as GitHub user <b>'+esc(g.login)+'</b>.</p>':'')
-  +(g.oauth?'<div class="meTok"><button class="meBtn" id="meGhStart" type="button">Authorise with GitHub</button><span class="meNote">Recommended: an authorisation grants what it grants, instead of a hand-made token that pushes but Copilot refuses, or the reverse.</span></div><div id="meGhStep"></div>':'<p class="meNote">No GitHub OAuth app is configured on this workbench, so pasting a token is the only option here. An administrator can enable it.</p>');
+  +((g.cli||g.oauth)?'<div class="meTok"><button class="meBtn" id="meGhStart" type="button">'+(g.cli?'Sign in with the GitHub CLI':'Authorise with GitHub')+'</button><span class="meNote">Recommended: an authorisation grants what it grants, instead of a hand-made token that pushes but Copilot refuses, or the reverse.</span></div><div id="meGhStep"></div>':'<p class="meNote">Neither the GitHub CLI nor an OAuth app is available here, so pasting a token is the only option. An administrator can install gh.</p>');
  const ghStartBtn=document.getElementById('meGhStart');
  if(ghStartBtn){
   const step=document.getElementById('meGhStep');
@@ -4495,9 +4503,32 @@ function render(s){
     setStatus('Done.');load();
    }catch(e){setStatus(e.message||String(e),true)}
   },ms);
-  ghStartBtn.onclick=async()=>{
-   ghStartBtn.disabled=true;setStatus('Asking GitHub for a code\u2026');
+  /* gh stores the token itself, so this watches for THAT rather than polling GitHub. */
+  const pollCapture=(ms)=>setTimeout(async()=>{
+   if(Date.now()>deadline){setStatus('Gave up waiting. Your terminal is still open \u2014 finish it there, then press the button again to pick it up.',true);return}
    try{
+    const r=await fetch('${base}/api/github-cli/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(j.ok&&j.status==='pending'){setStatus('Waiting for you to finish gh auth login\u2026');return pollCapture(ms)}
+    if(!j.ok){setStatus(j.error||'Could not read what gh stored.',true);return}
+    step.innerHTML='<p class="meNote">Connected as <b>'+esc(j.login)+'</b>. Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>';
+    setStatus('Done.');load();
+   }catch(e){setStatus(e.message||String(e),true)}
+  },ms);
+  ghStartBtn.onclick=async()=>{
+   ghStartBtn.disabled=true;setStatus('Working\u2026');
+   try{
+    if(g.cli){
+     const r=await fetch('${base}/api/github-cli/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+     const j=await r.json();
+     if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+     deadline=Date.now()+15*60*1000;
+     step.innerHTML='<p class="meNote">A terminal opened in <b>'+esc(j.project)+'</b> running <code>'+esc(j.command)+'</code>. Follow its prompts \u2014 gh prints a one-time code and a URL. <a href="'+esc(j.url)+'" target="_blank" rel="noopener">Open that terminal \u2197</a></p>';
+     setStatus('Waiting for you to finish gh auth login\u2026');
+     pollCapture(3000);
+     return;
+    }
+    setStatus('Asking GitHub for a code\u2026');
     const r=await fetch('${base}/api/github-oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
     const j=await r.json();
     if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
@@ -4612,6 +4643,7 @@ app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
    kind: me.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(me.ghToken)); } catch { return 'unreadable'; } })() : 'none',
    login: me.ghLogin || '',
    oauth: GITHUB_OAUTH.enabled,
+   cli: await ghCliAvailable(),
   },
   // chosen is '' when the colour was assigned automatically; name/css is what it is.
   color: {
@@ -4624,6 +4656,67 @@ app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
   clis: out,
  });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// ── GitHub via the gh CLI, per person ───────────────────────────────────────
+//
+// The better of the two routes, and the one to prefer when gh is installed: gh IS an app
+// GitHub trusts, so `gh auth login` needs no client id from us and produces the one kind
+// of token that has always done both jobs here — pushing and Copilot.
+//
+// PW does not implement any of the OAuth. It opens a terminal running the login AS THAT
+// PERSON (so gh writes into their own GH_CONFIG_DIR), and then reads back what gh stored.
+// The person completes the flow in their own browser, which is the only part that cannot
+// be automated and the reason to use gh rather than fake it.
+async function ghCliAvailable(){ return !!(await getCliVersion('gh')); }
+
+app.post(BASE + '/api/github-cli/connect', requireTerminalRole, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity to connect.'});
+ if(!PER_USER_CLAUDE) return res.status(409).json({ok:false,error:'Per-user credentials are off, so every terminal shares one gh login. Enable PW_PER_USER_CLAUDE first.'});
+ if(!await ghCliAvailable()) return res.status(409).json({ok:false,error:'The GitHub CLI is not installed. An administrator runs deploy/install-gh.sh (see Settings → System & Updates → Readiness checklist).'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ const users = await loadUsers();
+ const targetUser = users.find(u => u.username === target);
+ if(!targetUser) return res.status(404).json({ok:false,error:`User "${target}" not found`});
+ // The tab must run as the TARGET, not as whoever pressed the button, or gh would write
+ // into the presser's config dir and authorise the wrong person. That is only possible
+ // when tabs are keyed to a person at all.
+ if(target !== req.user.username && !PER_LAUNCHER_CLAUDE){
+  return res.status(409).json({ok:false,error:'Connecting on somebody else\'s behalf needs per-launcher credentials (PW_PER_LAUNCHER_CLAUDE), because the terminal has to run as them. They can do it from their own /me page instead.'});
+ }
+ const projects = filterProjectsForUser(await loadProjects(), targetUser);
+ if(!projects.length) return res.status(409).json({ok:false,error:`${target} has access to no projects, and the sign-in runs inside a project terminal. Grant a project first.`});
+ const preferred = await lastProjectForUser(target);
+ const project = projects.find(p => p.name === preferred) || projects[0];
+ const command = ghLoginCommand({ scopes: GH_DEFAULT_SCOPES });
+ const index = await newTmuxWindow(project, 'GitHub login', command, target);
+ await audit('github_cli_connect_started', { target, startedBy: req.user.username, project: project.name }, req);
+ res.json({ ok:true, target, project: project.name, windowIndex: index, command,
+  url: `${BASE}/term/${encodeURIComponent(project.name)}/` });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Read back what gh stored and adopt it as this person's credential. Polled while they
+// finish in their browser, so "nothing yet" is the normal answer rather than a failure.
+app.post(BASE + '/api/github-cli/capture', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first.'});
+ if(!PER_USER_CLAUDE) return res.status(409).json({ok:false,error:'Per-user credentials are off.'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ const token = await readUserGhToken({
+  base: USER_CRED_BASE, username: target,
+  owner: await terminalOwner(), currentUid: process.getuid?.() ?? null,
+  runJob: runCredentialJob, execFile: execFileAsync,
+ });
+ if(!token) return res.json({ ok:true, status:'pending' });
+ // Verified before it is adopted: which account it belongs to is what the row shows, and
+ // a token GitHub will not identify is not one to pin as a push credential.
+ const who = await verifyToken({ fetchImpl: fetch, config: GITHUB_OAUTH, token });
+ const stored = await setUserGithubToken(target, token, who.login);
+ if(stored.failure) return res.status(stored.failure.status).json({ok:false,error:stored.failure.error});
+ invalidateTabColorCache();
+ await audit('github_cli_connect_completed', { target, githubLogin: who.login, scopes: who.scopes }, req);
+ res.json({ ok:true, status:'ok', target, login: who.login, scopes: who.scopes, ...describeTokenCapability(who.scopes) });
+} catch(e){ res.status(502).json({ok:false,error:e.message||String(e)}); }});
 
 // ── GitHub OAuth, per person ────────────────────────────────────────────────
 //
@@ -4897,7 +4990,7 @@ let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BA
    than a second round trip or an injected template value: the sign-in means is
    self-service, so the table has to know which row is yours. */
 function uColspan(){return 6+PW_CLIS.length+${DEPLOY_CENTRE ? '1' : '0'}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};PW_GH_OAUTH=!!j.githubOauth;renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};PW_GH_OAUTH=!!j.githubOauth;PW_GH_CLI=!!j.githubCli;renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
 /* A stored token was previously write-only from this table: an empty field meant "keep
@@ -4922,7 +5015,7 @@ function tokenCellHtml(u){
    browser, and this polls for the result. Nothing has to reach this box, which is what
    makes it work on a LAN host behind a private CA. */
 const ghBackdrop=document.getElementById('ghBackdrop'),ghTitle=document.getElementById('ghTitle'),ghStep=document.getElementById('ghStep'),ghStatus=document.getElementById('ghStatus'),ghStart=document.getElementById('ghStart'),ghIntro=document.getElementById('ghIntro');
-let ghTarget='',ghTimer=null,ghDeadline=0,PW_GH_OAUTH=false;
+let ghTarget='',ghTimer=null,ghDeadline=0,PW_GH_OAUTH=false,PW_GH_CLI=false;
 function ghSet(t,err){ghStatus.textContent=t||'';ghStatus.classList.toggle('err',!!err)}
 function ghStop(){if(ghTimer){clearTimeout(ghTimer);ghTimer=null}}
 function ghCloseFn(){ghStop();ghBackdrop.classList.add('hidden');loadUsers()}
@@ -4931,10 +5024,15 @@ ghBackdrop.addEventListener('click',e=>{if(e.target===ghBackdrop)ghCloseFn()});
 function ghOpen(username){
  ghTarget=username;ghStop();
  ghTitle.textContent='Connect GitHub \u2014 '+username;
- ghStep.innerHTML='';ghSet('');ghStart.disabled=!PW_GH_OAUTH;
- ghIntro.textContent=PW_GH_OAUTH
-  ?'Authorise GitHub for this person. The token is stored encrypted, becomes the push credential for every project they own, and authenticates Copilot in their terminals.'
-  :'No GitHub OAuth app is configured on this workbench, so there is nothing to authorise against yet. An administrator sets PW_GITHUB_OAUTH_CLIENT_ID to an OAuth app with Device Flow enabled. Until then, paste a token in the Edit form instead.';
+ ghStep.innerHTML='';ghSet('');ghStart.disabled=!(PW_GH_CLI||PW_GH_OAUTH);
+ /* Prefer gh when it is installed: it needs no OAuth app of our own, and the token it
+    produces is the one kind that has always done both jobs here — pushing and Copilot. */
+ ghIntro.textContent=PW_GH_CLI
+  ?'Authorise GitHub for this person with the GitHub CLI. A terminal opens running gh auth login; they complete it in their own browser, and the token is then stored encrypted, becomes the push credential for every project they own, and authenticates Copilot.'
+  :(PW_GH_OAUTH
+   ?'Authorise GitHub for this person. The token is stored encrypted, becomes the push credential for every project they own, and authenticates Copilot in their terminals.'
+   :'Neither the GitHub CLI nor an OAuth app is available on this workbench. An administrator installs gh (deploy/install-gh.sh) or sets PW_GITHUB_OAUTH_CLIENT_ID. Until then, paste a token in the Edit form instead.');
+ ghStart.textContent=PW_GH_CLI?'Open a terminal and start':'Start authorisation';
  ghBackdrop.classList.remove('hidden');
 }
 async function ghPoll(intervalMs){
@@ -4956,9 +5054,42 @@ async function ghPoll(intervalMs){
   }catch(e){ghSet(e.message||String(e),true)}
  },intervalMs);
 }
+/* The gh route: PW opens the terminal and then watches for what gh stored. It does not
+   implement, proxy or scrape the OAuth — the person does that part in their browser. */
+async function ghPollCapture(intervalMs){
+ ghStop();
+ if(Date.now()>ghDeadline){ghSet('Gave up waiting. The terminal is still open if they want to finish it \u2014 then press Start again to pick it up.',true);return}
+ ghTimer=setTimeout(async()=>{
+  try{
+   const r=await fetch('${BASE}/api/github-cli/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+   const j=await r.json();
+   if(j.ok&&j.status==='pending'){ghSet('Waiting for them to finish gh auth login\u2026');return ghPollCapture(intervalMs)}
+   if(!j.ok){ghSet(j.error||'Could not read what gh stored.',true);return}
+   ghStep.innerHTML='<p class="gh-where gh-ok">Connected as <b>'+esc(j.login)+'</b></p>'
+    +'<p class="gh-hint">Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>'
+    +'<p class="gh-hint">Stored for <b>'+esc(j.target)+'</b>. The push credential of every project they own has been updated, and gh itself stays signed in for their terminals.</p>';
+   ghSet('Done.');
+  }catch(e){ghSet(e.message||String(e),true)}
+ },intervalMs);
+}
+async function ghStartViaCli(){
+ ghSet('Opening a terminal\u2026');
+ const r=await fetch('${BASE}/api/github-cli/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+ const j=await r.json();
+ if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+ ghDeadline=Date.now()+15*60*1000;
+ ghStep.innerHTML='<p class="gh-where">A terminal opened in <b>'+esc(j.project)+'</b> running:</p>'
+  +'<div class="gh-code" style="font-size:.95rem;letter-spacing:0">'+esc(j.command)+'</div>'
+  +'<p class="gh-hint">'+esc(ghTarget)+' follows the prompts there \u2014 gh prints a one-time code and a URL to enter it at. They must be signed in to GitHub as themselves.</p>'
+  +'<p class="gh-where"><a href="'+esc(j.url)+'" target="_blank" rel="noopener">Open that terminal \u2197</a></p>';
+ ghSet('Waiting for them to finish gh auth login\u2026');
+ ghPollCapture(3000);
+}
 ghStart.onclick=async()=>{
- ghStart.disabled=true;ghSet('Asking GitHub for a code\u2026');
+ ghStart.disabled=true;ghSet('Working\u2026');
  try{
+  if(PW_GH_CLI){ await ghStartViaCli(); return; }
+  ghSet('Asking GitHub for a code\u2026');
   const r=await fetch('${BASE}/api/github-oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
   const j=await r.json();
   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
@@ -5408,7 +5539,7 @@ app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
   }));
   // `me` drives the self-service sign-in buttons. Empty for the implicit admin of an
   // auth-disabled instance: it is a placeholder, not one of these people.
-  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, palette: userTabPaletteList(), colorClaims: claims, githubOauth: GITHUB_OAUTH.enabled, users: out });
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, palette: userTabPaletteList(), colorClaims: claims, githubOauth: GITHUB_OAUTH.enabled, githubCli: await ghCliAvailable(), users: out });
  }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });

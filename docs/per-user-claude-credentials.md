@@ -149,6 +149,50 @@ without recycling any terminal.
 
 ### Authorising GitHub per person (instead of pasting a token)
 
+Two routes exist. **Prefer the GitHub CLI one** — it needs no OAuth app of our own,
+because gh *is* an app GitHub trusts, and the token it issues is the one kind that has
+always done both jobs on this workbench: pushing and Copilot.
+
+#### Via `gh auth login` (recommended)
+
+Settings → Users → **connect** opens a terminal **as that person**, running:
+
+```
+gh auth login --hostname github.com --git-protocol https --web --insecure-storage --scopes repo,read:org,workflow
+```
+
+They follow gh's prompts — it prints a one-time code and a URL — in their own browser.
+The modal then reads back what gh stored and adopts it: the token becomes the push
+credential of every project they own and is exported as `GH_TOKEN` in their terminals,
+and **gh itself stays signed in** for their own `gh pr` / `gh api` use.
+
+Three things make that work:
+
+* **`GH_CONFIG_DIR` is per person** (`<cred root>/gh`), so a login writes into their own
+  tree rather than overwriting one shared `hosts.yml` — and PW can tell whose token it is
+  reading back.
+* **The terminal runs as the target**, not as whoever pressed the button. Doing it for
+  somebody else therefore needs per-launcher credentials, and is refused rather than
+  silently writing into the presser's directory.
+* **The read-back strips `GH_TOKEN` and friends from the environment.** `gh auth token`
+  *echoes an ambient token* — measured against gh 2.101.0 — and every pane already has
+  one, so an unsanitised read would return the token PW already had and report a fresh
+  login that never happened. With nothing stored, gh writes to stderr and leaves stdout
+  empty, so the answer is decided by the shape of stdout and never by the exit code.
+
+`--insecure-storage` is deliberate: gh uses an OS credential store when it finds one and
+plain text otherwise, and this container has no keyring — so being explicit makes the
+result land where `gh auth token` can always read it, instead of depending on the
+continued absence of a keyring. The file is `0600` inside the person's own `0700`
+directory.
+
+If `gh` is missing, the modal says so and names `deploy/install-gh.sh`. Note that gh has
+disappeared here before — see the readiness checklist entry.
+
+#### Via our own device flow (fallback)
+
+
+
 One stored token per person has to do two unrelated jobs here: it is the **push
 credential** pinned into every repository that person owns, and it is what
 **authenticates Copilot** in their terminals. A hand-made PAT reliably satisfies one and

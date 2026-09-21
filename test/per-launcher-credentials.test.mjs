@@ -233,9 +233,16 @@ test('ensureUserCredentials reports copilotHome, and tolerates an older helper t
 // by source assertion — the same style test/per-user-stale-grandfather.test.mjs uses.
 // ---------------------------------------------------------------------------
 
-test('the pane gets COPILOT_HOME alongside CLAUDE_CONFIG_DIR', () => {
-  assert.match(SRC, /tokens: \['CLAUDE_CONFIG_DIR=' \+ cred\.configDir, \.\.\.\(cred\.copilotHome \? \['COPILOT_HOME=' \+ cred\.copilotHome\] : \[\]\)\]/,
+test('the pane gets COPILOT_HOME and GH_CONFIG_DIR alongside CLAUDE_CONFIG_DIR', () => {
+  // Asserted per variable rather than as one exact expression: the previous version
+  // pinned the whole array literal, so adding a third directory to it failed a test whose
+  // subject had not changed. Each of these is a separate claim about the pane's
+  // environment, and each is checked as one.
+  assert.match(SRC, /'CLAUDE_CONFIG_DIR=' \+ cred\.configDir/);
+  assert.match(SRC, /cred\.copilotHome \? \['COPILOT_HOME=' \+ cred\.copilotHome\] : \[\]/,
     'without COPILOT_HOME, per-user tokens still leave everyone sharing $HOME/.copilot');
+  assert.match(SRC, /cred\.ghConfigDir \? \['GH_CONFIG_DIR=' \+ cred\.ghConfigDir\] : \[\]/,
+    'and without GH_CONFIG_DIR one shared hosts.yml is overwritten by whoever logged in last');
   // The token itself must still never travel as an env/argv token (tmux keeps a
   // pane's start command for its lifetime, readable by every other pane).
   assert.doesNotMatch(SRC, /'GH_TOKEN=' \+/, 'the GitHub token must stay in the 0600 rcfile');

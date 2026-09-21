@@ -170,6 +170,14 @@ export function userCopilotConfigDir(base, username) {
   return path.join(userCredRoot(base, username), 'copilot');
 }
 
+// The GitHub CLI's config dir. GH_CONFIG_DIR is gh's documented override, and pointing
+// it here is what makes `gh auth login` in somebody's terminal authorise THEM: the token
+// lands in their own tree, where PW can read it back and where their own `gh pr`/`gh api`
+// calls will find it. Without it every person's gh login would overwrite one shared file.
+export function userGhConfigDir(base, username) {
+  return path.join(userCredRoot(base, username), 'gh');
+}
+
 // ---------------------------------------------------------------------------
 // Session fingerprint
 // ---------------------------------------------------------------------------
@@ -309,6 +317,7 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
   const credRoot = userCredRoot(base, username);
   const configDir = userClaudeConfigDir(base, username);
   const copilotHome = userCopilotConfigDir(base, username);
+  const ghConfigDir = userGhConfigDir(base, username);
 
   // The base itself may legitimately need creating; below it we build one level
   // at a time so a planted symlink cannot smuggle us out of the tree.
@@ -316,6 +325,7 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
   await mkdirChecked(fsp, credRoot, { enforceMode: true });
   await mkdirChecked(fsp, configDir, { enforceMode: true });
   await mkdirChecked(fsp, copilotHome, { enforceMode: true });
+  await mkdirChecked(fsp, ghConfigDir, { enforceMode: true });
 
   // Seed the managed MCP servers from the shared config so a per-user Claude
   // still gets team MCP (teamkb / pulse / skillhub). Only on first creation:
@@ -384,7 +394,7 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
     }
   }
 
-  return { configDir, copilotHome, envFile: ghToken ? envFile : '', seeded };
+  return { configDir, copilotHome, ghConfigDir, envFile: ghToken ? envFile : '', seeded };
 }
 
 // Remove credential trees that no longer belong to a current user, so a deleted
@@ -522,6 +532,7 @@ export async function ensureUserCredentials({
     // deploy): callers must treat '' as "no COPILOT_HOME to set" rather than
     // passing `undefined` into a tmux env token.
     copilotHome: result.copilotHome || '',
+    ghConfigDir: result.ghConfigDir || '',
     envFile: result.envFile,
     seeded: !!result.seeded,
     fingerprint: credentialFingerprint({ username, configDir: result.configDir, ghToken }),
@@ -586,6 +597,21 @@ export async function userCopilotSignedIn({ fsp, base, username }) {
   if (tokens && typeof tokens === 'object' && Object.values(tokens).some((v) => typeof v === 'string' && v.trim())) return true;
   if (Array.isArray(parsed.loggedInUsers) && parsed.loggedInUsers.some((u) => u && typeof u.login === 'string' && u.login.trim())) return true;
   return typeof parsed.lastLoggedInUser?.login === 'string' && !!parsed.lastLoggedInUser.login.trim();
+}
+
+// What has this person's gh stored? Runs through the SAME privilege-dropped helper as
+// every other access to the credential tree: the config dir belongs to the pane account,
+// and the dashboard (often root) must not read inside it directly — nor run gh as root
+// against it, which would be the same confused deputy wearing a different hat.
+export async function readUserGhToken({ base, username, owner = null, currentUid = null, runJob = null, execFile = null }) {
+  const job = { action: 'gh-token', base, username };
+  const plan = credentialExecutionPlan({ owner, currentUid });
+  if (plan.drop) {
+    const result = await runJob(job, plan);
+    return String(result?.token || '');
+  }
+  const { readStoredGhToken } = await import('./gh-cli.js');
+  return readStoredGhToken({ execFile, ghConfigDir: userGhConfigDir(base, username), env: process.env });
 }
 
 // Same in-process-or-dropped-helper shape as ensureUserCredentials/

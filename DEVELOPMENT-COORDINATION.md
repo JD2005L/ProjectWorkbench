@@ -3409,3 +3409,44 @@ shape and that the installer keeps refusing an ephemeral destination.
 **Still open (PVI relevant):** the running image is a month stale relative to `main`. That is
 a separate, disruptive job — recreating the **pw-tmux** container kills every live tmux session
 — so it is deliberately not bundled here. The bind-mount install makes gh available without it.
+
+---
+
+## GOA — 2026-09-21 (10) — per-user GitHub auth via `gh auth login` (the better route)
+
+GOA asked the right question about the previous entry: "if gh auth login is what gave me my
+oauth, then why not facilitate that?" It is the better design and it is now the preferred
+route — PW implements no OAuth for it at all.
+
+**Settings → Users → connect** (and `/me`) opens a terminal AS THAT PERSON running
+`gh auth login --hostname github.com --git-protocol https --web --insecure-storage --scopes
+repo,read:org,workflow`, then reads back what gh stored and adopts it. No client id: gh is
+itself an app GitHub trusts, and its token is the one kind that has always done both jobs here.
+
+Three things carry the correctness, each measured against gh 2.101.0 rather than assumed:
+
+1. **`GH_CONFIG_DIR` is per person** (`<cred root>/gh`, created with the rest of the tree,
+   0700) and exported into panes. Otherwise every login overwrites one shared `hosts.yml` and
+   PW cannot tell whose token it is reading.
+2. **The tab runs as the TARGET** (`newTmuxWindow(..., target)`), because gh writes into the
+   config dir of the account the pane runs as. Doing it for somebody else therefore requires
+   `PW_PER_LAUNCHER_CLAUDE` and is refused otherwise rather than writing into the wrong tree.
+3. **`gh auth token` ECHOES AN AMBIENT `GH_TOKEN`** — and per-user credentials export one into
+   every pane. An unsanitised read therefore returns the token PW already had and reports a
+   fresh login that never happened: a silent no-op that looks like success. `ghReadEnv()` strips
+   `GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` before asking.
+   With nothing stored gh writes to stderr and leaves stdout EMPTY, so the answer is decided by
+   the SHAPE of stdout, never the exit code. Both behaviours are pinned, including against the
+   real binary when it is installed (`test/gh-cli-auth.test.mjs`).
+
+`--insecure-storage` is deliberate, not a downgrade: gh uses an OS credential store when it
+finds one and plain text otherwise, and this container has no keyring — being explicit makes
+the result deterministic and readable by `gh auth token` rather than dependent on a keyring's
+continued absence. 0600 inside the person's own 0700 directory.
+
+The read-back goes through the SAME privilege-dropped helper as every other access to that tree
+(new `gh-token` action in `credential-writer.mjs`): the config dir belongs to the pane account,
+and running gh as root against it would be the same confused deputy in a different hat.
+
+The device flow from the previous entry stays as the fallback for a box without gh, and the
+modal picks the gh route whenever the tool is present.
