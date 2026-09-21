@@ -86,6 +86,7 @@ test('settings: switching local retains endpoint/token; clearing is explicit and
   await f.store.updateDeployment({ backend: 'local', token: '' });
   assert.equal(await f.store.connection(), null);
   assert.deepEqual(await f.store.connection({}), { endpoint, token: TOKEN });
+  assert.deepEqual(await f.store.externalConnection(), { endpoint, token: TOKEN });
   assert.equal(publicDeploymentSettings(await f.store.load()).hasCredential, true);
   await f.store.updateDeployment({ clearToken: true });
   assert.equal(publicDeploymentSettings(await f.store.load()).hasCredential, false);

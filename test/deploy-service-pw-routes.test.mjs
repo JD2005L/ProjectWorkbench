@@ -55,7 +55,11 @@ async function apiFixture(t, options = {}) {
   ].join('\n'), { BASE: '/pw', loadProjects: async () => projects });
   const service = {
     client: async () => { if (options.connectionError) throw options.connectionError; return options.local ? null : client; },
-    requiredClient: async () => { if (options.connectionError) throw options.connectionError; return client; },
+    requiredClient: async (selection) => {
+      calls.push(['required-client', selection?.forceExternal]);
+      if (options.connectionError) throw options.connectionError;
+      return client;
+    },
     settingsStore: {
       load: async () => ({ deployment: { backend: options.local ? 'local' : 'external', endpoint: 'https://deploy.example.test', credential: 'enc:YWJjZA==',
         ...(options.consoleUrl ? { consoleUrl: options.consoleUrl } : {}) } }),
@@ -154,6 +158,15 @@ test('PW API: production cancellation requires explicit confirmation and termina
   assert.equal(result.body.job.state, 'cancelled');
   assert.deepEqual(f.calls.filter(call => call[0] === 'cancel'), [['cancel', 'job-production-001']]);
   assert.ok(!JSON.stringify(f.audit).includes(TOKEN));
+});
+
+test('PW API: job reads, logs, cancellation and version keep using the service client when the global default is local', async t => {
+  const f = await apiFixture(t, { local: true });
+  assert.equal((await f.request('/api/deploy-service/jobs/job-own-001')).status, 200);
+  assert.equal((await f.request('/api/deploy-service/jobs/job-own-001/log')).status, 200);
+  assert.equal((await f.request('/api/deploy-service/jobs/job-own-001/cancel', { method: 'POST', body: {} })).status, 200);
+  assert.equal((await f.request('/api/deploy-service/version/OwnApp/dev')).status, 200);
+  assert.ok(f.calls.filter(call => call[0] === 'required-client').every(call => call[1] === true));
 });
 
 test('PW API: public landing health is generic JSON, not a login redirect or administrative diagnostics', async t => {
@@ -279,6 +292,129 @@ test('PW dispatch: external version/card/history surfaces never execute a saved 
   assert.equal(harness.executions.length, 0);
   assert.equal(harness.credentialReads, 0);
   assert.ok(calls.length > 0);
+});
+
+test('PW slot backend: one explicit external slot uses the shared service while its inherited local sibling keeps local execution, history and version', async t => {
+  const root = await workspace(t);
+  const submitted = [];
+  class Client {
+    async health() { return health; }
+    async submit(request) {
+      submitted.push(request);
+      return { ...makeJob('job-slot-external-001', request.project, request.target, 'queued'), revision: request.revision };
+    }
+    async version(project, target) {
+      assert.equal(project, 'demo');
+      assert.equal(target, 'dev');
+      return { version: '2.0.0', revision: 'a'.repeat(40), deployedAt: '2026-09-15T12:00:00Z' };
+    }
+    async jobs() { return [makeJob('job-slot-external-001', 'demo', 'dev', 'succeeded')]; }
+  }
+  const service = createDeploymentService({
+    settingsStore: {
+      load: async () => ({ deployment: { backend: 'local' } }),
+      connection: async draft => draft === undefined ? null : { endpoint: 'https://deploy.example.test', token: TOKEN },
+    },
+    snapshot: async () => sourceSnapshot([{ path: 'deploy.sh', data: Buffer.from('printf deployed').toString('base64'), executable: true }]),
+    Client,
+  });
+  const harness = deployRouteHarness(root, {
+    config: { demo: {
+      dev: { script: 'external script', backend: 'external' },
+      prod: { script: 'local script', versionCmd: 'echo local-version' },
+    } },
+    deploymentService: service,
+    onExec: execution => ({ stdout: execution.args.includes('echo local-version') ? '1.0.0' : 'local deployed' }),
+  });
+
+  const dev = await harness.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
+  assert.equal(dev.statusCode, 202);
+  assert.equal(dev.body.backend, 'external');
+  assert.equal(submitted.length, 1);
+  assert.equal(harness.executions.length, 0);
+
+  const prod = await harness.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'prod' } });
+  assert.equal(prod.statusCode, 200);
+  assert.equal(prod.body.ok, true);
+  assert.equal(harness.executions.length, 2, 'the inherited local slot runs its script and local version command');
+  assert.equal(harness.history[0].backend, 'local');
+
+  const externalVersion = await harness.call('GET', '/api/deploy/:project/:target/version', { params: { project: 'demo', target: 'dev' } });
+  assert.deepEqual(externalVersion.body, { ok: true, version: '2.0.0', revision: 'a'.repeat(40), deployedAt: '2026-09-15T12:00:00Z', backend: 'external', configured: true, metadata: true });
+  const localVersion = await harness.call('GET', '/api/deploy/:project/:target/version', { params: { project: 'demo', target: 'prod' } });
+  assert.deepEqual(localVersion.body, { ok: true, backend: 'local', version: '1.0.0', configured: true });
+
+  const history = await harness.call('GET', '/api/deploy/:project/log', { params: { project: 'demo' } });
+  assert.deepEqual(new Set(history.body.log.map(entry => entry.backend)), new Set(['local', 'external']));
+  assert.equal(history.body.log.find(entry => entry.jobId)?.target, 'dev');
+  assert.equal(history.body.log.find(entry => !entry.jobId)?.target, 'prod');
+});
+
+test('PW slot backend: inherit follows global external, editor serialization is admin-only, and unknown backend values are refused', async t => {
+  const root = await workspace(t);
+  const submitted = [];
+  class Client {
+    async health() { return health; }
+    async submit(request) { submitted.push(request); return { ...makeJob('job-inherit-001', request.project), revision: request.revision }; }
+    async version() { return { version: null, revision: null, deployedAt: null }; }
+    async jobs() { return []; }
+  }
+  const service = createDeploymentService({
+    settingsStore: {
+      load: async () => ({ deployment: { backend: 'external' } }),
+      connection: async () => ({ endpoint: 'https://deploy.example.test', token: TOKEN }),
+    },
+    snapshot: async () => sourceSnapshot([{ path: 'deploy.sh', data: Buffer.from('printf deployed').toString('base64'), executable: true }]),
+    Client,
+  });
+  const harness = deployRouteHarness(root, { deploymentService: service });
+  const card = await harness.call('GET', '/api/deploy/:project/card', { params: { project: 'demo' } });
+  assert.match(card.body.html, /Execution backend/);
+  assert.match(card.body.html, /value="inherit" selected/);
+
+  const inherited = await harness.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
+  assert.equal(inherited.statusCode, 202);
+  assert.equal(submitted.length, 1);
+
+  const saved = await harness.call('POST', '/api/deploy/config', { body: {
+    project: 'demo', target: 'dev', script: 'true', versionCmd: '', backend: 'local',
+  } });
+  assert.equal(saved.statusCode, 200);
+  assert.equal(harness.config.demo.dev.backend, 'local');
+  const explicitLocal = await harness.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
+  assert.equal(explicitLocal.statusCode, 200);
+  assert.equal(harness.executions.length, 1);
+  assert.equal(submitted.length, 1, 'the explicit local override must not inherit global external execution');
+  const invalid = await harness.call('POST', '/api/deploy/config', { body: {
+    project: 'demo', target: 'dev', script: 'true', versionCmd: '', backend: 'other',
+  } });
+  assert.equal(invalid.statusCode, 400, JSON.stringify(invalid.body));
+  assert.equal(harness.config.demo.dev.backend, 'local');
+  const developer = await harness.call('POST', '/api/deploy/config', {
+    caller: { username: 'developer', role: 'developer', projects: ['demo'] },
+    body: { project: 'demo', target: 'dev', script: 'true', versionCmd: '', backend: 'external' },
+  });
+  assert.equal(developer.statusCode, 403);
+  assert.equal(harness.config.demo.dev.backend, 'local');
+});
+
+test('PW slot backend: an explicit external transport failure never runs the local script', async t => {
+  const root = await workspace(t);
+  const harness = deployRouteHarness(root, {
+    config: { demo: { dev: { script: 'must not run', backend: 'external' } } },
+    deploymentService: {
+      backend: async () => 'local',
+      client: async ({ forceExternal } = {}) => {
+        assert.equal(forceExternal, true);
+        throw new DeploymentError('External deployment refused.', 503, 'deployment_unreachable');
+      },
+    },
+  });
+  const result = await harness.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
+  assert.equal(result.statusCode, 503);
+  assert.equal(result.body.code, 'deployment_unreachable');
+  assert.equal(harness.executions.length, 0);
+  assert.equal(harness.history.length, 0);
 });
 
 test('PW dispatch: local script semantics and explicit root ownership repair remain intact on success and failure', async t => {

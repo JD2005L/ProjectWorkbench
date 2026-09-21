@@ -58,23 +58,30 @@ export function buildDeploymentJob({
 }
 
 export function createDeploymentService({ settingsStore, snapshot, Client = DeploymentClient }) {
-  async function client(draft) {
-    const connection = await settingsStore.connection(draft);
+  async function client(options = {}) {
+    const { forceExternal = false, ...draft } = options;
+    const connection = forceExternal
+      ? await (settingsStore.externalConnection ? settingsStore.externalConnection() : settingsStore.connection({}))
+      : await settingsStore.connection(Object.keys(draft).length ? draft : undefined);
     return connection ? new Client(connection) : null;
   }
-  async function requiredClient() {
-    const value = await client();
-    if (!value) throw new DeploymentError('External deployment is not selected. Use Settings > Deployment to change the global backend.', 409, 'deployment_local');
+  async function requiredClient({ forceExternal = false } = {}) {
+    const value = await client({ forceExternal });
+    if (!value) throw new DeploymentError('External deployment is not selected. Use Settings > Deployment or the slot execution backend to select it.', 409, 'deployment_local');
     return value;
   }
+  async function backend() {
+    if (typeof settingsStore.load !== 'function') return (await client()) ? 'external' : 'local';
+    return (await settingsStore.load()).deployment.backend;
+  }
   async function enqueue(options) {
-    const worker = options.client || await requiredClient();
+    const worker = options.client || await requiredClient({ forceExternal: options.forceExternal });
     if (!(await worker.health()).ready) throw new DeploymentError('Deployment service is not ready.', 503, 'deployment_not_ready');
     const source = await snapshot(options.workspace);
     const job = buildDeploymentJob({ ...options, snapshot: source });
     return worker.submit(job);
   }
-  return { client, requiredClient, enqueue, settingsStore };
+  return { client, requiredClient, backend, enqueue, settingsStore };
 }
 
 export function deploymentHistoryEntry(job) {
@@ -85,5 +92,6 @@ export function deploymentHistoryEntry(job) {
     version: job.version || null, user: 'deployment service',
     duration: job.startedAt && job.finishedAt ? ((Date.parse(job.finishedAt) - Date.parse(job.startedAt)) / 1000).toFixed(1) : null,
     active: !TERMINAL_STATES.has(job.state),
+    backend: 'external',
   };
 }

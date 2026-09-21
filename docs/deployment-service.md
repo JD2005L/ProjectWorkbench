@@ -18,7 +18,7 @@ scripts in `deploy/service/` prepare an installation; running tests or updating
 this repository does not change a live host. The installer does not modify the
 PW service, container, settings, application data, or existing application units.
 
-## Global selection, not per-project enrollment
+## Global selection and per-slot opt-in
 
 PW's portable/global Settings selects **LOCAL** or **EXTERNAL**, with the
 external endpoint and a protected token. LOCAL remains the default until a PW
@@ -41,6 +41,21 @@ Changing an identity requires an operator-controlled host policy change and
 explicit runner restart. Optional target pause/timeout overrides are
 operational controls, not a prerequisite for a new project. Changing the
 global backend does not translate arbitrary old shell scripts.
+
+An administrator editing an ordinary saved `dev` or `prod` slot can instead set
+its **Execution backend** to `external`. This stores `backend: "external"` in
+that slot's existing `deploy-config.json` record and uses the same globally
+administered endpoint and encrypted credential; no endpoint, token, or
+execution identity is stored with the project. `backend: "local"` explicitly
+keeps a slot local, while omitted or `backend: "inherit"` follows the global
+selection. Existing records omit the field and therefore retain their current
+behavior. Repository-managed slots remain read-only in the slot editor.
+
+An external slot submits, reads versions and history, and opens job/log/cancel
+operations through the authenticated deployment service. A transport or policy
+failure is returned to the caller; PW never retries the slot locally. Local
+history entries are marked `local` and service entries `external` so mixed
+projects retain backend provenance.
 
 ### Existing applications with legacy resource names
 

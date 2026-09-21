@@ -171,5 +171,13 @@ export function createWorkbenchSettingsStore({
     return { endpoint: value.endpoint, token: decryptCredential(value.credential) };
   }
 
-  return { load, updateGeneral, updateDeployment, connection };
+  // Slot-level EXTERNAL selection uses the globally administered endpoint and
+  // encrypted credential even when the inherited global backend remains LOCAL.
+  async function externalConnection() {
+    const current = await load();
+    const value = await applyDraft(current, {});
+    return { endpoint: value.endpoint, token: decryptCredential(value.credential) };
+  }
+
+  return { load, updateGeneral, updateDeployment, connection, externalConnection };
 }

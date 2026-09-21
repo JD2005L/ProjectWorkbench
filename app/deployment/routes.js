@@ -32,7 +32,7 @@ export function mountDeploymentRoutes(app, {
     return requireProjectAccess(req, res, action);
   };
   const jobRoute = handler => route(async (req, res) => {
-    const client = await service.requiredClient();
+    const client = await service.requiredClient({ forceExternal: true });
     const job = await client.job(req.params.id);
     return authorizeProject(req, res, job.project, () => handler(req, res, client, job));
   });
@@ -67,7 +67,7 @@ export function mountDeploymentRoutes(app, {
     res.json({ ok: true, health: await client.health() });
   }));
   app.get(`${api}/diagnostics`, requireAdmin, route(async (_req, res) => {
-    res.json({ ok: true, health: await (await service.requiredClient()).health() });
+    res.json({ ok: true, health: await (await service.requiredClient({ forceExternal: true })).health() });
   }));
   app.get(`${api}/jobs`, requireAuth, route(async (req, res) => {
     const limit = req.query.limit === undefined ? 50 : Number(req.query.limit);
@@ -76,7 +76,7 @@ export function mountDeploymentRoutes(app, {
     const target = req.query.target === undefined ? undefined : targetName(req.query.target);
     const state = req.query.state;
     if (state !== undefined && !JOB_STATES.has(state)) throw new DeploymentError('Invalid deployment job state.');
-    const client = await service.requiredClient();
+    const client = await service.requiredClient({ forceExternal: true });
     const list = async () => {
       let jobs;
       if (req.user.role === 'admin' || project !== undefined) jobs = await client.jobs({ project, target, limit: 200 });
@@ -110,22 +110,22 @@ export function mountDeploymentRoutes(app, {
   }));
   app.get(`${api}/version/:project/:target`, requireAuth, requireProjectAccess, route(async (req, res) => {
     return authorizeProject(req, res, req.params.project, async () => {
-      res.json({ ok: true, ...await (await service.requiredClient()).version(req.params.project, req.params.target) });
+      res.json({ ok: true, ...await (await service.requiredClient({ forceExternal: true })).version(req.params.project, req.params.target) });
     });
   }));
   app.get(`${api}/targets`, requireAdmin, route(async (_req, res) => {
-    res.json({ ok: true, targets: await (await service.requiredClient()).targets() });
+    res.json({ ok: true, targets: await (await service.requiredClient({ forceExternal: true })).targets() });
   }));
   app.put(`${api}/targets/:project/:target`, requireAdmin, requireDeploymentOrigin, route(async (req, res) => {
-    const target = await (await service.requiredClient()).updateTarget(req.params.project, req.params.target, req.body);
+    const target = await (await service.requiredClient({ forceExternal: true })).updateTarget(req.params.project, req.params.target, req.body);
     await audit('deploy_service_target_update', { project: req.params.project, target: req.params.target }, req);
     res.json({ ok: true, target });
   }));
   app.get(`${api}/settings`, requireAdmin, route(async (_req, res) => {
-    res.json({ ok: true, settings: await (await service.requiredClient()).settings() });
+    res.json({ ok: true, settings: await (await service.requiredClient({ forceExternal: true })).settings() });
   }));
   app.put(`${api}/settings`, requireAdmin, requireDeploymentOrigin, route(async (req, res) => {
-    const settings = await (await service.requiredClient()).updateSettings(req.body);
+    const settings = await (await service.requiredClient({ forceExternal: true })).updateSettings(req.body);
     await audit('deploy_service_settings_update', { paused: settings.paused, maxConcurrent: settings.maxConcurrent }, req);
     res.json({ ok: true, settings });
   }));
