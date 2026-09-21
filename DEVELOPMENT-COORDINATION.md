@@ -3144,3 +3144,46 @@ symlink planted at that path reads as not-signed-in (pinned in
 would write the shared one. `CODEX_HOME` looks like the analogue of `COPILOT_HOME` but is
 unverified against the CLI (Codex is not installed on this host), so the route refuses Codex
 with that reason instead of guessing. Install/update from Settings is unaffected.
+
+---
+
+## GOA — 2026-09-21 (3) — sign-in leaves the CLIs page entirely; Users gets a column per CLI
+
+Correction to the entry above, at GOA's request after seeing it live. Relabelling the shared
+sign-in was not enough: a control that authenticates an identity the presser does not use
+should not be on that page at all.
+
+**Settings → CLIs is now install / update / enable only** when `PW_PER_USER_CLAUDE` is on.
+The button, the badge and the shared-terminal section are removed (not captioned), and
+`POST /api/setup/cli/auth` refuses in that mode. **With the feature OFF everything comes
+back unchanged** — that is deliberate and matters for PVI/upstream: where the box login IS
+everybody's login, that page is the right place to sign in, so the capability is gated on the
+mode rather than deleted. The shared setup terminal itself (`ensureSetupTerminal`, the
+`/pty/_setup/` nginx location, `scripts/setup-terminal-start`, the systemd unit) is
+deliberately UNTOUCHED — decommissioning it would reach into nginx generation, the save/restore
+scripts and a host unit, which is a separate change on request rather than a side effect.
+
+**Settings → Users now has one column per OFFERED CLI** (enabled by the operator AND
+installed), replacing the two hardcoded Claude/Copilot columns. Each cell is resolved by
+`resolveCliAuthCell()` in `app/cli-auth-status.js` — one pure function, rendered by both the
+admin table and the person's own page, so the two cannot disagree about who is signed in.
+`canSelfSignIn` (not "is signed in") gates the means, because a Copilot login cannot take
+effect while a stored token overrides it.
+
+**The Git-token column shows the token TYPE and can CLEAR it.** It was write-only: an empty
+field meant "keep what is there", so a stored token could never be removed — and clearing is
+the only fix when Copilot refuses the type. The server already accepted `ghToken:''`; only
+the control was missing.
+
+**New self-service surface `/me`** ("My CLI sign-ins"), linked from the status-bar user chip
+on every page including the cockpit, because Settings is admin-only and a developer could
+otherwise see Copilot fail without seeing why. Routes, all self-scoped with NO username
+parameter: `GET /api/me/cli-status`, `POST|DELETE /api/me/github-token`,
+`POST /api/me/cli-login`. Self token management is the load-bearing part: a token Copilot
+refuses overrides any login, so without it the "sign in yourself" path was advice, not a
+means. Audited; the token never appears in a response, the audit log, or a pane's argv.
+`setUserGithubToken()` mirrors the PATCH route's token branch — deliberately not shared,
+because that route's lock section also spans rename reconciliation — and both resync the git
+credential of every project the person owns, which
+`test/per-user-cli-signin.test.mjs` pins end to end (clear → sign-in now possible → store a
+fine-grained one → cell goes green).

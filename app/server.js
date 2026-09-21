@@ -33,7 +33,7 @@ import { assertTmuxOwner } from './tmux-owner-gate.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { normalizeUserTabColors, resolveUserTabColor, userTabColorCss } from './user-colors.js';
-import { classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, COPILOT_AUTH_STATES } from './cli-auth-status.js';
+import { classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, resolveCliAuthCell } from './cli-auth-status.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
@@ -2736,14 +2736,20 @@ const landingCss = `body.landing{margin:0;min-height:100vh;background:radial-gra
 
 const wizardCss = `.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem}.modal-backdrop.hidden{display:none}.modal-box{background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:14px;max-width:920px;width:100%;max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7)}.modal-box header{display:flex;justify-content:space-between;align-items:center;padding:.95rem 1.25rem;border-bottom:1px solid #1f2937}.modal-box header h2{margin:0;font-size:1.2rem}.modal-box .body{padding:1rem 1.25rem;overflow:auto;flex:1 1 auto}.modal-box footer{display:flex;justify-content:flex-end;gap:.5rem;padding:.8rem 1.25rem;border-top:1px solid #1f2937;align-items:center}.modal-close{background:transparent;border:0;color:#cbd5e1;font-size:1.6rem;cursor:pointer;line-height:1;padding:0 .25rem}.modal-close:hover{color:#fff}.modal-box section{margin-bottom:1.25rem}.modal-box section h3{margin:0 0 .35rem;font-size:1rem;color:#bfdbfe}.section-help{margin:0 0 .55rem;color:#94a3b8;font-size:.85rem}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .75rem;align-items:center;padding:.55rem .7rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#111827}.cli-row .meta{display:flex;flex-direction:column;gap:.15rem;min-width:0}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.8rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .5rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}.cli-row .actions .button{padding:.4rem .65rem;font-size:.82rem;margin:0}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}.env-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}.env-grid label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.env-grid select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.45rem;font:inherit}.env-grid .opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.15rem;min-height:2.6em}.env-grid .opt-help.warn{color:#fca5a5}.env-grid .opt-help b{color:#fde68a}.heal-row{display:flex;gap:.5rem;flex-wrap:wrap}.heal-out{margin:.5rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.6rem .8rem;font-size:.82rem;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block}#authFrame.hidden{display:none}#authHint{color:#94a3b8;font-size:.85rem;margin:.3rem 0 .5rem}#saveStatus{color:#bbf7d0;font-size:.85rem;margin-right:auto}#saveStatus.err{color:#fca5a5}@media(max-width:640px){.cli-row{grid-template-columns:1fr}.env-grid{grid-template-columns:1fr}}`;
 
-const wizardScript = `<script>(function(){const open=document.getElementById('setupBtn');const backdrop=document.getElementById('setupBackdrop');if(!backdrop)return;const closeBtn=document.getElementById('setupCloseBtn');const cancelBtn=document.getElementById('setupCancelBtn');const saveBtn=document.getElementById('setupSaveBtn');const cliRows=document.getElementById('cliRows');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const saveStatus=document.getElementById('saveStatus');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setHealOut(t,err){healOut.textContent=t||'';healOut.classList.toggle('show',!!t);healOut.classList.toggle('err',!!err)}function setSave(t,err){saveStatus.textContent=t||'';saveStatus.classList.toggle('err',!!err)}function render(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+escHtml(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+escHtml(c.version)+'</span>'+(c.authenticated?'<span class="signed-in" title="'+(state.perUserClaude?'The SHARED box identity is signed in — this is not your own login. Per-person status is in Settings → Users.':'Credentials detected on disk')+'">'+(state.perUserClaude?'Shared login':'Signed in')+'</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button type="button" class="button secondary inst">'+(c.installed?'Update':'Install')+'</button><button type="button" class="button auth">'+(c.authenticated?'Reauthenticate':'Sign in')+(state.perUserClaude?' shared':'')+'</button></div><div class="note">'+escHtml(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');const orig=btn.textContent;btn.disabled=true;btn.textContent='Installing…';setSave('');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');const v=row.querySelector('.version');v.textContent=j.version;v.classList.add('installed');btn.textContent='Update';setSave(c.label+': '+j.version)}catch(e){btn.textContent=orig;setSave(e.message,true)}finally{btn.disabled=false}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setSave('');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setSave(e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderOptHelp();
+const wizardScript = `<script>(function(){const open=document.getElementById('setupBtn');const backdrop=document.getElementById('setupBackdrop');if(!backdrop)return;const closeBtn=document.getElementById('setupCloseBtn');const cancelBtn=document.getElementById('setupCancelBtn');const saveBtn=document.getElementById('setupSaveBtn');const cliRows=document.getElementById('cliRows');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const saveStatus=document.getElementById('saveStatus');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setHealOut(t,err){healOut.textContent=t||'';healOut.classList.toggle('show',!!t);healOut.classList.toggle('err',!!err)}function setSave(t,err){saveStatus.textContent=t||'';saveStatus.classList.toggle('err',!!err)}function render(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+escHtml(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+escHtml(c.version)+'</span>'+(c.authenticated&&!state.perUserClaude?'<span class="signed-in" title="Credentials detected on disk">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button type="button" class="button secondary inst">'+(c.installed?'Update':'Install')+'</button>'+(state.perUserClaude?'':'<button type="button" class="button auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button>')+'</div><div class="note">'+escHtml(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');const orig=btn.textContent;btn.disabled=true;btn.textContent='Installing…';setSave('');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');const v=row.querySelector('.version');v.textContent=j.version;v.classList.add('installed');btn.textContent='Update';setSave(c.label+': '+j.version)}catch(e){btn.textContent=orig;setSave(e.message,true)}finally{btn.disabled=false}};const authBtn=row.querySelector('.auth');if(authBtn)authBtn.onclick=async()=>{const btn=authBtn;btn.disabled=true;setSave('');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setSave(e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderOptHelp();
 /* With per-user credentials on, this identity no longer runs anybody's project tabs —
    it is the template a per-user config dir is seeded from. Saying so here is the
    difference between an operator signing in once and wondering why nothing changed
    for their team. */
+/* Per-user credentials make this whole section a wrong answer: it signs in an identity
+   that runs nobody's terminals. Remove it rather than caption it — sign-in belongs to a
+   person, on the Users tab. What stays here is installing and updating, which is a
+   property of the machine. */
+const shSec=document.getElementById('sharedAuthSection');
+if(shSec&&state.perUserClaude)shSec.remove();
 const sh=document.getElementById('sharedAuthHelp');if(sh&&state.perUserClaude)sh.innerHTML='Per-user credentials are <b>on</b>, so this is the <b>shared seed identity</b>: it is what a new per-user config dir is created from, and what a project with no owner falls back to. It is <b>not</b> how a person signs in \u2014 each person signs in from their own terminal, and the <b>Users</b> tab shows who has. Credentials land in <code>/home/admin</code>.';}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest. Use this unless you fully trust everyone with dashboard access.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude will execute any shell command, file write, or tool call without asking. Anyone with basic-auth access effectively has shell on this box.'};const MCP_HELP={inherit:'Claude uses the MCP servers configured on your Anthropic account (whatever <code>~/.claude.json</code> currently has).',isolated:'Forces Claude to use an empty MCP config so no external MCP servers load. Good when you want this box self-contained or your account MCP is unreachable from the LAN.',custom:'Use a custom MCP JSON config file. Path is set via the <code>PW_MCP_CONFIG</code> env var the wrapper reads.'};function renderOptHelp(){const ph=document.getElementById('permHelp');const mh=document.getElementById('mcpHelp');if(ph){ph.innerHTML=PERM_HELP[permMode.value]||'';ph.classList.toggle('warn',permMode.value==='skip')}if(mh)mh.innerHTML=MCP_HELP[mcpMode.value]||''}permMode&&permMode.addEventListener('change',renderOptHelp);mcpMode&&mcpMode.addEventListener('change',renderOptHelp);async function load(){setSave('Loading…');try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');render();setSave('')}catch(e){setSave(e.message,true)}}function show(){backdrop.classList.remove('hidden');load()}function hide(){backdrop.classList.add('hidden');authFrame.src='about:blank';authFrame.classList.add('hidden');authHint.textContent='Click "Sign in" on a CLI above to send its login command here.';setHealOut('');setSave('')}if(open)open.onclick=show;if(closeBtn)closeBtn.onclick=hide;if(cancelBtn)cancelBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});saveBtn.onclick=async()=>{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);saveBtn.disabled=true;setSave('Saving…');try{const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setSave('Saved.')}catch(e){setSave(e.message,true)}finally{saveBtn.disabled=false}};async function heal(url,btn){btn.disabled=true;setHealOut('Working…');try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');setHealOut(j.message||'OK')}catch(e){setHealOut(e.message,true)}finally{btn.disabled=false}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);load()})();</script>`;
 
-const wizardModalHtml = `<div id="setupBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box"><header><h2>Setup Wizard</h2><button class="modal-close" id="setupCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><section><h3>CLIs</h3><p class="section-help">Pick which assistants this instance offers. "Auto-update" CLIs are upgraded nightly by the update timer.</p><div id="cliRows"></div></section><section><h3>Shared identity</h3><p class="section-help" id="sharedAuthHelp">Signs in the box's own CLI login, in the shared setup terminal at <code>${BASE}/pty/_setup/</code>. Credentials land in <code>/home/admin</code>.</p><div id="authHint">Click "Sign in" on a CLI above to send its login command here.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></section><section><h3>Environment</h3><div class="env-grid"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div></section><section><h3>Heal</h3><p class="section-help">Self-repair common installation drift. Run if a route is missing or a runtime path looks broken.</p><div class="heal-row"><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button><button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button></div><pre class="heal-out" id="healOut"></pre></section></div><footer><span id="saveStatus"></span><button class="button secondary" id="setupCancelBtn" type="button">Close</button><button class="button" id="setupSaveBtn" type="button">Save settings</button></footer></div></div>`;
+const wizardModalHtml = `<div id="setupBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box"><header><h2>Setup Wizard</h2><button class="modal-close" id="setupCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><section><h3>CLIs</h3><p class="section-help">Pick which assistants this instance offers. "Auto-update" CLIs are upgraded nightly by the update timer.</p><div id="cliRows"></div></section><section id="sharedAuthSection"><h3>Shared identity</h3><p class="section-help" id="sharedAuthHelp">Signs in the box's own CLI login, in the shared setup terminal at <code>${BASE}/pty/_setup/</code>. Credentials land in <code>/home/admin</code>.</p><div id="authHint">Click "Sign in" on a CLI above to send its login command here.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></section><section><h3>Environment</h3><div class="env-grid"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div></section><section><h3>Heal</h3><p class="section-help">Self-repair common installation drift. Run if a route is missing or a runtime path looks broken.</p><div class="heal-row"><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button><button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button></div><pre class="heal-out" id="healOut"></pre></section></div><footer><span id="saveStatus"></span><button class="button secondary" id="setupCancelBtn" type="button">Close</button><button class="button" id="setupSaveBtn" type="button">Save settings</button></footer></div></div>`;
 
 const modalBaseCss = `.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem}.modal-backdrop.hidden{display:none}.modal-box{background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:14px;max-width:920px;width:100%;max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7)}.modal-box header{display:flex;justify-content:space-between;align-items:center;padding:.95rem 1.25rem;border-bottom:1px solid #1f2937}.modal-box header h2{margin:0;font-size:1.2rem}.modal-box .body{padding:1rem 1.25rem;overflow:auto;flex:1 1 auto}.modal-close{background:transparent;border:0;color:#cbd5e1;font-size:1.6rem;cursor:pointer;line-height:1;padding:0 .25rem}.modal-close:hover{color:#fff}.button{display:inline-block;background:#2563eb;color:#fff;padding:.6rem .85rem;border-radius:8px;text-decoration:none;margin:.15rem;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button:disabled{opacity:.55;cursor:not-allowed}.subtle{color:#94a3b8;font-size:.8rem}`;
 
@@ -4071,7 +4077,7 @@ app.get(BASE + '/api/preview/:project/logs', requireAuth, requireProjectAccess, 
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.get(BASE + '/api/setup/state', requireAdmin, async (_req,res)=>{ try {
- const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatuses()]);
+ const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatusesCached()]);
  const updateStamp = await getClaudeUpdateStamp();
  // perUserClaude tells the UI whether this box's own CLI login is the identity that
  // runs project terminals (off) or merely the seed a per-user config dir is built
@@ -4176,7 +4182,245 @@ app.post(BASE + '/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
  const { stdout, stderr } = await sh('npm',['install','-g',`${cfg.pkg}@latest`],{timeout:300000});
  const version = await getCliVersion(cfg.bin);
+ // The memo exists to keep account management off the subprocess path, not to hide an
+ // install from the operator who just ran one.
+ invalidateCliStatusCache();
  res.json({ ok:true, version: version || 'not installed', log:(stdout+stderr).slice(-1500) });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Set or clear ONE user's stored GitHub token, with the dependent state that has to
+// move with it.
+//
+// This mirrors the token branch of PATCH /api/users/:username deliberately rather than
+// being shared with it: that route's lock section also spans rename reconciliation and
+// project.primaryUser repointing, so extracting it would mean restructuring the far
+// more delicate path. What must not drift is the EFFECT — a token change has to resync
+// the git credential of every project this person owns, or their pushes keep using the
+// old secret — so both paths call syncProjectCredentials over the same set, and
+// test/per-user-self-service.test.mjs asserts they agree.
+//
+// `token` is '' to clear. Returns the (safe-shaped) user, or a failure to surface.
+async function setUserGithubToken(username, token){
+ return credentialDomain.withLocks(['lifecycle'], async () => {
+  const users = await loadUsers();
+  const u = users.find(x => x.username === username);
+  if(!u) return { failure: { status:404, error:`User "${username}" not found` } };
+  if(token) u.ghToken = encrypt(token); else delete u.ghToken;
+  await saveUsers(users);
+  try {
+   const projects = await loadProjects();
+   for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p); }
+  } catch(e){
+   throw new Error(`your token was stored, but resyncing the git credential of the projects you own failed: ${e?.message || e}. Retry, or ask an administrator to re-save it.`);
+  }
+  return { user: u };
+ });
+}
+
+// ============================================================================
+// "My CLI sign-ins" — the one page a NON-admin needs.
+//
+// Everything else about identity lives behind Settings, which only an admin can open.
+// That left a developer able to see that their Copilot did not work but not why, and
+// unable to do anything about it without asking someone: the diagnosis (a token type
+// Copilot refuses) and both remedies (replace the token, or clear it and sign in) were
+// admin-only. This page is that missing surface, and it is strictly about the viewer —
+// every route it calls is self-scoped and takes no username.
+// ============================================================================
+const mePageCss = `.meWrap{max-width:860px;margin:0 auto;padding:26px 20px 60px;display:flex;flex-direction:column;gap:16px}
+.meHead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.meHead h1{margin:0;font-size:1.45rem}
+.meHead .meWho{color:var(--dim);font-size:.9rem}
+.meHead .meWho b{color:var(--text)}
+.meLead{color:var(--dim);margin:0;font-size:.92rem;line-height:1.55}
+.meCard{background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.meCard h2{margin:0 0 4px;font-size:1.02rem}
+.meCard .meNote{color:var(--faint);font-size:.82rem;margin:.35rem 0 0;line-height:1.5}
+.meRow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 0;border-bottom:1px solid var(--line)}
+.meRow:last-child{border-bottom:0}
+.meRow .meName{font-weight:600;min-width:9.5rem}
+.meRow .meVer{color:var(--faint);font-size:.78rem;font-family:var(--mono)}
+.meRow .meGrow{flex:1}
+.mePill{font-size:.76rem;border-radius:999px;padding:1px .6rem;border:1px solid var(--line2);color:var(--dim);white-space:nowrap}
+.mePill.ok{color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)}
+.mePill.bad{color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)}
+.mePill.warn{color:#fde68a;border-color:#854d0e;background:rgba(251,191,36,.1)}
+.meBtn{background:var(--blue);color:#fff;border:0;border-radius:8px;padding:.42rem .7rem;font:inherit;font-size:.83rem;cursor:pointer}
+.meBtn.secondary{background:#374151}
+.meBtn:disabled{opacity:.5;cursor:not-allowed}
+.meWhy{width:100%;color:var(--faint);font-size:.82rem;line-height:1.5;margin:.15rem 0 0}
+.meTok{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:.7rem}
+.meTok input{flex:1 1 20rem;background:#0a1120;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:.45rem .6rem;font:inherit;font-size:.85rem;font-family:var(--mono)}
+.meStatus{font-size:.85rem;min-height:1.2em;color:#bbf7d0}
+.meStatus.err{color:#fca5a5}
+.meBack{color:var(--cyan);text-decoration:none;font-size:.85rem}
+.meBack:hover{text-decoration:underline}`;
+
+const mePageScript = (base) => `<script>(function(){
+const list=document.getElementById('meClis'),tokBox=document.getElementById('meTokBox'),st=document.getElementById('meStatus');
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function setStatus(t,bad){st.textContent=t||'';st.classList.toggle('err',!!bad)}
+function pill(tone,text){return '<span class="mePill '+(tone||'')+'">'+esc(text)+'</span>'}
+/* Every label, tone and explanation comes from the SERVER (resolveCliAuthCell), the
+   same call the admin Users table renders from — so the two can never tell different
+   stories about whether you are signed in. */
+function render(s){
+ list.innerHTML='';
+ if(!s.clis.length){list.innerHTML='<p class="meNote">No assistants are enabled on this workbench yet.</p>'}
+ for(const c of s.clis){
+  const row=document.createElement('div');row.className='meRow';
+  row.innerHTML='<span class="meName">'+esc(c.label)+'</span><span class="meVer">'+esc(c.version)+'</span><span class="meGrow"></span>'+pill(c.auth.tone,c.auth.label);
+  if(c.auth.canSelfSignIn&&s.canOpenTerminal){
+   const b=document.createElement('button');b.className='meBtn';b.type='button';b.textContent=c.auth.label==='signed in'?'Sign in again':'Sign in';
+   b.onclick=async()=>{b.disabled=true;setStatus('Opening a terminal for the sign-in…');
+    try{const r=await fetch('${base}/api/me/cli-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();
+     if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+     setStatus('Running '+j.command+' in '+j.project+' — finish it in the terminal that just opened.');
+     window.open(j.url,'_blank','noopener');
+    }catch(e){setStatus(e.message||String(e),true)}finally{b.disabled=false;setTimeout(load,1500)}};
+   row.appendChild(b);
+  }
+  const w=document.createElement('p');w.className='meWhy';w.textContent=c.auth.detail;row.appendChild(w);
+  list.appendChild(row);
+ }
+ const g=s.github;
+ tokBox.innerHTML='<h2>My GitHub token</h2><p class="meNote">Used for your git pushes, and it is also what authenticates Copilot — a stored token takes precedence over any Copilot sign-in. It is stored encrypted and is never shown back to you or to anyone else.</p>'
+  +'<div class="meTok"><span>'+(g.hasToken?pill(g.kind==='classic'||g.kind==='unreadable'?'bad':'ok','stored · '+g.kind):pill('','none stored'))+'</span>'
+  +'<input id="meTokInput" type="password" autocomplete="off" placeholder="Paste a new token to replace it (fine-grained, with Copilot Requests)">'
+  +'<button class="meBtn" id="meTokSave" type="button">Save</button>'
+  +(g.hasToken?'<button class="meBtn secondary" id="meTokClear" type="button">Clear</button>':'')+'</div>'
+  +'<p class="meNote">Clearing it lets a Copilot sign-in take effect, but your git pushes from projects you own will have no credential until you store a new one.</p>';
+ document.getElementById('meTokSave').onclick=async()=>{
+  const v=document.getElementById('meTokInput').value.trim();if(!v){setStatus('Paste a token first.',true);return}
+  setStatus('Saving…');try{const r=await fetch('${base}/api/me/github-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:v})});const j=await r.json();
+   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));setStatus('Stored ('+j.github.kind+').');load()}catch(e){setStatus(e.message||String(e),true)}};
+ const cb=document.getElementById('meTokClear');
+ if(cb)cb.onclick=async()=>{if(!confirm('Clear your stored GitHub token?\\n\\nA Copilot sign-in can then take effect, but git pushes from projects you own will have no credential until you store a new token.'))return;
+  setStatus('Clearing…');try{const r=await fetch('${base}/api/me/github-token',{method:'DELETE'});const j=await r.json();
+   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));setStatus('Cleared.');load()}catch(e){setStatus(e.message||String(e),true)}};
+}
+async function load(){try{const r=await fetch('${base}/api/me/cli-status',{cache:'no-store'});const j=await r.json();
+ if(!j.ok)throw new Error(j.error||'could not load');render(j)}catch(e){setStatus(e.message||String(e),true)}}
+load();})();</script>`;
+
+app.get(BASE + '/me', requireAuth, async (req,res)=>{
+ if(req.user.implicit) return res.redirect(BASE + '/login?next=' + encodeURIComponent(BASE + '/me'));
+ const [claudeVersion, updateStamp] = await Promise.all([
+  getCliVersion('claude').then(v => v || 'not installed').catch(()=> 'unknown'),
+  getClaudeUpdateStamp().catch(()=> 'unknown'),
+ ]);
+ const back = await lastProjectForUser(req.user.username).catch(()=> '');
+ const backLink = back ? `<a class="meBack" href="${BASE}/term/${encodeURIComponent(back)}/">← back to ${esc(back)}</a>` : `<a class="meBack" href="${BASE}/">← back to the dashboard</a>`;
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>My CLI sign-ins — Workbench</title><style>${designTokensCss}${landingCss}${mePageCss}${statusBarCss}</style></head><body class="landing"><div class="meWrap">${backLink}<div class="meHead"><h1>My CLI sign-ins</h1><span class="meWho">signed in as <b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></div><p class="meLead">Which assistants this workbench offers is set by an administrator. <b>Being signed in to one is yours</b> — these are your own credentials, kept in your own configuration directory, and used by the terminals you open.</p><div class="meCard"><div id="meClis"></div></div><div class="meCard" id="meTokBox"></div><div class="meStatus" id="meStatus"></div></div>${mePageScript(BASE)}${statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE })}</body></html>`);
+});
+
+// CLI statuses, memoised briefly.
+//
+// getCliStatuses() spawns `<bin> --version` for every supported CLI, each with its own
+// timeout. That was fine while only the Settings page asked; the Users table asks too
+// now, and per-request subprocess spawns on a route that manages accounts is the wrong
+// trade — a slow or wedged binary would show up as slow user management. The window is
+// short enough that an operator never sees a stale version, and an install invalidates
+// it immediately so the UI reflects what it just did.
+let cliStatusCache = { at: 0, value: null };
+const CLI_STATUS_TTL_MS = 30000;
+async function getCliStatusesCached(){
+ const now = Date.now();
+ if(cliStatusCache.value && now - cliStatusCache.at < CLI_STATUS_TTL_MS) return cliStatusCache.value;
+ const value = await getCliStatuses();
+ cliStatusCache = { at: now, value };
+ return value;
+}
+function invalidateCliStatusCache(){ cliStatusCache = { at: 0, value: null }; }
+
+// The CLIs this workbench offers a PERSON: enabled by the operator and actually
+// installed. Anything else cannot have a sign-in state worth showing — an unenabled CLI
+// is not on offer, and an uninstalled one has nothing to sign in to.
+//
+// Degrades to NO columns rather than propagating a failure: these are informational,
+// and the route that carries them also manages accounts. An unreadable workbench.json
+// must not be able to take down user management — which is exactly what it did the first
+// time this was wired straight through.
+async function offeredClis(){
+ try {
+  const [settings, statuses] = await Promise.all([loadWorkbenchSettings(), getCliStatusesCached()]);
+  const enabled = new Set(settings.enabledClis || []);
+  return Object.values(statuses)
+   .filter(c => enabled.has(c.key))
+   .map(c => ({ key:c.key, label:c.label, installed:!!c.installed, version:c.version,
+    userAuthSupported: !!SUPPORTED_CLIS[c.key]?.userAuthCmd }));
+ } catch(e){
+  console.warn(`[cli-auth] could not determine which CLIs this workbench offers; showing no sign-in columns: ${e?.message || e}`);
+  return [];
+ }
+}
+// One person's CLI identity state: the per-CLI cells both surfaces render from
+// (resolveCliAuthCell, so they cannot disagree), plus the plain claudeSignedIn boolean
+// that GET /api/users has always reported.
+async function userCliState(user, clis){
+ const off = () => Object.fromEntries(clis.map(c => [c.key, resolveCliAuthCell({ cli:c.key, perUserEnabled:false, installed:c.installed, userAuthSupported:c.userAuthSupported })]));
+ // Null, not false, while the feature is off: there is no per-person identity to be
+ // signed in as, and `false` would read as "this person has not got round to it".
+ if(!PER_USER_CLAUDE) return { claudeSignedIn: null, cells: off() };
+ const signIn = await userCliSignIn(user.username);
+ const copilot = userCopilotAuth(user, signIn.copilot);
+ return {
+  claudeSignedIn: signIn.claude,
+  cells: Object.fromEntries(clis.map(c => [c.key, resolveCliAuthCell({
+   cli: c.key, perUserEnabled: true, installed: c.installed, userAuthSupported: c.userAuthSupported,
+   claudeSignedIn: signIn.claude, copilotState: copilot.state, copilotOverridesLogin: copilot.overridesLogin,
+  })])),
+ };
+}
+
+// My own CLI sign-in state. Self-only by construction: there is no username
+// parameter, so this cannot be used to enumerate anybody else's credentials.
+app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const [clis, users] = await Promise.all([offeredClis(), loadUsers()]);
+ const me = users.find(u => u.username === req.user.username) || { username: req.user.username };
+ const { cells } = await userCliState(me, clis);
+ // Only the fields a person needs in order to decide what to do — never authCmd/pkg,
+ // which stay internal (the same trimming getCliStatuses already does).
+ const out = clis.map(c => ({ ...c, auth: cells[c.key] }));
+ res.json({
+  ok:true, perUserClaude: PER_USER_CLAUDE, username: req.user.username, role: req.user.role,
+  canOpenTerminal: TERMINAL_ROLES.has(req.user.role),
+  // The KIND of their own token, never the token. Knowing it is a classic PAT is the
+  // difference between "sign in again" and "this can never work until it is replaced".
+  github: { hasToken: !!me.ghToken, kind: me.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(me.ghToken)); } catch { return 'unreadable'; } })() : 'none' },
+  clis: out,
+ });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Replace or clear MY OWN stored GitHub token.
+//
+// Self-service on purpose. Copilot reads a stored token ahead of any login, so a token
+// Copilot refuses (a classic ghp_ PAT) makes `copilot login` unable to take effect —
+// and until now the only way out was to ask an admin. A person being able to fix their
+// own credential is the difference between self-service sign-in working and it being
+// advice. It is their credential, used for their own attribution; it grants nothing on
+// this box, and every change is audited.
+app.post(BASE + '/api/me/github-token', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const token = String(req.body?.token || '').trim();
+ if(!token) return res.status(400).json({ok:false,error:'No token supplied. Use DELETE to clear the stored one.'});
+ if(token.length > 512) return res.status(400).json({ok:false,error:'That does not look like a GitHub token (too long).'});
+ if(/\s/.test(token)) return res.status(400).json({ok:false,error:'A GitHub token contains no spaces — check for a stray newline or a partial paste.'});
+ const result = await setUserGithubToken(req.user.username, token);
+ if(result.failure) return res.status(result.failure.status).json({ok:false,error:result.failure.error});
+ // The token itself never reaches the audit log; its TYPE is what an operator would
+ // need to understand a later Copilot failure.
+ await audit('self_github_token_set', { kind: classifyGithubToken(token) }, req);
+ res.json({ ok:true, github:{ hasToken:true, kind: classifyGithubToken(token) } });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+app.delete(BASE + '/api/me/github-token', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const result = await setUserGithubToken(req.user.username, '');
+ if(result.failure) return res.status(result.failure.status).json({ok:false,error:result.failure.error});
+ await audit('self_github_token_cleared', {}, req);
+ res.json({ ok:true, github:{ hasToken:false, kind:'none' } });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 // Sign THIS person in to a CLI, as themselves.
@@ -4225,9 +4469,14 @@ app.post(BASE + '/api/me/cli-login', requireTerminalRole, async (req,res)=>{ try
  res.json({ ok:true, cli, command: cfg.userAuthCmd, project: target.name, windowIndex: index, url: `${BASE}/term/${encodeURIComponent(target.name)}/` });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
+// Sign in the SHARED box identity. Kept for the mode where that identity is genuinely
+// everybody's — PW_PER_USER_CLAUDE off, which is the upstream default — and refused
+// when it is not, because then it signs in an identity that runs nobody's terminals and
+// the honest answer is per person (POST /api/me/cli-login).
 app.post(BASE + '/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
  const cli = String(req.body?.cli || '');
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
+ if(PER_USER_CLAUDE) return res.status(409).json({ok:false,error:'Per-user credentials are on, so this shared login runs nobody\'s project terminals — it is only the seed a per-user config dir is created from. Sign in per person from Settings → Users.'});
  const ready = await ensureSetupTerminal();
  if(!ready) return res.status(503).json({ok:false,error:'Setup terminal failed to start. Check `systemctl status project-setup-terminal.service`.'});
  await tmux(['send-keys','-t',setupTmuxSession,cfg.authCmd,'Enter']);
@@ -4257,12 +4506,12 @@ app.get(BASE + '/agents.md', async (_req,res) => {
 // ============================================================================
 function statusBarHtml({ claudeVersion, updateStamp, user, enforce }){
  const u = user && !user.implicit
-  ? `<span class="sb-user"><b>${esc(user.username)}</b> · ${esc(user.role)}</span>`
+  ? `<a class="sb-user" href="${BASE}/me" title="My CLI sign-ins"><b>${esc(user.username)}</b> · ${esc(user.role)}</a>`
   : `<span class="sb-user subtle">anonymous (enforce ${enforce ? 'on' : 'off'})</span>`;
  const enforceTag = enforce ? '<span class="sb-tag warn">enforce</span>' : '<span class="sb-tag">soft</span>';
  return `<footer id="pwStatusBar"><span class="sb-item sb-version">Release: <b>${esc(RELEASE_VERSION)}</b></span><span class="sb-sep">·</span><span class="sb-item">Claude Code: <b>${esc(claudeVersion)}</b></span><span class="sb-sep">·</span><span class="sb-item">Last update check: <b>${esc(updateStamp)}</b></span><span class="sb-sep">·</span><span class="sb-item">Auth: ${enforceTag}</span><span class="sb-grow"></span>${u}</footer>`;
 }
-const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);border-top:1px solid #1f2937;color:#94a3b8;font:12px system-ui,-apple-system,Segoe UI,sans-serif;padding:5px 14px;display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);z-index:50;overflow:hidden;white-space:nowrap}#pwStatusBar b{color:#e5e7eb;font-weight:600}#pwStatusBar .sb-sep{opacity:.45}#pwStatusBar .sb-grow{flex:1}#pwStatusBar .sb-tag{padding:1px 7px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:11px;border:1px solid #334155}#pwStatusBar .sb-tag.warn{color:#fde68a;border-color:#854d0e;background:#3b2e0a}#pwStatusBar .sb-version{white-space:nowrap}body{padding-bottom:32px}body.pw-cockpit{padding-bottom:0}body.pw-cockpit #shell{height:calc(100% - 32px)}`;
+const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);border-top:1px solid #1f2937;color:#94a3b8;font:12px system-ui,-apple-system,Segoe UI,sans-serif;padding:5px 14px;display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);z-index:50;overflow:hidden;white-space:nowrap}#pwStatusBar b{color:#e5e7eb;font-weight:600}#pwStatusBar .sb-sep{opacity:.45}#pwStatusBar .sb-grow{flex:1}#pwStatusBar .sb-tag{padding:1px 7px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:11px;border:1px solid #334155}#pwStatusBar .sb-tag.warn{color:#fde68a;border-color:#854d0e;background:#3b2e0a}#pwStatusBar .sb-version{white-space:nowrap}#pwStatusBar a.sb-user{color:inherit;text-decoration:none;border-bottom:1px dotted #475569}#pwStatusBar a.sb-user:hover{color:#e5e7eb;border-bottom-color:#94a3b8}body{padding-bottom:32px}body.pw-cockpit{padding-bottom:0}body.pw-cockpit #shell{height:calc(100% - 32px)}`;
 
 // ============================================================================
 // Settings page (admin-only). Tabbed surface — primary settings destination.
@@ -4276,35 +4525,60 @@ const settingsScript = `<script>(function(){const tabs=document.querySelectorAll
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
 let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
-/* Who the viewer is, from the same response rather than a second round trip or an
-   injected template value: the sign-in button is self-service, so the table has to
-   know which row is yours. */
-let PW_ME='';
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '9' : '8'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '9' : '8'}" class="muted">'+esc(e.message)+'</td></tr>'}}
+/* Who the viewer is and which CLIs have columns, both from the same response rather
+   than a second round trip or an injected template value: the sign-in means is
+   self-service, so the table has to know which row is yours. */
+function uColspan(){return 6+PW_CLIS.length+${DEPLOY_CENTRE ? '1' : '0'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
-function tokenCellHtml(u){return u.hasToken?'<td><span class="role-pill" style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)">✓ token</span></td>':'<td><span class="role-pill">none</span></td>'}
-/* Copilot's per-person auth state. It is NOT just "signed in or not", because the
-   stored GitHub token overrides any login (Copilot reads GH_TOKEN first), and a
-   classic ghp_ PAT is a token Copilot refuses — which fails ONLY for inference, so it
-   otherwise looks perfectly configured. Each state therefore says what will actually
-   happen and what to do about it. */
-const COPILOT_CELL={'via-token':['✓ via token','#86efac','#166534','Their own stored GitHub token authenticates Copilot. Nothing else to do.'],'token-rejected':['✗ token type','#fca5a5','#7f1d1d','Copilot CLI does not accept this token type (classic ghp_ PATs are not supported). It also overrides any sign-in. Replace it with a fine-grained token carrying the "Copilot Requests" permission, or clear it so they can sign in.'],'token-unknown':['? token type','#fde68a','#854d0e','This token is not a recognised GitHub token type, and it overrides any sign-in. Replace or clear it.'],'signed-in':['✓ signed in','#86efac','#166534','They completed their own copilot login; the credential is in their own COPILOT_HOME.'],'none':['not yet','','','No stored token and no sign-in: Copilot will ask them to authenticate the first time they open a Copilot tab.'],'unreadable':['! token unreadable','#fca5a5','#7f1d1d','Their stored GitHub token could not be decrypted, so it is unclear what Copilot would use. Replace it.']};
-function copilotCellHtml(u){const st=u.copilotAuth;if(!st)return '<td><span class="muted" title="Per-user credentials are off (PW_PER_USER_CLAUDE), so every terminal shares one Copilot identity">·</span></td>';const c=COPILOT_CELL[st]||['?','','','Unrecognised state'];const extra=u.copilotOverridesLogin?' Their own sign-in exists but is being ignored because the token takes precedence.':'';const title=esc(c[3]+extra);if(!c[1])return '<td><span class="muted" title="'+title+'">'+c[0]+'</span></td>';return '<td><span class="role-pill" style="color:'+c[1]+';border-color:'+c[2]+';background:rgba(0,0,0,.15)" title="'+title+'">'+c[0]+'</span></td>'}
-/* Sign-in buttons, on YOUR row only — the route is self-service, because a tab opened
-   for someone else would carry the clicker's credentials and sign the wrong person in.
-   Copilot's button appears only in the states where a login could actually take effect:
-   a stored token overrides it, so offering it otherwise sends you round a loop that
-   cannot succeed (the cell already explains what to fix instead). */
-function signInButtonsHtml(u){
- if(u.username!==PW_ME)return '';
- let html='';
- if(u.claudeSignedIn!==null)html+='<button class="button secondary tiny" data-signin="claude" title="Open a tab in one of your projects running claude /login, so the login lands in YOUR config dir">Sign in Claude</button>';
- if(u.copilotAuth==='none'||u.copilotAuth==='signed-in')html+='<button class="button secondary tiny" data-signin="copilot" title="Open a tab in one of your projects running copilot login, so the login lands in YOUR own COPILOT_HOME">Sign in Copilot</button>';
- return html;
+/* A stored token was previously write-only from this table: an empty field meant "keep
+   what is there", so there was no way to REMOVE one. That matters because a token
+   Copilot refuses overrides any sign-in, making "clear it, then sign in" the only fix —
+   and it was unreachable. The server already accepted ghToken:'' as a clear; this is
+   the control that sends it. */
+function tokenCellHtml(u){
+ if(!u.hasToken)return '<td><span class="role-pill">none</span></td>';
+ const bad=u.tokenKind==='classic'||u.tokenKind==='unreadable';
+ const style=bad?'color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)':'color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)';
+ const title=u.tokenKind==='classic'?'A classic personal access token. Fine for git, but Copilot CLI refuses this type — and it overrides any Copilot sign-in.'
+  :u.tokenKind==='unreadable'?'This stored token could not be decrypted. Replace it.'
+  :'Stored encrypted; used for their git pushes and, if the type allows, for Copilot.';
+ return '<td><span class="role-pill" style="'+style+'" title="'+esc(title)+'">'+esc(u.tokenKind)+'</span>'
+  +'<div style="margin-top:.25rem"><button class="button secondary tiny" data-cleartok="'+esc(u.username)+'">Clear</button></div></td>'
 }
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '9' : '8'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Claude</th><th>Copilot</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+(u.claudeSignedIn===true?'<span class="signed-in" title="This user completed their own Claude login">✓ signed in</span>':(u.claudeSignedIn===false?'<span class="muted" title="Owner has not completed their Claude login yet — they run claude once in a project they own">not yet</span>':'<span class="muted" title="Per-user Claude login is off (PW_PER_USER_CLAUDE)">·</span>'))+'</td>'+copilotCellHtml(u)+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions">'+signInButtonsHtml(u)+'<button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
-uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.signin){
+/* One column per CLI the workbench offers, one cell per person per CLI. The cell is
+   resolved on the SERVER (resolveCliAuthCell) so this table and each person's own
+   sign-ins page cannot tell different stories about who is signed in. */
+let PW_CLIS=[];
+let PW_ME='';
+function cliCellHtml(u,cli){
+ const cell=(u.cliAuth||{})[cli.key];
+ if(!cell)return '<td><span class="muted">·</span></td>';
+ const tone=cell.tone==='ok'?'style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)"'
+  :cell.tone==='bad'?'style="color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)"'
+  :cell.tone==='warn'?'style="color:#fde68a;border-color:#854d0e;background:rgba(251,191,36,.1)"':'';
+ const pill=tone?'<span class="role-pill" '+tone+' title="'+esc(cell.detail)+'">'+esc(cell.label)+'</span>'
+  :'<span class="muted" title="'+esc(cell.detail)+'">'+esc(cell.label)+'</span>';
+ /* The MEANS, next to the status, and only where it can actually work: the sign-in
+    happens in a terminal that carries the signer's own credentials, so pressing it for
+    somebody else would sign in the presser. Other people's rows therefore show the
+    status and, where the fix is an admin one (a token Copilot refuses), the token
+    controls in the Git-token column are that means. */
+ const mine=u.username===PW_ME;
+ const btn=(mine&&cell.canSelfSignIn)
+  ? '<button class="button secondary tiny" data-signin="'+esc(cli.key)+'" title="Open a tab in one of your projects running this CLI\\'s login, so the credential lands in YOUR own config dir">Sign in</button>'
+  : '';
+ return '<td>'+pill+(btn?'<div style="margin-top:.25rem">'+btn+'</div>':'')+'</td>';
+}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th>'+PW_CLIS.map(c=>'<th>'+esc(c.label.replace(/ CLI$/,''))+'</th>').join('')+'<th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+PW_CLIS.map(c=>cliCellHtml(u,c)).join('')+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.cleartok){
+ if(!confirm('Clear the stored GitHub token for "'+t.dataset.cleartok+'"?\\n\\nA Copilot sign-in can then take effect for them, but git pushes from projects they own will have no credential until a new token is stored.'))return;
+ t.disabled=true;setStatus(uStatus,'Clearing…');
+ try{const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.cleartok),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({ghToken:''})});const j=await r.json();
+  if(!j.ok)throw new Error(j.error||('HTTP '+r.status));setStatus(uStatus,'Token cleared for '+t.dataset.cleartok+'.');loadUsers()}
+ catch(err){setStatus(uStatus,err.message||String(err),true);t.disabled=false}
+}else if(t.dataset.signin){
  /* Deliberately self-service: the route acts only for the signed-in user, because a
     tab opened on an admin's behalf would carry the ADMIN's credentials and sign the
     wrong person in. That is why the button renders on your own row only. */
@@ -4331,8 +4605,15 @@ const cliRows=document.getElementById('cliRows');const cliStatus=document.getEle
 /* Same point as the wizard's: with per-user credentials on, the login on this page is
    the SEED identity, not the one that runs anybody's project terminal. */
 const lead=document.getElementById('cliLead');
-if(lead&&state.perUserClaude)lead.innerHTML='Install or update each assistant here \u2014 that part is a property of the machine. The sign-in below is the <b>shared seed identity</b>: what a new per-user config dir is created from, and what a project with no owner falls back to. It is <b>not</b> how a person signs in; each person signs in from their own terminal, and the <b>Users</b> tab shows who has.';
-const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in" title="'+(state.perUserClaude?'The SHARED box identity is signed in — this is not your own login. Per-person status is in the Users tab.':'Credentials detected on disk')+'">'+(state.perUserClaude?'Shared login':'Signed in')+'</span>':'')+'<span class="cli-checked'+(c.lastUpdateOk===false?' bad':'')+'" title="When the auto-updater last checked this CLI">'+(c.lastUpdate==='never'?'never checked':(c.lastUpdateOk===false?'check failed \u00b7 ':'checked ')+esc(c.lastUpdate))+'</span>'+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+(state.perUserClaude?' shared':'')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);loadState();loadSystem();const tokLabel=document.getElementById('tokLabel');const tokScopes=document.getElementById('tokScopes');const tokCreate=document.getElementById('tokCreate');const tokList=document.getElementById('tokList');const tokStatus=document.getElementById('tokStatus');const tokNew=document.getElementById('tokNew');const tokNewVal=document.getElementById('tokNewVal');const tokCopy=document.getElementById('tokCopy');function fmtWhen(v){if(!v)return 'never';try{return new Date(v).toLocaleString()}catch(e){return v}}async function loadTokens(){try{const r=await fetch('${BASE}/api/tokens',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');if(!tokScopes.dataset.built){tokScopes.innerHTML='<legend>Scopes</legend>'+(j.scopes||[]).map(sc=>'<label><input type="checkbox" class="tokScope" value="'+esc(sc)+'">'+esc(sc)+'</label>').join('');tokScopes.dataset.built='1'}const ts=j.tokens||[];if(!ts.length){tokList.innerHTML='<span class="empty">No tokens yet.</span>';return}tokList.innerHTML=ts.map(t=>'<div class="tok-row'+(t.disabled?' revoked':'')+'">'+'<div><b>'+esc(t.label||'(unlabelled)')+'</b>'+(t.disabled?' <span class="tok-tag">revoked</span>':'')+'</div>'+'<div class="muted">scopes: '+esc((t.scopes||[]).join(', ')||'none')+'</div>'+'<div class="muted">created '+esc(fmtWhen(t.createdAt))+(t.createdBy?' by '+esc(t.createdBy):'')+' | last used '+esc(fmtWhen(t.lastUsedAt))+'</div>'+(t.disabled?'':'<button class="button secondary tiny tokRevoke" data-id="'+esc(t.id)+'" type="button">Revoke</button>')+'</div>').join('');tokList.querySelectorAll('.tokRevoke').forEach(b=>{b.onclick=async()=>{if(!confirm('Revoke this token? Any client using it stops working immediately.'))return;b.disabled=true;try{const rr=await fetch('${BASE}/api/tokens/'+encodeURIComponent(b.dataset.id)+'/revoke',{method:'POST'});const jj=await rr.json();if(!jj.ok)throw new Error(jj.error||'revoke failed');setStatus(tokStatus,'Token revoked.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true);b.disabled=false}}})}catch(e){tokList.innerHTML='';setStatus(tokStatus,e.message,true)}}tokCreate.onclick=async()=>{const scopes=[...tokScopes.querySelectorAll('.tokScope')].filter(c=>c.checked).map(c=>c.value);tokCreate.disabled=true;setStatus(tokStatus,'Creating...');tokNew.hidden=true;try{const r=await fetch('${BASE}/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:tokLabel.value,scopes})});const j=await r.json();if(!j.ok)throw new Error(j.error||'create failed');tokNewVal.textContent=j.token;tokNew.hidden=false;tokLabel.value='';tokScopes.querySelectorAll('.tokScope').forEach(c=>{c.checked=false});setStatus(tokStatus,'Token created. Copy it now.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true)}finally{tokCreate.disabled=false}};tokCopy.onclick=async()=>{try{await navigator.clipboard.writeText(tokNewVal.textContent);setStatus(tokStatus,'Copied to clipboard.')}catch(e){setStatus(tokStatus,'Copy failed; select it manually.',true)}};loadTokens();
+const shCard=document.getElementById('sharedAuthCard');
+if(state.perUserClaude){
+ /* Signing in is per person here, so this page is about the MACHINE only. The shared
+    login still exists as the seed a per-user config dir is created from, but it is not
+    something anyone signs in to from this page any more. */
+ if(shCard)shCard.remove();
+ if(lead)lead.innerHTML='Install, update and enable each assistant \u2014 that is a property of the machine. <b>Signing in is per person:</b> see the <b>Users</b> tab, which shows each user\\'s status for every installed assistant and lets each person sign themselves in.';
+}
+const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated&&!state.perUserClaude?'<span class="signed-in" title="Credentials detected on disk">Signed in</span>':'')+'<span class="cli-checked'+(c.lastUpdateOk===false?' bad':'')+'" title="When the auto-updater last checked this CLI">'+(c.lastUpdate==='never'?'never checked':(c.lastUpdateOk===false?'check failed \u00b7 ':'checked ')+esc(c.lastUpdate))+'</span>'+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button>'+(state.perUserClaude?'':'<button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button>')+'</div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};const authBtn=row.querySelector('.auth');if(authBtn)authBtn.onclick=async()=>{const btn=authBtn;btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);loadState();loadSystem();const tokLabel=document.getElementById('tokLabel');const tokScopes=document.getElementById('tokScopes');const tokCreate=document.getElementById('tokCreate');const tokList=document.getElementById('tokList');const tokStatus=document.getElementById('tokStatus');const tokNew=document.getElementById('tokNew');const tokNewVal=document.getElementById('tokNewVal');const tokCopy=document.getElementById('tokCopy');function fmtWhen(v){if(!v)return 'never';try{return new Date(v).toLocaleString()}catch(e){return v}}async function loadTokens(){try{const r=await fetch('${BASE}/api/tokens',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');if(!tokScopes.dataset.built){tokScopes.innerHTML='<legend>Scopes</legend>'+(j.scopes||[]).map(sc=>'<label><input type="checkbox" class="tokScope" value="'+esc(sc)+'">'+esc(sc)+'</label>').join('');tokScopes.dataset.built='1'}const ts=j.tokens||[];if(!ts.length){tokList.innerHTML='<span class="empty">No tokens yet.</span>';return}tokList.innerHTML=ts.map(t=>'<div class="tok-row'+(t.disabled?' revoked':'')+'">'+'<div><b>'+esc(t.label||'(unlabelled)')+'</b>'+(t.disabled?' <span class="tok-tag">revoked</span>':'')+'</div>'+'<div class="muted">scopes: '+esc((t.scopes||[]).join(', ')||'none')+'</div>'+'<div class="muted">created '+esc(fmtWhen(t.createdAt))+(t.createdBy?' by '+esc(t.createdBy):'')+' | last used '+esc(fmtWhen(t.lastUsedAt))+'</div>'+(t.disabled?'':'<button class="button secondary tiny tokRevoke" data-id="'+esc(t.id)+'" type="button">Revoke</button>')+'</div>').join('');tokList.querySelectorAll('.tokRevoke').forEach(b=>{b.onclick=async()=>{if(!confirm('Revoke this token? Any client using it stops working immediately.'))return;b.disabled=true;try{const rr=await fetch('${BASE}/api/tokens/'+encodeURIComponent(b.dataset.id)+'/revoke',{method:'POST'});const jj=await rr.json();if(!jj.ok)throw new Error(jj.error||'revoke failed');setStatus(tokStatus,'Token revoked.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true);b.disabled=false}}})}catch(e){tokList.innerHTML='';setStatus(tokStatus,e.message,true)}}tokCreate.onclick=async()=>{const scopes=[...tokScopes.querySelectorAll('.tokScope')].filter(c=>c.checked).map(c=>c.value);tokCreate.disabled=true;setStatus(tokStatus,'Creating...');tokNew.hidden=true;try{const r=await fetch('${BASE}/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:tokLabel.value,scopes})});const j=await r.json();if(!j.ok)throw new Error(j.error||'create failed');tokNewVal.textContent=j.token;tokNew.hidden=false;tokLabel.value='';tokScopes.querySelectorAll('.tokScope').forEach(c=>{c.checked=false});setStatus(tokStatus,'Token created. Copy it now.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true)}finally{tokCreate.disabled=false}};tokCopy.onclick=async()=>{try{await navigator.clipboard.writeText(tokNewVal.textContent);setStatus(tokStatus,'Copied to clipboard.')}catch(e){setStatus(tokStatus,'Copy failed; select it manually.',true)}};loadTokens();
 /* ---- scheduled tasks ---- */
 const tRows=document.getElementById('taskRows'),tStatus=document.getElementById('taskStatus');
 const tF={id:'tId',name:'tName',window:'tWindow',kind:'tKind',at:'tAt',every:'tEvery',tz:'tTz',weekdays:'tWeekdays',enabled:'tEnabled',target:'tTarget',pick:'tPick',cmd:'tCmd',prompt:'tPrompt',agent:'tAgent'};
@@ -4427,9 +4708,9 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
 <section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed. When per-user Claude is enabled (<code>PW_PER_USER_CLAUDE</code>), the <b>Claude</b> column shows whether a user has completed their own Claude login — used automatically for the projects they own (their <code>primaryUser</code> assignment).</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
-<section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead" id="cliLead">Install or update each assistant, then sign in. Credentials land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Shared identity terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
+<section id="tab-clis"><h2>${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</h2><p class="lead" id="cliLead">Install or update each assistant, then sign in. Credentials land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card" id="sharedAuthCard"><h3>Shared identity terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
 ${renderDeploymentSettings(BASE)}
 <section id="tab-tasks"><h2>Scheduled tasks</h2><p class="lead">Run a command in your projects on a clock. Each run opens a named tab in the project's terminal, so you can read what it did afterwards.</p>
@@ -4648,18 +4929,25 @@ app.post(BASE + '/api/tokens/:id/revoke', requireAdmin, async (req,res) => {
 app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
  try {
   const users = await loadUsers();
-  // Both CLIs' per-person state, resolved in one privilege-dropped job per user.
-  // Null (not false) while the feature is off: there is no per-person identity to be
-  // signed in as, and a column of crosses would read as "everyone is broken".
+  // One column per CLI this workbench offers, and one resolved cell per user per CLI,
+  // so the table reads as "who is signed in to what" rather than as two special cases.
+  const clis = await offeredClis();
   const out = await Promise.all(users.map(async u => {
-   if(!PER_USER_CLAUDE) return { ...safeUserShape(u), claudeSignedIn: null, copilotAuth: null, copilotOverridesLogin: false };
-   const signIn = await userCliSignIn(u.username);
-   const copilot = userCopilotAuth(u, signIn.copilot);
-   return { ...safeUserShape(u), claudeSignedIn: signIn.claude, copilotAuth: copilot.state, copilotOverridesLogin: copilot.overridesLogin };
+   const state = await userCliState(u, clis);
+   return {
+   ...safeUserShape(u),
+   // Retained alongside the per-CLI cells: it is the field this endpoint has always
+   // reported, and dropping it would break a consumer to save a boolean.
+   claudeSignedIn: state.claudeSignedIn,
+   cliAuth: state.cells,
+   // The KIND of their token, never the token. A classic PAT is the difference between
+   // "sign in" and "this can never work until it is replaced", so an admin has to see it.
+   tokenKind: u.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(u.ghToken)); } catch { return 'unreadable'; } })() : 'none',
+   };
   }));
-  // `me` drives the self-service sign-in button. Empty for the implicit admin of an
+  // `me` drives the self-service sign-in buttons. Empty for the implicit admin of an
   // auth-disabled instance: it is a placeholder, not one of these people.
-  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), users: out });
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, users: out });
  }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
