@@ -327,7 +327,7 @@ Concretely:
 | Git/Copilot actions attributed to the right person | yes |
 | Secrets hidden from a *remote* user with no terminal | yes |
 | Secrets hidden from another user **who has a terminal on this box** | **no** |
-| A tab's colour prevents someone typing into another person's tab | **no** — the colour is awareness. A client-side guard discourages it (below), but it is not a boundary |
+| A tab's colour prevents someone typing into another person's tab | **no** — the colour is awareness only. Anyone with a terminal can type into anyone's tab, and nothing in the browser could change that while every pane runs as one OS account |
 | Root compromise from a terminal | no — see below |
 
 Real cross-user isolation would require one OS account per person, which is a
@@ -337,33 +337,6 @@ scope the tokens accordingly.
 
 What the feature *must* not do is turn that shared-UID situation into a **root**
 compromise, which is what the next section is about.
-
-### Read-only in somebody else's tab
-
-The tab strip is shared by everyone in a project, so typing into a teammate's tab spends
-their seat and lands in their agent's conversation — by accident, easily. A guard in
-`app/terminal-preload.js` (the script nginx injects into every terminal page) drops
-keystrokes and pastes while the active tab belongs to somebody else, and shows a bar
-naming whose it is.
-
-**It is a guardrail, not a boundary, and the difference is structural rather than
-laziness.** tmux can make a whole *client* read-only (`attach -r`) but has no per-window
-notion of writability, so a per-tab rule can only live client-side — where devtools
-steps around it. `tmux attach` from a shell steps around everything, which is already
-true of every pane here, because they all run as one OS account.
-
-It **fails open**: an unreadable window list, an unresolved identity, an anonymous
-session, or no `fetch` at all leaves everything writable. A guardrail that locks someone
-out of their own terminal because a poll failed is worse than the mistake it prevents.
-Resize, pause and ttyd's handshake are never gated — only input — because blocking those
-breaks the terminal instead of making it read-only.
-
-Two things it does not change: an unlabelled tab (the shared login, or a session that
-predates labels) belongs to nobody and stays writable; and multiple clients attached to
-one tmux session still share the same active window, so two people in a project move
-each other's tab selection. Giving each person their own tmux session per project would
-fix both and make the lock enforceable server-side — that is the real design if
-enforcement is ever wanted, and it is a much larger change.
 
 ## How the credential tree is written (and why root never touches it)
 

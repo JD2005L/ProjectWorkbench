@@ -33,9 +33,6 @@
 
   let activeSend = null;
   window.__pwSendToTerminal = function(text) {
-    // The file drawer and the paste handler write through here, bypassing ws.send — so
-    // the same rule has to be applied again rather than assumed.
-    if (pwInputBlocked()) { flashLock(); return false; }
     if (activeSend) {
       // ttyd's WS protocol expects the first byte to be a command code:
       // '0' = INPUT (write the rest to the PTY).
@@ -238,106 +235,12 @@
     } catch {}
   }
 
-  // ---------------------------------------------------------------------------
-  // Read-only in somebody else's tab
-  // ---------------------------------------------------------------------------
-  // A tab now carries the identity whose Claude/Copilot account it spends. Typing into
-  // one that is not yours spends THEIR seat and lands in THEIR agent's conversation —
-  // easy to do by accident, because the tab strip is shared by everyone in the project.
-  //
-  // This is a GUARDRAIL, not a boundary, and that is a deliberate choice rather than a
-  // shortcut: tmux can make a whole CLIENT read-only but has no per-window notion of
-  // writability, so the only place a per-tab rule can live is here, in front of the
-  // websocket. Anyone can step around it with devtools, or ignore it entirely by
-  // running `tmux attach` from a shell — which is true of every pane on this box in any
-  // case, since they all run as one OS account. What it does is stop the accident.
-  //
-  // It FAILS OPEN. If the window list or the viewer's identity cannot be read, nothing
-  // is blocked: a guardrail that locks people out of their own terminal when a poll
-  // fails would be worse than the mistake it prevents.
-  let lockOwner = '';   // '' = not locked
-  let lockMe = '';
-  let lockBar = null;
-
-  function pwInputBlocked() { return !!lockOwner; }
-
-  function setLock(owner) {
-    if (owner === lockOwner) return;
-    lockOwner = owner;
-    try {
-      if (!lockBar) {
-        if (!document.body || typeof document.createElement !== 'function') return;
-        lockBar = document.createElement('div');
-        lockBar.style.cssText = 'position:fixed;left:0;right:0;top:0;z-index:2147483647;'
-          + 'background:rgba(127,29,29,.94);color:#fee2e2;font:12px/1.5 system-ui,-apple-system,Segoe UI,sans-serif;'
-          + 'padding:3px 10px;text-align:center;pointer-events:none;display:none';
-        document.body.appendChild(lockBar);
-      }
-      if (owner) {
-        lockBar.textContent = 'Read-only — this tab runs on ' + owner + "'s account. Open your own tab with + to type.";
-        lockBar.style.display = 'block';
-      } else {
-        lockBar.style.display = 'none';
-      }
-    } catch {}
-  }
-
-  function flashLock() {
-    // Something was typed into a tab that is not the typist's. Saying so beats
-    // swallowing the keystroke silently, which reads as a broken terminal.
-    try {
-      if (!lockBar) return;
-      lockBar.style.background = 'rgba(185,28,28,1)';
-      setTimeout(() => { try { lockBar.style.background = 'rgba(127,29,29,.94)'; } catch {} }, 180);
-    } catch {}
-  }
-
-  async function refreshLock() {
-    if (typeof fetch !== 'function') return;
-    try {
-      if (!lockMe) {
-        const who = await (await fetch(base + '/api/auth/me', { cache: 'no-store', headers: { Accept: 'application/json' } })).json();
-        // An anonymous session (auth not enforced) is nobody in particular, so it is
-        // never locked out of anything.
-        if (!who || !who.user || who.user.implicit || !who.user.username) return setLock('');
-        lockMe = who.user.username;
-      }
-      const out = await (await fetch(base + '/api/term/' + encodeURIComponent(project) + '/windows', { cache: 'no-store' })).json();
-      const active = (out && out.windows || []).find((w) => w.active);
-      const owner = (active && active.credUser) || '';
-      // An unlabelled tab (the shared box login, or a terminal that predates labels)
-      // belongs to nobody, so it stays writable.
-      setLock(owner && owner !== lockMe ? owner : '');
-    } catch {
-      setLock('');
-    }
-  }
-  // Exposed for the same reason __pwSendToTerminal is: this file is a browser IIFE with
-  // no module system, and the tests drive it through the same surface the page does.
-  window.__pwRefreshLock = refreshLock;
-  window.__pwLockedBy = () => lockOwner;
-  if (typeof setInterval === 'function') {
-    refreshLock();
-    setInterval(() => { try { if (!document.hidden) refreshLock(); } catch { refreshLock(); } }, 2000);
-  }
-
   const NativeWebSocket = window.WebSocket;
   window.WebSocket = function(...args) {
     const ws = new NativeWebSocket(...args);
     const nativeSend = ws.send.bind(ws);
     activeSend = nativeSend;
     ws.send = function(data) {
-      // Drop INPUT while this tab belongs to somebody else. Only INPUT: resize, pause
-      // and ttyd's own handshake frames must keep flowing, or the terminal breaks
-      // instead of going read-only. ttyd's client frames are '0'-prefixed for input
-      // (0x30 when they arrive as bytes).
-      if (pwInputBlocked()) {
-        try {
-          if (typeof data === 'string') { if (data.charAt(0) === '0') { flashLock(); return; } }
-          else if (data instanceof ArrayBuffer) { const b = new Uint8Array(data); if (b.length && b[0] === 0x30) { flashLock(); return; } }
-          else if (data && data.buffer instanceof ArrayBuffer && data.length && data[0] === 0x30) { flashLock(); return; }
-        } catch {}
-      }
       // Strip stray SYN bytes (^V). The paste handler above already uploaded the image;
       // we don't want Claude's image-detection path to fire on the raw ^V byte.
       try {
