@@ -143,6 +143,70 @@ clear their stored GitHub token so no `GH_TOKEN` is exported and `copilot login`
 their own `COPILOT_HOME` takes effect. Clearing it does not break pushes — those use
 the repository's own pinned credential, not `GH_TOKEN`.
 
+## Who signs in, and where
+
+Two different questions get asked in the same place, and they have different answers:
+
+| Question | Scope | Where it is answered |
+|---|---|---|
+| Which assistants does this box offer, at which version? | the machine | Settings → CLIs (install / update / auto-update) |
+| Is *this person* signed in to one? | a person | Settings → **Users** (Claude and Copilot columns) |
+
+The **"Sign in" button on the CLIs page authenticates the box's own shared identity**,
+by sending the login command into one shared setup terminal (`/pty/_setup/`) that
+carries no per-user credential environment. With per-user credentials on, that identity
+does not run anybody's project terminals any more. It is still load-bearing, but as a
+**seed**: a new per-user config dir is created from it (`.claude.json`'s MCP servers,
+`settings.json`'s infrastructure keys, `CLAUDE.md`, `copilot-instructions.md`,
+`mcp-config.json`), and a project with no `primaryUser` still falls back to it. Both
+sign-in surfaces say so when the feature is on, and the green badge reads **"Shared
+login"** rather than "Signed in", because it is not yours.
+
+### How a person signs themselves in
+
+Opening a CLI tab is usually all it takes: the pane already carries that person's
+`CLAUDE_CONFIG_DIR` and `COPILOT_HOME`, so an unauthenticated CLI prompts them and the
+credential lands in their own directory.
+
+`POST /api/me/cli-login {cli}` does the same thing deliberately, and is what the
+**Sign in Claude** button on your own row in Settings → Users calls. It picks a project
+you can already reach (your last-viewed one, else the first) and opens a tab running
+that CLI's login command **as you**.
+
+It is **self-service by construction — it takes no username.** An admin pressing it for
+someone else would create the tab on the *admin's* credentials and sign the wrong
+person in, so the identity comes from the session and nowhere else. That is also why
+the button renders only on your own row.
+
+### What the Users columns mean
+
+**Claude** is a plain "has this person completed `claude /login`" — read from their own
+config dir via the privilege-dropped helper.
+
+**Copilot** is not a boolean, because a stored GitHub token *overrides* any login
+(Copilot reads `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` first) and not
+every token type is accepted:
+
+| Cell | Meaning |
+|---|---|
+| ✓ via token | their stored token authenticates Copilot; nothing else to do |
+| ✗ token type | Copilot refuses this type — a classic `ghp_` PAT. It also overrides any sign-in, so signing in cannot help until it is replaced or cleared |
+| ? token type | not a recognised GitHub token type, and it overrides any sign-in |
+| ✓ signed in | no stored token, but they completed their own `copilot login` |
+| not yet | neither — Copilot will ask them on their first Copilot tab |
+| ! token unreadable | their stored token would not decrypt; an admin must replace it |
+
+A sign-in is offered only when it could take effect. Everything else returns the reason
+instead of opening a terminal that silently changes nothing.
+
+### Codex
+
+Not wired for per-user identity: there is no per-user Codex config directory, so a
+"login" would write the shared one. `CODEX_HOME` looks like the analogue of
+`COPILOT_HOME` but has not been verified against the CLI, so the per-user sign-in route
+refuses Codex with that reason rather than pretending. Installing and updating Codex
+from Settings is unaffected.
+
 ## Threat model: what this feature is and is not
 
 > **Per-user credentials give per-user _attribution_, not cross-user _isolation_.**

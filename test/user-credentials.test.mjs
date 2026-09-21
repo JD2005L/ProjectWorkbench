@@ -497,15 +497,20 @@ test('the credential-writer helper answers a "status" job over stdin/stdout, sam
   await fsp.rm(base, { recursive: true, force: true });
 });
 
-test('SECURITY: userClaudeSignedIn (server.js) no longer fs.stat()s inside the credential tree directly', async () => {
+// Renamed userClaudeSignedIn -> userCliSignIn when the Users table gained a Copilot
+// column: one status job now answers for both CLIs, because it runs per user per
+// request and each job is a privilege-dropped process spawn. The property being
+// guarded is unchanged — the dashboard must not touch the pane-owned credential tree
+// itself, whichever CLI is being asked about.
+test('SECURITY: the per-user sign-in status check (server.js) never fs.stat()s inside the credential tree directly', async () => {
   const src = await fsp.readFile(path.join(APP_DIR, 'server.js'), 'utf8');
-  const start = src.indexOf('async function userClaudeSignedIn(');
-  assert.notEqual(start, -1);
+  const start = src.indexOf('async function userCliSignIn(');
+  assert.notEqual(start, -1, 'the per-user sign-in status helper must still exist under a findable name');
   let depth = 0, i = src.indexOf('{', start);
   for (; i < src.length; i++) { if (src[i] === '{') depth++; else if (src[i] === '}') { depth--; if (depth === 0) { i++; break; } } }
   const body = src.slice(start, i);
-  assert.equal(/\bfs\.stat\(/.test(body), false, 'must not stat inside the credential tree as this (possibly root) process — see checkUserSignedIn');
-  assert.match(body, /checkUserSignedIn|runCredentialJob/, 'must route through the privilege-dropped helper, like every other write into that tree');
+  assert.equal(/\bfs\.stat\(/.test(body), false, 'must not stat inside the credential tree as this (possibly root) process — see checkUserCliSignIn');
+  assert.match(body, /checkUserCliSignIn|runCredentialJob/, 'must route through the privilege-dropped helper, like every other write into that tree');
 });
 
 // ---------------------------------------------------------------------------

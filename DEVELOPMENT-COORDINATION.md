@@ -3087,3 +3087,60 @@ while session persistence is parked — flagging it so it is a known gap and not
 
 **Not isolation, unchanged.** Every pane still runs as one OS account. A colour is awareness:
 the tmux session is shared, so it does not stop anyone typing into anyone else's tab.
+
+---
+
+## GOA — 2026-09-21 — sign-in is per PERSON; the wizard's login is now the SEED identity
+
+Follow-up to the per-launcher change above, and the half of it that was still wrong: the
+Setup Wizard's "Sign in" authenticates the box's ONE shared identity in one shared setup
+terminal (`/pty/_setup/`, no per-user credential env). Once per-launcher credentials went
+live that identity stopped running anybody's project terminals, so the button was offering
+to sign you in and then signing in somebody else — and the green "Signed in" badge was
+reporting an identity unrelated to the viewer.
+
+The split now matches reality: **installing/updating a CLI is a property of the machine;
+being signed in to one is a property of a person.**
+
+- `/api/setup/state` reports `perUserClaude`, and both CLI renderers (the wizard modal and
+  the Settings page) relabel accordingly: badge reads **"Shared login"**, buttons read
+  **"Sign in shared"**, and the section explains that this identity is the SEED a per-user
+  config dir is created from plus the fallback for a project with no `primaryUser`. Nothing
+  about the shared login was removed — it is still load-bearing as that seed.
+- **`POST /api/me/cli-login {cli}`** signs the CALLER in, by opening a tab in a project they
+  can already reach running that CLI's per-user login command. No new terminal
+  infrastructure: the per-launcher path already guarantees a tab created by a person carries
+  their config dirs. It takes **no username** on purpose — an admin pressing it for someone
+  else would create the tab on the admin's credentials and sign the wrong person in — so the
+  button renders only on your own row in Settings → Users.
+- New `requireTerminalRole` is the ROLE half of `requireTerminalAccess`, for routes with no
+  project in the URL to authorise. `requireTerminalAccess` is now composed from it, so the
+  role check and its messages are not duplicated. The route's authorisation is
+  `filterProjectsForUser` picking the target, so there is no caller-supplied project name.
+- Copilot's per-user `userAuthCmd` is **`copilot login`**, not `gh auth login`: the latter
+  writes the shared `~/.config/gh`, which is the opposite of the point.
+
+**Settings → Users gained a Copilot column, and it is deliberately not a boolean.** A stored
+GitHub token OVERRIDES any login (Copilot reads `COPILOT_GITHUB_TOKEN`/`GH_TOKEN`/
+`GITHUB_TOKEN` first) and Copilot CLI does not accept classic `ghp_` PATs — which
+authenticate git perfectly well and fail only for inference, so the box looks correctly
+configured while one person's Copilot is broken. States: `via-token`, `token-rejected`,
+`token-unknown`, `signed-in`, `none`, `unreadable`, plus an `overridesLogin` flag for the
+"your sign-in is being ignored" case. Classification is by PREFIX only, in
+`app/cli-auth-status.js` (pure); the token is decrypted to read its type and **only the
+state name ever reaches the response**.
+
+**Shared-contract change PVI should know about:** the credential helper's `status` job now
+answers `{signedIn, copilotSignedIn}` instead of `{signedIn}` — one job, because it runs per
+user per request and each job is a privilege-dropped spawn. `checkUserSignedIn` is kept as
+the single-answer wrapper, so existing callers are unaffected. `userCopilotSignedIn` reads
+`<COPILOT_HOME>/config.json` with lstat + `O_NOFOLLOW` + a bounded read and strips Copilot's
+JSONC header before parsing; it returns a BOOLEAN only, never the account or the token, and a
+symlink planted at that path reads as not-signed-in (pinned in
+`test/per-user-cli-signin.test.mjs`, same defect class already closed for Claude's
+`.credentials.json`).
+
+**Codex is explicitly NOT wired** for per-user identity — no per-user config dir, so a login
+would write the shared one. `CODEX_HOME` looks like the analogue of `COPILOT_HOME` but is
+unverified against the CLI (Codex is not installed on this host), so the route refuses Codex
+with that reason instead of guessing. Install/update from Settings is unaffected.
