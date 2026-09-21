@@ -236,6 +236,37 @@ new one is offered alongside clearing, so they are not left without git credenti
 Their token grants nothing on this workbench; it is their own identity, used for their
 own attribution.
 
+### Upgrading terminals that already exist
+
+A session created before per-window identity stamps existed runs on perfectly good
+per-user credentials — it simply never recorded whose, so the cockpit shows its tabs
+uncoloured. **Settings → System & Updates → Heal → "Label existing terminals"**
+(`POST /api/setup/heal/session-labels`, admin) fills that record in.
+
+It writes a tmux window option, which is metadata: the pane's process is not signalled,
+restarted or otherwise disturbed, and the test for this asserts the pane PID is
+unchanged afterwards. That is the point — recycling would also fix the label, by killing
+everything running in the session.
+
+The care is all in what it refuses to label, because a wrong name is worse than none:
+
+| Situation | What happens |
+|---|---|
+| session's stamped fingerprint matches what its owner resolves to today | every **unlabelled** window is labelled with that owner |
+| a window already carries a label | left alone — with per-launcher credentials a session legitimately holds several identities, and the owner is not all of them |
+| stamp is stale (panes are on older credentials) | **skipped and named**, with "recycle to migrate" — the current owner's name would be a guess |
+| owner no longer resolves, or the stamp cannot be read | skipped and named |
+| project has no `primaryUser`, or the feature is off | skipped: there is no per-person identity to record |
+
+It is idempotent — a second run reports everything as already labelled — so it is safe
+to press again after recycling something.
+
+One thing a label does **not** retrofit: `COPILOT_HOME`. A pane's environment is fixed
+by tmux when the pane is created, so a terminal that predates that variable keeps using
+the shared `~/.copilot` until it is recycled. The label is still accurate about **whose
+account the tab spends** — that follows `GH_TOKEN` and `CLAUDE_CONFIG_DIR`, which those
+panes do carry — but Copilot's sessions and history stay pooled until a recycle.
+
 ### Codex
 
 Not wired for per-user identity: there is no per-user Codex config directory, so a

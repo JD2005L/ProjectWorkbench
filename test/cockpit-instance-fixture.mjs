@@ -90,7 +90,12 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = 
     if (child.exitCode === null) child.kill('SIGKILL');
     try { await tmux(sock, ['kill-server']); } catch { /* already gone */ }
     try { fs.rmSync(path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${process.getuid()}`, sock), { force: true }); } catch { /* fine */ }
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Retry the removal: a pane the test opened can still be dying inside the tmux
+    // server while this runs, writing into the instance's credential tree — and rmSync
+    // then fails ENOTEMPTY on a directory that repopulated itself mid-walk. Observed
+    // once the sign-in tests started launching real CLI logins in a pane. The failure
+    // is in teardown, so it fails a test that already passed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 

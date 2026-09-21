@@ -3187,3 +3187,35 @@ because that route's lock section also spans rename reconciliation — and both 
 credential of every project the person owns, which
 `test/per-user-cli-signin.test.mjs` pins end to end (clear → sign-in now possible → store a
 fine-grained one → cell goes green).
+
+---
+
+## GOA — 2026-09-21 (4) — labelling terminals that already exist, without recycling them
+
+Last piece of the per-launcher work. Sessions created before per-window identity stamps
+render uncoloured: they are on good per-user credentials but never recorded whose. Recycling
+fixes it by killing everything running in the session, which is an absurd price for a label.
+
+`POST /api/setup/heal/session-labels` (admin, audited; button in Settings → System → Heal)
+backfills the stamp on LIVE sessions. A stamp is a tmux window OPTION, so nothing running is
+disturbed — `test/session-label-backfill.test.mjs` asserts the pane PID is identical
+afterwards.
+
+The whole risk here is epistemic rather than technical: writing a name that is not true. So
+it labels only what it can PROVE, and skips the rest by name:
+
+- the session's stamped fingerprint must equal what its `primaryUser` resolves to TODAY
+  (that is the proof the panes really run on that person's credentials);
+- a window that already carries a label is never overwritten — per-launcher credentials mean
+  one session legitimately holds several identities;
+- stale stamp → skipped, reported as "recycle to migrate" (its panes are on older
+  credentials; the current owner's name would be a guess). Unreadable stamp, unresolvable
+  owner, no primaryUser, feature off → skipped and named.
+
+Idempotent; a second run reports everything as already labelled.
+
+**Known non-retrofit:** `COPILOT_HOME` cannot be backfilled — a pane's environment is fixed at
+creation — so a pre-upgrade terminal keeps using the shared `~/.copilot` until recycled. The
+label stays accurate about whose ACCOUNT the tab spends (`GH_TOKEN` + `CLAUDE_CONFIG_DIR` are
+per-user in those panes); only Copilot's session/history storage is still pooled. Documented
+rather than hidden.
