@@ -268,7 +268,8 @@ test('managed deployment HTTP: data-only panels and fresh validated choices neve
       const prod = targetSection(html, 'prod');
       assert.match(prod, /Deploy MCP server/);
       assert.match(prod, /No input selections required/);
-      assert.doesNotMatch(prod, /<select\b|<button[^>]*class="[^"]*deploy-btn"[^>]*\bdisabled/);
+      assert.match(prod, /class="deploy-backend"/);
+      assert.doesNotMatch(prod, /class="deploy-input"|<button[^>]*class="[^"]*deploy-btn"[^>]*\bdisabled/);
     }
     const version = await (await fetch(`${base}/api/deploy/demo/dev/version`)).json();
     assert.equal(version.managed, true);

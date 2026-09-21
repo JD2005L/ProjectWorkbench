@@ -49,7 +49,10 @@ administered endpoint and encrypted credential; no endpoint, token, or
 execution identity is stored with the project. `backend: "local"` explicitly
 keeps a slot local, while omitted or `backend: "inherit"` follows the global
 selection. Existing records omit the field and therefore retain their current
-behavior. Repository-managed slots remain read-only in the slot editor.
+behavior. Repository-managed slots keep their scripts, inputs, and execution
+recipes read-only, but an administrator may save this same operator-owned
+backend choice independently; `.pw/deploy.json` cannot select a backend or
+change any privileged routing setting.
 
 An external slot submits, reads versions and history, and opens job/log/cancel
 operations through the authenticated deployment service. A transport or policy
