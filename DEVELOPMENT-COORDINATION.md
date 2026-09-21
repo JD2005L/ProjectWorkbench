@@ -3369,3 +3369,43 @@ CLI's public client id yields a token Copilot documents it accepts (which is why
 token that does both jobs on this box is of that kind), at the cost of authorising as another
 vendor's app. That is an operator's call, so unset disables the button with an actionable
 message instead of falling back to either.
+
+---
+
+## GOA — 2026-09-21 (9) — why "gh isn't installed" keeps coming back, and the fix
+
+GOA: "this has been done several times yet I always run into 'gh isn't installed' issues, so
+whatever way we install it it needs to be hardened and permanent."
+
+**The recipe was never the problem.** The Containerfile has installed gh since 5ec4bf0
+(2026-09-09), correctly: `set -eux`, checksum-free but version-resolved via the
+releases/latest redirect, and a closing `gh --version` so a partial download fails the layer.
+Two other things went wrong instead:
+
+1. **The running image predates that layer.** Everything in its `/usr/local/bin` is dated
+   2026-08-21 — the dotnet toolchain build — twelve days before the gh layer was committed.
+   An image is only rebuilt deliberately, and nobody had.
+2. **Every runtime install since went into the container's writable layer**, which the next
+   `podman run` discards. Same failure as the deploy toolchain before it was baked in.
+
+`deploy/install-gh.sh` installs into **`/opt/npm-global/bin`** — a real host filesystem
+(rootvg-srvlv) bind-mounted into the containers, already first on a pane's PATH, and the
+reason sqlcmd has survived every recreate. It refuses tmpfs/overlay destinations outright,
+verifies the tarball against GitHub's published SHA-256 (a missing or mismatched checksum
+aborts), installs atomically under a temporary name, and runs `gh --version` before claiming
+success. Proven in-container before shipping: gh 2.101.0 downloads, verifies, runs, and
+`gh auth token` exists — which is the capability the per-user GitHub work needs.
+
+The Containerfile layer STAYS. Belt and braces: whichever exists, PATH finds one, and they are
+the same tool.
+
+**The part that actually stops the recurrence** is that the dashboard now reports it:
+`ghInstalled` in `/api/system/status` and a line in Settings → System & Updates → Readiness
+checklist, naming `deploy/install-gh.sh` as the remedy. Each previous disappearance was found
+by an agent failing mid-task; a missing tool that nothing surfaces is the defect worth fixing.
+Pinned in `test/gh-install.test.mjs` — including that the image layer keeps its fail-loud
+shape and that the installer keeps refusing an ephemeral destination.
+
+**Still open (PVI relevant):** the running image is a month stale relative to `main`. That is
+a separate, disruptive job — recreating the **pw-tmux** container kills every live tmux session
+— so it is deliberately not bundled here. The bind-mount install makes gh available without it.

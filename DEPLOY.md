@@ -103,6 +103,23 @@ previous config on failure before reloading.
 | `PW_DEPLOY_CENTRE` | `false` | enable the Windows (WinRM/SMB) Deploy Centre |
 | `PW_PER_USER_CLAUDE` | `false` | `true` runs each project under its owner's (`primaryUser`'s) identity: the owner's GitHub token is injected as `GH_TOKEN` (via a sourced `0600` env file — never on the process command line, so `ps` cannot leak it between panes) and Claude uses a per-user config dir seeded from the shared `~/.claude.json` MCP servers. The config dir is keyed on the user, not the project, so each owner logs into Claude once regardless of how many projects they own. Fail-closed: a project whose `primaryUser` has no resolvable token refuses to launch its terminal rather than silently using the shared login |
 | `PW_PER_LAUNCHER_CLAUDE` | `true` (only matters when `PW_PER_USER_CLAUDE` is on) | Keys a cockpit tab's credentials to the person who OPENED it rather than to the project's owner, so a shared project stops billing every teammate's Claude/Copilot work to the owner's seat. Each tab also gets `COPILOT_HOME` pointed at that person's own Copilot dir, and the cockpit colours the tab by whose account it runs on (see `userTabColors` in `workbench.json`). Everything with no person behind it — the base session, the boot reattach, scheduled tasks, bots — stays on the project owner. Set to `false` to pin the old owner-keyed behaviour without reverting the app. Requires `PW_PER_USER_CLAUDE=true`; on its own it does nothing |
+
+### GitHub CLI (`gh`)
+
+`gh` is installed by the image (Containerfile), but **the running image can be older than
+that layer**, and anything installed inside a running container is discarded when it is
+recreated. Both have happened here. Install it where it survives:
+
+```
+sudo bash /opt/project-workbench/workspaces/ProjectWorkbench/deploy/install-gh.sh
+```
+
+That targets `/opt/npm-global/bin` — a host filesystem bind-mounted into the containers,
+already first on a pane's PATH — verifies the download against GitHub's published SHA-256,
+and refuses an ephemeral destination. Settings → System & Updates → Readiness checklist has
+a line for `gh`, so if it ever goes missing the dashboard says so instead of an agent
+discovering it mid-task.
+
 | `PW_GITHUB_OAUTH_CLIENT_ID` (set it with `sudo bash deploy/set-github-oauth.sh <client-id>`) | `''` (feature off) | An OAuth app with **Device Flow** enabled, used by Settings → Users → *connect* (and a person's own `/me`) to authorise GitHub per user instead of pasting a token. Unset leaves the button disabled with an actionable message; nothing falls back silently. Two ways to fill it, NOT equivalent: an app this org registers (accountable, pushes fine, **but GitHub gates Copilot access and a self-registered app is not on that list**), or the GitHub CLI's own public client id (Copilot CLI documents that it accepts gh-app OAuth tokens, so one token does both jobs — at the cost of authorising as another vendor's app). A deliberate operator choice, which is why there is no default |
 | `PW_GITHUB_OAUTH_SCOPES` | `repo,read:org,workflow` | What the authorisation asks for. `repo` is what makes the resulting token usable as a push credential — a token without it cannot push anywhere. Comma- or space-separated |
 | `PW_GITHUB_OAUTH_BASE` / `PW_GITHUB_API_BASE` | `https://github.com` / `https://api.github.com` | Where the device flow and the verification call go. Overridable for GitHub Enterprise, and for tests, which point them at a local stub |
