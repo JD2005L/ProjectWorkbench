@@ -12,7 +12,7 @@
 //   in : {"action":"ensure","base":…,"username":…,"ghToken":…,"sharedClaudeJson":…,
 //          "sharedSettings":…,"sharedClaudeMd":…,"sharedCopilotHome":…}
 //         {"action":"prune","base":…,"keep":[…]}
-//         {"action":"status","base":…,"username":…}
+//         {"action":"status","base":…,"username":…}   -> {signedIn, copilotSignedIn}
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
 //
 // The job travels on stdin specifically so the GitHub token never appears in
@@ -22,7 +22,7 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
-import { applyCredentialJob, pruneUserCredentials, userSignedIn } from './user-credentials.js';
+import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn } from './user-credentials.js';
 import { runGitCredentialJob, remediateGitCredentials, nodeJobDeps, nodeRunGit } from './git-credentials.js';
 
 // Jobs that operate on the per-user credential TREE are addressed by `base`.
@@ -85,7 +85,12 @@ async function main() {
       : job.action === 'prune'
       ? await pruneUserCredentials({ fsp, base: job.base, keep: Array.isArray(job.keep) ? job.keep : [] })
       : job.action === 'status'
-      ? { signedIn: await userSignedIn({ fsp, base: job.base, username: job.username }) }
+      // Both CLIs in one job: the Users table asks per user per request, and each job
+      // is a privilege-dropped process spawn.
+      ? {
+        signedIn: await userSignedIn({ fsp, base: job.base, username: job.username }),
+        copilotSignedIn: await userCopilotSignedIn({ fsp, base: job.base, username: job.username }),
+      }
       : await applyCredentialJob({
         fsp,
         base: job.base,

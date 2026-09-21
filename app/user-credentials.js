@@ -549,14 +549,67 @@ export async function userSignedIn({ fsp, base, username }) {
   }
 }
 
+// Has this user completed their own `copilot login`?
+//
+// Copilot writes the credential into <COPILOT_HOME>/config.json when there is no OS
+// credential store to use — which is the case on this workbench (no keyring in the
+// container). Two signals are accepted because only one of them survives a box that
+// DOES have a credential store: `copilotTokens` holds the material itself, while
+// `loggedInUsers` / `lastLoggedInUser` record the account and remain even when the
+// token went to a keyring instead.
+//
+// The file is Copilot's own, so it is read defensively: lstat first (never follow a
+// symlink planted in a pane-controlled tree), a bounded read, and `//` comment lines
+// stripped before parsing because Copilot writes a JSONC-style header into it. Only a
+// BOOLEAN ever leaves this function — never an account name, never the token.
+const COPILOT_CONFIG_MAX_BYTES = 1024 * 1024;
+
+export async function userCopilotSignedIn({ fsp, base, username }) {
+  const file = path.join(userCopilotConfigDir(base, username), 'config.json');
+  let body;
+  try {
+    const st = await fsp.lstat(file);
+    if (!st.isFile() || st.size === 0 || st.size > COPILOT_CONFIG_MAX_BYTES) return false;
+    const fh = await fsp.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try { body = await fh.readFile('utf8'); } finally { await fh.close(); }
+  } catch {
+    return false;   // absent, a symlink, unreadable: not signed in, never an error
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(body.split('\n').filter((line) => !line.trimStart().startsWith('//')).join('\n'));
+  } catch {
+    return false;   // Copilot changed the format, or the file is half-written
+  }
+  if (!parsed || typeof parsed !== 'object') return false;
+  const tokens = parsed.copilotTokens;
+  if (tokens && typeof tokens === 'object' && Object.values(tokens).some((v) => typeof v === 'string' && v.trim())) return true;
+  if (Array.isArray(parsed.loggedInUsers) && parsed.loggedInUsers.some((u) => u && typeof u.login === 'string' && u.login.trim())) return true;
+  return typeof parsed.lastLoggedInUser?.login === 'string' && !!parsed.lastLoggedInUser.login.trim();
+}
+
 // Same in-process-or-dropped-helper shape as ensureUserCredentials/
 // pruneCredentials: when the dashboard is NOT the credential-tree's owning
 // account, this check runs inside the SAME privilege-dropped helper
 // (credential-writer.mjs) as every other read of that tree, rather than the
 // dashboard (often root) touching a pane-controlled path itself.
-export async function checkUserSignedIn({ fsp, base, username, owner = null, currentUid = null, runJob = null }) {
+//
+// Returns BOTH CLIs' sign-in state from one job, because the Users table needs both
+// and each extra job is another privilege-dropped process spawn per user per request.
+// `copilotSignedIn` is absent from an older helper's reply (a rolling deploy); it is
+// coerced to false rather than optimistically true, so a stale helper can never make
+// someone look signed in when nobody has checked.
+export async function checkUserCliSignIn({ fsp, base, username, owner = null, currentUid = null, runJob = null }) {
   const job = { action: 'status', base, username };
   const plan = credentialExecutionPlan({ owner, currentUid });
-  const result = plan.drop ? await runJob(job, plan) : { signedIn: await userSignedIn({ fsp, base, username }) };
-  return !!result.signedIn;
+  const result = plan.drop ? await runJob(job, plan) : {
+    signedIn: await userSignedIn({ fsp, base, username }),
+    copilotSignedIn: await userCopilotSignedIn({ fsp, base, username }),
+  };
+  return { claude: !!result.signedIn, copilot: !!result.copilotSignedIn };
+}
+
+// Kept as the single-answer form for callers that only care about Claude.
+export async function checkUserSignedIn(args) {
+  return (await checkUserCliSignIn(args)).claude;
 }
