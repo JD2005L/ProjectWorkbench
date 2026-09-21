@@ -147,6 +147,49 @@ hashed colour — an explicit choice always wins over a hashed one.
 The mapping is resolved on every poll, so a change repaints the strip within seconds
 without recycling any terminal.
 
+### Authorising GitHub per person (instead of pasting a token)
+
+One stored token per person has to do two unrelated jobs here: it is the **push
+credential** pinned into every repository that person owns, and it is what
+**authenticates Copilot** in their terminals. A hand-made PAT reliably satisfies one and
+fails the other — both directions have happened on this workbench:
+
+* a classic `ghp_` PAT pushed perfectly and Copilot refused the type;
+* replacing it with a fine-grained PAT satisfied Copilot and returned
+  `403 Write access to repository not granted` on push.
+
+**Settings → Users → _connect_** opens a modal that runs GitHub's **device flow**: the
+dashboard asks GitHub for a code, the person enters that code at
+`github.com/login/device` in their own browser (any device), and the dashboard polls for
+the result. A person can do the same for themselves from **`/me`**. Nothing needs to
+reach this box inbound, which is why the device flow and not the web flow — this is a LAN
+host behind a private CA.
+
+What the result gives you:
+
+* the token is stored encrypted, becomes the push credential of every project that
+  person owns (`syncProjectCredentials` runs immediately), and is exported as `GH_TOKEN`
+  in their terminals;
+* the **GitHub account that actually authorised** is verified through `GET /user` and
+  shown on the row. That matters because an admin may start the flow on somebody else's
+  row — a real workflow when sitting with them — and whoever is signed into GitHub in
+  that browser is who gets authorised. Showing the login makes a mis-binding visible
+  instead of silent;
+* the granted **scopes** are shown, with a plain note about whether `repo` is present.
+  That is deliberately phrased as what the token *carries*, never as a promise that a
+  push will succeed: a token with `repo` still cannot push where its account has no
+  write access, which is exactly the failure that prompted this.
+
+The device code never reaches the browser (it is the secret that collects the token), the
+token never appears in a response or the audit log, and each authorisation is single-use.
+
+**Configuration is required and has no default** — see `PW_GITHUB_OAUTH_CLIENT_ID` in
+[DEPLOY.md](../DEPLOY.md). Briefly: an org-registered OAuth app is the accountable
+choice and pushes fine, but GitHub gates Copilot access and a self-registered app is not
+on that list; the GitHub CLI's public client id yields a token Copilot documents it
+accepts, at the cost of authorising as another vendor's app. That is an operator's
+decision, so an unset value disables the button with a message rather than guessing.
+
 ### Prerequisites for Copilot specifically
 
 Each person needs their own Copilot seat, and a token Copilot CLI will actually

@@ -3323,3 +3323,49 @@ identity — that is the nginx `auth_request` subrequest, which answers 200/401 
 in the body. The right route is `/api/auth/me`. It survived review because the test's fetch
 stub answered the same wrong URL, written from the same wrong assumption; the stub now THROWS
 on any URL it does not recognise, so a wrong endpoint fails the test instead of passing it.
+
+---
+
+## GOA — 2026-09-21 (8) — GitHub OAuth device flow, per user, from the Users page
+
+Context, because this is a fix for a class rather than a feature request out of nowhere: a
+stored GitHub token here does TWO unrelated jobs — it is the push credential pinned into every
+repo its owner owns (`syncProjectCredentials`) and it authenticates Copilot in that person's
+terminals. A hand-made PAT satisfies one and fails the other, and both directions happened
+here in one afternoon: a classic `ghp_` that pushed and Copilot refused, then a fine-grained
+PAT that Copilot took and returned `403 Write access to repository not granted` on push.
+
+**Settings → Users → _connect_** (and the same on a person's own `/me`) now runs GitHub's
+**device flow**: `POST /api/github-oauth/start` → the person enters the shown code at
+github.com on any device → `POST /api/github-oauth/poll` until GitHub answers. Device flow
+rather than web flow because the web flow needs an inbound redirect URL and this is a LAN host
+behind a private CA — the same reason `gh auth login` uses it here.
+
+Protocol lives in `app/github-oauth.js` with fetch injected, so the state machine is tested
+without a network (`test/github-oauth.test.mjs`, which also drives the whole thing end to end
+against a stub GitHub over HTTP).
+
+Three properties worth reviewing deliberately:
+
+- **The device code never reaches the browser.** It is the secret that COLLECTS the token, so
+  it is kept in an in-memory map keyed by target user and only the `user_code` is returned.
+  Not persisted: it is worthless after ~15 minutes, and a restart mid-flow should cancel
+  rather than resurrect. Asserted in the tests.
+- **Who may authorise for whom:** yourself always, anybody if you are an admin. An admin
+  starting it on someone else's row is a real workflow (sitting with them while they authorise
+  on their phone), so the resulting token is VERIFIED with `GET /user` and the GitHub login is
+  stored (`ghLogin`) and shown on the row. Whoever is signed into github.com in that browser
+  is who gets authorised, and showing it is what makes a mis-binding visible rather than silent.
+- **Capability is reported as what the token CARRIES, never as a promise.** Scopes are shown
+  with a note about `repo`; the note says "wherever this account already has write access",
+  because a token with `repo` still cannot push where its account cannot — which is precisely
+  the failure that prompted all this. Copilot acceptance is not a scope at all (it depends on
+  the app the token came from), so it is not guessed at.
+
+**`PW_GITHUB_OAUTH_CLIENT_ID` has NO default, deliberately, and PVI should weigh in.** The two
+ways to fill it are not equivalent: an org-registered OAuth app is accountable and pushes fine,
+but GitHub gates Copilot API access and a self-registered app is not on that list; the GitHub
+CLI's public client id yields a token Copilot documents it accepts (which is why the one
+token that does both jobs on this box is of that kind), at the cost of authorising as another
+vendor's app. That is an operator's call, so unset disables the button with an actionable
+message instead of falling back to either.

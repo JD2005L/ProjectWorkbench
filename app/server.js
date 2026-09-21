@@ -34,6 +34,7 @@ import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCu
 import { uniqueTabNameClientSrc } from './tab-util.js';
 import { normalizeUserTabColors, resolveUserTabColor, userTabColorCss, mergeUserTabColors, userTabColorClaims, userTabPaletteList, normalizeUserTabColorChoice } from './user-colors.js';
 import { classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, resolveCliAuthCell } from './cli-auth-status.js';
+import { githubOauthConfig, startDeviceFlow, pollDeviceFlow, verifyToken, describeTokenCapability } from './github-oauth.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
@@ -4349,12 +4350,16 @@ app.post(BASE + '/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
 // test/per-user-self-service.test.mjs asserts they agree.
 //
 // `token` is '' to clear. Returns the (safe-shaped) user, or a failure to surface.
-async function setUserGithubToken(username, token){
+async function setUserGithubToken(username, token, githubLogin = ''){
  return credentialDomain.withLocks(['lifecycle'], async () => {
   const users = await loadUsers();
   const u = users.find(x => x.username === username);
   if(!u) return { failure: { status:404, error:`User "${username}" not found` } };
   if(token) u.ghToken = encrypt(token); else delete u.ghToken;
+  // Which GitHub account the stored token actually belongs to. Known only when the
+  // token came through an authorisation we verified; a pasted one is anonymous to us,
+  // so the old label is cleared rather than left to describe a different credential.
+  if(token && githubLogin) u.ghLogin = githubLogin; else delete u.ghLogin;
   await saveUsers(users);
   try {
    const projects = await loadProjects();
@@ -4472,7 +4477,37 @@ function render(s){
   +'<input id="meTokInput" type="password" autocomplete="off" placeholder="Paste a new token to replace it (fine-grained, with Copilot Requests)">'
   +'<button class="meBtn" id="meTokSave" type="button">Save</button>'
   +(g.hasToken?'<button class="meBtn secondary" id="meTokClear" type="button">Clear</button>':'')+'</div>'
-  +'<p class="meNote">Clearing it lets a Copilot sign-in take effect, but your git pushes from projects you own will have no credential until you store a new one.</p>';
+  +'<p class="meNote">Clearing it lets a Copilot sign-in take effect, but your git pushes from projects you own will have no credential until you store a new one.</p>'
+  +(g.login?'<p class="meNote">Authorised as GitHub user <b>'+esc(g.login)+'</b>.</p>':'')
+  +(g.oauth?'<div class="meTok"><button class="meBtn" id="meGhStart" type="button">Authorise with GitHub</button><span class="meNote">Recommended: an authorisation grants what it grants, instead of a hand-made token that pushes but Copilot refuses, or the reverse.</span></div><div id="meGhStep"></div>':'<p class="meNote">No GitHub OAuth app is configured on this workbench, so pasting a token is the only option here. An administrator can enable it.</p>');
+ const ghStartBtn=document.getElementById('meGhStart');
+ if(ghStartBtn){
+  const step=document.getElementById('meGhStep');
+  let deadline=0;
+  const poll=(ms)=>setTimeout(async()=>{
+   if(Date.now()>deadline){setStatus('That code expired before it was authorised \u2014 start again.',true);return}
+   try{
+    const r=await fetch('${base}/api/github-oauth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(j.ok&&j.status==='pending'){setStatus('Waiting for the authorisation on github.com\u2026');return poll(j.intervalMs||ms)}
+    if(!j.ok){setStatus(j.error||'That authorisation did not complete.',true);return}
+    step.innerHTML='<p class="meNote">Connected as <b>'+esc(j.login)+'</b>. Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>';
+    setStatus('Done.');load();
+   }catch(e){setStatus(e.message||String(e),true)}
+  },ms);
+  ghStartBtn.onclick=async()=>{
+   ghStartBtn.disabled=true;setStatus('Asking GitHub for a code\u2026');
+   try{
+    const r=await fetch('${base}/api/github-oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+    deadline=Date.now()+(j.expiresInMs||900000);
+    step.innerHTML='<div class="gh-code">'+esc(j.userCode)+'</div><p class="meNote">Open <a href="'+esc(j.verificationUri)+'" target="_blank" rel="noopener">'+esc(j.verificationUri)+'</a> and enter that code. Any device will do.</p>';
+    setStatus('Waiting for the authorisation on github.com\u2026');
+    poll(j.intervalMs||5000);
+   }catch(e){setStatus(e.message||String(e),true)}finally{ghStartBtn.disabled=false}
+  };
+ }
  document.getElementById('meTokSave').onclick=async()=>{
   const v=document.getElementById('meTokInput').value.trim();if(!v){setStatus('Paste a token first.',true);return}
   setStatus('Saving…');try{const r=await fetch('${base}/api/me/github-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:v})});const j=await r.json();
@@ -4494,7 +4529,7 @@ app.get(BASE + '/me', requireAuth, async (req,res)=>{
  ]);
  const back = await lastProjectForUser(req.user.username).catch(()=> '');
  const backLink = back ? `<a class="meBack" href="${BASE}/term/${encodeURIComponent(back)}/">← back to ${esc(back)}</a>` : `<a class="meBack" href="${BASE}/">← back to the dashboard</a>`;
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>My CLI sign-ins — Workbench</title><style>${designTokensCss}${landingCss}${mePageCss}${statusBarCss}${colorPickCss}</style></head><body class="landing"><div class="meWrap">${backLink}<div class="meHead"><h1>My CLI sign-ins</h1><span class="meWho">signed in as <b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></div><p class="meLead">Which assistants this workbench offers is set by an administrator. <b>Being signed in to one is yours</b> — these are your own credentials, kept in your own configuration directory, and used by the terminals you open.</p><div class="meCard"><div id="meClis"></div></div><div class="meCard" id="meColorBox"></div><div class="meCard" id="meTokBox"></div><div class="meStatus" id="meStatus"></div></div>${mePageScript(BASE)}${statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE })}</body></html>`);
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>My CLI sign-ins — Workbench</title><style>${designTokensCss}${landingCss}${mePageCss}${statusBarCss}${colorPickCss}${deviceCodeCss}</style></head><body class="landing"><div class="meWrap">${backLink}<div class="meHead"><h1>My CLI sign-ins</h1><span class="meWho">signed in as <b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></div><p class="meLead">Which assistants this workbench offers is set by an administrator. <b>Being signed in to one is yours</b> — these are your own credentials, kept in your own configuration directory, and used by the terminals you open.</p><div class="meCard"><div id="meClis"></div></div><div class="meCard" id="meColorBox"></div><div class="meCard" id="meTokBox"></div><div class="meStatus" id="meStatus"></div></div>${mePageScript(BASE)}${statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE })}</body></html>`);
 });
 
 // CLI statuses, memoised briefly.
@@ -4572,7 +4607,12 @@ app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
   canOpenTerminal: TERMINAL_ROLES.has(req.user.role),
   // The KIND of their own token, never the token. Knowing it is a classic PAT is the
   // difference between "sign in again" and "this can never work until it is replaced".
-  github: { hasToken: !!me.ghToken, kind: me.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(me.ghToken)); } catch { return 'unreadable'; } })() : 'none' },
+  github: {
+   hasToken: !!me.ghToken,
+   kind: me.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(me.ghToken)); } catch { return 'unreadable'; } })() : 'none',
+   login: me.ghLogin || '',
+   oauth: GITHUB_OAUTH.enabled,
+  },
   // chosen is '' when the colour was assigned automatically; name/css is what it is.
   color: {
    chosen: me.tabColor || '',
@@ -4584,6 +4624,85 @@ app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
   clis: out,
  });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// ── GitHub OAuth, per person ────────────────────────────────────────────────
+//
+// A stored GitHub token here has to push (it is pinned as the credential of every repo
+// its owner owns) AND authenticate Copilot. A hand-made PAT satisfies one and fails the
+// other with dreary regularity — both directions have now happened on this box — so a
+// person authorising an app, and getting whatever that authorisation grants, removes the
+// class of problem rather than another instance of it.
+//
+// Device flow, because the alternative needs an inbound redirect URL and this is a LAN
+// host behind a private CA. The person reads a code off the modal and types it into
+// github.com themselves; nothing needs to reach this box.
+const GITHUB_OAUTH = githubOauthConfig(process.env);
+// Pending authorisations, in memory only, keyed by the user the token will be stored
+// for. Not persisted on purpose: the device code is a secret that collects a token, it
+// is worthless after ~15 minutes, and a dashboard restart mid-flow should cancel the
+// flow rather than resurrect it.
+const pendingGithubOauth = new Map();
+function pruneGithubOauth(){
+ const now = Date.now();
+ for(const [k,v] of pendingGithubOauth) if(v.expiresAt <= now) pendingGithubOauth.delete(k);
+}
+// Who may authorise for whom: yourself always; anybody, if you are an admin. An admin
+// starting it on someone else's row is a real workflow (sitting with them while they
+// authorise on their own phone), which is exactly why the GitHub login the token turns
+// out to belong to is verified and shown afterwards — see verifyToken.
+function oauthTargetUser(req){
+ const asked = String(req.body?.username || '').trim();
+ if(!asked || asked === req.user.username) return { target: req.user.username };
+ if(req.user.role !== 'admin') return { error: 'You can only connect your own GitHub account.' };
+ return { target: asked };
+}
+
+app.post(BASE + '/api/github-oauth/start', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity to connect.'});
+ if(!GITHUB_OAUTH.enabled) return res.status(409).json({ok:false,error:'No GitHub OAuth app is configured. An administrator sets PW_GITHUB_OAUTH_CLIENT_ID to an OAuth app with Device Flow enabled (GitHub → Settings → Developer settings → OAuth Apps). Until then, paste a token instead.'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ const users = await loadUsers();
+ if(!users.some(u => u.username === target)) return res.status(404).json({ok:false,error:`User "${target}" not found`});
+ pruneGithubOauth();
+ const flow = await startDeviceFlow({ fetchImpl: fetch, config: GITHUB_OAUTH });
+ pendingGithubOauth.set(target, {
+  deviceCode: flow.deviceCode, intervalMs: flow.intervalMs,
+  expiresAt: Date.now() + flow.expiresInMs, startedBy: req.user.username,
+ });
+ await audit('github_oauth_started', { target, startedBy: req.user.username }, req);
+ // The device code itself is NOT returned: it is the secret that collects the token.
+ res.json({ ok:true, target, userCode: flow.userCode, verificationUri: flow.verificationUri,
+  intervalMs: flow.intervalMs, expiresInMs: flow.expiresInMs });
+} catch(e){ res.status(502).json({ok:false,error:e.message||String(e)}); }});
+
+app.post(BASE + '/api/github-oauth/poll', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first.'});
+ if(!GITHUB_OAUTH.enabled) return res.status(409).json({ok:false,error:'No GitHub OAuth app is configured.'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ pruneGithubOauth();
+ const pending = pendingGithubOauth.get(target);
+ if(!pending) return res.status(409).json({ok:false,error:'That authorisation is no longer in progress — start it again.'});
+ const out = await pollDeviceFlow({ fetchImpl: fetch, config: GITHUB_OAUTH, deviceCode: pending.deviceCode });
+ if(out.status === 'pending') return res.json({ ok:true, status:'pending' });
+ if(out.status === 'slow-down'){ pending.intervalMs = out.intervalMs; return res.json({ ok:true, status:'pending', intervalMs: out.intervalMs }); }
+ if(out.status !== 'ok'){
+  pendingGithubOauth.delete(target);
+  return res.json({ ok:false, status: out.status,
+   error: out.status === 'denied' ? 'The authorisation was declined on GitHub.' : 'That code expired before it was authorised — start again.' });
+ }
+ // One authorisation, one use.
+ pendingGithubOauth.delete(target);
+ const who = await verifyToken({ fetchImpl: fetch, config: GITHUB_OAUTH, token: out.token });
+ const stored = await setUserGithubToken(target, out.token, who.login);
+ if(stored.failure) return res.status(stored.failure.status).json({ok:false,error:stored.failure.error});
+ invalidateTabColorCache();
+ // The token is never returned, logged or echoed; the GitHub login and the scopes are,
+ // because those are what make a mis-binding or a missing permission visible.
+ await audit('github_oauth_completed', { target, startedBy: pending.startedBy, githubLogin: who.login, scopes: who.scopes }, req);
+ res.json({ ok:true, status:'ok', target, login: who.login, scopes: who.scopes, ...describeTokenCapability(who.scopes) });
+} catch(e){ res.status(502).json({ok:false,error:e.message||String(e)}); }});
 
 // Choose MY OWN tab colour.
 //
@@ -4734,6 +4853,9 @@ function statusBarHtml({ claudeVersion, updateStamp, user, enforce }){
    swatches plus an explicit automatic option. A native select cannot show a colour, and a
    colour you cannot see is not a choice. Defined once because two copies of the same
    control drifting apart is how one of them ends up lying. */
+// Shared by the Users modal and a person's own page, for the same reason the colour
+// picker is: one definition, so the two cannot drift.
+const deviceCodeCss = `.gh-code{font:700 1.5rem/1.2 ui-monospace,Menlo,monospace;letter-spacing:.18em;background:#020617;border:1px solid var(--line);border-radius:10px;padding:.6rem 1rem;text-align:center;color:#fde68a;user-select:all;margin:.6rem 0}`;
 const colorPickCss = `.cPick{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:.3rem}
 .cPick button{width:22px;height:22px;border-radius:6px;border:2px solid transparent;cursor:pointer;padding:0}
 .cPick button.sel{border-color:#e5e7eb;box-shadow:0 0 0 2px rgba(148,163,184,.35)}
@@ -4754,6 +4876,14 @@ const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-seri
 .uSwatch{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:.45rem;vertical-align:baseline;border:1px solid rgba(255,255,255,.25)}
 .uColorName{color:#64748b;font-size:.72rem;margin-left:.4rem}
 .cellAct{background:none;border:0;padding:0;margin-left:.45rem;color:#7dd3fc;font:inherit;font-size:.74rem;cursor:pointer;text-decoration:underline dotted;white-space:nowrap}
+/* The device code is the one thing a person has to carry to another device, so it is the
+   largest thing in the modal and selectable in one click. */
+.gh-step{margin:.8rem 0}
+.gh-code{font:700 1.7rem/1.2 ui-monospace,Menlo,monospace;letter-spacing:.18em;background:#020617;border:1px solid #334155;border-radius:10px;padding:.7rem 1rem;text-align:center;color:#fde68a;user-select:all}
+.gh-where{margin:.6rem 0 0;font-size:.9rem}
+.gh-where a{color:#7dd3fc}
+.gh-hint{color:#94a3b8;font-size:.82rem;margin:.5rem 0 0;line-height:1.5}
+.gh-ok{color:#86efac}
 .cellAct:hover{color:#bae6fd;text-decoration-style:solid}
 .cellAct:disabled{opacity:.5;cursor:not-allowed;text-decoration:none}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}/* display:flex above outranks the UA [hidden] rule, so a hidden field stays visible unless this re-asserts it — the same trap as .tabMenu vs .projLinks[hidden]. */.t-grid label[hidden]{display:none}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-agentrow{display:flex;align-items:center;gap:.6rem;margin:.5rem 0 .2rem;font-size:.85rem;color:#cbd5e1}.t-agentrow label{display:flex;align-items:center;gap:.35rem}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
 .um-form{display:flex;flex-direction:column;gap:.9rem}.um-form label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.um-form label.inline{flex-direction:row;align-items:center;gap:.45rem}.um-form label.inline input[type=checkbox]{width:auto;margin:0}.proj-picker{border:1px solid #1f2937;border-radius:8px;padding:.5rem .65rem;background:#0b1220}.proj-picker .star{display:flex;align-items:center;gap:.45rem;color:#fde68a;font-size:.85rem;padding-bottom:.45rem;border-bottom:1px solid #1f2937;margin-bottom:.45rem}.proj-picker .star input{width:auto;margin:0}.proj-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.3rem .85rem;max-height:240px;overflow-y:auto}.proj-list.disabled{opacity:.45;pointer-events:none}.proj-list label{flex-direction:row;align-items:center;gap:.4rem;font-size:.82rem;color:#cbd5e1;padding:.2rem 0;cursor:pointer}.proj-list label input{width:auto;margin:0}.proj-list .empty{color:#94a3b8;font-style:italic;font-size:.82rem}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}`;
@@ -4767,7 +4897,7 @@ let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BA
    than a second round trip or an injected template value: the sign-in means is
    self-service, so the table has to know which row is yours. */
 function uColspan(){return 6+PW_CLIS.length+${DEPLOY_CENTRE ? '1' : '0'}}
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};PW_GH_OAUTH=!!j.githubOauth;renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
 /* A stored token was previously write-only from this table: an empty field meant "keep
@@ -4776,15 +4906,70 @@ function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td
    and it was unreachable. The server already accepted ghToken:'' as a clear; this is
    the control that sends it. */
 function tokenCellHtml(u){
- if(!u.hasToken)return '<td><span class="role-pill">none</span></td>';
+ if(!u.hasToken)return '<td><span class="role-pill">none</span><button class="cellAct" data-ghoauth="'+esc(u.username)+'" title="Authorise GitHub through GitHub itself, instead of pasting a token">connect</button></td>';
  const bad=u.tokenKind==='classic'||u.tokenKind==='unreadable';
  const style=bad?'color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)':'color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)';
  const title=u.tokenKind==='classic'?'A classic personal access token. Fine for git, but Copilot CLI refuses this type — and it overrides any Copilot sign-in.'
   :u.tokenKind==='unreadable'?'This stored token could not be decrypted. Replace it.'
   :'Stored encrypted; used for their git pushes and, if the type allows, for Copilot.';
  return '<td><span class="role-pill" style="'+style+'" title="'+esc(title)+'">'+esc(u.tokenKind)+'</span>'
+  +(u.ghLogin?'<span class="uColorName" title="The GitHub account this token was authorised as">'+esc(u.ghLogin)+'</span>':'')
+  +'<button class="cellAct" data-ghoauth="'+esc(u.username)+'" title="Authorise GitHub through GitHub itself, instead of pasting a token">connect</button>'
   +'<button class="cellAct" data-cleartok="'+esc(u.username)+'" title="Remove this stored token. Needed when Copilot refuses its type, because a stored token overrides any sign-in.">clear</button></td>'
 }
+/* GitHub authorisation, per person, in a modal.
+   Device flow: the dashboard gets a code, the PERSON types it into github.com in their own
+   browser, and this polls for the result. Nothing has to reach this box, which is what
+   makes it work on a LAN host behind a private CA. */
+const ghBackdrop=document.getElementById('ghBackdrop'),ghTitle=document.getElementById('ghTitle'),ghStep=document.getElementById('ghStep'),ghStatus=document.getElementById('ghStatus'),ghStart=document.getElementById('ghStart'),ghIntro=document.getElementById('ghIntro');
+let ghTarget='',ghTimer=null,ghDeadline=0,PW_GH_OAUTH=false;
+function ghSet(t,err){ghStatus.textContent=t||'';ghStatus.classList.toggle('err',!!err)}
+function ghStop(){if(ghTimer){clearTimeout(ghTimer);ghTimer=null}}
+function ghCloseFn(){ghStop();ghBackdrop.classList.add('hidden');loadUsers()}
+document.getElementById('ghClose').onclick=ghCloseFn;document.getElementById('ghCancel').onclick=ghCloseFn;
+ghBackdrop.addEventListener('click',e=>{if(e.target===ghBackdrop)ghCloseFn()});
+function ghOpen(username){
+ ghTarget=username;ghStop();
+ ghTitle.textContent='Connect GitHub \u2014 '+username;
+ ghStep.innerHTML='';ghSet('');ghStart.disabled=!PW_GH_OAUTH;
+ ghIntro.textContent=PW_GH_OAUTH
+  ?'Authorise GitHub for this person. The token is stored encrypted, becomes the push credential for every project they own, and authenticates Copilot in their terminals.'
+  :'No GitHub OAuth app is configured on this workbench, so there is nothing to authorise against yet. An administrator sets PW_GITHUB_OAUTH_CLIENT_ID to an OAuth app with Device Flow enabled. Until then, paste a token in the Edit form instead.';
+ ghBackdrop.classList.remove('hidden');
+}
+async function ghPoll(intervalMs){
+ ghStop();
+ if(Date.now()>ghDeadline){ghSet('That code expired before it was authorised \u2014 start again.',true);return}
+ ghTimer=setTimeout(async()=>{
+  try{
+   const r=await fetch('${BASE}/api/github-oauth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+   const j=await r.json();
+   if(j.ok&&j.status==='pending'){ghSet('Waiting for the authorisation on github.com\u2026');return ghPoll(j.intervalMs||intervalMs)}
+   if(!j.ok){ghSet(j.error||'That authorisation did not complete.',true);return}
+   /* WHICH GitHub account it turned out to be is the point of showing this: an admin can
+      start the flow on somebody else's row, and whoever is signed into github.com in that
+      browser is the account that gets authorised. */
+   ghStep.innerHTML='<p class="gh-where gh-ok">Connected as <b>'+esc(j.login)+'</b></p>'
+    +'<p class="gh-hint">Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>'
+    +'<p class="gh-hint">Stored for <b>'+esc(j.target)+'</b>. The push credential of every project they own has been updated.</p>';
+   ghSet('Done.');
+  }catch(e){ghSet(e.message||String(e),true)}
+ },intervalMs);
+}
+ghStart.onclick=async()=>{
+ ghStart.disabled=true;ghSet('Asking GitHub for a code\u2026');
+ try{
+  const r=await fetch('${BASE}/api/github-oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+  const j=await r.json();
+  if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+  ghDeadline=Date.now()+(j.expiresInMs||900000);
+  ghStep.innerHTML='<div class="gh-code">'+esc(j.userCode)+'</div>'
+   +'<p class="gh-where">Open <a href="'+esc(j.verificationUri)+'" target="_blank" rel="noopener">'+esc(j.verificationUri)+'</a> and enter that code.</p>'
+   +'<p class="gh-hint">Whoever is signed into GitHub in that browser is the account being authorised, so '+esc(ghTarget)+' should do this themselves, on any device. This page notices when it is done.</p>';
+  ghSet('Waiting for the authorisation on github.com\u2026');
+  ghPoll(j.intervalMs||5000);
+ }catch(e){ghSet(e.message||String(e),true)}finally{ghStart.disabled=false}
+};
 /* The colour picker, shared by the Add and Edit forms. PW_CLAIMS names who already holds
    each colour so a duplicate cannot be chosen by accident — the server refuses it too,
    but a disabled swatch explains itself better than an error does. */
@@ -4834,7 +5019,9 @@ function cliCellHtml(u,cli){
  return '<td>'+pill+act+'</td>';
 }
 function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th>'+PW_CLIS.map(c=>'<th>'+esc(c.label.replace(/ CLI$/,''))+'</th>').join('')+'<th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td>'+(u.tabColorCss?'<span class="uSwatch" style="background:'+esc(u.tabColorCss)+'" title="'+esc(u.tabColorName+(u.tabColor?' (chosen)':' (assigned automatically)'))+'"></span>':'')+'<b>'+esc(u.username)+'</b>'+(u.tabColorName?'<span class="uColorName">'+esc(u.tabColorName)+(u.tabColor?'':' · auto')+'</span>':'')+'</td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+PW_CLIS.map(c=>cliCellHtml(u,c)).join('')+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
-uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.cleartok){
+uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.ghoauth){
+ ghOpen(t.dataset.ghoauth);
+}else if(t.dataset.cleartok){
  if(!confirm('Clear the stored GitHub token for "'+t.dataset.cleartok+'"?\\n\\nA Copilot sign-in can then take effect for them, but git pushes from projects they own will have no credential until a new token is stored.'))return;
  t.disabled=true;setStatus(uStatus,'Clearing…');
  try{const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.cleartok),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({ghToken:''})});const j=await r.json();
@@ -4997,6 +5184,7 @@ ${renderDeploymentSettings(BASE)}
 </div></section><section id="tab-tokens"><h2>API tokens</h2><p class="lead">Bearer credentials for the machine API, so a script or an agent on another machine can register a project without an interactive sign-in. A token carries only the scopes you grant it &mdash; it is <b>not</b> an admin session and cannot reach user management, permission modes, or CLI installs.</p><div class="s-card"><h3>Create a token</h3><label>Label<input id="tokLabel" placeholder="e.g. laptop-copilot" maxlength="80"></label><fieldset id="tokScopes"><legend>Scopes</legend></fieldset><button class="button" id="tokCreate" type="button">Create token</button><div id="tokNew" class="tok-new" hidden><p><b>Copy this now &mdash; it is shown once and cannot be retrieved again.</b></p><pre id="tokNewVal"></pre><button class="button secondary tiny" id="tokCopy" type="button">Copy</button></div><div id="tokStatus" class="muted"></div></div><div class="s-card"><h3>Existing tokens</h3><p class="muted">Revoking disables a token immediately; the record is kept so the audit trail outlives it. Sensitive events are logged to <code>/var/log/project-workbench/audit.log</code>.</p><div id="tokList" class="muted">loading&hellip;</div></div></section><section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button>${PER_USER_CLAUDE ? ' <button class="button secondary" id="healLabelsBtn" type="button">Label existing terminals</button>' : ''}<pre class="heal-out" id="healOut"></pre>${PER_USER_CLAUDE ? '<p class="muted" style="margin-top:.6rem">A terminal opened before per-person identity existed runs on good credentials but never recorded whose, so its tabs show uncoloured. Labelling writes that record in place &mdash; it is a tmux option, so nothing running is disturbed. Only sessions whose stamped credentials still match their owner are labelled; anything that cannot be proven is skipped and named.</p>' : ''}</div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
+<div id="ghBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:520px"><header><h2 id="ghTitle">Connect GitHub</h2><button class="modal-close" id="ghClose" aria-label="Close" type="button">&times;</button></header><div class="body"><p class="muted" id="ghIntro"></p><div id="ghStep" class="gh-step"></div><div class="status-line" id="ghStatus"></div></div><footer><button class="button secondary" id="ghCancel" type="button">Close</button><button class="button" id="ghStart" type="button">Start authorisation</button></footer></div></div>
 <div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label><label>Terminal tab colour <span class="muted">(how their tabs are marked in the cockpit)</span><div class="cPick" id="umColor"></div></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
 ${wizardModalHtml}${wizardScript}${settingsScript}${deploymentSettingsScript(BASE)}${footer}</body></html>`);
 });
@@ -5212,6 +5400,7 @@ app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
    // "sign in" and "this can never work until it is replaced", so an admin has to see it.
    tokenKind: u.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(u.ghToken)); } catch { return 'unreadable'; } })() : 'none',
    // tabColor is what they CHOSE ('' = automatic); tabColorName/Css is what they GET.
+   ghLogin: u.ghLogin || '',
    tabColor: u.tabColor || '',
    tabColorName: resolveUserTabColor(u.username, colorMap),
    tabColorCss: userTabColorCss(resolveUserTabColor(u.username, colorMap)),
@@ -5219,7 +5408,7 @@ app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
   }));
   // `me` drives the self-service sign-in buttons. Empty for the implicit admin of an
   // auth-disabled instance: it is a placeholder, not one of these people.
-  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, palette: userTabPaletteList(), colorClaims: claims, users: out });
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, palette: userTabPaletteList(), colorClaims: claims, githubOauth: GITHUB_OAUTH.enabled, users: out });
  }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
