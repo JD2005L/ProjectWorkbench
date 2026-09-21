@@ -3020,3 +3020,120 @@ If PVI2 (host mode) enables per-user, mirror this grandfather behaviour there, o
 accept that host-mode requires a recycle before a stale session will attach. The
 credential-RESOLUTION contract (fail-closed on resolution failure) is unchanged and
 still identical across both entrypoints.
+
+---
+
+## GOA — 2026-09-21 — per-LAUNCHER credentials: a tab runs on the account of whoever opened it
+
+FYI for PVE, with one host-mode item that needs PVI's call.
+
+**Problem.** Per-user credentials key a terminal to the project's `primaryUser`, so on a
+project two people share, every teammate's Claude and Copilot work runs on the OWNER's
+login. On GOA that meant one person's Copilot seat and rate limit gating the whole team
+(reported on AITDataHub), and an audit trail naming the wrong person.
+
+**Change on `main`.** `PW_PER_LAUNCHER_CLAUDE` (default `true` once `PW_PER_USER_CLAUDE`
+is on; `false` pins the old behaviour without a revert):
+
+- `credentialContext(project, launcher)` resolves the LAUNCHER first
+  (`resolveLauncherCredentialOwner`, new in `app/project-owner.js`) and falls back to the
+  project owner when there is no person — the base session, the boot reattach, scheduled
+  tasks, bots. `POST /api/term/:project/windows` passes `req.user?.username`.
+- A launcher that does not resolve to a user record returns `null` (→ project owner), NOT
+  a throw: that is an unauthenticated instance's implicit admin, not a fault. Resolution
+  FAILURE (corrupt token, dangling `primaryUser`) still fails closed with no shared
+  fallback — AC1 unchanged.
+- **`COPILOT_HOME`** now rides alongside `CLAUDE_CONFIG_DIR` in every per-user pane. Copilot
+  CLI keeps sessions, history, skills and any `copilot /login` in ONE directory, so per-user
+  tokens alone still left everyone sharing `~/.copilot`. Seeded fill-only with
+  `copilot-instructions.md` + `mcp-config.json`; per-person state deliberately not copied.
+- **`CLAUDE.md` is now seeded** into each per-user config dir. It was not, and that silently
+  removed this workbench's standing agent guardrails from every per-user session (repaired by
+  hand on 2026-09-14). Per-launcher mode materializes a dir per PERSON, which multiplies that
+  gap, so it is fixed rather than documented.
+
+**Invariant that CHANGED — please review deliberately.** `newTmuxWindow` no longer requires a
+new window to match the session's credential fingerprint. That rule was the guard against
+unlabelled mixed-attribution panes, and it was correct while a session could hold only one
+identity; per-launcher mode makes the mix the point. The guard MOVED rather than disappeared:
+every window is stamped at creation with `@pw_cred_user` + `@pw_cred_key`, read back to confirm
+the write landed, and a window whose identity cannot be recorded is killed rather than handed
+over unlabelled. The cockpit colours each tab by that stamp (`userTabColors` in
+`workbench.json`; uncoloured = shared box login). Pinned by
+`test/per-launcher-credentials.test.mjs`; the superseded assertion in
+`test/per-user-stale-grandfather.test.mjs` was updated in the same commit, with both halves
+asserted so the two tests cannot disagree about which rule is in force.
+
+Side effect worth knowing: this also fixes the "+ tab" failure on grandfathered sessions
+(`existing session credentials are stale … recycle required`), which was the same rule firing.
+
+**PVI item (host mode).** `scripts/project-terminal-start` +
+`project-terminal-credentials.mjs` now carry `COPILOT_HOME` for parity — the script type-checks
+`copilotHome` as OPTIONAL (string or absent) so a newer script still works against an older
+helper, which is the state a partial deploy leaves behind. Per-LAUNCHER keying is deliberately
+NOT in the host-mode path: that pane is the project's, created by systemd with no person behind
+it, so the project owner remains the correct identity there. If PVI2 wants per-launcher panes in
+host mode, the launcher has to come from somewhere the unit does not have today — worth a
+disposition rather than an assumption.
+
+**Left alone on purpose.** `app/orchestrator/lane-credentials.js` stays owner-keyed and gets no
+`COPILOT_HOME`: a lane is the project's automation, not a person's tab, and it already omits
+`sharedSettings` for the same reason. Flagged rather than changed so it reads as a decision.
+
+**Known cosmetic gap.** `scripts/pw-tmux-save` does not capture `@pw_cred_user`, so a window
+recreated by a restore comes back UNCOLOURED (its pane env, and therefore its actual identity, is
+whatever the restore gave it). Left alone deliberately rather than changing the manifest format
+while session persistence is parked — flagging it so it is a known gap and not a surprise.
+
+**Not isolation, unchanged.** Every pane still runs as one OS account. A colour is awareness:
+the tmux session is shared, so it does not stop anyone typing into anyone else's tab.
+
+---
+
+## GOA - 2026-09-21 - PR70 contained deployment service and PW slot handoff
+
+**Review scope.** The ordinary-slot integration at
+`80b17ed208ed1eb22cac33b981ab99eb59e8e259`, empty-connection-draft correction at
+`14bcbfd72406a18437ceae2eb37ecf45bf7ec165`, and managed-slot increment at
+`028842d0350b022f77d46568fa8054671ab86aa9` are incorporated into PR70, together
+with main `a4a4c79977f79fc57461f53307c55dc697ce7e4e`. The upstream per-launcher
+changes above are preserved, not reverted or reinterpreted. Release:1.26.0921.1723.
+
+**AGREE - independent contained unit.** The engine, API, operator console and
+job SDKs run in one separate rootless container; PW is a client. The actual
+installed engine is source `dc46f07356417ba6b8af39de1b4a861d0c5ed6c0`,
+image `4a722e8bca403bed0fb621fef992acc9fc2e26abf5afd7e3792f118f77bc1ed5`.
+Later PW-only commits are not described as an installed SDK replacement.
+
+**AGREE - bounded operational evidence.** On the explicitly authorized,
+disposable GOA Linux destination, actual dependency build/activation, unhealthy
+rollback,3.482-second cancellation, an independent deadline while the controller
+was paused, and controlled stop/start recovery without replay received
+independent evidence review. Console access and separate UI/machine
+authentication also passed. The controller is persistent; the disposable
+application expired at its own configured30-minute cap. This is not a claim of
+current fixture health, hard-crash, SELinux-enforcing or production acceptance.
+Sanitized job identities and receipt digests are in the PR70 body.
+
+**AGREE - complete operator-owned slot selection.** Global LOCAL and existing
+slots are preserved. Admins can choose inherit/local/external for ordinary and
+repository-managed slots. Managed saves accept only project, target and backend;
+existing host fields survive, repository scripts/inputs/recipes remain read-only,
+and the manifest cannot select a backend. External failures do not fall back
+locally. The empty connection-test draft remains distinct from internal forced
+backend selection. Both focused increments received independent review.
+
+**NEEDS EVIDENCE - normal PW release and signed-in canary.** The new PW code has
+not been claimed live. Review/merge PR70, use the normal PW release workflow, and
+then exercise a disposable deployment through its normal authenticated slot.
+The scoped project-registration token is not dashboard authority; no forged
+session or expanded authentication scope substitutes for this gate. Existing
+application cutovers remain separate, and dirty workspaces must be preserved.
+
+**Verification handoff.** The bounded serial Windows selection completed with
+162 passing cases; two authentication cases require native POSIX flock and one
+file-symlink case lacks Windows permission. The new managed HTTP/backend cases
+passed. Exact-head Linux host/container CI is required before review readiness;
+its authoritative result is attached to the PR rather than inferred from those
+Windows limitations. Please review the exact current PR70 head and record any
+concrete remaining blocker here or on the PR; no private inbox retrieval is needed.

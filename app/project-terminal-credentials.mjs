@@ -24,8 +24,8 @@
 //
 // Protocol (mirrors credential-writer.mjs): one JSON object on stdout, ALWAYS
 // — {"ok":true,"shared":true} | {"ok":true,"shared":false,"configDir":...,
-// "envFile":...,"fingerprint":...} | {"ok":false,"error":"..."} — and the
-// process exit code signals success/failure. No secret (a GitHub token) is
+// "copilotHome":...,"envFile":...,"fingerprint":...} | {"ok":false,"error":"..."}
+// — and the process exit code signals success/failure. No secret (a GitHub token) is
 // ever written to stdout, stderr, or an error message.
 //
 // Usage: node project-terminal-credentials.mjs <projectName> <primaryUser>
@@ -62,6 +62,11 @@ async function main() {
   const credBase = process.env.PW_USER_CRED_BASE || '/home/admin/pw-users';
   const sharedClaudeJson = path.join(process.env.HOME || '/home/admin', '.claude.json');
   const sharedSettings = path.join(process.env.HOME || '/home/admin', '.claude', 'settings.json');
+  // Seed sources for the two files a per-user config dir would otherwise silently
+  // lose: the agent's standing instructions, and Copilot's instructions + MCP. Both
+  // entrypoints must pass them or the host-mode terminal gets an unseeded dir.
+  const sharedClaudeMd = path.join(process.env.HOME || '/home/admin', '.claude', 'CLAUDE.md');
+  const sharedCopilotHome = path.join(process.env.HOME || '/home/admin', '.copilot');
 
   let owner;
   try {
@@ -99,11 +104,13 @@ async function main() {
       ghToken: owner.ghToken,
       sharedClaudeJson,
       sharedSettings,
+      sharedClaudeMd,
+      sharedCopilotHome,
       owner: terminalOwner,
       currentUid: process.getuid?.() ?? null,
       runJob,
     });
-    ok({ shared: false, configDir: cred.configDir, envFile: cred.envFile, fingerprint: cred.fingerprint });
+    ok({ shared: false, configDir: cred.configDir, copilotHome: cred.copilotHome, envFile: cred.envFile, fingerprint: cred.fingerprint });
   } catch (e) {
     fail(`project "${projectName}" (owner "${owner.username}") credential materialization failed: ${e?.message || e}. Refusing to fall back to the shared Claude/GitHub login.`);
   }

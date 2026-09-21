@@ -29,9 +29,16 @@ test('the still-fail-closed cases are preserved', () => {
   // Cannot RESOLVE the owner — credentialContext still refuses the shared fallback.
   assert.match(SRC, /Refusing to fall back to the shared Claude\/GitHub login/,
     'a resolution failure must still fail closed (no silent shared fallback)');
-  // Creating a NEW window in a stale session is still refused (no mixed-attribution).
-  assert.match(SRC, /Refusing to create a mixed-attribution window/,
-    'new-window creation must still fail closed against mixed attribution');
+  // Mixed attribution: the rule CHANGED with per-launcher credentials (a tab now runs
+  // on the credentials of whoever opened it, so one session legitimately holds several
+  // identities). Refusing a mismatched new window was the old guard; the new one is that
+  // every window RECORDS the identity it was created with, and is destroyed if that
+  // cannot be recorded. Pinned in test/per-launcher-credentials.test.mjs; asserted here
+  // only so the two tests cannot silently disagree about which rule is in force.
+  assert.doesNotMatch(SRC, /Refusing to create a mixed-attribution window/,
+    'the per-session match requirement was replaced by per-window identity stamping');
+  assert.match(SRC, /await stampWindowCredIdentity\(/,
+    'the replacement guard must be present: a new window records whose credentials it runs on');
 });
 
 test('a grandfathered session is left flagged, not re-stamped', () => {

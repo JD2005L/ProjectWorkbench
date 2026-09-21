@@ -664,7 +664,10 @@ function extractFunctionSource(src, signature) {
 
 test('SECURITY: the fail-closed credential path never catches a failure back into the shared/off credentials', () => {
   const src = fs.readFileSync(path.join(appDir, 'server.js'), 'utf8');
-  const credentialContext = extractFunctionSource(src, 'async function credentialContext(project){');
+  // Per-launcher credentials added the launcher argument; the fail-closed property
+  // asserted below is unchanged by that, so the extraction follows the signature
+  // rather than the property being weakened to match an old one.
+  const credentialContext = extractFunctionSource(src, "async function credentialContext(project, launcher = ''){");
   const owner = extractFunctionSource(src, 'async function projectCredentialOwner(project){');
   assert.ok(credentialContext, 'credentialContext must still exist under this name');
   assert.ok(owner, 'projectCredentialOwner must still exist under this name');

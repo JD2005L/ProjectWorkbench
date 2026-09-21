@@ -139,11 +139,35 @@ export const SEEDED_SETTINGS_KEYS = Object.freeze([
   'effortLevel',
 ]);
 
+/**
+ * Files copied from the shared $HOME/.copilot into a per-user COPILOT_HOME on first
+ * creation. Same contract as SEEDED_SETTINGS_KEYS: enabling per-user credentials changes
+ * WHOSE seat a tab spends, not what the agent is told or which tools it can reach.
+ *
+ *   copilot-instructions.md  Copilot's equivalent of CLAUDE.md, and one of the two live
+ *                            copies of the standing workspace-boundary guardrail.
+ *   mcp-config.json          the team MCP servers, so a per-user Copilot still has them.
+ *
+ * NOT seeded: config.json / *-state.json / session-store.db -- per-person state and any
+ * stored login, which is the whole point of splitting the directory.
+ */
+export const SEEDED_COPILOT_FILES = Object.freeze(['copilot-instructions.md', 'mcp-config.json']);
+
 export function userClaudeConfigDir(base, username) {
   return path.join(userCredRoot(base, username), 'claude');
 }
 export function userSessionEnvFile(base, username) {
   return path.join(userCredRoot(base, username), 'session-env.sh');
+}
+
+// Copilot CLI's config/state dir. COPILOT_HOME is its documented override
+// (`copilot help environment`) and the exact analogue of CLAUDE_CONFIG_DIR:
+// without it every user's Copilot sessions, history, skills and any stored
+// login stay pooled in the ONE shared $HOME/.copilot, so per-user tokens would
+// still leave a single shared Copilot identity on disk for anyone to /login
+// over.
+export function userCopilotConfigDir(base, username) {
+  return path.join(userCredRoot(base, username), 'copilot');
 }
 
 // ---------------------------------------------------------------------------
@@ -260,6 +284,20 @@ async function regularFileExists(fsp, file) {
   return false;
 }
 
+// Copy a shared file into the per-user tree, but only when the user does not
+// have their own. Fill-only, exactly like the settings.json merge: a file the
+// user has since edited is never clobbered, and a shared file that does not
+// exist is simply not seeded.
+async function seedFileIfAbsent(fsp, target, sourcePath) {
+  if (!sourcePath) return false;
+  if (await regularFileExists(fsp, target)) return false;
+  let body;
+  try { body = await fsp.readFile(sourcePath, 'utf8'); }
+  catch { return false; }   // no shared file, or unreadable: nothing to seed
+  await writeChecked(fsp, target, body);
+  return true;
+}
+
 // ---------------------------------------------------------------------------
 // The filesystem job
 // ---------------------------------------------------------------------------
@@ -267,15 +305,17 @@ async function regularFileExists(fsp, file) {
 // Everything that touches the credential tree. Runs EITHER in-process (when the
 // dashboard already is the terminal account) OR inside credential-writer.mjs
 // after the privilege drop. It never chowns: whoever runs it is the owner.
-export async function applyCredentialJob({ fsp, base, username, ghToken = '', sharedClaudeJson = '', sharedSettings = '' }) {
+export async function applyCredentialJob({ fsp, base, username, ghToken = '', sharedClaudeJson = '', sharedSettings = '', sharedClaudeMd = '', sharedCopilotHome = '' }) {
   const credRoot = userCredRoot(base, username);
   const configDir = userClaudeConfigDir(base, username);
+  const copilotHome = userCopilotConfigDir(base, username);
 
   // The base itself may legitimately need creating; below it we build one level
   // at a time so a planted symlink cannot smuggle us out of the tree.
   await mkdirChecked(fsp, base, { recursive: true });
   await mkdirChecked(fsp, credRoot, { enforceMode: true });
   await mkdirChecked(fsp, configDir, { enforceMode: true });
+  await mkdirChecked(fsp, copilotHome, { enforceMode: true });
 
   // Seed the managed MCP servers from the shared config so a per-user Claude
   // still gets team MCP (teamkb / pulse / skillhub). Only on first creation:
@@ -327,7 +367,24 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
     await fsp.rm(envFile, { force: true }).catch(() => {});
   }
 
-  return { configDir, envFile: ghToken ? envFile : '', seeded };
+  // CLAUDE.md is INSTRUCTIONS, not preference, and the shared one carries the
+  // standing workspace-boundary / no-attack-tooling guardrail every PW agent is
+  // supposed to start with. Pointing CLAUDE_CONFIG_DIR at an unseeded per-user
+  // dir silently removed it ("Instructions no longer present") and had to be
+  // repaired by hand for each owner on 2026-09-14. Per-launcher mode materializes
+  // a dir for every PERSON rather than every project owner, which multiplies that
+  // gap, so it is seeded here instead.
+  await seedFileIfAbsent(fsp, path.join(configDir, 'CLAUDE.md'), sharedClaudeMd);
+
+  // The same two classes of file for Copilot: its instructions (the other live
+  // copy of that guardrail) and its MCP servers. Fill-only, like .claude.json.
+  if (sharedCopilotHome) {
+    for (const name of SEEDED_COPILOT_FILES) {
+      await seedFileIfAbsent(fsp, path.join(copilotHome, name), path.join(sharedCopilotHome, name));
+    }
+  }
+
+  return { configDir, copilotHome, envFile: ghToken ? envFile : '', seeded };
 }
 
 // Remove credential trees that no longer belong to a current user, so a deleted
@@ -448,17 +505,23 @@ export async function ensureUserCredentials({
   ghToken = '',
   sharedClaudeJson = '',
   sharedSettings = '',
+  sharedClaudeMd = '',
+  sharedCopilotHome = '',
   owner = null,
   currentUid = null,
   runJob = null,
 }) {
-  const job = { action: 'ensure', base, username, ghToken, sharedClaudeJson, sharedSettings };
+  const job = { action: 'ensure', base, username, ghToken, sharedClaudeJson, sharedSettings, sharedClaudeMd, sharedCopilotHome };
   const plan = credentialExecutionPlan({ owner, currentUid });
   const result = plan.drop
     ? await runJob(job, plan)
     : await applyCredentialJob({ fsp, ...job });
   return {
     configDir: result.configDir,
+    // Absent when an older credential-writer.mjs answered the job (a rolling
+    // deploy): callers must treat '' as "no COPILOT_HOME to set" rather than
+    // passing `undefined` into a tmux env token.
+    copilotHome: result.copilotHome || '',
     envFile: result.envFile,
     seeded: !!result.seeded,
     fingerprint: credentialFingerprint({ username, configDir: result.configDir, ghToken }),
