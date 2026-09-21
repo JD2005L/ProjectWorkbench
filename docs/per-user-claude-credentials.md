@@ -183,6 +183,12 @@ What the result gives you:
 The device code never reaches the browser (it is the secret that collects the token), the
 token never appears in a response or the audit log, and each authorisation is single-use.
 
+**From a shell instead of the UI:** `tools/pw-connect-github.py <username>` does the same
+thing for people who would rather run a command — it signs in to the dashboard as you,
+starts the flow for that user, prints the code they must enter, and waits. The
+authorisation itself still has to be done by that person in a browser signed in as
+themselves; no script can stand in for it, which is the point of using OAuth at all.
+
 **Configuration is required and has no default** — see `PW_GITHUB_OAUTH_CLIENT_ID` in
 [DEPLOY.md](../DEPLOY.md). Briefly: an org-registered OAuth app is the accountable
 choice and pushes fine, but GitHub gates Copilot access and a self-registered app is not
