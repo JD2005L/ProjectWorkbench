@@ -62,16 +62,17 @@ export function makeDeployIdentity({ decrypt, instanceCredential }) {
     const candidates = [];
     const override = slotConfig?.deployCredential;
     if (override && (override.user || override.password)) {
-      if (!override.user || !override.password) {
-        candidates.push({ state: 'unreadable', source: 'project', user: '', password: '' });
-      } else {
-      const read = readStoredDeployPassword({ deployPassword: override.password }, decrypt);
-      // A slot override is hand-edited in deploy-config.json, so it never passes
-      // through the settings validator that canonicalises the domain. Do it here
-      // rather than leave one level able to hand a script `goa\` when the other
-      // hands it `GOA\`.
-      candidates.push({ state: read.state, source: 'project', user: canonicalDeployAccount(override.user || ''), password: read.password });
-      }
+      // An override is hand-edited in deploy-config.json, so it gets neither the
+      // settings validator's completeness check nor its domain canonicalisation.
+      // Half a pair is refused here rather than falling through to the instance
+      // default, which would publish as an account nobody chose for this slot
+      // (PR #74); the account name is still canonicalised so one level cannot
+      // hand a script `goa\` while the other hands it `GOA\`.
+      const read = override.user && override.password
+        ? readStoredDeployPassword({ deployPassword: override.password }, decrypt)
+        : { state: 'unreadable', password: '' };
+      candidates.push({ state: read.state, source: 'project',
+        user: canonicalDeployAccount(override.user || ''), password: read.password });
     }
     if (instanceCredential) candidates.push(await instanceCredential(target));
     if (operatorRecord) {

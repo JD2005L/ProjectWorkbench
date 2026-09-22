@@ -157,8 +157,6 @@ test('a malformed credential block is fail-closed, never "no credential configur
     { deployCredentials: { prod: { user: 'GOA\\ok', note: 'x'.repeat(201) } } },
     { deployCredentials: { staging: { user: 'GOA\\ok' } } },
     { deployCredentials: { prod: { user: 'has space' } } },
-    { deployCredentials: { prod: { user: 'GOA\\only-user', password: '' } } },
-    { deployCredentials: { prod: { user: '', password: encrypt('only-password') } } },
   ]) {
     assert.throws(() => savedDeployCredentials(bad), error => {
       assert.equal(error.statusCode, 503, `${JSON.stringify(bad)} must fail closed`);
@@ -166,6 +164,28 @@ test('a malformed credential block is fail-closed, never "no credential configur
     });
   }
   assert.deepEqual(savedDeployCredentials({}).prod, { user: '', password: '', note: '' });
+});
+
+test('half a credential refuses THAT target, and does not fall through or take the instance down', async () => {
+  // PR #74 caught the fall-through: an account with no password (or the reverse)
+  // read as "nothing configured" and the deploy ran as whoever pressed it. It is
+  // refused — but as one unusable target, not as a 503 on every settings read,
+  // so a half-typed prod account cannot disable Deploy for eleven other projects.
+  for (const prod of [{ user: 'GOA\\only-user', password: '', note: '' }, { user: '', password: encrypt('only-password'), note: '' }]) {
+    const half = store(JSON.stringify({ deployCredentials: { prod, dev: { user: 'GOA\\dev.acct', password: encrypt('devpass'), note: '' } } }));
+    const refused = await half.api.deployCredential('prod');
+    assert.equal(refused.state, 'unreadable', 'an incomplete pair is unusable, not absent');
+    assert.equal(refused.password, '');
+
+    const identity = makeDeployIdentity({ decrypt, instanceCredential: target => half.api.deployCredential(target) });
+    const resolved = await identity.resolve({}, 'prod', operator);
+    assert.deepEqual([resolved.state, resolved.source], ['unreadable', 'instance']);
+    assert.equal(identity.env(resolved, 'kevin.charlebois'), null, 'so no deploy environment is produced');
+
+    // The other target is untouched, and reading the settings still works.
+    assert.equal((await half.api.deployCredential('dev')).state, 'stored');
+    assert.equal((await half.api.load()).deployCredentials.prod.user, prod.user);
+  }
 });
 
 test('the password never leaves the server, in any state', async () => {

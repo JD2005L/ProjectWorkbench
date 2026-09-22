@@ -116,7 +116,9 @@ function settingsBrowser(base, makeApi) {
       element(`dc-password-${target}`).value = '';
       element(`dc-state-${target}`).textContent = value.hasPassword
         ? 'A password is saved for this account. Its value is never returned — leave the field blank to keep it.'
-        : 'No password is saved, so deploys on this target run as the person who pressed Deploy.';
+        : value.user
+          ? 'An account is saved with NO password, so deploys on this target are refused until one is entered. Half a credential is never used to fall back to somebody else.'
+          : 'No account is saved, so deploys on this target run as the person who pressed Deploy.';
     };
     const refresh = () => api('/credentials').then(value => showCredential(value.credentials[target]));
     refresh().catch(error => tell(error.message));

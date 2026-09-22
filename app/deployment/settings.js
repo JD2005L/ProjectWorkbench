@@ -114,7 +114,6 @@ export function savedDeployCredentials(settings) {
       const user = slot.user === undefined || slot.user === '' ? '' : validateDeployAccount(slot.user);
       const password = slot.password === undefined ? '' : slot.password;
       if (typeof password !== 'string' || (password && !/^enc:[A-Za-z0-9+/]+={0,2}$/.test(password))) throw settingsError();
-      if (!!user !== !!password) throw settingsError();
       const note = slot.note === undefined ? '' : slot.note;
       if (typeof note !== 'string' || note.length > 200) throw settingsError();
       result[target] = { user, password, note };
@@ -284,6 +283,12 @@ export function createWorkbenchSettingsStore({
     if (!DEPLOY_TARGETS.includes(target)) return { state: 'none', source: 'instance', user: '', password: '', note: '' };
     const saved = savedDeployCredentials(await load())[target];
     if (!saved.user && !saved.password) return { state: 'none', source: 'instance', user: '', password: '', note: '' };
+    // Half a credential is not "no credential": reporting it as absent is what
+    // let a deploy fall through to the operator's own account (PR #74). It is
+    // unusable, so it is unreadable — the state the resolver already refuses.
+    if (!saved.user || !saved.password) {
+      return { state: 'unreadable', source: 'instance', user: saved.user, password: '', note: saved.note };
+    }
     // A configured credential with no way to read it is a wiring fault, and must
     // not be reported as "none": that would deploy as whoever pressed the button.
     if (!readCredentialState) throw new DeploymentError('This build cannot read stored deploy credentials.', 503, 'deploy_credential_invalid');

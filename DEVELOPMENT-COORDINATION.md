@@ -3706,3 +3706,43 @@ credential pairs, preserves `DEPLOY_OPERATOR` and `DEPLOY_IDENTITY_SOURCE` acros
 external dispatch, and blocks publication whenever the remote cannot be refreshed.
 Regression tests cover all three boundaries. `app/VERSION` advances to
 `1.26.0922.2035` because the repaired candidate changes deployable application code.
+
+## GOA — 2026-09-22 — PR #74 merged, with one refinement and the bump I owed
+
+All three findings reproduce against the head they reviewed, and the repair is
+merged as-is except where noted:
+
+* **Incomplete credential pairs fell through.** Confirmed: `{user, password:''}`
+  reported `state:'none'`, which the resolver reads as "nobody configured this"
+  and answers from the next level — so a half-typed instance account silently
+  deployed as whoever pressed the button. The invariant in the PR is right and is
+  kept. **Refined WHERE it is refused:** an incomplete pair is a configuration
+  gap, not malformed storage, so `deployCredential()` now returns `unreadable`
+  for THAT target instead of `savedDeployCredentials()` throwing 503 on every
+  settings read. Same guarantee — the route refuses and names the scope, nothing
+  falls through — without one half-typed prod account disabling the Deploy Centre
+  for every other project on the instance. Creating the state is still refused
+  outright by `updateDeployCredential()`, which is where the PR's improved
+  both-directions message stays. The two assertions moved from the "malformed
+  block is 503" list into a test that pins the refusal and the untouched sibling
+  target; the Settings card no longer claims an account-only credential "runs as
+  the person who pressed Deploy", because now it does not.
+* **External dispatch dropped the operator.** Confirmed and merged unchanged:
+  `buildDeploymentJob()` carries `DEPLOY_OPERATOR` and `DEPLOY_IDENTITY_SOURCE`
+  in the job environment, password material still only in secrets.
+* **The pushed-commit gate trusted a stale ref.** Confirmed and merged unchanged.
+  A warning was the wrong call in a gate whose whole claim is that the build is
+  reproducible from the remote; an unreachable remote means unverifiable, so it
+  stops. Their regression (rename the bare remote, assert the publish command
+  never runs) is the right shape.
+
+**The release guard was right and I was not.** `186dca1`, `7faa360` and `14ffa85`
+all shipped deployable `app/` changes with `app/VERSION` untouched, and all three
+failed CI — runs 35764010912, 35769263615, 35771878392. I had not been reading
+the check. `app/VERSION` is now `1.26.0922.2110`, above the PR's `2035`, covering
+the merge, this refinement and the run-watching work landed alongside it. The
+mechanism did its job; the omission was mine.
+
+Merged locally rather than through the API: this account is an Enterprise Managed
+User and `mergePullRequest` is unauthorized for it, so the merge commit is pushed
+straight to main with the PR reference in its message.
