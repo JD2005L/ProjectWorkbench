@@ -184,6 +184,39 @@ tmux_ set-option -s exit-empty off 2>/dev/null || true
 # and a tmux client cannot be panned. tmux recomputes on detach as well as
 # attach, so a client left alone returns to its own full size.
 tmux_ set-option -g window-size smallest 2>/dev/null || true
+
+# Right-click in a project terminal popped a SECOND context menu on top of the
+# browser's own: tmux's pane menu (Copy Line, Horizontal/Vertical Split, Swap,
+# Kill, Respawn, Mark, Zoom). None of it is reachable work from a browser tab —
+# splits, kills and respawns come from the tab strip — and it lands over the
+# browser menu the operator was actually aiming for.
+#
+# /home/admin/.tmux.conf already unbinds MouseDown3Pane, and that could never
+# have worked: ttyd runs as ROOT, so the server it starts reads /root/.tmux.conf
+# and never looks at admin's. Same reason the window-size setting above lives
+# here — this script is the one place that runs against the server that actually
+# exists, in both deployments, without an image rebuild.
+#
+# Asked of the server rather than hardcoded, because the binding NAME moves
+# between tmux versions: 3.3a binds the pane menu to M-MouseDown3Pane and leaves
+# plain MouseDown3Pane free, while older builds bound the plain one — so a fixed
+# list silently stops covering the thing it was written for after an image
+# rebuild. Every mouse-triggered display-menu goes, whatever it is called; a
+# menu bound to a KEY is left alone, since nothing pops that by accident.
+pw_unbind_mouse_menus() {
+	local pw_key
+	while read -r pw_key; do
+		[ -n "$pw_key" ] || continue
+		tmux_ unbind-key -n "$pw_key" 2>/dev/null || true
+	done <<-KEYS
+		$(tmux_ list-keys -T root 2>/dev/null | awk '/display-menu/ && $4 ~ /Mouse/ { print $4 }')
+	KEYS
+	# Belt and braces for a build whose list-keys is unavailable or reshaped.
+	for pw_key in MouseDown3Pane M-MouseDown3Pane MouseDown3Status MouseDown3StatusLeft MouseDown3StatusRight MouseDown3Border; do
+		tmux_ unbind-key -n "$pw_key" 2>/dev/null || true
+	done
+}
+pw_unbind_mouse_menus
 # The marker goes on the SERVER, so it cannot be inherited by a client.
 tmux_ set-option -s "$OWNER_MARKER_OPTION" "$OWNER_MARKER_VALUE" 2>/dev/null || true
 
