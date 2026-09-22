@@ -8,10 +8,17 @@ script. On 2026-09-22 two people burned half an hour on
 "the ProjectWorkbench project is blocking this", when it meant "this project's own
 workspace has uncommitted files". The state was right; the sentence was not.
 
-This rewrites the known guards so each one says three things: what is wrong, the
-specific detail (which files, which branch, which commits), and what the person
-clicking Deploy has to do next. It changes MESSAGES ONLY — never a condition, an
-exit code, or an order of operations.
+`report`/`apply` rewrite the known guards so each one says three things: what is
+wrong, the specific detail (which files, which branch, which commits), and what the
+person clicking Deploy has to do next. Those two modes change MESSAGES ONLY — never
+a condition, an exit code, or an order of operations.
+
+`report-gates`/`add-gates` are the other half, and they DO change behaviour: most
+slots here never check what they are about to publish, so these add the missing
+clean-tree / publish-branch / pushed preflight to the slots that lack it. A slot
+that already makes a check keeps its own; `--only dirty,pushed` narrows the set.
+Deploys that succeed today with a dirty or unmerged workspace will start failing —
+that is the point, but it is worth saying out loud before running it.
 
 Run on the workbench host as root; the config is 0600 root:
 
@@ -174,6 +181,136 @@ RULES = [
     },
 ]
 
+# ─── Gate insertion (`report-gates` / `add-gates`) ──────────────────────────
+#
+# Most slots on this instance never check what they are about to publish: of 23,
+# only four (AITDataHub, SponsorPortal) refuse a dirty workspace, a non-publish
+# branch or unpushed commits. The rest will deploy whatever happens to be sitting
+# in the workspace, which is how a half-finished agent task reaches an app server.
+#
+# THE BRANCH IS NOT ALWAYS `main`. Four of the projects that need gates
+# (AIT-Interpreter-Tracker, AITCtrl, Bi-Tools, MySTNAdmin) are on `master` with no
+# origin/main at all, so a hardcoded `= main` gate would block every one of their
+# deploys forever. The block resolves the branch the clone itself publishes —
+# origin/HEAD, else the current branch's upstream, else main.
+#
+# Every git call is `git -C "$_pw_ws" -c safe.directory="$_pw_ws"`, because these
+# slots run as the pane account against a tree that has had root-owned drift
+# before, and one `dubious ownership` refusal must not read as "nothing to deploy".
+GATE_MARKER = '# --- PW preflight (added by pw-deploy-guard-messages.py) ---'
+GATE_NAMES = ('dirty', 'branch', 'pushed')
+
+GATE_HEADER = [
+    GATE_MARKER,
+    '_pw_ws={WS}',
+    '_pw_git() { git -C "$_pw_ws" -c safe.directory="$_pw_ws" "$@"; }',
+    '_pw_publish=$(_pw_git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)',
+    '_pw_publish=${_pw_publish#origin/}',
+    'if [ -z "$_pw_publish" ]; then',
+    '  _pw_publish=$(_pw_git rev-parse --abbrev-ref --symbolic-full-name \'@{upstream}\' 2>/dev/null || true)',
+    '  _pw_publish=${_pw_publish#origin/}',
+    'fi',
+    ': "${_pw_publish:=main}"',
+]
+
+GATE_BODY = {
+    'dirty': [
+        # The PW Files tray (_inbox) and the agent's hand-off tray (_outbox) are
+        # workbench scaffolding, not project source, and half the projects here do
+        # not gitignore them. Counting them would mean one dropped screenshot
+        # blocks every deploy with `?? _inbox/` — the same unreadable failure this
+        # whole exercise started from. Real changes still surface: the exclusion is
+        # a pathspec, not a blanket -uno.
+        '_pw_dirty=$(_pw_git status --porcelain -- . \':(exclude)_inbox\' \':(exclude)_inbox/*\' \':(exclude)_outbox\' \':(exclude)_outbox/*\')',
+        'if [ -n "$_pw_dirty" ]; then',
+        '  {',
+        '    echo "DEPLOY BLOCKED - the ${DEPLOY_PROJECT:-project} workspace has uncommitted changes, so there is no committed version to deploy. Nothing was published."',
+        '    echo "Not yet committed:"',
+        '    printf \'%s\\n\' "$_pw_dirty" | sed \'s/^/    /\'',
+        '    echo "NEEDED: in the ${DEPLOY_PROJECT:-project} terminal, have the agent commit and push this work (or discard it), then deploy again."',
+        '  } >&2',
+        '  exit 1',
+        'fi',
+    ],
+    'branch': [
+        '_pw_branch=$(_pw_git branch --show-current)',
+        'if [ "$_pw_branch" != "$_pw_publish" ]; then',
+        '  {',
+        '    echo "DEPLOY BLOCKED - the ${DEPLOY_PROJECT:-project} workspace is on branch \'$_pw_branch\', and this project publishes \'$_pw_publish\'. Nothing was published."',
+        '    echo "NEEDED: in the ${DEPLOY_PROJECT:-project} terminal, merge that branch into $_pw_publish (or switch the workspace to it), then deploy again."',
+        '  } >&2',
+        '  exit 1',
+        'fi',
+    ],
+    'pushed': [
+        '_pw_git fetch --quiet origin || echo "WARNING: could not reach the remote; comparing against the last fetched state." >&2',
+        'if [ "$(_pw_git rev-parse HEAD)" != "$(_pw_git rev-parse "origin/$_pw_publish")" ]; then',
+        '  {',
+        '    echo "DEPLOY BLOCKED - ${DEPLOY_PROJECT:-this project} has commits on $_pw_publish that are not on the remote, and a deployed build has to be reproducible from the repository. Nothing was published."',
+        '    echo "Not yet pushed:"',
+        '    _pw_git log --oneline "origin/$_pw_publish"..HEAD | sed \'s/^/    /\'',
+        '    echo "NEEDED: in the ${DEPLOY_PROJECT:-project} terminal, push $_pw_publish to the remote, then deploy again."',
+        '  } >&2',
+        '  exit 1',
+        'fi',
+    ],
+}
+GATE_FOOTER = ['# --- end PW preflight ---']
+
+# What already counts as that gate, however it is worded: the condition, not the
+# message. A slot that hand-rolls its own clean-tree check keeps it.
+ALREADY = {
+    'dirty': ('status --porcelain',),
+    'branch': ('branch --show-current',),
+    'pushed': ('rev-parse HEAD',),
+}
+
+CD_TO_VAR = re.compile(r'^\s*cd\s+"\$(\w+)"\s*$')
+WS_ASSIGN = re.compile(r'^\s*(WS|WORKSPACE|SCRIPT_DIR|PROJECT_DIR)=(?!\s*$)\S+\s*$')
+
+
+def plan_gates(script, wanted):
+    """Which gates this slot is missing, and where they can go.
+
+    Returns (index, ws_expr, missing, skip_reason). The anchor is deliberately
+    conservative: a `cd "$VAR"` line means the script has already put itself in
+    the workspace, so the gates go straight after it; otherwise the first
+    workspace-path assignment is used and the gates address it by path. Anything
+    else is skipped WITH A REASON rather than guessed at — a wrong insertion here
+    lands in a production deploy."""
+    if GATE_MARKER in script:
+        return None, None, [], 'already carries the PW preflight'
+    missing = [name for name in wanted if not any(token in script for token in ALREADY[name])]
+    if not missing:
+        return None, None, [], 'already checks all of these itself'
+    lines = script.split('\n')
+    for index in range(len(lines) - 1, -1, -1):
+        if CD_TO_VAR.match(lines[index]):
+            return index + 1, '"$PWD"', missing, None
+    for index, line in enumerate(lines):
+        if WS_ASSIGN.match(line):
+            return index + 1, '"$' + line.strip().split('=')[0] + '"', missing, None
+    return None, None, missing, 'no workspace anchor (no `cd "$VAR"` and no WS=/SCRIPT_DIR= line)'
+
+
+def gate_lines(ws_expr, missing, indent):
+    body = list(GATE_HEADER)
+    for name in GATE_NAMES:
+        if name in missing:
+            body.extend(GATE_BODY[name])
+    body.extend(GATE_FOOTER)
+    return [(indent + line.replace('{WS}', ws_expr) if line else '') for line in body]
+
+
+def insert_gates(script, wanted):
+    index, ws_expr, missing, reason = plan_gates(script, wanted)
+    if index is None:
+        return script, [], reason
+    lines = script.split('\n')
+    indent = lines[index - 1][:len(lines[index - 1]) - len(lines[index - 1].lstrip())]
+    return '\n'.join(lines[:index] + gate_lines(ws_expr, missing, indent) + lines[index:]), missing, None
+
+
 # An abort site worth reporting: it stops the deploy, or it writes to stderr.
 ABORT_HINT = re.compile(r'(^|[;&|\s])exit\s+1\b|>&2|ERROR:|DEPLOY BLOCKED')
 # A bare `exit 1` (or a lone brace) is control flow, not a message: reporting it
@@ -242,11 +379,23 @@ def report(config):
     print(f'\n{unmatched_total} abort site(s) no rule covers yet.')
 
 
-def apply(config, path, assume_yes):
+def report_gates(config, wanted):
+    """What add-gates would do, slot by slot, changing nothing."""
+    for project, target, slot in slots(config):
+        _, ws_expr, missing, reason = plan_gates(slot['script'], wanted)
+        if reason:
+            print(f'{project}/{target}: skipped - {reason}')
+        else:
+            print(f'{project}/{target}: would add {", ".join(missing)} (addressing the workspace as {ws_expr})')
+
+
+def transform(config, path, assume_yes, mutate, nothing_to_do):
     changed, refused = [], []
     for project, target, slot in slots(config):
-        new_script, applied = rewrite(slot['script'])
-        if not applied:
+        new_script, note, reason = mutate(slot['script'])
+        if new_script == slot['script']:
+            if reason:
+                print(f'skipped {project}/{target}: {reason}')
             continue
         ok, error = bash_syntax_ok(new_script)
         if not ok:
@@ -259,12 +408,12 @@ def apply(config, path, assume_yes):
         print('\n'.join(diff))
         print()
         slot['script'] = new_script
-        changed.append(f'{project}/{target}: {", ".join(applied)}')
+        changed.append(f'{project}/{target}: {", ".join(note)}')
 
     for project, target, error in refused:
         print(f'REFUSED {project}/{target}: rewritten script fails bash -n ({error})', file=sys.stderr)
     if not changed:
-        print('No slot needed rewording (already done, or none of the known guards are present).')
+        print(nothing_to_do)
         return 1 if refused else 0
 
     print('About to rewrite:')
@@ -292,12 +441,35 @@ def apply(config, path, assume_yes):
     return 1 if refused else 0
 
 
+def apply(config, path, assume_yes):
+    return transform(
+        config, path, assume_yes,
+        lambda script: (*rewrite(script), None),
+        'No slot needed rewording (already done, or none of the known guards are present).',
+    )
+
+
+def add_gates(config, path, assume_yes, wanted):
+    return transform(
+        config, path, assume_yes,
+        lambda script: insert_gates(script, wanted),
+        'No slot needed gates (every one already checks these, or none has a usable anchor).',
+    )
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument('mode', choices=['report', 'apply'])
+    parser.add_argument('mode', choices=['report', 'apply', 'report-gates', 'add-gates'])
     parser.add_argument('--config', default=DEFAULT_CONFIG)
     parser.add_argument('--yes', action='store_true', help='skip the confirmation prompt')
+    parser.add_argument('--only', default=','.join(GATE_NAMES),
+                        help=f'gates to add, comma separated, from {",".join(GATE_NAMES)} (default: all three)')
     args = parser.parse_args()
+    wanted = [name.strip() for name in args.only.split(',') if name.strip()]
+    unknown = [name for name in wanted if name not in GATE_NAMES]
+    if unknown:
+        print(f'Unknown gate(s): {", ".join(unknown)}. Choose from {", ".join(GATE_NAMES)}.', file=sys.stderr)
+        return 2
 
     try:
         with open(args.config) as handle:
@@ -312,6 +484,11 @@ def main():
     if args.mode == 'report':
         report(config)
         return 0
+    if args.mode == 'report-gates':
+        report_gates(config, wanted)
+        return 0
+    if args.mode == 'add-gates':
+        return add_gates(config, args.config, args.yes, wanted)
     return apply(config, args.config, args.yes)
 
 
