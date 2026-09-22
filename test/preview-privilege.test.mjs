@@ -66,29 +66,42 @@ test('startPreviewUnit drops to the terminal account before running project code
 // deploy text gets its own contract, keyed on the TEXT rather than on the cwd.
 test('NO DRIFT: operator-authored deploy shell text never reaches execFileAsync undropped', () => {
   const src = read('app/server.js');
-  for (const m of src.matchAll(/execFileAsync\(\s*'bash'\s*,\s*\[\s*'-c'\s*,\s*([A-Za-z_$][\w.$]*)/g)) {
+  // `spawn` is swept as well as execFileAsync: the streamed seam added for live
+  // deploy progress uses spawn, and a sweep that only knew one of them would
+  // have been blind to the very change that introduced the other.
+  for (const m of src.matchAll(/(?:execFileAsync|spawn)\(\s*'bash'\s*,\s*\[\s*'-c'\s*,\s*([A-Za-z_$][\w.$]*)/g)) {
     assert.ok(
       !/^(tc\.script|tc\.versionCmd|versionCmd)$/.test(m[1]),
       `deploy slot text \`${m[1]}\` is executed without the privilege drop — route it through deployExec()`,
     );
   }
-  // The definition plus all three call sites: the deploy script, the post-deploy
-  // version probe, and getDeployedVersion's status probe.
-  assert.equal([...src.matchAll(/deployExec\(/g)].length, 4, 'deployExec() is no longer the single deploy exec seam');
+  // TWO seams now, both audited, and the split is deliberate: deployExec() stays
+  // buffered for version probes (nothing to watch in a version echo), while the
+  // operator's script goes through deployExecStream() so the panel can show
+  // progress while it runs. A third would be drift.
+  //   deployExec:       definition + the post-deploy version probe + getDeployedVersion's status probe
+  //   deployExecStream: definition + the deploy script itself
+  assert.equal([...src.matchAll(/deployExec\(/g)].length, 3, 'deployExec() gained or lost a call site');
+  assert.equal([...src.matchAll(/deployExecStream\(/g)].length, 2, 'deployExecStream() is no longer the single seam for operator-authored deploy text');
   const body = functionSource(src, 'getDeployedVersion');
   assert.match(body, /deployExec\(pc\[target\]/, 'the deploy status probe bypasses deployExec()');
 });
 
-test('deployExec keeps the root escape hatch explicit and carries the pane HOME', () => {
+test('both deploy exec seams keep the root escape hatch explicit and carry the pane HOME', () => {
   const src = read('app/server.js');
-  const start = src.indexOf('function deployExec(');
-  assert.notEqual(start, -1, 'app/server.js no longer defines deployExec()');
-  const body = src.slice(start, src.indexOf('\nasync function', start));
-  assert.match(body, /tc\?\.runAsRoot \? \[\] : agentSpawnDrop\(TERMINAL_PRIV\)/, 'the runAsRoot opt-out is gone or no longer gates the drop');
-  // Dropping the uid without the HOME makes `dotnet publish` and `git` look in
-  // /root and fail on permissions — a different outage, not a fix.
-  for (const v of ['HOME', 'USER', 'LOGNAME']) {
-    assert.ok(body.includes(`execEnv.${v} = TERMINAL_PRIV.`), `the dropped deploy no longer sets ${v}`);
+  // Each seam is checked in its own right. Streaming the output changed the
+  // transport, and the privilege contract has to survive that unchanged.
+  for (const name of ['deployExec', 'deployExecStream']) {
+    const start = src.indexOf(`function ${name}(`);
+    assert.notEqual(start, -1, `app/server.js no longer defines ${name}()`);
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1) + 1 || undefined);
+    assert.match(body, /tc\?\.runAsRoot \? \[\] : agentSpawnDrop\(TERMINAL_PRIV\)/, `${name}: the runAsRoot opt-out is gone or no longer gates the drop`);
+    // Dropping the uid without the HOME makes `dotnet publish` and `git` look in
+    // /root and fail on permissions — a different outage, not a fix.
+    for (const v of ['HOME', 'USER', 'LOGNAME']) {
+      assert.ok(body.includes(`execEnv.${v} = TERMINAL_PRIV.`), `${name}: the dropped deploy no longer sets ${v}`);
+    }
+    assert.match(body, /\[\.\.\.drop, \.\.\.argvTail\]/, `${name}: argv no longer starts with the drop`);
   }
 });
 
