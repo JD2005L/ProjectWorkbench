@@ -71,6 +71,12 @@ export function deployRouteHarness(root, options = {}) {
    return req.user?.role === 'admin' || req.user?.projects?.includes(req.params.project) ? next() : res.status(403).json({ ok: false });
   },
   requireAdmin(req, res, next) { boundaryCalls.push('admin'); return req.user?.role === 'admin' ? next() : res.status(403).json({ ok: false }); },
+  // Triggering a deploy needs a role, not just a project grant: the instance
+  // credential means the button carries a service identity now.
+  requireDeployRole(req, res, next) {
+   boundaryCalls.push('deployRole');
+   return ['admin', 'developer'].includes(req.user?.role) ? next() : res.status(403).json({ ok: false, code: 'deploy_role_forbidden' });
+  },
  };
  const nativeExec = promisify(execFile);
  const context = {

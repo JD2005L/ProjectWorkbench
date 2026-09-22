@@ -395,15 +395,23 @@ test('managed routes: managed Save is refused, ordinary Save/options/URLs and mi
  assert.equal(h.executions[0].options.cwd, undefined, 'legacy saved scripts retain their own cwd semantics');
  assert.equal(h.history[0].option, 'patch');
  assert.equal(h.history[0].inputs, undefined);
- for (const route of [deployRoute, '/api/deploy/:project/:target/version', '/api/deploy/:project/card', '/api/deploy/:project/log']) {
-  const method = route === deployRoute ? 'POST' : 'GET';
-  const handlers = h.routes.get(`${method} /pw${route}`);
+ for (const route of ['/api/deploy/:project/:target/version', '/api/deploy/:project/card', '/api/deploy/:project/log']) {
+  const handlers = h.routes.get(`GET /pw${route}`);
   assert.equal(handlers[0], h.middleware.requireAuth);
   assert.equal(handlers[1], h.middleware.requireProjectAccess);
  }
+ // Triggering a deploy carries one more boundary than reading about one, and the
+ // role gate comes BEFORE project access: an account whose role may not deploy is
+ // refused without the registry being consulted at all.
+ const deployHandlers = h.routes.get(`POST /pw${deployRoute}`);
+ assert.deepEqual(deployHandlers.slice(0, 3),
+  [h.middleware.requireAuth, h.middleware.requireDeployRole, h.middleware.requireProjectAccess]);
  assert.equal(h.routes.get('POST /pw/api/deploy/config')[0], h.middleware.requireAdmin);
  assert.equal((await h.call('POST', deployRoute, { params, caller: null })).statusCode, 401);
  assert.equal((await h.call('POST', deployRoute, { params, caller: { role: 'developer', projects: ['another'] } })).statusCode, 403);
+ // A grant on the RIGHT project is still not enough for a role with no writes.
+ assert.equal((await h.call('POST', deployRoute, { params, caller: { role: 'viewer', projects: ['demo'] } })).statusCode, 403);
+ assert.equal((await h.call('POST', deployRoute, { params, caller: { role: 'content_editor', projects: ['demo'] } })).statusCode, 403);
  assert.equal((await h.call('POST', '/api/deploy/config', { caller: { role: 'developer' } })).statusCode, 403);
 });
 

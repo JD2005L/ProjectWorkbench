@@ -539,3 +539,59 @@ test('REGRESSION: the credential API is admin-only and never returns a password,
     assert.deepEqual((await cleared.json()).credentials.prod, { user: '', note: '', hasPassword: false });
   });
 });
+
+// Triggering a deploy needs a role, not merely a project grant.
+//
+// Before the workbench held its own credential this was answered by accident: a
+// deploy ran as whoever pressed it, so an account with no stored Windows password
+// could not publish anything. A configured instance credential removes the
+// accident — the button now carries a real service identity — so a viewer or
+// content_editor with a project grant must be refused explicitly.
+test('REGRESSION: a project grant alone does not let a viewer trigger a deploy', { timeout: 30000 }, async () => {
+  const port = 3919;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7824 }], null, 2));
+  const marker = path.join(inst.dir, 'viewer-published');
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({ demo: { prod: { script: `touch ${marker}` } } }));
+
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  const secretKey = fs.readFileSync(inst.env.PW_SECRET_KEY_PATH, 'utf8').trim();
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-view', username: 'watcher', role: 'viewer', projects: ['demo'], passwordHash },
+    { id: 'u-edit', username: 'editor', role: 'content_editor', projects: ['demo'], passwordHash },
+    { id: 'u-dev', username: 'builder', role: 'developer', projects: ['demo'], passwordHash },
+  ] }, null, 2));
+  // The instance credential is what makes this reachable at all: without it the
+  // script would run with an empty password instead of a real service identity.
+  fs.writeFileSync(inst.env.PW_WORKBENCH_SETTINGS, JSON.stringify({
+    deployCredentials: { prod: { user: 'GOA\\svc-pw-deploy-prod', password: encryptToken(secretKey, 'prod-secret'), note: '' } },
+  }, null, 2));
+
+  await withServer(inst, port, async (base) => {
+    const attempt = async username => {
+      const login = await fetch(`${base}/api/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      assert.equal((await login.json()).ok, true, `sanity: ${username} must be able to log in`);
+      const cookie = login.headers.get('set-cookie').split(';')[0];
+      return fetch(`${base}/api/deploy/demo/prod`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+      });
+    };
+
+    for (const username of ['watcher', 'editor']) {
+      const denied = await attempt(username);
+      assert.equal(denied.status, 403, `${username} must not be able to deploy`);
+      assert.match((await denied.json()).error, /admin or developer role/);
+    }
+    assert.equal(fs.existsSync(marker), false, 'and the slot script must never have run');
+
+    const allowed = await attempt('builder');
+    assert.equal(allowed.status, 200, 'a developer with a grant still deploys');
+    assert.equal(fs.existsSync(marker), true);
+  });
+});

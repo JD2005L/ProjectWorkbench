@@ -1380,6 +1380,21 @@ function requireScope(scope){
  };
 }
 
+// WHO MAY TRIGGER A DEPLOY. Until the workbench held its own deploy credential,
+// this was answered by accident: a deploy ran as the person who pressed it, so
+// somebody with no stored Windows password simply could not publish anything.
+// A configured instance credential removes that accident — the button now carries
+// a real service identity — so the permission has to be stated rather than
+// inherited. Project access alone is NOT enough: a viewer or content_editor with
+// a grant sees the project, and the role table (AGENTS.md) gives neither of them
+// writes. Editing a slot script stays admin-only (requireAdmin on /api/deploy/config).
+const DEPLOY_TRIGGER_ROLES = new Set(['admin','developer']);
+function requireDeployRole(req, res, next){
+ if(!req.user) return requireAuth(req, res, next);
+ if(DEPLOY_TRIGGER_ROLES.has(req.user.role)) return next();
+ return res.status(403).json({ ok:false, code:'deploy_role_forbidden',
+  error:`Deploying requires the admin or developer role; your account is ${req.user.role}.` });
+}
 async function requireProjectAccess(req, res, next){
  try {
   const projectName = req.params.project || req.params.name || req.params.oldName;
@@ -6347,7 +6362,7 @@ if(DEPLOY_CENTRE){
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
 
- app.post(BASE + '/api/deploy/:project/:target', requireAuth, requireProjectAccess, async (req,res)=>{
+ app.post(BASE + '/api/deploy/:project/:target', requireAuth, requireDeployRole, requireProjectAccess, async (req,res)=>{
   const { project, target } = req.params;
   if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
   if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
