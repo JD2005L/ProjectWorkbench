@@ -117,12 +117,33 @@ test('manifest execution: recipe changes invalidate a displayed selection and co
 
 test('manifest execution: private DEPLOY_* names cannot become public repository input selectors', async t => {
   const fixture = await workspace(t);
-  for (const env of ['DEPLOY_USER', 'DEPLOY_PASSWORD', 'DEPLOY_TOKEN', 'DEPLOY_API_KEY']) {
+  for (const env of ['DEPLOY_USER', 'DEPLOY_PASSWORD', 'DEPLOY_TOKEN', 'DEPLOY_API_KEY',
+    'DEPLOY_OPERATOR', 'DEPLOY_IDENTITY_SOURCE']) {
     fixture.document.slots.dev.inputs = [{ name: 'credential', type: 'select', label: 'Credential',
       required: true, env, choices: [{ value: 'synthetic-value', label: 'Not a public input' }] }];
     await fixture.save();
     await assert.rejects(resolveDeployManifest(fixture.root, 'dev'), DeployManifestError);
   }
+});
+
+test('manifest execution: repository input data cannot overwrite trusted deployment attribution', async t => {
+  const fixture = await workspace(t, {
+    ...simpleSlot(),
+    inputs: [{ name: 'release', type: 'select', label: 'Release', required: true,
+      env: 'DEPLOY_RELEASE', choices: [{ value: '1.2.3', label: 'Version 1.2.3' }] }],
+  });
+  const manifest = await resolveDeployManifest(fixture.root, 'dev');
+  const request = buildDeploymentJob({
+    project: 'RecipeApp', target: 'dev', snapshot: await snapshotFor(fixture),
+    config: { script: manifest.script }, manifest,
+    selection: { env: {
+      DEPLOY_RELEASE: '1.2.3', DEPLOY_OPERATOR: 'forged.operator', DEPLOY_IDENTITY_SOURCE: 'forged-source',
+    } },
+    deployOperator: 'real.operator', identitySource: 'instance',
+  });
+  assert.equal(request.environment.DEPLOY_RELEASE, '1.2.3');
+  assert.equal(request.environment.DEPLOY_OPERATOR, 'real.operator');
+  assert.equal(request.environment.DEPLOY_IDENTITY_SOURCE, 'instance');
 });
 
 test('manifest execution: unsupported local adapters never run only their preparation script or the saved legacy script', async t => {

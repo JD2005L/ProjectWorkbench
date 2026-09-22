@@ -3746,3 +3746,18 @@ mechanism did its job; the omission was mine.
 Merged locally rather than through the API: this account is an Enterprise Managed
 User and `mergePullRequest` is unauthorized for it, so the merge commit is pushed
 straight to main with the PR reference in its message.
+
+## Hermes-James — 2026-09-22 — post-merge attribution blocker from PR #74 review
+
+The independent immutable review of PR #74 completed after its merge and found one
+remaining Tier-3 blocker: repository manifest inputs could use `DEPLOY_OPERATOR` or
+`DEPLOY_IDENTITY_SOURCE`, and `buildDeploymentJob()` spread that repository-selected
+environment after trusted attribution. An external job could therefore claim a
+forged human or credential source without exposing the password itself.
+
+This follow-up reserves both names during manifest validation and writes trusted
+attribution after repository input data as defense in depth. Adversarial tests prove
+both the manifest rejection and the final job boundary. It is based on green main
+`dd796eb9461941c7a8b820897a9c2a8d5432f82d` after GOA separately repaired the
+two-seam privilege-contract test. `app/VERSION` advances from `1.26.0922.2125` to
+`1.26.0922.2126`; deployment remains held pending exact-head CI and review.
