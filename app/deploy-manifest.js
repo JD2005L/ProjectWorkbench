@@ -7,7 +7,10 @@ import { DeploymentError, validateEnvironment, validateRecipe } from './deployme
 const TARGETS = ['dev', 'prod'];
 const BUMPS = ['patch', 'minor', 'major'];
 const RESERVED = new Set(['__proto__', 'constructor', 'prototype']);
-const RESERVED_ENV = new Set(['DEPLOY_PROJECT', 'DEPLOY_TARGET', 'DEPLOY_OPTION']);
+const RESERVED_ENV = new Set([
+ 'DEPLOY_PROJECT', 'DEPLOY_TARGET', 'DEPLOY_OPTION',
+ 'DEPLOY_OPERATOR', 'DEPLOY_IDENTITY_SOURCE',
+]);
 const MAX_JSON_BYTES = 1024 * 1024;
 
 export class DeployManifestError extends Error {

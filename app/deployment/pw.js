@@ -48,10 +48,10 @@ export function buildDeploymentJob({
 }) {
   assertManifestSource(manifest, snapshot.source, target);
   const recipe = validateRecipe(manifest?.execution ?? config.execution ?? execution);
-  const environment = { DEPLOY_PROJECT: project, DEPLOY_TARGET: target,
+  const environment = { ...(manifest ? selection?.env : { DEPLOY_OPTION: option }),
+    DEPLOY_PROJECT: project, DEPLOY_TARGET: target,
     ...(deployOperator ? { DEPLOY_OPERATOR: deployOperator } : {}),
-    ...(identitySource ? { DEPLOY_IDENTITY_SOURCE: identitySource } : {}),
-    ...(manifest ? selection?.env : { DEPLOY_OPTION: option }) };
+    ...(identitySource ? { DEPLOY_IDENTITY_SOURCE: identitySource } : {}) };
   // Legacy slots received their option as $1. Transfer it as data, never splice
   // an operator's selection into shell text.
   const script = recipe.adapter === 'podman' ? (config.script || '') : manifest ? config.script : `set -- "$DEPLOY_OPTION"\n${config.script || ''}`;
