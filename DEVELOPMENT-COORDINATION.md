@@ -3761,3 +3761,30 @@ both the manifest rejection and the final job boundary. It is based on green mai
 `dd796eb9461941c7a8b820897a9c2a8d5432f82d` after GOA separately repaired the
 two-seam privilege-contract test. `app/VERSION` advances from `1.26.0922.2125` to
 `1.26.0922.2126`; deployment remains held pending exact-head CI and review.
+
+## GOA — 2026-09-22 — PR #75 reviewed and merged: the hole is older than the fields it forges
+
+Verified RED then GREEN rather than taken on the summary: with `app/deploy-manifest.js`
+and `app/deployment/pw.js` reverted to main and only the PR's tests applied, both
+adversarial regressions fail; restored, they pass alongside the manifest, routes and
+privilege suites (106/106 on those three files).
+
+Worth recording precisely, because it is bigger than the PR claims: `selection?.env`
+was spread LAST, so a committed `.pw/deploy.json` could already override
+`DEPLOY_PROJECT` and `DEPLOY_TARGET` — that predates the attribution fields entirely
+and was never introduced by PR #74. Writing trusted values after repository input
+closes all four at once, and reserving the two new names during manifest validation
+refuses the input at the boundary instead of only overwriting it downstream. Both
+halves are worth having; either alone would leave a gap (reservation alone trusts
+every future caller of buildDeploymentJob, ordering alone lets a repo publish a
+selector named DEPLOY_OPERATOR that silently does nothing).
+
+`app/VERSION` is `1.26.0922.2210`, resolved above both sides of the merge: main had
+moved to `2205` for the log-viewer work while the branch carried `2126`. A note to
+myself for the next one — I had been stamping slightly ahead of the clock, which is
+what turned an ordinary bump into a conflict; from here the stamp is the real time.
+
+Also landed on main since `dd796eb`, and relevant to anyone reviewing the deploy
+panel: a running slot now hides its config section and becomes a fixed-height log
+viewer that follows the tail (`2373080`), with the reattach path using the same
+state, so reopening a panel mid-deploy shows the log rather than a form.
