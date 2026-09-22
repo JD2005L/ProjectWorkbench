@@ -86,6 +86,21 @@ test('an UNREADABLE level stops the search instead of silently using another acc
   assert.deepEqual([overrideBroken.state, overrideBroken.source], ['unreadable', 'project']);
 });
 
+test('an incomplete project override is unreadable and never falls through to another account', async () => {
+  const identity = makeDeployIdentity({
+    decrypt,
+    instanceCredential: async () => ({ state: 'stored', source: 'instance', user: 'GOA\\svc-prod', password: 'shared' }),
+  });
+  for (const deployCredential of [
+    { user: 'GOA\\svc-project', password: '' },
+    { user: '', password: encrypt('project-secret') },
+  ]) {
+    const resolved = await identity.resolve({ deployCredential }, 'prod', operator);
+    assert.deepEqual([resolved.state, resolved.source, resolved.password], ['unreadable', 'project', '']);
+    assert.equal(identity.env(resolved, 'kevin.charlebois'), null);
+  }
+});
+
 test('the environment names the effective account AND the human who pressed Deploy', async () => {
   const identity = makeDeployIdentity({ decrypt, instanceCredential: async () => ({ state: 'none', source: 'instance', user: '', password: '' }) });
   const env = identity.env({ state: 'stored', source: 'instance', user: 'GOA\\svc-prod', password: 'shared' }, 'kevin.charlebois');
@@ -142,6 +157,8 @@ test('a malformed credential block is fail-closed, never "no credential configur
     { deployCredentials: { prod: { user: 'GOA\\ok', note: 'x'.repeat(201) } } },
     { deployCredentials: { staging: { user: 'GOA\\ok' } } },
     { deployCredentials: { prod: { user: 'has space' } } },
+    { deployCredentials: { prod: { user: 'GOA\\only-user', password: '' } } },
+    { deployCredentials: { prod: { user: '', password: encrypt('only-password') } } },
   ]) {
     assert.throws(() => savedDeployCredentials(bad), error => {
       assert.equal(error.statusCode, 503, `${JSON.stringify(bad)} must fail closed`);
@@ -180,6 +197,7 @@ test('blank password means KEEP, clearing is explicit, and a general settings sa
 test('a password with no account is refused, and dev/prod stay independent', async () => {
   const only = store(JSON.stringify({}));
   await assert.rejects(() => only.api.updateDeployCredential({ target: 'prod', password: 'lonely' }), /account name/);
+  await assert.rejects(() => only.api.updateDeployCredential({ target: 'prod', user: 'GOA\\lonely' }), /password/);
   await assert.rejects(() => only.api.updateDeployCredential({ target: 'staging', user: 'GOA\\x' }), /dev or prod/);
 
   const both = store(JSON.stringify({}));
@@ -198,6 +216,7 @@ test('deployCredential() reports the state the resolver needs, not a boolean', a
   const wrongKey = store(JSON.stringify({ deployCredentials: { dev: { user: 'GOA\\a', password: 'enc:b3RoZXI', note: '' } } }));
   const unreadable = await wrongKey.api.deployCredential('dev');
   assert.deepEqual([unreadable.state, unreadable.password], ['unreadable', '']);
+
 });
 
 test('the domain is canonicalised, because a slot script matched GOA literally and blocked every deploy', async () => {

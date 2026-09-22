@@ -62,12 +62,16 @@ export function makeDeployIdentity({ decrypt, instanceCredential }) {
     const candidates = [];
     const override = slotConfig?.deployCredential;
     if (override && (override.user || override.password)) {
+      if (!override.user || !override.password) {
+        candidates.push({ state: 'unreadable', source: 'project', user: '', password: '' });
+      } else {
       const read = readStoredDeployPassword({ deployPassword: override.password }, decrypt);
       // A slot override is hand-edited in deploy-config.json, so it never passes
       // through the settings validator that canonicalises the domain. Do it here
       // rather than leave one level able to hand a script `goa\` when the other
       // hands it `GOA\`.
       candidates.push({ state: read.state, source: 'project', user: canonicalDeployAccount(override.user || ''), password: read.password });
+      }
     }
     if (instanceCredential) candidates.push(await instanceCredential(target));
     if (operatorRecord) {

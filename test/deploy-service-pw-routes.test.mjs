@@ -510,7 +510,8 @@ test('PW job builder: explicit adapters, literal legacy option and ephemeral sec
   const files = [{ path: 'deploy.sh', data: Buffer.from('printf done').toString('base64'), executable: true }];
   const request = buildDeploymentJob({ project: 'ExampleApp', target: 'prod', snapshot: sourceSnapshot(files),
     config: { script: 'bash deploy.sh "$1"', runAsRoot: true, execution: { adapter: 'iis' } },
-    option: 'minor; touch forbidden', deployUser: 'fixture-deployer', deployPassword: 'synthetic-password' });
+    option: 'minor; touch forbidden', deployUser: 'fixture-deployer', deployPassword: 'synthetic-password',
+    deployOperator: 'kevin.charlebois', identitySource: 'instance' });
   assert.equal(request.recipe.adapter, 'iis');
   assert.equal(request.environment.DEPLOY_OPTION, 'minor; touch forbidden');
   assert.match(request.script, /^set -- "\$DEPLOY_OPTION"/);
@@ -518,6 +519,8 @@ test('PW job builder: explicit adapters, literal legacy option and ephemeral sec
   assert.equal(request.secrets.DEPLOY_PASSWORD, 'synthetic-password');
   assert.equal(request.runAsRoot, undefined);
   assert.equal(request.environment.DEPLOY_PASSWORD, undefined);
+  assert.equal(request.environment.DEPLOY_OPERATOR, 'kevin.charlebois');
+  assert.equal(request.environment.DEPLOY_IDENTITY_SOURCE, 'instance');
   assert.throws(() => buildDeploymentJob({ project: 'ExampleApp', target: 'dev', snapshot: sourceSnapshot(files),
     config: { script: 'true', execution: { adapter: 'script', credential: TOKEN } } }), /Unknown recipe/);
 });

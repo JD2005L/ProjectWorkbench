@@ -6465,7 +6465,8 @@ if(DEPLOY_CENTRE){
    if(client) return await requireDeploymentOrigin(req, res, async () => {
     const job = await deploymentService.enqueue({
      client, project, target, workspace:state.workspace, config:tc, manifest, selection, option,
-     execution:p.deploySlots?.[target]?.execution, deployUser, deployPassword, forceExternal:true,
+     execution:p.deploySlots?.[target]?.execution, deployUser, deployPassword,
+     deployOperator:operatorName, identitySource, forceExternal:true,
     });
     await audit('deploy_service_enqueue', { project, target, backend, jobId:job.id, revision:job.revision }, req);
     return res.status(202).json({ ok:true, backend:'external', queued:true, job,
