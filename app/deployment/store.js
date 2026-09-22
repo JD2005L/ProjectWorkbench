@@ -3,6 +3,7 @@ import path from 'node:path';
 import { writeFileAtomic } from '../atomic-file.js';
 import { DeploymentError, publicJob, projectName, targetName, ADAPTERS, TERMINAL_STATES, fields } from './protocol.js';
 import { deploymentVersion } from './engine.js';
+import { validateBuilderStartupFailure } from './builder-diagnostics.js';
 
 const JOB_ID = /^[a-f0-9]{8}-[a-f0-9]{4}-4[a-f0-9]{3}-[89ab][a-f0-9]{3}-[a-f0-9]{12}$/;
 const STATES = new Set(['queued', 'running', 'cancelling', ...TERMINAL_STATES]);
@@ -19,7 +20,7 @@ function validateJournal(job, id) {
   const invalid = () => { throw new DeploymentError('Corrupt deployment journal', 503, 'invalid_state'); };
   fields(job, ['id', 'requestId', 'project', 'target', 'revision', 'sourceDigest', 'adapter', 'state', 'phase',
     'createdAt', 'startedAt', 'finishedAt', 'version', 'errorCode', 'fingerprint', 'events', 'lastSeq',
-    'completionOrder'], 'journal');
+    'completionOrder', 'builderStartupFailure'], 'journal');
   projectName(job.project);
   targetName(job.target);
   if (job.id !== id || !/^[A-Za-z0-9_-]{8,100}$/.test(job.requestId || '')
@@ -34,6 +35,7 @@ function validateJournal(job, id) {
       || !Array.isArray(job.events) || job.events.length > 2048
       || !Number.isSafeInteger(job.lastSeq) || job.lastSeq < 0) invalid();
   deploymentVersion(job.version);
+  if (job.builderStartupFailure !== undefined) validateBuilderStartupFailure(job.builderStartupFailure, id);
   let previous = 0;
   for (const event of job.events) {
     fields(event, ['seq', 'at', 'phase', 'code', 'state'], 'event');
@@ -123,6 +125,9 @@ export class JobStore {
     const directory = this.jobDirectory(id);
     const retained = { ...publicJob(job), fingerprint: job.fingerprint, events: job.events,
       lastSeq: job.lastSeq, completionOrder: job.completionOrder };
+    if (job.builderStartupFailure !== undefined) {
+      retained.builderStartupFailure = validateBuilderStartupFailure(job.builderStartupFailure, id);
+    }
     const content = `${JSON.stringify(retained)}\n`;
     const work = (this.writes.get(id) || Promise.resolve()).then(() => this.writeJob(directory, content));
     this.writes.set(id, work);

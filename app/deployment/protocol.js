@@ -50,6 +50,27 @@ export function targetName(value) {
   return value;
 }
 
+export function consoleSelectorQuery(query) {
+  if (!record(query)) fail('Invalid deployment console selectors.');
+  const selected = {};
+  for (const key of ['job', 'project', 'target']) {
+    const values = query instanceof URLSearchParams
+      ? query.getAll(key) : Object.hasOwn(query, key) ? [query[key]] : [];
+    if (!values.length || values[0] === undefined) continue;
+    if (values.length !== 1) fail('Invalid deployment console selectors.');
+    const value = values[0];
+    if (key === 'job') {
+      if (typeof value !== 'string' || !/^[A-Za-z0-9_-]{1,100}$/.test(value)) {
+        fail('Invalid deployment job selector.');
+      }
+      selected.job = value;
+    } else {
+      selected[key] = key === 'project' ? projectName(value) : targetName(value);
+    }
+  }
+  return new URLSearchParams(selected).toString();
+}
+
 export function targetKey(project, target) {
   return `${projectName(project)}/${targetName(target)}`;
 }

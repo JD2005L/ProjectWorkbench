@@ -1,5 +1,11 @@
 # Shared host deployment service
 
+> **Legacy native package.** The current contained rollout direction packages
+> engine, administration UI and job tools as an independent Podman service;
+> see `docs/container-deployment-service.md` in the source repository. Do not
+> install this native broker or its host SDK prerequisites for that rollout.
+> This document remains the compatibility reference for native installations.
+
 The optional **EXTERNAL** deployment backend runs as a native host Node.js
 service, independently of the PW process/container. PW remains the authenticated
 UI for submitting jobs, viewing logs, cancelling work, and administering the
@@ -12,7 +18,7 @@ scripts in `deploy/service/` prepare an installation; running tests or updating
 this repository does not change a live host. The installer does not modify the
 PW service, container, settings, application data, or existing application units.
 
-## Global selection, not per-project enrollment
+## Global selection and per-slot opt-in
 
 PW's portable/global Settings selects **LOCAL** or **EXTERNAL**, with the
 external endpoint and a protected token. LOCAL remains the default until a PW
@@ -35,6 +41,24 @@ Changing an identity requires an operator-controlled host policy change and
 explicit runner restart. Optional target pause/timeout overrides are
 operational controls, not a prerequisite for a new project. Changing the
 global backend does not translate arbitrary old shell scripts.
+
+An administrator editing an ordinary saved `dev` or `prod` slot can instead set
+its **Execution backend** to `external`. This stores `backend: "external"` in
+that slot's existing `deploy-config.json` record and uses the same globally
+administered endpoint and encrypted credential; no endpoint, token, or
+execution identity is stored with the project. `backend: "local"` explicitly
+keeps a slot local, while omitted or `backend: "inherit"` follows the global
+selection. Existing records omit the field and therefore retain their current
+behavior. Repository-managed slots keep their scripts, inputs, and execution
+recipes read-only, but an administrator may save this same operator-owned
+backend choice independently; `.pw/deploy.json` cannot select a backend or
+change any privileged routing setting.
+
+An external slot submits, reads versions and history, and opens job/log/cancel
+operations through the authenticated deployment service. A transport or policy
+failure is returned to the caller; PW never retries the slot locally. Local
+history entries are marked `local` and service entries `external` so mixed
+projects retain backend provenance.
 
 ### Existing applications with legacy resource names
 

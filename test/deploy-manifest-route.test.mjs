@@ -45,7 +45,7 @@ test('VI contract: exact identity versions and malformed publishing history leav
  assert.deepEqual(dev.inputs[0].choices[1].targetVersions, { patch: '1.0.0', minor: '1.0.0', major: '1.0.0' });
  const normalCard = (await h.call('GET', '/api/deploy/:project/card', { params: { project: 'demo' } })).body.html;
  assert.match(normalCard, /name="identity" required><option value="">Choose Visual identity<\/option><option value="default">/);
- assert.doesNotMatch(normalCard, /<option[^>]*\sselected[=>\s]/);
+ assert.doesNotMatch(normalCard, /class="deploy-input"[^>]*>(?:(?!<\/select>)[\s\S])*?selected/);
  const initialProd = (await h.call('GET', versionRoute, { params: prodParams })).body.manifest;
  const index = path.join(root, 'releases', 'default', 'index.json');
  const corruptions = [
@@ -96,7 +96,8 @@ test('script-only routes: prod is discoverable and executable without saved host
   assert.match(prod, /Deploy MCP server/);
   assert.match(prod, /No input selections required/);
   assert.match(prod, /<textarea class="deploy-script" readonly>bash deploy\/deploy-mcp\.sh/);
-  assert.doesNotMatch(prod, /<select\b|class="selection-version"|class="[^"]*save-config"/);
+  assert.match(prod, /class="deploy-backend"/);
+  assert.doesNotMatch(prod, /class="deploy-input"|class="selection-version"|class="[^"]*save-config"/);
   assert.doesNotMatch(prod, /<button[^>]*class="[^"]*deploy-btn"[^>]*\bdisabled/);
   assert.match(targetHtml(html, 'dev'), /role="alert"/, 'bad publishing metadata only disables its own slot');
  }
@@ -172,13 +173,15 @@ test('managed routes: real page, modal, status and version handlers read only da
   assert.match(dev, /Repository-managed/);
   assert.match(dev, /<textarea class="deploy-script" readonly>/);
   assert.doesNotMatch(dev, /save-config|legacy-saved-script|legacy-version-command|src-newer|deploy-option/);
+  assert.match(dev, /class="deploy-backend"/);
+  assert.match(dev, /save-backend/);
   const slot = manifestAttribute(dev);
   assert.equal(slot.inputs.length, 2);
   for (const name of ['identity', 'bump']) {
    assert.match(dev, new RegExp(`<label[^>]*for="deploy-demo-dev-${name}"`));
    assert.match(dev, new RegExp(`<select[^>]*id="deploy-demo-dev-${name}"[^>]*name="${name}" required><option value="">Choose `));
   }
-  assert.doesNotMatch(dev, /<option[^>]*\sselected[=>\s]/);
+  assert.doesNotMatch(dev, /class="deploy-input"[^>]*>(?:(?!<\/select>)[\s\S])*?selected/);
   assert.match(dev, /aria-live="polite"/);
   assert.match(dev, /deploy-btn" type="button" disabled/);
  }

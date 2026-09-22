@@ -1,89 +1,69 @@
-# PR #70 PVI integration resolution gate
+# PR #70 PVI integration resolution record
 
 ## Scope
 
-This handoff records what remains before the contained deployment service in PR #70 can be integrated into canonical ProjectWorkbench and adopted by the PVI Workbench deployment.
+This record separates **canonical merge compatibility** from **contained-backend activation** for PR #70.
 
-Evidence is pinned to:
+Evidence used for the reconciliation:
 
-- Canonical `main`: `cfe0689f976b99dddaeda389af8eb7cb0cc1c756`
-- PR #70 head: `2527db958517e2a7230779d460632be5f5daed09`
-- PR merge base: `0fd2243539946b2d5e6b9d1d1422ab0ef1993a81`
-- Current PVI host-mode deployment: `cfe0689f976b99dddaeda389af8eb7cb0cc1c756`, release `1.26.0921.2221`
+- Canonical `main` merged through PR #71: `6878edb71e42dc1bac0a3e5cfa3f843ed3aed939`
+- PR #70 pre-reconciliation head: `2527db958517e2a7230779d460632be5f5daed09`
+- Original PR #70 merge base: `0fd2243539946b2d5e6b9d1d1422ab0ef1993a81`
+- Current PVI host-mode deployment before PR #70 release: `cfe0689f976b99dddaeda389af8eb7cb0cc1c756`, release `1.26.0921.2221`
 
-The PVI deployment is now byte-for-byte aligned with canonical `main`. This document does not authorize activation of a contained deployment backend or any production application cutover.
+## Canonical merge resolution
 
-## Blocking items for PR #70
+The current canonical branch was merged into PR #70 without rewriting its history. The only textual Git conflict was `app/VERSION`; it was resolved with a new forward-moving release identifier.
 
-### 1. Reconcile current canonical main
+The automatic merge preserved both sides of the integration:
 
-GitHub currently reports PR #70 as `CONFLICTING` / `DIRTY`. The conflict surface includes `app/server.js` and `DEVELOPMENT-COORDINATION.md`.
-
-Resolve against current `main` without losing the per-person GitHub CLI authorization and persistent GitHub CLI installation work added after the PR's last common base. In particular, preserve:
-
+- PR #70's contained deployment engine, console, SDK, and per-slot backend controls;
+- per-person and per-launcher terminal identity;
 - per-user `GH_CONFIG_DIR` isolation;
-- privilege-dropped token capture through the credential helper;
+- privilege-dropped GitHub token capture through the credential helper;
 - ambient GitHub token stripping before `gh auth token` is read;
 - target-user authorization and project filtering;
-- the current host/container readiness behavior and documentation.
+- persistent GitHub CLI installation/readiness behavior;
+- the PR #71 review and operational handoff.
 
-After reconciliation, publish a new exact head and rerun both host and container GitHub checks on that head.
+Focused integration verification passed 559 runnable tests with 11 environment-declared skips. The canonical full suite passed 2,080 runnable tests with 17 environment-declared skips. Syntax and diff checks passed.
 
-### 2. Bind acceptance to the exact final packaged image
+## Merge-safe activation boundary
 
-The accepted native-service evidence cited in PR #70 is associated with the earlier `dc46f073...` source/image artifact. Changes after that artifact modify packaged runtime inputs, including:
+Merging this feature does not select or activate a contained backend:
 
-- `app/VERSION`
-- `app/deployment/pw.js`
-- `app/deployment/routes.js`
-- `app/deployment/settings.js`
+- global routing remains `LOCAL`;
+- existing ordinary and managed slots retain their current routing;
+- a manifest cannot choose a backend;
+- connection drafts remain distinct from active slot routing;
+- external failures do not silently fall back to local execution;
+- production application activation remains a separate human-authorized operation.
 
-Build the final reconciled head, publish its immutable image digest, and run the accepted lifecycle against that exact digest. Evidence from an older image is useful diagnostic history but cannot establish release acceptance for the amended head.
+This default-off boundary makes canonical integration safe independently of commissioning a PVI deployment-service host.
 
-### 3. Complete the signed-in ProjectWorkbench slot canary
+## Post-merge contained-backend activation gate
 
-The PR handoff explicitly leaves one gate open: a disposable canary launched through an actual authenticated PW slot after the normal PW update.
+The native service evidence in PR #70 remains valid evidence for the earlier installed `dc46f073...` / `4a722e8b...` artifact. Later PW routing and settings changes do not authorize treating a newly built image as already accepted.
 
-The canary must prove the real browser-to-PW-to-contained-service path, not only direct service jobs or isolated route fixtures:
+Before any PVI slot is switched from `LOCAL` to the contained backend, complete these operational gates against the exact canonical release image:
 
-1. Save the contained connection as an administrator while global routing remains `LOCAL`.
-2. Assign only a disposable managed slot.
-3. Execute the repository-managed recipe through that signed-in slot.
-4. Verify build, activation, version/health acceptance, cancellation, independent deadline behavior, controller stop/start recovery, and failed-health rollback.
-5. Verify existing application slots, mappings and runtime state are unchanged.
-6. Return the disposable slot to `LOCAL` and confirm no backend remains selected unintentionally.
+1. Build the canonical head and record its immutable image digest.
+2. Commission the selected deployment-service host with Podman/Quadlet, dedicated identities, subordinate-ID ranges, user manager/linger, fixed connector fingerprints, installed units, policy/configuration ownership, private proxy/auth, backup, restore, and rollback.
+3. Run an authenticated disposable PW slot canary through the actual browser-to-PW-to-contained-service path.
+4. Verify dependency build, activation, version/health acceptance, cancellation, independent deadline behavior, controller stop/start recovery, and failed-health rollback.
+5. Confirm existing application slots, mappings, workspaces, and runtime state are unchanged.
+6. Return the disposable slot to `LOCAL` and verify no unintended external selection remains.
 
-### 4. Commission the PVI target deliberately
+These are **activation gates**, not permission for an unreviewed branch to diverge from canonical main.
 
-Neither pvi2 nor CT2115 currently provides the Podman/Quadlet service boundary, dedicated deployment identities, installed connector units, or operator-owned policy required by this feature. Do not infer target readiness from source or CI.
+## GOA morning handoff
 
-Before PVI activation, record and verify:
+After GitHub reports PR #70 merged and canonical CI is green, GOA should use the ordinary fast-forward workflow:
 
-- selected deployment-service host;
-- Podman and Quadlet versions;
-- builder/runtime Unix identities and subordinate-ID ranges;
-- user manager/linger state;
-- fixed SSH connector identities and fingerprints;
-- installed unit names and immutable release path;
-- configuration/policy paths and ownership/modes;
-- private proxy/auth route;
-- backup, restore and rollback procedure.
+```bash
+git fetch --prune origin
+git switch main
+git pull --ff-only origin main
+```
 
-Keep `PW_DEPLOY_MODE=host`, global destination `LOCAL`, and all existing slots unchanged until this commissioning and the signed-in canary are accepted.
-
-## Required completion report
-
-GOA should update PR #70 with:
-
-1. the reconciled exact head and merge base;
-2. green host/container checks for that head;
-3. final image digest built from that head;
-4. unskipped exact-image lifecycle evidence;
-5. signed-in PW disposable-slot canary evidence;
-6. target commissioning identities and rollback evidence;
-7. an independent exact-head review verdict;
-8. explicit confirmation that production application activation remains separately authorized.
-
-## Non-blocking repository note
-
-PR #69 is independent of this feature. It remains a small mergeable hardening fix for creating a private backup in a non-writable public directory and should be assessed/landed separately rather than folded into PR #70 conflict resolution.
+GOA should continue from canonical `main`, not from the retired PR #70 feature head. No force-push, history rewrite, private inbox recovery, or manual conflict replay is required.

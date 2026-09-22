@@ -13,7 +13,7 @@ import { resolveDeployReauth } from '../app/deploy-reauth.js';
 import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
 import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
 import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
-import { validateRecipe } from '../app/deployment/protocol.js';
+import { DeploymentError, validateRecipe } from '../app/deployment/protocol.js';
 
 export const serverSource = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -76,7 +76,7 @@ export function deployRouteHarness(root, options = {}) {
   BASE: '/pw', DEPLOY_CENTRE: true, deployCss, deployInputsClientSrc,
   DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth,
   deployInputNotice, describeDeploySelection, renderDeployInputs, agentSpawnDrop,
-  deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin, validateRecipe,
+  deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin, DeploymentError, validateRecipe,
   deploymentService: options.deploymentService || { client: async () => null },
   TERMINAL_PRIV: resolveTerminalPriv({ PW_DEPLOY_MODE: 'container', PW_TERMINAL_UID: '1001', PW_TERMINAL_GID: '1001', PW_TERMINAL_USER: 'pane' }),
   process: { env: { PATH: process.env.PATH, SystemRoot: process.env.SystemRoot, TEMP: process.env.TEMP, TMP: process.env.TMP, HOME: options.nativeExec ? root : '/root', USER: 'root', LOGNAME: 'root', DEPLOY_OPTION: 'must-not-leak' } },
@@ -136,6 +136,7 @@ export function deployRouteHarness(root, options = {}) {
   functionSource('deploymentHistory'),
   functionSource('reclaimWorkspaceOwnership'),
   section('const DEFAULT_DEPLOY_SLOTS = ', 'async function getLocalVersion('),
+  section('const DEPLOY_BACKENDS = ', 'async function getDeployedVersion('),
   section('const DEPLOY_STAMP_RE = ', 'function hasDeployConfigFor('),
  ].join('\n');
  const deployment = section('if(DEPLOY_CENTRE){\n const fmtDeployLog', '\napp.use((err,_req,res,_next)');

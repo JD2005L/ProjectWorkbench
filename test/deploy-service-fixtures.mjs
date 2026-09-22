@@ -18,6 +18,24 @@ export function deploymentConfig(overrides = {}) {
   });
 }
 
+export function builderStartupDiagnostic(jobId, instanceId = '11111111-1111-4111-8111-111111111111') {
+  return {
+    version: 1, instanceId, jobId,
+    primary: { stage: 'client_start', code: 'process_failed', rule: 'client_failure', errno: null },
+    relay: {
+      version: 1, instanceId, jobId,
+      primary: { stage: 'api_readiness', code: 'resource_not_allowed', rule: 'api_peer', errno: null },
+      cleanup: { stage: 'stop', outcome: 'failed',
+        failure: { stage: 'stop', code: 'process_failed', rule: 'manager_incomplete', errno: null } },
+      recordingErrors: [],
+    },
+    exchange: null,
+    cleanup: [{ outcome: 'failed',
+      failure: { stage: 'client_stop', code: 'process_failed', rule: 'client_failure', errno: null } }],
+    recordingFailure: null,
+  };
+}
+
 export class MemoryJobStore {
   constructor() { this.jobs = new Map(); this.settings = new Map(); }
   async init() {}
@@ -26,9 +44,11 @@ export class MemoryJobStore {
   async loadJobs() { return structuredClone([...this.jobs.values()]); }
   async saveJob(job) {
     const { id, requestId, project, target, revision, sourceDigest, adapter, state, phase,
-      createdAt, startedAt, finishedAt, version, errorCode, fingerprint, events, lastSeq, completionOrder } = job;
+      createdAt, startedAt, finishedAt, version, errorCode, fingerprint, events, lastSeq, completionOrder,
+      builderStartupFailure } = job;
     this.jobs.set(id, structuredClone({ id, requestId, project, target, revision, sourceDigest,
-      adapter, state, phase, createdAt, startedAt, finishedAt, version, errorCode, fingerprint, events, lastSeq, completionOrder }));
+      adapter, state, phase, createdAt, startedAt, finishedAt, version, errorCode, fingerprint, events, lastSeq, completionOrder,
+      ...(builderStartupFailure === undefined ? {} : { builderStartupFailure }) }));
   }
   async removeJob(id) { this.jobs.delete(id); }
   jobDirectory(id) { return `/fixture/jobs/${id}`; }

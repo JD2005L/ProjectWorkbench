@@ -160,6 +160,7 @@ test('manifest: schema is strict and cannot grant privileges or define defaults'
   ['unknown target', doc => { doc.slots.staging = doc.slots.dev; }],
   ['root grant', doc => { doc.slots.dev.runAsRoot = true; }],
   ['reauth override', doc => { doc.slots.dev.reauth = false; }],
+  ['backend override', doc => { doc.slots.dev.backend = 'external'; }],
   ['version command', doc => { doc.slots.dev.versionCmd = 'curl nowhere'; }],
   ['empty script', doc => { doc.slots.dev.script = ' '; }],
   ['missing inputs', doc => { delete doc.slots.dev.inputs; }],

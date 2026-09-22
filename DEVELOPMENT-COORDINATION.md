@@ -3090,6 +3090,57 @@ the tmux session is shared, so it does not stop anyone typing into anyone else's
 
 ---
 
+## GOA - 2026-09-21 - PR70 contained deployment service and PW slot handoff
+
+**Review scope.** The ordinary-slot integration at
+`80b17ed208ed1eb22cac33b981ab99eb59e8e259`, empty-connection-draft correction at
+`14bcbfd72406a18437ceae2eb37ecf45bf7ec165`, and managed-slot increment at
+`028842d0350b022f77d46568fa8054671ab86aa9` are incorporated into PR70, together
+with main `0fd2243539946b2d5e6b9d1d1422ab0ef1993a81`. The upstream per-launcher
+and per-person sign-in changes are preserved, not reverted or reinterpreted.
+Release:1.26.0921.1749.
+
+**AGREE - independent contained unit.** The engine, API, operator console and
+job SDKs run in one separate rootless container; PW is a client. The actual
+installed engine is source `dc46f07356417ba6b8af39de1b4a861d0c5ed6c0`,
+image `4a722e8bca403bed0fb621fef992acc9fc2e26abf5afd7e3792f118f77bc1ed5`.
+Later PW-only commits are not described as an installed SDK replacement.
+
+**AGREE - bounded operational evidence.** On the explicitly authorized,
+disposable GOA Linux destination, actual dependency build/activation, unhealthy
+rollback,3.482-second cancellation, an independent deadline while the controller
+was paused, and controlled stop/start recovery without replay received
+independent evidence review. Console access and separate UI/machine
+authentication also passed. The controller is persistent; the disposable
+application expired at its own configured30-minute cap. This is not a claim of
+current fixture health, hard-crash, SELinux-enforcing or production acceptance.
+Sanitized job identities and receipt digests are in the PR70 body.
+
+**AGREE - complete operator-owned slot selection.** Global LOCAL and existing
+slots are preserved. Admins can choose inherit/local/external for ordinary and
+repository-managed slots. Managed saves accept only project, target and backend;
+existing host fields survive, repository scripts/inputs/recipes remain read-only,
+and the manifest cannot select a backend. External failures do not fall back
+locally. The empty connection-test draft remains distinct from internal forced
+backend selection. Both focused increments received independent review.
+
+**NEEDS EVIDENCE - normal PW release and signed-in canary.** The new PW code has
+not been claimed live. Review/merge PR70, use the normal PW release workflow, and
+then exercise a disposable deployment through its normal authenticated slot.
+The scoped project-registration token is not dashboard authority; no forged
+session or expanded authentication scope substitutes for this gate. Existing
+application cutovers remain separate, and dirty workspaces must be preserved.
+
+**Verification handoff.** The bounded serial Windows selection completed with
+162 passing cases; two authentication cases require native POSIX flock and one
+file-symlink case lacks Windows permission. The new managed HTTP/backend cases
+passed. Exact-head Linux host/container CI is required before review readiness;
+its authoritative result is attached to the PR rather than inferred from those
+Windows limitations. Please review the exact current PR70 head and record any
+concrete remaining blocker here or on the PR; no private inbox retrieval is needed.
+
+---
+
 ## GOA — 2026-09-21 — sign-in is per PERSON; the wizard's login is now the SEED identity
 
 Follow-up to the per-launcher change above, and the half of it that was still wrong: the

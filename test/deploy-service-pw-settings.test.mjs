@@ -5,7 +5,8 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { makeSecretCrypto } from '../app/secret-crypto.js';
-import { createWorkbenchSettingsStore, publicWorkbenchSettings, publicDeploymentSettings } from '../app/deployment/settings.js';
+import { createWorkbenchSettingsStore, publicWorkbenchSettings, publicDeploymentSettings, validateConsoleUrl } from '../app/deployment/settings.js';
+import { createDeploymentService } from '../app/deployment/pw.js';
 
 const TOKEN = 'synthetic-service-credential-0123456789';
 const endpoint = 'https://deploy.example.test';
@@ -86,6 +87,7 @@ test('settings: switching local retains endpoint/token; clearing is explicit and
   await f.store.updateDeployment({ backend: 'local', token: '' });
   assert.equal(await f.store.connection(), null);
   assert.deepEqual(await f.store.connection({}), { endpoint, token: TOKEN });
+  assert.deepEqual(await f.store.externalConnection(), { endpoint, token: TOKEN });
   assert.equal(publicDeploymentSettings(await f.store.load()).hasCredential, true);
   await f.store.updateDeployment({ clearToken: true });
   assert.equal(publicDeploymentSettings(await f.store.load()).hasCredential, false);
@@ -101,6 +103,26 @@ test('settings: draft connection supports current and replacement endpoints with
   assert.equal(f.raw, before);
   await assert.rejects(f.store.connection({ endpoint: 'http://remote.example.test' }), /HTTPS/);
   assert.equal(f.raw, before);
+});
+
+test('settings: PW client preserves an empty connection-test draft separately from slot backend selection', async t => {
+  const f = await fixture(t);
+  await f.store.updateDeployment({ backend: 'local', endpoint, token: TOKEN });
+  const before = f.raw;
+  class Client {
+    constructor(connection) { this.connection = connection; }
+  }
+  const service = createDeploymentService({ settingsStore: f.store, Client });
+  assert.equal(await service.client(), null);
+  await assert.rejects(service.requiredClient(), error => error.code === 'deployment_local');
+  const draft = await service.client({});
+  assert.ok(draft instanceof Client);
+  assert.deepEqual(draft.connection, { endpoint, token: TOKEN });
+  const selected = await service.requiredClient({ forceExternal: true });
+  assert.deepEqual(selected.connection, draft.connection);
+  await assert.rejects(service.client({ forceExternal: true }), /Unknown/);
+  assert.equal(f.raw, before);
+  assert.equal(await service.client(), null);
 });
 
 test('settings: malformed saved external mode, missing credentials, and invalid ciphertext fail closed', async t => {
@@ -128,5 +150,32 @@ test('settings: invalid writes and encryption failures remain errors rather than
     assert.equal(error.code, 'deployment_settings_write_failed');
     assert.ok(!error.message.includes(TOKEN)); return true;
   });
+  assert.equal(f.raw, undefined);
+});
+
+test('settings: standalone console destination is explicit, optional, and independent of LOCAL selection', async t => {
+  const f = await fixture(t);
+  const consoleUrl = 'https://deploy.example.test/deploy-service';
+  await f.store.updateDeployment({ backend: 'local', endpoint, token: TOKEN, consoleUrl: `${consoleUrl}/` });
+  assert.equal(await f.store.connection(), null);
+  assert.equal(publicDeploymentSettings(await f.store.load()).consoleUrl, consoleUrl);
+  await f.store.updateGeneral({ permissionMode: 'skip' });
+  assert.equal(publicDeploymentSettings(await f.store.load()).consoleUrl, consoleUrl);
+  await f.store.updateDeployment({ backend: 'external', token: '' });
+  assert.deepEqual(await f.store.connection(), { endpoint, token: TOKEN });
+  await f.store.updateDeployment({ consoleUrl: '' });
+  assert.equal(Object.hasOwn(publicDeploymentSettings(await f.store.load()), 'consoleUrl'), false);
+  assert.equal((await f.store.connection()).token, TOKEN);
+});
+
+test('settings: console redirects reject unsafe destinations without changing saved settings', async t => {
+  const f = await fixture(t);
+  for (const consoleUrl of ['http://localhost/console', '//host/console', 'javascript:alert(1)',
+    'https://user:password@host/console', 'https://host/console?token=example',
+    'https://host/console#example', 'https://host/a/../console', 'https://host/%2e%2e/console',
+    'https://host/console\n', 'https://host\\console', null, 42]) {
+    assert.throws(() => validateConsoleUrl(consoleUrl), /console URL/);
+  }
+  await assert.rejects(f.store.updateDeployment({ consoleUrl: 'https://host/console?token=example' }), /console URL/);
   assert.equal(f.raw, undefined);
 });

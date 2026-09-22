@@ -8,9 +8,14 @@ const json = value => JSON.stringify(value).replace(/</g, '\\u003c');
 
 export function createDeploymentApi(base, environment = globalThis) {
   return async (route, options = {}) => {
+    // Only present on the standalone console's authenticated pages (see
+    // renderDeploymentPage's `standalone` option); absent here on every PW
+    // page, so this never changes PW's existing request shape.
+    const csrfToken = environment.document?.querySelector?.('meta[name="ds-csrf-token"]')?.content;
     const response = await environment.fetch(`${base}/api/deploy-service${route}`, {
       ...options, credentials: 'same-origin', redirect: 'error', cache: 'no-store',
-      headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}), ...options.headers },
+      headers: { Accept: 'application/json', ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(csrfToken ? { 'X-CSRF-Token': csrfToken } : {}), ...options.headers },
     });
     if (response.redirected || !/^application\/json(?:\s*;|$)/i.test(response.headers.get('content-type') || '')) {
       throw new Error('The workbench did not return deployment JSON. Sign in again; no deployment was retried.');
@@ -83,6 +88,7 @@ function settingsBrowser(base, makeApi) {
     element('ds-endpoint').value = value.endpoint;
     element('ds-token').value = '';
     element('ds-clear-token').checked = false;
+    element('ds-console-url').value = value.consoleUrl || '';
     element('ds-credential-state').textContent = value.hasCredential ? 'A credential is saved. Its value is never returned.' : 'No service credential is saved.';
   }
   api('/backend').then(value => show(value.deployment)).catch(error => say(error.message));
@@ -91,7 +97,8 @@ function settingsBrowser(base, makeApi) {
     const button = element('ds-backend-save'); button.disabled = true;
     try {
       const body = { backend: element('ds-backend').value, endpoint: element('ds-endpoint').value,
-        token: element('ds-token').value, clearToken: element('ds-clear-token').checked };
+        token: element('ds-token').value, clearToken: element('ds-clear-token').checked,
+        consoleUrl: element('ds-console-url').value };
       const value = await api('/backend', { method: 'PUT', body: JSON.stringify(body) });
       show(value.deployment);
       say(value.deployment.backend === 'external' ? 'External execution saved for every project, including new projects. No deployment was started.' : 'Current/local execution saved. The saved endpoint and credential are retained unless explicitly cleared.');
@@ -120,9 +127,13 @@ export function renderDeploymentSettings(base) {
 <label for="ds-token">Service credential (leave blank to keep)</label><input id="ds-token" type="password" maxlength="512" autocomplete="new-password">
 <p id="ds-credential-state" class="muted"></p><label><input id="ds-clear-token" type="checkbox"> Explicitly clear the saved credential (requires local execution)</label>
 <p>The credential is encrypted at rest. Switching to local preserves the endpoint and credential. Testing a draft endpoint sends the entered or saved credential to that endpoint but does not save it.</p>
+<label for="ds-console-url">Standalone console URL (optional)</label><input id="ds-console-url" type="text" maxlength="2048" autocomplete="off" placeholder="https://deploy.example.test/deploy-service">
+<p class="muted">When the deployment engine and console run as their own separately hosted unit, set its public HTTPS address here to send administrators there instead of this legacy page. Leave blank to keep this page (backward compatible). The API endpoint above may still be loopback; no credential is ever placed in this URL.</p>
 <button id="ds-backend-save" class="button" type="submit">Save deployment backend</button>
 <button id="ds-test-connection" class="button secondary" type="button">Test connection</button>
 <a class="button secondary" href="${escape(base)}/deploy-service">Jobs and service controls</a>
+<a class="button secondary" href="${escape(base)}/deploy-service/connection">Deployment connection settings</a>
+<p class="muted">The connection settings link above always stays in Project Workbench, even when jobs and service controls redirect to a separately hosted deployment console.</p>
 <p id="ds-backend-status" role="status" aria-live="polite"></p></form></div></section>`;
 }
 
@@ -152,7 +163,9 @@ export const deploymentUiCss = `
 .ds-page table{width:100%;border-collapse:collapse}.ds-page th,.ds-page td{text-align:left;padding:.55rem;border-bottom:1px solid #475569;vertical-align:top}
 .ds-page code{overflow-wrap:anywhere}.ds-page .ds-table{overflow:auto}.ds-page pre{max-height:28rem;overflow:auto;white-space:pre-wrap;overflow-wrap:anywhere;background:#020617;padding:1rem}
 .ds-page .ds-target{border-top:1px solid #475569;padding:.6rem 0}.ds-page .ds-muted{color:#cbd5e1}
-.ds-page [hidden]{display:none!important}`;
+.ds-page [hidden]{display:none!important}
+.ds-page .ds-brand{font-weight:600}.ds-page form.ds-logout{margin:0}
+.ds-page main.ds-login{max-width:26rem}.ds-page [role="alert"]{color:#fca5a5}`;
 
 export function deploymentPageBrowser(config, makeApi) {
   const api = makeApi(config.base), el = id => document.getElementById(id), terminal = new Set(config.terminalStates);
@@ -166,6 +179,7 @@ export function deploymentPageBrowser(config, makeApi) {
   const stop = () => { clearTimeout(timer); controller?.abort(); };
 
   if (query.get('project')) el('ds-project').value = query.get('project');
+  if (['dev', 'prod'].includes(query.get('target'))) el('ds-target').value = query.get('target');
   function renderJobs(jobs) {
     const keep = new Set(jobs.map(job => job.id));
     for (const [id, value] of rows) if (!keep.has(id)) { value.row.remove(); rows.delete(id); }
@@ -173,8 +187,9 @@ export function deploymentPageBrowser(config, makeApi) {
       let value = rows.get(job.id);
       if (!value) {
         const row = node('tr'), link = node('a'), cells = Array.from({ length: 7 }, () => node('td'));
-        link.href = `${config.base}/deploy-service?job=${encodeURIComponent(job.id)}`;
+        link.href = `${config.pagePath || `${config.base}/deploy-service`}?job=${encodeURIComponent(job.id)}`;
         link.addEventListener('click', event => {
+          if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button > 0) return;
           event.preventDefault(); select(job.id);
           window.history.replaceState(null, '', link.href);
         });
@@ -320,7 +335,31 @@ export function deploymentPageBrowser(config, makeApi) {
   refresh();
 }
 
-export function renderDeploymentPage({ base, admin, projects }) {
+// `standalone` is how the independently hosted console (standalone-web.js)
+// reuses this exact page for its job/log/pause/target/settings surface: it
+// swaps only the navigation (no Dashboard/Deploy/Settings links, which don't
+// exist there) for a sign-out control, and nonces the inline style/script for
+// its strict Content-Security-Policy. Omitted, PW's own rendering is
+// byte-for-byte unchanged from before this option existed.
+//
+// `connectionOnly` serves a different, PW-side need: once the admin
+// /deploy-service route redirects to a configured standalone console (see
+// the optional ds-console-url setting below), operators still need a page
+// that stays inside Project Workbench to edit its own LOCAL/EXTERNAL backend
+// connection (and the console URL that drives that redirect). It renders
+// only the existing connection settings markup/script -- never the host job
+// list, filters or admin service-policy controls -- so `projects`/`admin`/
+// `standalone` are not needed and are ignored in this mode.
+export function renderDeploymentPage({ base, admin, projects, standalone, connectionOnly }) {
+  if (connectionOnly) {
+    return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deployment connection settings - Project Workbench</title><style>${deploymentUiCss}</style></head><body class="ds-page"><main>
+<nav aria-label="Deployment navigation"><a href="${escape(base)}/">Dashboard</a></nav>
+<h1>Deployment connection settings</h1>
+<p>Host job status, live logs and per-target pause/timeout controls live on the deployment console when one is configured. This page only edits which backend -- and which console -- this workbench points to.</p>
+${renderDeploymentSettings(base)}
+</main>${deploymentSettingsScript(base)}</body></html>`;
+  }
   const options = projects.map(project => `<option value="${escape(project.name)}">${escape(project.name)}</option>`).join('');
   const adminPanel = !admin ? '' : `<section><h2>Service controls (admin)</h2>
 <form id="ds-service-settings"><label><input id="ds-paused" type="checkbox"> Pause service acceptance and queued execution</label>
@@ -333,9 +372,15 @@ export function renderDeploymentPage({ base, admin, projects }) {
 <p id="ds-admin-status" role="status" aria-live="polite"></p>
 <h3>Target overrides</h3><p>Targets appear from deployment activity. New projects use service defaults without enrollment or privilege setup.</p>
 <p id="ds-no-targets">No target activity yet.</p><div id="ds-target-policies"></div></section>`;
+  const nonceAttr = standalone?.nonce ? ` nonce="${escape(standalone.nonce)}"` : '';
+  const meta = standalone?.csrfToken ? `<meta name="ds-csrf-token" content="${escape(standalone.csrfToken)}">` : '';
+  const nav = standalone
+    ? `<span class="ds-brand">Deployment console</span><form class="ds-logout" method="post" action="${escape(standalone.logoutPath)}">`
+      + `<input type="hidden" name="csrf" value="${escape(standalone.csrfToken)}"><button type="submit">Log out</button></form>`
+    : `<a href="${escape(base)}/">Dashboard</a><a href="${escape(base)}/deploy">Deploy projects</a>${admin ? `<a href="${escape(base)}/settings#deployment">Deployment settings</a>` : ''}`;
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Deployment service - Project Workbench</title><style>${deploymentUiCss}</style></head><body class="ds-page"><main>
-<nav aria-label="Deployment navigation"><a href="${escape(base)}/">Dashboard</a><a href="${escape(base)}/deploy">Deploy projects</a>${admin ? `<a href="${escape(base)}/settings#deployment">Deployment settings</a>` : ''}</nav>
+${meta}<title>Deployment service - Project Workbench</title><style${nonceAttr}>${deploymentUiCss}</style></head><body class="ds-page"><main>
+<nav aria-label="Deployment navigation">${nav}</nav>
 <h1>Deployment service</h1><p>Host jobs continue independently of the workbench. Reopening this page retrieves retained jobs after a workbench restart. Versions describe the last successful deployment, not a fresh runtime probe.</p>
 <p id="ds-status" role="status" aria-live="polite">Loading deployment service.</p>
 <form id="ds-filters" class="ds-filters"><label for="ds-project">Project<select id="ds-project"><option value="">All authorized projects</option>${options}</select></label>
@@ -346,5 +391,42 @@ export function renderDeploymentPage({ base, admin, projects }) {
 <section id="ds-detail" hidden aria-labelledby="ds-detail-title"><h2 id="ds-detail-title">Job details</h2><p id="ds-job-meta"></p><button id="ds-cancel" type="button" disabled>Cancel active job</button>
 <h3>Operational history</h3><ol id="ds-history"></ol><h3>Live logs</h3><p class="ds-muted">Raw text is bounded, redacted, and memory-only. It may no longer be available after a service restart.</p>
 <label><input id="ds-follow" type="checkbox" checked> Follow new output while at the bottom</label><pre id="ds-live" tabindex="0" aria-label="Deployment live log text" aria-live="off"></pre></section>
-${adminPanel}</main><script>(${deploymentPageBrowser.toString()})(${json({ base, admin, terminalStates: [...TERMINAL_STATES] })}, ${createDeploymentApi.toString()});</script></body></html>`;
+${adminPanel}</main><script${nonceAttr}>(${deploymentPageBrowser.toString()})(${json({ base, admin, pagePath: standalone ? base : `${base}/deploy-service`, terminalStates: [...TERMINAL_STATES] })}, ${createDeploymentApi.toString()});</script></body></html>`;
+}
+
+// The standalone console's own sign-in page (standalone-web.js). It is a
+// plain HTML form post (no fetch/JS involved), so it keeps working even if
+// script is blocked, and needs no CSRF token of its own: no session exists
+// yet to forge. `error`, when present, is operator-facing text describing
+// why a previous attempt did not succeed (never which part of a credential
+// was wrong, since there is only one field).
+export function renderStandaloneLogin({ basePath, error = '', nonce, query = '' }) {
+  const nonceAttr = nonce ? ` nonce="${escape(nonce)}"` : '';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Deployment console sign-in</title><style${nonceAttr}>${deploymentUiCss}</style></head><body class="ds-page"><main class="ds-login">
+<h1>Deployment console</h1>
+${error ? `<p role="alert">${escape(error)}</p>` : ''}
+<section><form method="post" action="${escape(`${basePath}/login${query ? `?${query}` : ''}`)}">
+<label for="ds-login-token">Administrator token</label>
+<input id="ds-login-token" name="token" type="password" autocomplete="current-password" required maxlength="512" autofocus>
+<button type="submit">Sign in</button>
+</form><p class="ds-muted">This is a separate administrative console. Project Workbench does not serve it, authenticate it, or ever receive this token.</p></section>
+</main></body></html>`;
+}
+
+// A minimal, session-preserving notice page for the standalone console
+// (standalone-web.js). Used when an authenticated action is refused for an
+// Origin/CSRF reason (for example, a forged cross-site logout submission),
+// so the response never looks like a success-shaped redirect: the visitor is
+// told plainly that the action was NOT completed and that they are still
+// signed in, with a safe same-origin link back and no token/session id ever
+// disclosed.
+export function renderStandaloneNotice({ basePath, title, message, nonce }) {
+  const nonceAttr = nonce ? ` nonce="${escape(nonce)}"` : '';
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>${escape(title)}</title><style${nonceAttr}>${deploymentUiCss}</style></head><body class="ds-page"><main class="ds-login">
+<h1>${escape(title)}</h1>
+<p role="alert">${escape(message)}</p>
+<p><a href="${escape(basePath)}/">Return to the deployment console</a></p>
+</main></body></html>`;
 }

@@ -157,7 +157,50 @@ test('manifest execution: malformed metadata blocks POST and saved-script fallba
   assert.equal(harness.executions.length, 0);
 });
 
-test('manifest execution: a new scriptless Podman project reaches the real service API with pinned source and selected non-secret inputs', async t => {
+test('manifest execution: managed backend selection is admin-only metadata that preserves host config and rejects recipe edits', async t => {
+  const fixture = await workspace(t);
+  const original = { script: 'legacy saved script', versionCmd: 'legacy version command', runAsRoot: true, reauth: true, opaqueHostSetting: 'retain' };
+  const harness = deployRouteHarness(fixture.root, { config: { demo: { dev: structuredClone(original) } } });
+  const manifest = await resolveDeployManifest(fixture.root, 'dev');
+  const adminCard = await harness.call('GET', '/api/deploy/:project/card', { params: { project: 'demo' } });
+  assert.match(adminCard.body.html, /save-backend/);
+  assert.match(adminCard.body.html, /Execution backend is an operator setting/);
+  assert.match(adminCard.body.html, /Repository-managed deploy script \(bash, read-only\)/);
+  const developerCard = await harness.call('GET', '/api/deploy/:project/card', {
+    params: { project: 'demo' }, caller: { username: 'developer', role: 'developer', projects: ['demo'] },
+  });
+  assert.doesNotMatch(developerCard.body.html, /save-backend/);
+
+  const selected = await harness.call('POST', '/api/deploy/config', {
+    body: { project: 'demo', target: 'dev', backend: 'external' },
+  });
+  assert.equal(selected.statusCode, 200);
+  assert.deepEqual(harness.config.demo.dev, { ...original, backend: 'external' });
+  assert.equal((await resolveDeployManifest(fixture.root, 'dev')).revision, manifest.revision);
+
+  for (const body of [
+    { project: 'demo', target: 'dev', backend: 'local', script: 'attempted override' },
+    { project: 'demo', target: 'dev', backend: 'local', versionCmd: 'attempted override' },
+    { project: 'demo', target: 'dev', backend: 'local', execution: { adapter: 'script' } },
+    { project: 'demo', target: 'dev', backend: 'local', unexpected: true },
+  ]) {
+    const rejected = await harness.call('POST', '/api/deploy/config', { body });
+    assert.equal(rejected.statusCode, 400, JSON.stringify(rejected.body));
+    assert.deepEqual(harness.config.demo.dev, { ...original, backend: 'external' });
+  }
+  const legacySave = await harness.call('POST', '/api/deploy/config', {
+    body: { project: 'demo', target: 'dev', script: 'attempted override' },
+  });
+  assert.equal(legacySave.statusCode, 409);
+  const unauthorized = await harness.call('POST', '/api/deploy/config', {
+    caller: { username: 'developer', role: 'developer', projects: ['demo'] },
+    body: { project: 'demo', target: 'dev', backend: 'local' },
+  });
+  assert.equal(unauthorized.statusCode, 403);
+  assert.deepEqual(harness.config.demo.dev, { ...original, backend: 'external' });
+});
+
+test('manifest execution: an admin-selected external managed Podman slot reaches the real service API while the global backend remains local', async t => {
   const resource = resourceName('RecipeApp', 'dev');
   const execution = { ...podmanRecipe(), image: resource, service: resource };
   const fixture = await workspace(t, {
@@ -177,11 +220,19 @@ test('manifest execution: a new scriptless Podman project reaches the real servi
     await new Promise(resolve => { server.close(resolve); server.closeAllConnections(); });
   });
   const service = createDeploymentService({
-    settingsStore: { connection: async () => ({ endpoint: `http://127.0.0.1:${server.address().port}`, token }) },
+    settingsStore: {
+      load: async () => ({ deployment: { backend: 'local' } }),
+      connection: async draft => draft === undefined ? null : ({ endpoint: `http://127.0.0.1:${server.address().port}`, token }),
+    },
     snapshot: async root => { assert.equal(root, fixture.root); return snapshotFor(fixture); },
   });
   const harness = deployRouteHarness(fixture.root, { project: { name: 'RecipeApp' }, config: {}, deploymentService: service });
   const manifest = await resolveDeployManifest(fixture.root, 'dev');
+  const saved = await harness.call('POST', '/api/deploy/config', {
+    body: { project: 'RecipeApp', target: 'dev', backend: 'external' },
+  });
+  assert.equal(saved.statusCode, 200);
+  assert.deepEqual(harness.config.RecipeApp.dev, { backend: 'external' });
   const result = await harness.call('POST', '/api/deploy/:project/:target', {
     params: { project: 'RecipeApp', target: 'dev' }, body: { inputs: { release: '1.2.3' }, manifestRevision: manifest.revision },
   });
@@ -195,5 +246,5 @@ test('manifest execution: a new scriptless Podman project reaches the real servi
   assert.equal(executed[0].revision, 'a'.repeat(40));
   assert.ok(!JSON.stringify(executed[0]).includes(token));
   assert.equal(harness.executions.length, 0);
-  assert.equal((await (await service.requiredClient()).version('RecipeApp', 'dev')).version, '1.2.3');
+  assert.equal((await (await service.requiredClient({ forceExternal:true })).version('RecipeApp', 'dev')).version, '1.2.3');
 });

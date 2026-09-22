@@ -1,0 +1,12 @@
+{
+  "apiVersion": 1,
+  "instanceId": "64b475cf-eaf9-4783-8b0b-5c2418434c21",
+  "user": "builder",
+  "controllerUnit": "deployment-engine.service",
+  "stateDir": "/var/lib/deployment-builder",
+  "runtimeDir": "/run/user/1001/pw-builder",
+  "imageStore": "/var/lib/deployment-sdk-cache/graph",
+  "maxLifetimeSeconds": 3600,
+  "maxMemoryMiB": 8192,
+  "maxPids": 1024
+}
