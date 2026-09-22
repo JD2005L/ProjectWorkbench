@@ -333,12 +333,18 @@ test('boot repair: inventories first, and NEVER revokes on a failed lookup', () 
   // every path that cannot positively resolve a token must fall through to
   // `blocked` and leave the artifact alone. Turning "cannot read the token" into
   // "the token is gone" would be a worse outcome than the bug.
-  for (const guard of ['no longer in the registry', 'no primaryUser', 'does not resolve to a user record', 'left untouched rather than revoked']) {
+  for (const guard of ['no longer in the registry', 'left untouched rather than revoked']) {
     assert.ok(body.includes(guard), `missing the guard that reports instead of revoking: ${guard}`);
   }
+  // Resolving WHICH token is authoritative moved into app/project-push-token.js when a
+  // project gained its own push credential, so the per-case reasons ("does not resolve
+  // to a user record", "no stored GitHub token", a decrypt failure) are pinned there and
+  // in test/project-push-credential.test.mjs. What has to hold HERE is that this repair
+  // asks that resolver and treats an unresolved answer as report-and-leave-alone.
+  assert.match(body, /resolveProjectGitToken\(/, 'the repair must resolve through the shared resolver');
   const syncAt = body.indexOf('syncProjectCredentials(project)');
   assert.notEqual(syncAt, -1, 'the repair no longer rewrites from the authoritative state');
-  assert.ok(body.indexOf('if(!token)') < syncAt, 'the empty-token guard must precede the rewrite');
+  assert.ok(body.indexOf('if(!resolved.token)') < syncAt, 'the empty-token guard must precede the rewrite');
 
   // Only ever root->owner, and only when a drop is actually configured.
   assert.match(body, /currentUid !== 0/, 'the repair must be a no-op unless this process is root');

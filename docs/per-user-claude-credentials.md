@@ -545,6 +545,51 @@ to the helper on stdin.
 
 `CLAUDE_CONFIG_DIR` is not secret and is still passed as a normal env token.
 
+## Two jobs, two credentials: a project's own push credential
+
+A person's GitHub token is their **AI identity**: it authenticates Copilot in their
+terminals, and it is the default credential pinned into the projects they own. For a
+long time it was the only credential, because one GitHub account could do both jobs.
+
+An **Enterprise Managed User** cannot. An EMU account (`someone_enterprise`) exists
+only inside its enterprise: the public API answers `404` for it, GitHub's collaborator
+search cannot find it, and it cannot be added to a repository outside that enterprise.
+That is the data-isolation guarantee EMU is sold on, not a setting anybody can change.
+So when the Copilot seat lives on an enterprise account and a project's remote does
+not, **no single token can serve both roles**.
+
+This was discovered the hard way on 2026-09-21. Authorising a person through
+`gh auth login` replaced their stored token with an enterprise OAuth token and, because
+the same field is the push credential, silently re-pinned it into every project they
+own. Pushes to a remote that account cannot reach then failed with a 403 naming an
+account nobody had chosen.
+
+So the two roles are separate fields:
+
+| | set where | used for |
+|---|---|---|
+| the person's token | Users page (*connect*), or their own `/me` page | Copilot, `GH_TOKEN` in their panes, and the default git credential for projects they own |
+| the project's **push credential** | Manage projects → General → *Push credential* | that project's git remote only |
+
+The project's credential **wins** for git and is used for nothing else — it never
+authenticates Copilot and never enters a pane's environment. It is stored encrypted in
+the registry, never returned to a browser (`/api/config` reports only `hasPushToken`
+and `pushTokenKind`), and never written to the audit log.
+
+Three rules worth knowing:
+
+* **A blank field means keep.** The form never receives the stored secret, so blank
+  cannot mean "remove it" — clearing is a separate, explicit checkbox.
+* **An unreadable override is a fault, not a fallback.** If the stored credential
+  cannot be decrypted, the sync refuses rather than quietly pinning the owner's token:
+  falling back would authenticate as exactly the account the override exists to avoid.
+* **The clone uses it too.** Otherwise a project could be created from a remote it
+  then cannot push to, which is the failure the field exists to end.
+
+Resolution lives in `app/project-push-token.js` (`resolveProjectGitToken`), shared by
+`syncProjectCredentials` and the boot credential repair so the two cannot disagree
+about which token is authoritative.
+
 ## Removing stale credentials
 
 `DELETE /api/users/:username` revokes, in order, every project reference,

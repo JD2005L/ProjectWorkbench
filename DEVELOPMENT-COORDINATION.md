@@ -3523,3 +3523,46 @@ quiet link ("Re-authorise with GitHub") rather than the page's main call to acti
 Pinned in `test/per-user-cli-signin.test.mjs`: the test splits `tokenCellHtml` at its two
 branches and asserts each control appears in exactly one of them, so re-adding a
 context-free button fails rather than reviewing as harmless.
+
+## GOA — 2026-09-22 — a project can carry its own push credential (EMU forces it)
+
+Yesterday's `gh auth login` route had a consequence nobody predicted, and it is worth
+recording as a design lesson rather than a bug fix.
+
+PW stored ONE GitHub token per person and used it for two jobs: the credential pinned
+into every project they own, and what authenticates Copilot in their terminals. That
+holds only while one GitHub account can do both. When James authorised himself through
+*connect*, his token changed from a personal-account PAT to an enterprise OAuth token,
+the resync re-pinned it into all his projects, and pushes to JD2005L/ProjectWorkbench
+began failing with `Permission ... denied to james-levac_goa`.
+
+The obvious fix — grant that account write access — is impossible. `james-levac_goa` is
+an **Enterprise Managed User**: it exists only inside its enterprise, the public API
+answers 404 for it while it answers 200 for `JD2005L`, the collaborator search cannot
+find it, and EMU accounts cannot be collaborators outside their enterprise at all. That
+is the isolation guarantee EMU is sold on. One account genuinely cannot do both jobs
+when the Copilot seat is enterprise and the remote is not.
+
+So the two roles are now separate fields. A person's token remains their AI identity
+and the default push credential. A project may carry its OWN push credential (Manage
+projects → General), which wins for git and is used for nothing else — never Copilot,
+never a pane environment. `app/project-push-token.js` resolves it, shared by
+`syncProjectCredentials` and the boot credential repair so those two cannot disagree
+about which token is authoritative.
+
+Three decisions in it that are not obvious:
+
+* **A broken override refuses; it does not fall back.** An override exists precisely
+  because the owner's account authenticates as the wrong identity for that remote, so
+  substituting the owner's token would be the original bug in a different hat.
+* **Blank means keep, clearing is explicit.** The form never receives the stored
+  secret, so a blank field cannot be read as "remove it".
+* **The clone uses the same credential as the pushes**, or a project can be created
+  from a remote it then cannot push to.
+
+Refactoring note for reviewers: `repairGitCredentialOwnership` used to inline its own
+"is there an authoritative token" checks, and `test/git-credential-remediation.test.mjs`
+pinned those literal strings. The safety property is unchanged — unresolved means
+report-and-leave-alone, never revoke — but it is now expressed through the shared
+resolver, so that test asserts the property in its new form and the per-case reasons are
+pinned in `test/project-push-credential.test.mjs`.

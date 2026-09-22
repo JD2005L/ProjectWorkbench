@@ -21,6 +21,7 @@ import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credential
 import { ghLoginCommand, GH_DEFAULT_SCOPES } from './gh-cli.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
+import { resolveProjectGitToken, PUSH_TOKEN_SOURCES } from './project-push-token.js';
 import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv, selectExpiredBoxFiles } from './workspace-file.js';
 import { repairWorkspaceBoxes } from './workspace-box-owner.js';
 import { loadUsersFile } from './users-file.js';
@@ -429,8 +430,23 @@ async function syncProjectCredentials(project){
   // workspace path of a project, checked inside the helper against this list.
   const registeredPaths = projects.map(p => p?.path).filter(Boolean);
   const users = await loadUsers();
-  const owner = project.primaryUser ? users.find(u => u.username === project.primaryUser) : null;
-  const token = owner?.ghToken ? (decrypt(owner.ghToken) || '') : '';
+  // The project's OWN push credential is read from disk by registered path, because it
+  // is a property of the project rather than of whoever called: a caller holding a
+  // stale snapshot must not be able to re-pin a credential that has since been
+  // replaced. `primaryUser` deliberately still comes from the caller's object — the
+  // user-deletion path revokes by passing a synthetic project with it cleared.
+  const onDisk = projects.find(x => x?.path && x.path === project.path) || null;
+  const resolved = resolveProjectGitToken({
+   project: { primaryUser: project.primaryUser, pushToken: onDisk?.pushToken ?? project.pushToken },
+   users, decrypt,
+  });
+  const token = resolved.token;
+  // An override that exists but cannot be read is a fault, not a reason to fall back to
+  // the owner's token — that would authenticate as exactly the account the override
+  // exists to avoid. Refuse rather than revoke or substitute.
+  if(!token && resolved.source === PUSH_TOKEN_SOURCES.override){
+   throw new Error(`[git-credential] project "${project.name || project.path}": ${resolved.detail}. Refusing to fall back to the git identity's token — replace or clear the project's push credential.`);
+  }
   const terminal = await terminalOwner();
   const plan = credentialExecutionPlan({ owner: terminal, currentUid: process.getuid?.() ?? null });
   // Resolved from passwd, INDEPENDENTLY of whoever this process happens to be:
@@ -786,12 +802,12 @@ async function repairGitCredentialOwnership(){
   const project = byPath.get(row.path);
   const label = row.project || project?.name || row.path;
   if(!project){ blocked.push({ name: label, detail: 'no longer in the registry' }); continue; }
-  if(!project.primaryUser){ blocked.push({ name: label, detail: 'no primaryUser, so no authoritative token to rewrite from' }); continue; }
-  const record = users.find(u => u.username === project.primaryUser);
-  if(!record){ blocked.push({ name: label, detail: `primaryUser "${project.primaryUser}" does not resolve to a user record` }); continue; }
-  let token = '';
-  try { token = record.ghToken ? (decrypt(record.ghToken) || '') : ''; } catch { token = ''; }
-  if(!token){ blocked.push({ name: label, detail: `no usable stored credential for "${project.primaryUser}" — left untouched rather than revoked` }); continue; }
+  // One resolver for "what SHOULD be pinned here", shared with syncProjectCredentials,
+  // so a project carrying its own push credential is repairable even with no git
+  // identity chosen — and so the two can never disagree about which token is
+  // authoritative. Anything unresolved is still reported and left exactly as it is.
+  const resolved = resolveProjectGitToken({ project, users, decrypt });
+  if(!resolved.token){ blocked.push({ name: label, detail: `${resolved.detail} — left untouched rather than revoked` }); continue; }
   try {
    await syncProjectCredentials(project);
    repaired.push({ name: label, detail: `rewritten as ${terminal.user || terminal.uid}` });
@@ -3579,7 +3595,7 @@ const manageModalHtml = `<style>
 @media(max-width:760px){.pmBody{grid-template-columns:1fr;grid-template-rows:auto minmax(0,1fr)}.pmListWrap{border-right:0;border-bottom:1px solid var(--line);max-height:200px}.modal-box.pm{height:94vh}}
 </style>
 <div id="pmBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-label="Manage projects"><div class="modal-box pm"><header><h2>Projects<span class="pmHint">drag to reorder — the rail follows this order</span></h2><button class="modal-close" id="pmClose" aria-label="Close" type="button">×</button></header><div class="body"><div class="pmBody"><div class="pmListWrap"><button class="pmAdd" id="pmAddBtn" type="button">+ New project</button><div class="pmItems" id="pmItems"></div></div><div class="pmDetail" id="pmDetail"><div class="pmTabs" id="pmTabs" role="tablist"><button type="button" data-t="general" class="active">General</button><button type="button" data-t="preview">Preview</button><button type="button" data-t="tabs">Terminal tabs</button><button type="button" data-t="danger" class="dangerTab">Danger</button></div><div class="pmPanes">
-<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmField"><span>Dev site URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmDevUrl" type="url" placeholder="http://host:port/ — shown in the project name menu" autocomplete="off"></div><div class="pmField"><span>Prod site URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmProdUrl" type="url" placeholder="https://host/ — shown in the project name menu" autocomplete="off"></div><div class="pmField"><span>Categories <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmCategories" type="text" list="pmCatList" placeholder="Client Sites, Internal — comma-separated tags" autocomplete="off"><datalist id="pmCatList"></datalist><span class="pmHelp">Tag this project with one or more categories. The dropdown at the top of the project rail can then show or hide projects by category.</span></div><div class="pmField"><span>Git identity <em style="text-transform:none;font-style:normal;font-weight:400">(for private repos)</em></span><select id="pmPrimaryUser"></select><span class="pmHelp">Choose which user's GitHub token authenticates this workspace's git. Blank leaves git unauthenticated.</span></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><label class="pmField"><span>Admin only</span><span class="pmHelp"><input type="checkbox" id="pmAdminOnly"> Admin only — hidden from non-admins</span></label><label class="pmField"><span>Sign-in landing</span><span class="pmHelp"><input type="checkbox" id="pmDefaultProject"> Default project at sign-in — used for a user's first login, or when the project they last opened is gone. Everyone else resumes whatever they had open last. Only one project can hold this.</span></label><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
+<section class="pmPane active" data-p="general"><div class="pmField"><span>Name</span><input id="pmName" type="text" pattern="[A-Za-z0-9._-]+" maxlength="120" autocomplete="off"><span class="pmHelp">Letters, digits, dot, dash, underscore. Renaming moves the workspace folder.</span></div><div class="pmField"><span>Repo URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmRepo" type="text" placeholder="https://github.com/owner/Repo.git — blank = local-only workspace" autocomplete="off"></div><div class="pmField"><span>Dev site URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmDevUrl" type="url" placeholder="http://host:port/ — shown in the project name menu" autocomplete="off"></div><div class="pmField"><span>Prod site URL <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmProdUrl" type="url" placeholder="https://host/ — shown in the project name menu" autocomplete="off"></div><div class="pmField"><span>Categories <em style="text-transform:none;font-style:normal;font-weight:400">(optional)</em></span><input id="pmCategories" type="text" list="pmCatList" placeholder="Client Sites, Internal — comma-separated tags" autocomplete="off"><datalist id="pmCatList"></datalist><span class="pmHelp">Tag this project with one or more categories. The dropdown at the top of the project rail can then show or hide projects by category.</span></div><div class="pmField"><span>Git identity <em style="text-transform:none;font-style:normal;font-weight:400">(for private repos)</em></span><select id="pmPrimaryUser"></select><span class="pmHelp">Choose which user's GitHub token authenticates this workspace's git, and whose AI account its terminals run on. Blank leaves git unauthenticated.</span></div><div class="pmField"><span>Push credential <em style="text-transform:none;font-style:normal;font-weight:400">(override, optional)</em></span><input id="pmPushToken" type="password" autocomplete="new-password" placeholder="Paste a token to use for this repo instead of the git identity's"><span class="pmHelp" id="pmPushState"></span><span class="pmHelp">Only needed when the git identity's GitHub account cannot reach this remote &mdash; most often because it is an enterprise-managed account and the repo lives outside that enterprise, which no permission grant can bridge. Stored encrypted, used for git only: it never authenticates Copilot and never enters a terminal's environment. Leave blank to keep whatever is stored.</span><span class="pmHelp"><input type="checkbox" id="pmPushClear"> Remove the stored push credential &mdash; git falls back to the git identity's token</span></div><div class="pmRow2"><div class="pmField"><span>Terminal port</span><input id="pmPort" type="number" min="1024" max="65535"></div><div class="pmField"><span>Workspace</span><span class="pmHelp" id="pmPath" style="padding-top:9px;word-break:break-all"></span></div></div><label class="pmField"><span>Admin only</span><span class="pmHelp"><input type="checkbox" id="pmAdminOnly"> Admin only — hidden from non-admins</span></label><label class="pmField"><span>Sign-in landing</span><span class="pmHelp"><input type="checkbox" id="pmDefaultProject"> Default project at sign-in — used for a user's first login, or when the project they last opened is gone. Everyone else resumes whatever they had open last. Only one project can hold this.</span></label><div class="pmCallout" id="pmRestartNote">Saving restarts this project's terminal service — running processes in its tabs are killed.</div></section>
 <section class="pmPane" data-p="preview"><div class="pmField"><span>Preview command</span><textarea id="pmPrevCmd" rows="3" placeholder="empty = preview disabled"></textarea><span class="pmHelp">Runs inside the workspace. Use <code>\${PORT}</code> and <code>\${BASEPATH}</code>; the app must bind <code>127.0.0.1:\${PORT}</code>.</span></div><details class="pmExamples"><summary>Examples — click one to use it</summary><div><code>npm run dev -- --host 127.0.0.1 --port \${PORT}</code><code>dotnet watch run --project Foo/Foo.csproj --urls http://127.0.0.1:\${PORT} --non-interactive</code><code>hugo server --bind 127.0.0.1 --port \${PORT} --baseURL http://127.0.0.1:\${PORT}\${BASEPATH}/ --appendPort=false</code><code>python3 -m http.server \${PORT} --bind 127.0.0.1</code></div></details><div class="pmRow2"><div class="pmField"><span>Preview port</span><input id="pmPrevPort" type="number" min="1024" max="65535" placeholder="auto"></div><div></div></div><div class="pmField"><span>Environment</span><textarea id="pmPrevEnv" rows="4" placeholder="# one KEY=VALUE per line&#10;# ASPNETCORE_ENVIRONMENT=Development"></textarea><span class="pmHelp">Exported before the command runs. <code>PORT</code> and <code>BASEPATH</code> are reserved.</span></div></section>
 <section class="pmPane" data-p="tabs"><div class="pmField"><span>Tab templates</span><span class="pmHelp">Named tabs offered in the terminal's <b>+</b> menu. <b>auto-start</b> spawns the tab when the project's tmux session is first created. Empty command = plain bash.</span></div><div class="pmTabRows" id="pmTabRows"></div><button class="pmAddTab" id="pmAddTabBtn" type="button">+ Add tab template</button></section>
 <section class="pmPane" data-p="danger"><div class="pmCallout red"><b>Delete project</b> — stops its terminal service, kills its tmux session, removes it from the registry <b>and deletes the workspace folder</b> shown in General. Repos without a remote copy are gone for good.</div><div class="pmDelArm"><input id="pmDelName" type="text" placeholder="type the project name to arm" autocomplete="off"><button class="pmDelBtn" id="pmDelBtn" type="button" disabled>Delete project</button></div></section>
@@ -3588,7 +3604,7 @@ const manageModalHtml = `<style>
 const manageModalScript = `<script>(function(){
 const backdrop=document.getElementById('pmBackdrop');if(!backdrop)return;
 const items=document.getElementById('pmItems'),addBtn=document.getElementById('pmAddBtn'),tabsBar=document.getElementById('pmTabs'),panes=[...document.querySelectorAll('.pmPane')],saveBtn=document.getElementById('pmSave'),statusEl=document.getElementById('pmStatus'),closeBtn=document.getElementById('pmClose');
-const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fDevUrl=document.getElementById('pmDevUrl'),fProdUrl=document.getElementById('pmProdUrl'),fCategories=document.getElementById('pmCategories'),fCatList=document.getElementById('pmCatList'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fAdminOnly=document.getElementById('pmAdminOnly'),fDefaultProject=document.getElementById('pmDefaultProject'),fPrimaryUser=document.getElementById('pmPrimaryUser'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
+const fName=document.getElementById('pmName'),fRepo=document.getElementById('pmRepo'),fDevUrl=document.getElementById('pmDevUrl'),fProdUrl=document.getElementById('pmProdUrl'),fCategories=document.getElementById('pmCategories'),fCatList=document.getElementById('pmCatList'),fPort=document.getElementById('pmPort'),fPath=document.getElementById('pmPath'),fAdminOnly=document.getElementById('pmAdminOnly'),fDefaultProject=document.getElementById('pmDefaultProject'),fPrimaryUser=document.getElementById('pmPrimaryUser'),fPushToken=document.getElementById('pmPushToken'),fPushClear=document.getElementById('pmPushClear'),fPushState=document.getElementById('pmPushState'),fPrevCmd=document.getElementById('pmPrevCmd'),fPrevPort=document.getElementById('pmPrevPort'),fPrevEnv=document.getElementById('pmPrevEnv'),tabRows=document.getElementById('pmTabRows'),addTabBtn=document.getElementById('pmAddTabBtn'),delName=document.getElementById('pmDelName'),delBtn=document.getElementById('pmDelBtn'),restartNote=document.getElementById('pmRestartNote');
 const CUR=(typeof project!=='undefined')?project:null;
 let cfg=null,sel=null,mode='edit',formDirty=false,reloadOnClose=false,navTarget=null,busy=false,curNow=CUR;
 function esc(s){return String(s==null?'':s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -3596,7 +3612,8 @@ function hue(name){let h=5381;const s=String(name);for(let i=0;i<s.length;i++)h=
 function mono(name){const p=String(name).replace(/[_\\-.]+/g,' ').replace(/([a-z0-9])([A-Z])/g,'$1 $2').split(/\\s+/).filter(Boolean);if(p.length>=2)return(p[0][0]+p[1][0]).toUpperCase();return(p[0]||'?').slice(0,2).toUpperCase()}
 function setStatus(t,err){statusEl.textContent=t||'';statusEl.classList.toggle('err',!!err)}
 function markDirty(){formDirty=true}
-[fName,fRepo,fDevUrl,fProdUrl,fCategories,fPort,fPrimaryUser,fAdminOnly,fPrevCmd,fPrevPort,fPrevEnv].forEach(el=>el.addEventListener('input',markDirty));
+[fName,fRepo,fDevUrl,fProdUrl,fCategories,fPort,fPrimaryUser,fAdminOnly,fPrevCmd,fPrevPort,fPrevEnv,fPushToken].forEach(el=>el.addEventListener('input',markDirty));
+fPushClear.addEventListener('change',markDirty);
 fAdminOnly.addEventListener('change',markDirty);fDefaultProject.addEventListener('change',markDirty);fPrimaryUser.addEventListener('change',markDirty);
 function activatePane(id){tabsBar.querySelectorAll('button').forEach(b=>b.classList.toggle('active',b.dataset.t===id));panes.forEach(p=>p.classList.toggle('active',p.dataset.p===id))}
 tabsBar.addEventListener('click',e=>{const b=e.target.closest('button[data-t]');if(b&&mode==='edit')activatePane(b.dataset.t)});
@@ -3608,7 +3625,11 @@ addTabBtn.onclick=()=>{tabRows.insertAdjacentHTML('beforeend',tabRowHtml({autoSt
 document.querySelectorAll('.pmExamples code').forEach(c=>c.addEventListener('click',()=>{fPrevCmd.value=c.textContent;markDirty()}));
 function envText(env){return Object.entries(env||{}).map(([k,v])=>k+'='+v).join('\\n')}
 function primaryOptions(selected){return '<option value="">— none —</option>'+((cfg&&cfg.users)||[]).map(u=>'<option value="'+esc(u.username)+'"'+(selected===u.username?' selected':'')+'>'+esc(u.username)+(u.hasToken?' ✓':'')+'</option>').join('')}
-function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fDevUrl.value=p?(p.devUrl||''):'';fProdUrl.value=p?(p.prodUrl||''):'';fCategories.value=p&&Array.isArray(p.categories)?p.categories.join(', '):'';fCatList.innerHTML=[...new Set(((cfg&&cfg.projects)||[]).flatMap(x=>x.categories||[]))].sort((a,b)=>a.localeCompare(b)).map(c=>'<option value="'+esc(c)+'">').join('');fPrimaryUser.innerHTML=primaryOptions(p?p.primaryUser:'');fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fAdminOnly.checked=!!(p&&p.adminOnly);fDefaultProject.checked=!!(p&&cfg&&cfg.defaultProject===p.name);fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
+function fillForm(p){fName.value=p?p.name:'';fRepo.value=p?(p.repo||''):'';fDevUrl.value=p?(p.devUrl||''):'';fProdUrl.value=p?(p.prodUrl||''):'';fCategories.value=p&&Array.isArray(p.categories)?p.categories.join(', '):'';fCatList.innerHTML=[...new Set(((cfg&&cfg.projects)||[]).flatMap(x=>x.categories||[]))].sort((a,b)=>a.localeCompare(b)).map(c=>'<option value="'+esc(c)+'">').join('');fPrimaryUser.innerHTML=primaryOptions(p?p.primaryUser:'');fPushToken.value='';fPushClear.checked=false;fPushClear.disabled=!(p&&p.hasPushToken);
+/* The stored token is never sent to the browser, so the form reports its TYPE and
+   leaves the input blank. A classic PAT is called out because it pushes perfectly well
+   and is the one type Copilot refuses -- harmless here, confusing anywhere else. */
+fPushState.textContent=(p&&p.hasPushToken)?('Stored ('+p.pushTokenKind+') -- this repo uses it instead of whatever the git identity holds.'):'None stored -- this repo uses whatever the git identity holds.';fPort.value=p?p.port:'';fPort.placeholder=p?'':(cfg.suggestedPort||'auto');fPath.textContent=p?p.path:'(created under /opt/project-workbench/workspaces/<Name>)';fAdminOnly.checked=!!(p&&p.adminOnly);fDefaultProject.checked=!!(p&&cfg&&cfg.defaultProject===p.name);fPrevCmd.value=p&&p.preview?p.preview.cmd:'';fPrevPort.value=p&&p.preview&&p.preview.port?p.preview.port:'';fPrevPort.placeholder=cfg.suggestedPreviewPort||'auto';fPrevEnv.value=p&&p.preview?envText(p.preview.env):'';tabRows.innerHTML=(p&&p.tabs||[]).map(tabRowHtml).join('');delName.value='';delBtn.disabled=true;formDirty=false}
 function select(name){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='edit';sel=name;const p=cfg.projects.find(x=>x.name===name);fillForm(p);restartNote.textContent=(name===CUR?'You are looking at this project\\u2019s terminal right now — saving restarts it and kills this very session\\u2019s processes.':'Saving restarts this project\\u2019s terminal service — running processes in its tabs are killed.');tabsBar.style.display='';saveBtn.textContent='Save changes';activatePane('general');renderList();setStatus('')}
 function startAdd(){if(busy)return;if(formDirty&&!confirm('Discard unsaved changes?'))return;mode='add';sel=null;fillForm(null);tabsBar.style.display='none';activatePane('general');saveBtn.textContent='Create project';renderList();setStatus('Preview, tab templates and more are configurable after the project exists.');setTimeout(()=>fName.focus(),40)}
 addBtn.onclick=startAdd;
@@ -3617,8 +3638,8 @@ async function api(url,params){const r=await fetch(url,{method:'POST',headers:{'
 async function refreshCfg(){const r=await fetch('${BASE}/api/projects/config',{cache:'no-store'});cfg=await r.json();if(!cfg.ok)throw new Error(cfg.error||'config load failed')}
 function collectTabs(){const arr=[];tabRows.querySelectorAll('.pmTabRow').forEach(row=>{const n=row.querySelector('.tt-name').value.trim();if(!n)return;arr.push({name:n,cmd:row.querySelector('.tt-cmd').value,autoStart:row.querySelector('.tt-auto').checked})});return arr}
 saveBtn.onclick=async()=>{if(busy)return;busy=true;saveBtn.disabled=true;try{
-if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),devUrl:fDevUrl.value.trim(),prodUrl:fProdUrl.value.trim(),categories:fCategories.value,port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':'',defaultProject:fDefaultProject.checked?'yes':''});await api('${BASE}/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
-else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),devUrl:fDevUrl.value.trim(),prodUrl:fProdUrl.value.trim(),categories:fCategories.value,port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':'',defaultProject:fDefaultProject.checked?'yes':'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs())});await api('${BASE}/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'${BASE}/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
+if(mode==='add'){const name=fName.value.trim();setStatus('Creating'+(fRepo.value.trim()?' — cloning can take a minute…':'…'));const params=new URLSearchParams({name,repo:fRepo.value.trim(),devUrl:fDevUrl.value.trim(),prodUrl:fProdUrl.value.trim(),categories:fCategories.value,port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':'',defaultProject:fDefaultProject.checked?'yes':'',pushToken:fPushToken.value.trim()});await api('${BASE}/manage/add',params);reloadOnClose=true;await refreshCfg();busy=false;sel=name;mode='edit';select(name);setStatus('Created '+name+' — configure Preview and Terminal tabs, or just close to reload.')}
+else{const oldName=sel;const newName=fName.value.trim();setStatus('Saving — restarting terminal service…');const params=new URLSearchParams({name:newName,repo:fRepo.value.trim(),devUrl:fDevUrl.value.trim(),prodUrl:fProdUrl.value.trim(),categories:fCategories.value,port:fPort.value||'',primaryUser:fPrimaryUser.value||'',adminOnly:fAdminOnly.checked?'yes':'',defaultProject:fDefaultProject.checked?'yes':'',previewCmd:fPrevCmd.value,previewPort:fPrevPort.value||'',previewEnv:fPrevEnv.value,tabs:JSON.stringify(collectTabs()),pushToken:fPushToken.value.trim(),pushTokenClear:fPushClear.checked?'yes':''});await api('${BASE}/manage/update/'+encodeURIComponent(oldName),params);reloadOnClose=true;if(oldName===curNow){curNow=newName;navTarget=(curNow===CUR)?null:'${BASE}/term/'+encodeURIComponent(curNow)+'/'}await refreshCfg();busy=false;sel=newName;formDirty=false;select(newName);setStatus('Saved '+newName+' — terminal restarted.')}
 }catch(e){setStatus(e.message||String(e),true)}finally{busy=false;saveBtn.disabled=false}};
 delBtn.onclick=async()=>{if(busy||delBtn.disabled)return;if(!confirm('Really delete "'+sel+'" AND its workspace folder? This cannot be undone.'))return;busy=true;delBtn.disabled=true;try{setStatus('Deleting '+sel+'…');await api('${BASE}/manage/delete/'+encodeURIComponent(sel),new URLSearchParams({confirm:'yes'}));reloadOnClose=true;if(sel===curNow)navTarget='${BASE}/';await refreshCfg();busy=false;sel=null;formDirty=false;if(cfg.projects.length){select(cfg.projects[0].name);setStatus('Deleted.')}else{navTarget=navTarget||'${BASE}/';closeModal()}}catch(e){setStatus(e.message||String(e),true)}finally{busy=false}};
 let dragSrc=null;
@@ -3699,6 +3720,29 @@ app.get(BASE + '/manage', requireAdmin, async (req,res)=>{
  } catch(error) { return deploymentFailure(res, error); }
 });
 
+// A project's own push credential, off a form or a JSON body.
+//
+// Deliberately NOT restricted to GitHub token shapes: a project's remote may be
+// GitLab or Azure DevOps, whose tokens look like nothing in particular. What IS
+// refused is anything that cannot be a credential at all — whitespace, which would
+// corrupt the git credential file it is written into, and absurd lengths.
+// `classifyGithubToken` still labels the ones it recognises, so a classic PAT is
+// named as such in the UI without being rejected here.
+function parsePushToken(body){
+ const raw = body?.pushToken;
+ if(typeof raw !== 'string') return { set:false, clear:false, token:'' };
+ const token = raw.trim();
+ // An explicit clear is a positive decision, never the residue of a blank field: a
+ // blank field means "leave whatever is stored alone", which is what makes it safe to
+ // render a form that never receives the stored secret.
+ const clear = String(body?.pushTokenClear || '') === 'yes';
+ if(clear) return { set:false, clear:true, token:'' };
+ if(!token) return { set:false, clear:false, token:'' };
+ if(/\s/.test(token)) throw new Error('The push credential must not contain spaces or line breaks');
+ if(token.length > 512) throw new Error('That push credential is implausibly long (over 512 characters)');
+ return { set:true, clear:false, token };
+}
+
 // Shared by the dashboard form (admin session) and the machine API (scoped service token).
 // One implementation, two mounts, two auth gates - so a token can never reach a capability its
 // scope does not name, and the two callers cannot drift apart.
@@ -3726,8 +3770,13 @@ const addProjectHandler = async (req,res,next)=>{ try {
   // Default the project's git identity to the adding admin when they have a token
   // and none was chosen, so the clone (and later pull/push) can authenticate.
   if(!p.primaryUser && users.find(u=>u.username===req.user?.username)?.ghToken) p.primaryUser = req.user.username;
-  const credUser = p.primaryUser ? users.find(u=>u.username===p.primaryUser) : null;
-  let cloneToken = null; try { if(credUser?.ghToken) cloneToken = decrypt(credUser.ghToken); } catch {}
+  const push = parsePushToken(req.body);
+  if(push.set) p.pushToken = encrypt(push.token);
+  // The CLONE must use the same credential the pushes will, or a project can be
+  // created from a remote it then cannot push to — which is the failure this whole
+  // field exists to end.
+  const resolvedClone = resolveProjectGitToken({ project:p, users, decrypt });
+  const cloneToken = resolvedClone.token || null;
   // The clone happens with NO registry lock held — it is network work with a
   // 300s timeout, and a token rotation must not queue behind it.
   await cloneWorkspace(p, cloneToken);
@@ -3747,7 +3796,9 @@ const addProjectHandler = async (req,res,next)=>{ try {
  // above is still running, or every login waits behind the network.
  if(added?.primaryUser){ await syncProjectCredentials(added); }
  await applyDefaultProjectFlag(null, name, req.body.defaultProject);
- await audit('project_add', { project: name, port: Number(req.body.port) || null, repo }, req);
+ // The value is never audited — only that the project carries one, which is the fact
+ // an operator needs when a push authenticates as an unexpected account.
+ await audit('project_add', { project: name, port: Number(req.body.port) || null, repo, hasPushToken: !!added?.pushToken }, req);
  if(wantsJson(req)) return res.json({ok:true,name});
  res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }};
@@ -3807,6 +3858,11 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  await stopProject(oldName); const oldPath = p.path; p.name = newName; if(repo) p.repo = repo; else delete p.repo; const devUrl = safeHttpUrl(req.body.devUrl); if(devUrl) p.devUrl = devUrl; else delete p.devUrl; const prodUrl = safeHttpUrl(req.body.prodUrl); if(prodUrl) p.prodUrl = prodUrl; else delete p.prodUrl; p.port = port; p.path = workspacePath(newName);
  if(req.body.adminOnly === 'yes') p.adminOnly = true; else delete p.adminOnly;
  if(primaryUser) p.primaryUser = primaryUser; else delete p.primaryUser;
+ // Three states, not two: set a new one, clear the stored one, or leave it alone. The
+ // form never receives the stored secret, so a blank field cannot mean "remove it".
+ { const push = parsePushToken(req.body);
+   if(push.set) p.pushToken = encrypt(push.token);
+   else if(push.clear) delete p.pushToken; }
  { const categories = parseCategories(req.body.categories);
    if(categories.length) p.categories = categories; else delete p.categories; }
  if(previewBlock) p.preview = previewBlock; else delete p.preview;
@@ -3821,7 +3877,7 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  // and is taken after the long project work has released its lock.
  if(updated){ await syncProjectCredentials(updated); }
  await applyDefaultProjectFlag(oldName, newName, req.body.defaultProject);
- await audit('project_update', { oldName, newName, port }, req);
+ await audit('project_update', { oldName, newName, port, hasPushToken: !!updated?.pushToken }, req);
  if(wantsJson(req)) return res.json({ok:true,name:newName});
  res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }});
@@ -3894,7 +3950,11 @@ app.post(BASE + '/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
 app.get(BASE + '/api/projects/config', requireAdmin, async (_req,res)=>{ try {
  const [projects, users, settings] = await Promise.all([loadProjects(), loadUsers(), loadWorkbenchSettings()]);
  res.json({ ok:true, defaultProject: settings.defaultProject || '',
+  // hasPushToken / pushTokenKind and never the token: the manage form has to be able
+  // to say "one is stored, of this type" without the secret travelling to a browser.
   projects: projects.map(p => ({ name:p.name, repo:p.repo||'', devUrl:p.devUrl||'', prodUrl:p.prodUrl||'', port:p.port, path:p.path, adminOnly: !!p.adminOnly, primaryUser:p.primaryUser||'', categories: Array.isArray(p.categories) ? p.categories : [],
+   hasPushToken: !!p.pushToken,
+   pushTokenKind: p.pushToken ? (()=>{ try { return classifyGithubToken(decrypt(p.pushToken)); } catch { return 'unreadable'; } })() : 'none',
    preview: p.preview ? { cmd:p.preview.cmd||'', port:p.preview.port||'', env:p.preview.env||{} } : null,
    tabs: Array.isArray(p.tabs) ? p.tabs : [] })),
   users: users.map(u => ({ username:u.username, hasToken: !!u.ghToken })),
