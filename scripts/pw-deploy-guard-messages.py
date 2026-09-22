@@ -90,6 +90,78 @@ RULES = [
             'fi',
         ],
     },
+    # The launcher slots check that the repository actually carries the script
+    # they are about to exec. "missing in $WS" told the operator a path, not a
+    # remedy, and the remedy is in a different place entirely (the project's repo).
+    {
+        'id': 'missing-deploy-script-dev',
+        'old': '[ -f deploy-dev.sh ] || { echo "ERROR: deploy-dev.sh missing in $WS" >&2; exit 1; }',
+        'new': [
+            'if [ ! -f deploy-dev.sh ]; then',
+            '  {',
+            '    echo "DEPLOY BLOCKED - ${DEPLOY_PROJECT:-this project} has no deploy-dev.sh at the top of its repository ($WS), so there is nothing to run. Nothing was published."',
+            '    echo "NEEDED: in the ${DEPLOY_PROJECT:-project} terminal, have the agent add or restore deploy-dev.sh on main and push it, then deploy again."',
+            '  } >&2',
+            '  exit 1',
+            'fi',
+        ],
+    },
+    {
+        'id': 'missing-deploy-script-prod',
+        'old': '[ -f deploy-prod.sh ] || { echo "ERROR: deploy-prod.sh missing in $WS" >&2; exit 1; }',
+        'new': [
+            'if [ ! -f deploy-prod.sh ]; then',
+            '  {',
+            '    echo "DEPLOY BLOCKED - ${DEPLOY_PROJECT:-this project} has no deploy-prod.sh at the top of its repository ($WS), so there is nothing to run. Nothing was published."',
+            '    echo "NEEDED: in the ${DEPLOY_PROJECT:-project} terminal, have the agent add or restore deploy-prod.sh on main and push it, then deploy again."',
+            '  } >&2',
+            '  exit 1',
+            'fi',
+        ],
+    },
+    # The app server's own words, relayed. The remote message is the useful part,
+    # so this only makes clear WHO is speaking — no invented remedy, because a
+    # WinRM/PowerShell failure can be anything from a locked DLL to a bad path.
+    {
+        'id': 'remote-command-failed',
+        'old': 'print(f"ERROR: {result.std_err.decode()}", file=sys.stderr)',
+        'new': [
+            'print(f"DEPLOY FAILED - the app server rejected a remote command. It said: {result.std_err.decode()}", file=sys.stderr)',
+        ],
+    },
+    # PowerShell, inside a doubled-brace payload template: the braces must stay
+    # doubled, and the text must contain no apostrophe (single-quoted PS string).
+    {
+        'id': 'worker-still-running',
+        'old': "if ($w) {{ Write-Error 'Worker still running after pool stop; DLLs may be locked.'; exit 1 }}",
+        'new': [
+            "if ($w) {{ Write-Error 'DEPLOY BLOCKED - the app pool worker is still running after the stop request, so the site DLLs are locked and cannot be replaced. Nothing was published. NEEDED: an admin has to stop this app pool in IIS Manager on the server (or end its w3wp process), then deploy again.'; exit 1 }}",
+        ],
+    },
+    {
+        'id': 'pool-restart-on-abort',
+        'old': 'echo "Deploy aborted \u2014 restarting app pool to restore service\u2026" >&2',
+        'new': [
+            'echo "DEPLOY ABORTED - restarting the app pool so the previous build keeps serving." >&2',
+        ],
+    },
+    {
+        'id': 'copy-failures',
+        'old': 'echo "ERROR: some files failed to copy:" >&2',
+        'new': [
+            'echo "DEPLOY FAILED - some files could not be copied to the app server, so the site is still running its previous build." >&2',
+            'echo "Files that did not copy:" >&2',
+        ],
+    },
+    {
+        # Paired with copy-failures: the remedy belongs AFTER the file list.
+        'id': 'copy-failures-remedy',
+        'old': 'cat "$FAIL_LIST" >&2',
+        'new': [
+            'cat "$FAIL_LIST" >&2',
+            'echo "NEEDED: a file held open on the server usually copies on a second attempt. If the same files keep failing, an admin has to stop the app pool (or release the file) on the server, then deploy again." >&2',
+        ],
+    },
     {
         # Message-only: this echo sits inside the script's own if/fi, and the
         # condition is not this tool's business.
@@ -104,6 +176,9 @@ RULES = [
 
 # An abort site worth reporting: it stops the deploy, or it writes to stderr.
 ABORT_HINT = re.compile(r'(^|[;&|\s])exit\s+1\b|>&2|ERROR:|DEPLOY BLOCKED')
+# A bare `exit 1` (or a lone brace) is control flow, not a message: reporting it
+# as a raw abort site just buried the lines that actually needed rewording.
+CONTROL_ONLY = re.compile(r'^(exit\s+1;?|\}|\};?|fi;?|\)|done)$')
 # Keep a literal credential out of the report, if a slot ever grows one.
 SECRETISH = re.compile(r'((?:password|passwd|secret|token|apikey|api_key)\s*=\s*)([\'"]?)(?!\$)(\S+)', re.I)
 
@@ -157,6 +232,7 @@ def report(config):
             SECRETISH.sub(lambda m: m.group(1) + m.group(2) + '<redacted>', line.strip())
             for line in slot['script'].split('\n')
             if ABORT_HINT.search(line) and line.strip() not in covered
+            and not CONTROL_ONLY.match(line.strip())
         ]
         unmatched_total += len(leftover)
         print(f'### {project}/{target}  ({len(slot["script"].splitlines())} lines)')
