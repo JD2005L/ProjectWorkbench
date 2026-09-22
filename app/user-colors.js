@@ -90,3 +90,54 @@ export function userTabColorCss(color) {
   const key = String(color || '').trim().toLowerCase();
   return Object.hasOwn(USER_TAB_PALETTE, key) ? USER_TAB_PALETTE[key] : '';
 }
+
+/**
+ * The instance's colour assignments, from the two places a choice can live.
+ *
+ * Precedence, and why:
+ *   1. the person's own stored choice (`tabColor` on their user record) — a colour is
+ *      part of how a team refers to each other ("the orange tabs are James"), so the
+ *      person and their administrator can set it deliberately;
+ *   2. the operator map in workbench.json (`userTabColors`) — how this was configured
+ *      before there was any UI for it, kept working rather than silently discarded;
+ *   3. nothing: resolveUserTabColor() then hashes a stable colour out of whatever is
+ *      left unclaimed by 1 and 2.
+ *
+ * Merging them into ONE map is what makes 3 behave: the hash draws only from colours
+ * nobody has claimed, and it cannot tell a record choice from an operator one.
+ */
+export function mergeUserTabColors(userRecords = [], operatorMap = {}) {
+  const chosen = {};
+  for (const u of userRecords || []) {
+    if (u && u.username && u.tabColor) chosen[u.username] = u.tabColor;
+  }
+  return { ...normalizeUserTabColors(operatorMap), ...normalizeUserTabColors(chosen) };
+}
+
+/**
+ * Who has explicitly claimed each colour — for a picker, so two people cannot end up
+ * agreeing on the same colour and undoing the point of having one.
+ *
+ * Only EXPLICIT claims count. A hashed colour is not a claim: it moves aside on its own
+ * the moment somebody chooses that colour deliberately, so refusing a deliberate choice
+ * because a hash happened to land there would be backwards.
+ */
+export function userTabColorClaims(userRecords = [], operatorMap = {}) {
+  const claims = {};
+  for (const [username, color] of Object.entries(mergeUserTabColors(userRecords, operatorMap))) {
+    if (!claims[color]) claims[color] = username;
+  }
+  return claims;
+}
+
+/** The palette as the UI needs it: a name and the colour it draws. */
+export function userTabPaletteList() {
+  return USER_TAB_COLOR_NAMES.map((name) => ({ name, css: USER_TAB_PALETTE[name] }));
+}
+
+/** A colour name as it may be stored on a user record: a palette name, or '' for automatic. */
+export function normalizeUserTabColorChoice(value) {
+  const v = String(value ?? '').trim().toLowerCase();
+  if (!v) return '';
+  return Object.hasOwn(USER_TAB_PALETTE, v) ? v : null;   // null = invalid, caller rejects
+}

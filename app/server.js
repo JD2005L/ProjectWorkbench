@@ -17,7 +17,8 @@ import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken } from './user-credentials.js';
+import { ghLoginCommand, GH_DEFAULT_SCOPES } from './gh-cli.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
 import { INBOX_DIR, OUTBOX_DIR, runWorkspaceJob, runWorkspaceRead, runWorkspaceWrite, workspaceJobArgv, selectExpiredBoxFiles } from './workspace-file.js';
@@ -32,8 +33,9 @@ import { makeCredentialLockDomain } from './credential-domain-lock.js';
 import { assertTmuxOwner } from './tmux-owner-gate.js';
 import { resolveLifecycleTarget, reservedUsernameConflict, reconciliationStillCurrent } from './user-lifecycle.js';
 import { uniqueTabNameClientSrc } from './tab-util.js';
-import { normalizeUserTabColors, resolveUserTabColor, userTabColorCss } from './user-colors.js';
-import { classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, COPILOT_AUTH_STATES } from './cli-auth-status.js';
+import { normalizeUserTabColors, resolveUserTabColor, userTabColorCss, mergeUserTabColors, userTabColorClaims, userTabPaletteList, normalizeUserTabColorChoice } from './user-colors.js';
+import { classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, resolveCliAuthCell } from './cli-auth-status.js';
+import { githubOauthConfig, startDeviceFlow, pollDeviceFlow, verifyToken, describeTokenCapability } from './github-oauth.js';
 import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
@@ -876,7 +878,14 @@ async function credentialContext(project, launcher = ''){
    // sessions, history, skills and any stored login in one directory: per-user tokens
    // without it still leave every user sharing $HOME/.copilot. The token itself never
    // travels here — it is exported by the 0600 rcfile below, never as an argv token.
-   tokens: ['CLAUDE_CONFIG_DIR=' + cred.configDir, ...(cred.copilotHome ? ['COPILOT_HOME=' + cred.copilotHome] : [])],
+   tokens: [
+    'CLAUDE_CONFIG_DIR=' + cred.configDir,
+    ...(cred.copilotHome ? ['COPILOT_HOME=' + cred.copilotHome] : []),
+    // GH_CONFIG_DIR makes `gh` in this pane that PERSON's gh: their login, their
+    // hosts.yml. Without it, one shared file would be overwritten by whoever logged in
+    // last, and PW could not tell whose token it was reading back.
+    ...(cred.ghConfigDir ? ['GH_CONFIG_DIR=' + cred.ghConfigDir] : []),
+   ],
    shellArgs: cred.envFile ? ['--noprofile','--rcfile',cred.envFile] : DEFAULT_SHELL_ARGS,
    key: cred.fingerprint,
    username: owner.username,
@@ -1955,19 +1964,36 @@ async function withCredColors(windows){
   : w));
 }
 // The cockpit polls the window list every 2s per open tab strip, so the mapping is
-// read from workbench.json at most once per TTL rather than once per poll. A read
-// failure keeps serving the last good mapping: a colour is awareness, and losing it
-// must never be able to fail the window list the tab strip is built from.
+// resolved at most once per TTL rather than once per poll. A read failure keeps serving
+// the last good mapping: a colour is awareness, and losing it must never be able to fail
+// the window list the tab strip is built from.
+//
+// Both sources are consulted (see mergeUserTabColors): each person's own stored choice,
+// then the operator map in workbench.json, then a stable hash of whatever is unclaimed.
 let credColorCache = { at:0, map:{} };
 async function userTabColorMap(){
  const now = Date.now();
  if(credColorCache.at && now - credColorCache.at < 10000) return credColorCache.map;
  let map = credColorCache.map;
- try { map = normalizeUserTabColors((await loadWorkbenchSettings()).userTabColors); }
- catch(e){ console.warn(`[per-user-claude] could not read the tab colour mapping, keeping the previous one: ${e?.message || e}`); }
+ try {
+  const [users, settings] = await Promise.all([loadUsers(), loadWorkbenchSettings().catch(()=> ({}))]);
+  map = mergeUserTabColors(users, settings.userTabColors);
+ } catch(e){ console.warn(`[per-user-claude] could not read the tab colour mapping, keeping the previous one: ${e?.message || e}`); }
  credColorCache = { at: now, map };
  return map;
 }
+// A deliberate choice is refused when it would duplicate somebody else's, because two
+// people sharing a colour undoes the only thing the colour is for. Returns the other
+// person's name, or null when the colour is free. '' (automatic) never conflicts.
+function tabColorClaimedBy(users, settings, username, color){
+ if(!color) return null;
+ const claims = userTabColorClaims(users, settings?.userTabColors);
+ const holder = claims[color];
+ return holder && holder !== username ? holder : null;
+}
+// Resolving a colour invalidates nothing on its own, but a CHANGE has to be visible
+// without waiting out the poll memo.
+function invalidateTabColorCache(){ credColorCache = { at:0, map:{} }; }
 
 async function tmuxWindowDetails(project){
  const fmt = '#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{pane_current_command}|#{pane_current_path}|#{pane_pid}';
@@ -2769,14 +2795,20 @@ const landingCss = `body.landing{margin:0;min-height:100vh;background:radial-gra
 
 const wizardCss = `.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem}.modal-backdrop.hidden{display:none}.modal-box{background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:14px;max-width:920px;width:100%;max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7)}.modal-box header{display:flex;justify-content:space-between;align-items:center;padding:.95rem 1.25rem;border-bottom:1px solid #1f2937}.modal-box header h2{margin:0;font-size:1.2rem}.modal-box .body{padding:1rem 1.25rem;overflow:auto;flex:1 1 auto}.modal-box footer{display:flex;justify-content:flex-end;gap:.5rem;padding:.8rem 1.25rem;border-top:1px solid #1f2937;align-items:center}.modal-close{background:transparent;border:0;color:#cbd5e1;font-size:1.6rem;cursor:pointer;line-height:1;padding:0 .25rem}.modal-close:hover{color:#fff}.modal-box section{margin-bottom:1.25rem}.modal-box section h3{margin:0 0 .35rem;font-size:1rem;color:#bfdbfe}.section-help{margin:0 0 .55rem;color:#94a3b8;font-size:.85rem}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .75rem;align-items:center;padding:.55rem .7rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#111827}.cli-row .meta{display:flex;flex-direction:column;gap:.15rem;min-width:0}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.8rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .5rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem;flex-wrap:wrap;justify-content:flex-end}.cli-row .actions .button{padding:.4rem .65rem;font-size:.82rem;margin:0}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}.env-grid{display:grid;grid-template-columns:1fr 1fr;gap:.75rem}.env-grid label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.env-grid select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.45rem;font:inherit}.env-grid .opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.15rem;min-height:2.6em}.env-grid .opt-help.warn{color:#fca5a5}.env-grid .opt-help b{color:#fde68a}.heal-row{display:flex;gap:.5rem;flex-wrap:wrap}.heal-out{margin:.5rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.6rem .8rem;font-size:.82rem;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block}#authFrame.hidden{display:none}#authHint{color:#94a3b8;font-size:.85rem;margin:.3rem 0 .5rem}#saveStatus{color:#bbf7d0;font-size:.85rem;margin-right:auto}#saveStatus.err{color:#fca5a5}@media(max-width:640px){.cli-row{grid-template-columns:1fr}.env-grid{grid-template-columns:1fr}}`;
 
-const wizardScript = `<script>(function(){const open=document.getElementById('setupBtn');const backdrop=document.getElementById('setupBackdrop');if(!backdrop)return;const closeBtn=document.getElementById('setupCloseBtn');const cancelBtn=document.getElementById('setupCancelBtn');const saveBtn=document.getElementById('setupSaveBtn');const cliRows=document.getElementById('cliRows');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const saveStatus=document.getElementById('saveStatus');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setHealOut(t,err){healOut.textContent=t||'';healOut.classList.toggle('show',!!t);healOut.classList.toggle('err',!!err)}function setSave(t,err){saveStatus.textContent=t||'';saveStatus.classList.toggle('err',!!err)}function render(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+escHtml(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+escHtml(c.version)+'</span>'+(c.authenticated?'<span class="signed-in" title="'+(state.perUserClaude?'The SHARED box identity is signed in — this is not your own login. Per-person status is in Settings → Users.':'Credentials detected on disk')+'">'+(state.perUserClaude?'Shared login':'Signed in')+'</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button type="button" class="button secondary inst">'+(c.installed?'Update':'Install')+'</button><button type="button" class="button auth">'+(c.authenticated?'Reauthenticate':'Sign in')+(state.perUserClaude?' shared':'')+'</button></div><div class="note">'+escHtml(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');const orig=btn.textContent;btn.disabled=true;btn.textContent='Installing…';setSave('');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');const v=row.querySelector('.version');v.textContent=j.version;v.classList.add('installed');btn.textContent='Update';setSave(c.label+': '+j.version)}catch(e){btn.textContent=orig;setSave(e.message,true)}finally{btn.disabled=false}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setSave('');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setSave(e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderOptHelp();
+const wizardScript = `<script>(function(){const open=document.getElementById('setupBtn');const backdrop=document.getElementById('setupBackdrop');if(!backdrop)return;const closeBtn=document.getElementById('setupCloseBtn');const cancelBtn=document.getElementById('setupCancelBtn');const saveBtn=document.getElementById('setupSaveBtn');const cliRows=document.getElementById('cliRows');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const saveStatus=document.getElementById('saveStatus');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;function escHtml(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setHealOut(t,err){healOut.textContent=t||'';healOut.classList.toggle('show',!!t);healOut.classList.toggle('err',!!err)}function setSave(t,err){saveStatus.textContent=t||'';saveStatus.classList.toggle('err',!!err)}function render(){cliRows.innerHTML='';const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+escHtml(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+escHtml(c.version)+'</span>'+(c.authenticated&&!state.perUserClaude?'<span class="signed-in" title="Credentials detected on disk">Signed in</span>':'')+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button type="button" class="button secondary inst">'+(c.installed?'Update':'Install')+'</button>'+(state.perUserClaude?'':'<button type="button" class="button auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button>')+'</div><div class="note">'+escHtml(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');const orig=btn.textContent;btn.disabled=true;btn.textContent='Installing…';setSave('');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');const v=row.querySelector('.version');v.textContent=j.version;v.classList.add('installed');btn.textContent='Update';setSave(c.label+': '+j.version)}catch(e){btn.textContent=orig;setSave(e.message,true)}finally{btn.disabled=false}};const authBtn=row.querySelector('.auth');if(authBtn)authBtn.onclick=async()=>{const btn=authBtn;btn.disabled=true;setSave('');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setSave(e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderOptHelp();
 /* With per-user credentials on, this identity no longer runs anybody's project tabs —
    it is the template a per-user config dir is seeded from. Saying so here is the
    difference between an operator signing in once and wondering why nothing changed
    for their team. */
+/* Per-user credentials make this whole section a wrong answer: it signs in an identity
+   that runs nobody's terminals. Remove it rather than caption it — sign-in belongs to a
+   person, on the Users tab. What stays here is installing and updating, which is a
+   property of the machine. */
+const shSec=document.getElementById('sharedAuthSection');
+if(shSec&&state.perUserClaude)shSec.remove();
 const sh=document.getElementById('sharedAuthHelp');if(sh&&state.perUserClaude)sh.innerHTML='Per-user credentials are <b>on</b>, so this is the <b>shared seed identity</b>: it is what a new per-user config dir is created from, and what a project with no owner falls back to. It is <b>not</b> how a person signs in \u2014 each person signs in from their own terminal, and the <b>Users</b> tab shows who has. Credentials land in <code>/home/admin</code>.';}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest. Use this unless you fully trust everyone with dashboard access.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude will execute any shell command, file write, or tool call without asking. Anyone with basic-auth access effectively has shell on this box.'};const MCP_HELP={inherit:'Claude uses the MCP servers configured on your Anthropic account (whatever <code>~/.claude.json</code> currently has).',isolated:'Forces Claude to use an empty MCP config so no external MCP servers load. Good when you want this box self-contained or your account MCP is unreachable from the LAN.',custom:'Use a custom MCP JSON config file. Path is set via the <code>PW_MCP_CONFIG</code> env var the wrapper reads.'};function renderOptHelp(){const ph=document.getElementById('permHelp');const mh=document.getElementById('mcpHelp');if(ph){ph.innerHTML=PERM_HELP[permMode.value]||'';ph.classList.toggle('warn',permMode.value==='skip')}if(mh)mh.innerHTML=MCP_HELP[mcpMode.value]||''}permMode&&permMode.addEventListener('change',renderOptHelp);mcpMode&&mcpMode.addEventListener('change',renderOptHelp);async function load(){setSave('Loading…');try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');render();setSave('')}catch(e){setSave(e.message,true)}}function show(){backdrop.classList.remove('hidden');load()}function hide(){backdrop.classList.add('hidden');authFrame.src='about:blank';authFrame.classList.add('hidden');authHint.textContent='Click "Sign in" on a CLI above to send its login command here.';setHealOut('');setSave('')}if(open)open.onclick=show;if(closeBtn)closeBtn.onclick=hide;if(cancelBtn)cancelBtn.onclick=hide;backdrop.addEventListener('click',e=>{if(e.target===backdrop)hide()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!backdrop.classList.contains('hidden'))hide()});saveBtn.onclick=async()=>{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);saveBtn.disabled=true;setSave('Saving…');try{const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setSave('Saved.')}catch(e){setSave(e.message,true)}finally{saveBtn.disabled=false}};async function heal(url,btn){btn.disabled=true;setHealOut('Working…');try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');setHealOut(j.message||'OK')}catch(e){setHealOut(e.message,true)}finally{btn.disabled=false}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);load()})();</script>`;
 
-const wizardModalHtml = `<div id="setupBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box"><header><h2>Setup Wizard</h2><button class="modal-close" id="setupCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><section><h3>CLIs</h3><p class="section-help">Pick which assistants this instance offers. "Auto-update" CLIs are upgraded nightly by the update timer.</p><div id="cliRows"></div></section><section><h3>Shared identity</h3><p class="section-help" id="sharedAuthHelp">Signs in the box's own CLI login, in the shared setup terminal at <code>${BASE}/pty/_setup/</code>. Credentials land in <code>/home/admin</code>.</p><div id="authHint">Click "Sign in" on a CLI above to send its login command here.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></section><section><h3>Environment</h3><div class="env-grid"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div></section><section><h3>Heal</h3><p class="section-help">Self-repair common installation drift. Run if a route is missing or a runtime path looks broken.</p><div class="heal-row"><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button><button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button></div><pre class="heal-out" id="healOut"></pre></section></div><footer><span id="saveStatus"></span><button class="button secondary" id="setupCancelBtn" type="button">Close</button><button class="button" id="setupSaveBtn" type="button">Save settings</button></footer></div></div>`;
+const wizardModalHtml = `<div id="setupBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box"><header><h2>Setup Wizard</h2><button class="modal-close" id="setupCloseBtn" aria-label="Close" type="button">×</button></header><div class="body"><section><h3>CLIs</h3><p class="section-help">Pick which assistants this instance offers. "Auto-update" CLIs are upgraded nightly by the update timer.</p><div id="cliRows"></div></section><section id="sharedAuthSection"><h3>Shared identity</h3><p class="section-help" id="sharedAuthHelp">Signs in the box's own CLI login, in the shared setup terminal at <code>${BASE}/pty/_setup/</code>. Credentials land in <code>/home/admin</code>.</p><div id="authHint">Click "Sign in" on a CLI above to send its login command here.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></section><section><h3>Environment</h3><div class="env-grid"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div></section><section><h3>Heal</h3><p class="section-help">Self-repair common installation drift. Run if a route is missing or a runtime path looks broken.</p><div class="heal-row"><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button><button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button></div><pre class="heal-out" id="healOut"></pre></section></div><footer><span id="saveStatus"></span><button class="button secondary" id="setupCancelBtn" type="button">Close</button><button class="button" id="setupSaveBtn" type="button">Save settings</button></footer></div></div>`;
 
 const modalBaseCss = `.modal-backdrop{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:100;padding:1rem}.modal-backdrop.hidden{display:none}.modal-box{background:#0f172a;color:#e5e7eb;border:1px solid #334155;border-radius:14px;max-width:920px;width:100%;max-height:92vh;display:flex;flex-direction:column;box-shadow:0 20px 60px rgba(0,0,0,.7)}.modal-box header{display:flex;justify-content:space-between;align-items:center;padding:.95rem 1.25rem;border-bottom:1px solid #1f2937}.modal-box header h2{margin:0;font-size:1.2rem}.modal-box .body{padding:1rem 1.25rem;overflow:auto;flex:1 1 auto}.modal-close{background:transparent;border:0;color:#cbd5e1;font-size:1.6rem;cursor:pointer;line-height:1;padding:0 .25rem}.modal-close:hover{color:#fff}.button{display:inline-block;background:#2563eb;color:#fff;padding:.6rem .85rem;border-radius:8px;text-decoration:none;margin:.15rem;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button:disabled{opacity:.55;cursor:not-allowed}.subtle{color:#94a3b8;font-size:.8rem}`;
 
@@ -4127,7 +4159,7 @@ app.get(BASE + '/api/preview/:project/logs', requireAuth, requireProjectAccess, 
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.get(BASE + '/api/setup/state', requireAdmin, async (_req,res)=>{ try {
- const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatuses()]);
+ const [settings, clis] = await Promise.all([loadWorkbenchSettings(), getCliStatusesCached()]);
  const updateStamp = await getClaudeUpdateStamp();
  // perUserClaude tells the UI whether this box's own CLI login is the identity that
  // runs project terminals (off) or merely the seed a per-user config dir is built
@@ -4204,6 +4236,138 @@ app.post(BASE + '/api/setup/state', requireAdmin, async (req,res)=>{ try {
  res.json({ ok:true, settings:publicWorkbenchSettings(s) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
+// Label the windows of sessions that PREDATE per-window identity stamps.
+//
+// A session created before the stamp existed runs on perfectly good credentials — it
+// just never recorded whose, so the cockpit shows its tabs uncoloured. Recycling would
+// fix that by recreating the session, but recycling kills whatever is running in it,
+// which is far too high a price for a label.
+//
+// It does not need to be paid. A stamp is a tmux window OPTION: writing one is metadata,
+// invisible to the pane's process. So the label can be backfilled in place on a live
+// session, provided the label is TRUE — and that is the whole design of this function:
+//
+//   * the session's own stamped fingerprint must VERIFIABLY equal the fingerprint its
+//     current owner resolves to today. That is what proves the panes really are running
+//     on that person's credentials, rather than us assuming it;
+//   * anything that cannot be established — an unreadable stamp, an owner who no longer
+//     resolves, a stale stamp (the panes are on OLD credentials, so the current owner's
+//     name would be a lie) — is SKIPPED with the reason, never guessed at. A stale
+//     session still needs a deliberate recycle, which is exactly what it needed before;
+//   * a window that ALREADY carries a label is left alone. With per-launcher credentials
+//     a session legitimately holds several identities, and overwriting one of those with
+//     the project owner's name would replace a true label with a false one.
+//
+// Upgrading is therefore additive: it fills in blanks it can prove, and reports the rest.
+async function listWindowIdentities(sess){
+ // pane_start_command is the argv tmux recorded when the pane was created, and for a
+ // per-user pane that argv contains CLAUDE_CONFIG_DIR=<base>/<encoded-username>/claude.
+ // That NAMES the person the pane actually runs as — which is better evidence than any
+ // hash comparison, and it is the same evidence for a session created years ago.
+ const { stdout } = await tmux(['list-panes','-s','-t',sess,'-F','#{window_id}|#{@pw_cred_user}|#{pane_start_command}']);
+ const byWindow = new Map();
+ for(const line of String(stdout || '').split('\n').filter(Boolean)){
+  const [id, user, ...cmdParts] = line.split('|');
+  if(!id) continue;
+  const prev = byWindow.get(id) || { id, user:'', paneUser:'' };
+  byWindow.set(id, {
+   id,
+   user: prev.user || (user || '').trim(),
+   // First pane that names somebody wins; a window's panes are created together.
+   paneUser: prev.paneUser || usernameFromPaneCommand(cmdParts.join('|')),
+  });
+ }
+ return [...byWindow.values()];
+}
+// Whose credential directory does this pane's start command point at?
+//
+// '' when it names none (the shared box login) or names a directory outside the
+// credential base, or one whose segment is not our own encoding, or a user who no longer
+// exists — each of those is "cannot tell", and cannot tell must never become a label.
+function usernameFromPaneCommand(cmd){
+ const m = /CLAUDE_CONFIG_DIR=(\S+)/.exec(String(cmd || ''));
+ if(!m) return '';
+ const dir = m[1];
+ const prefix = USER_CRED_BASE.endsWith('/') ? USER_CRED_BASE : USER_CRED_BASE + '/';
+ if(!dir.startsWith(prefix)) return '';
+ const segment = dir.slice(prefix.length).split('/')[0];
+ if(!segment || !isEncodedUserName(segment)) return '';
+ const decoded = decodeUserName(segment);
+ if(!decoded) return '';
+ // Whether that person still exists is the caller's check; this reads the path only.
+ return decoded;
+}
+async function backfillSessionIdentityLabels(){
+ const projects = await loadProjects();
+ const roster = new Set((await loadUsers()).map(u => u.username));
+ const results = [];
+ for(const p of projects){
+  const sess = tmuxSession(p.name);
+  try { await tmux(['has-session','-t',sess]); } catch { results.push({ project:p.name, status:'no-session' }); continue; }
+  const stamped = await readSessionCredKey(sess);
+  if(!stamped.ok){ results.push({ project:p.name, status:'unverifiable', detail:stamped.error }); continue; }
+  let owner = null;
+  try { owner = await projectCredentialOwner(p); }
+  catch(e){ /* the pane may still name somebody; an unresolvable OWNER is not fatal now */
+   results.push({ project:p.name, status:'owner-unresolved', detail:e?.message || String(e) });
+   continue;
+  }
+  // The owner-fingerprint match is the FALLBACK, for panes whose start command was not
+  // recorded (a restored session, or one whose pane was replaced). It is strictly weaker
+  // evidence, so it is only consulted when the pane itself says nothing.
+  const ownerKey = owner
+   ? credentialFingerprint({ username: owner.username, configDir: userClaudeDir(owner.username), ghToken: owner.ghToken })
+   : CREDENTIALS_OFF;
+  const ownerVouched = !!owner && stamped.key === ownerKey;
+  let labelled = 0, kept = 0, skipped = 0;
+  try {
+   for(const w of await listWindowIdentities(sess)){
+    if(w.user){ kept += 1; continue; }
+    // Whose credential dir the pane was GIVEN — the strong evidence, and the only kind
+    // that survives a rotated token or a reassigned primaryUser.
+    const fromPane = w.paneUser && roster.has(w.paneUser) ? w.paneUser : '';
+    const who = fromPane || (ownerVouched ? owner.username : '');
+    if(!who){ skipped += 1; continue; }
+    // The stamped key must describe the identity being written. For a pane-derived
+    // label of somebody who is not the project owner (or whose token has since
+    // changed) that key is not recomputable here — the token may be gone — so the
+    // session's existing stamp is left in place and only the NAME is recorded. The
+    // name is what the strip renders; the key is what a recycle reconciles.
+    await stampWindowCredIdentity(w.id, who === owner?.username ? ownerKey : stamped.key, who);
+    labelled += 1;
+   }
+  } catch(e){
+   results.push({ project:p.name, status:'partial', owner:owner?.username || '', labelled, kept, detail:e?.message || String(e) });
+   continue;
+  }
+  if(!labelled && !kept && skipped){
+   // Nothing could be established: no pane named anybody and the session's stamp does
+   // not match its owner. That is the case a deliberate recycle exists for.
+   results.push({ project:p.name, status:'stale', owner:owner?.username || '', skipped });
+   continue;
+  }
+  if(!labelled && !kept && !skipped){ results.push({ project:p.name, status:'shared' }); continue; }
+  results.push({ project:p.name, status:'labelled', owner:owner?.username || '', labelled, kept, skipped });
+ }
+ return results;
+}
+
+app.post(BASE + '/api/setup/heal/session-labels', requireAdmin, async (req,res)=>{ try {
+ if(!PER_USER_CLAUDE) return res.status(409).json({ ok:false, error:'Per-user credentials are off, so terminals have no per-person identity to label.' });
+ const results = await backfillSessionIdentityLabels();
+ const total = results.reduce((n,r) => n + (r.labelled || 0), 0);
+ const needRecycle = results.filter(r => r.status === 'stale').map(r => r.project);
+ const unresolved = results.filter(r => ['unverifiable','owner-unresolved','partial'].includes(r.status));
+ const lines = [
+  `Labelled ${total} existing tab${total === 1 ? '' : 's'} across ${results.filter(r => r.status === 'labelled').length} live session${results.filter(r => r.status === 'labelled').length === 1 ? '' : 's'} — no process was touched.`,
+  ...results.filter(r => r.status === 'labelled' && (r.labelled || r.kept)).map(r => `  ${r.project}: ${r.labelled} labelled as ${r.owner}${r.kept ? `, ${r.kept} already labelled and left alone` : ''}`),
+ ];
+ if(needRecycle.length) lines.push(`Skipped (running on older credentials than their owner resolves to today, so the current owner's name would be wrong — recycle to migrate): ${needRecycle.join(', ')}`);
+ for(const r of unresolved) lines.push(`Skipped ${r.project} (${r.status}): ${r.detail || 'could not establish whose credentials these panes use'}`);
+ await audit('session_labels_backfilled', { labelled: total, results }, req);
+ res.json({ ok:true, message: lines.join('\n'), results });
+} catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }});
+
 app.post(BASE + '/api/setup/heal/nginx', requireAdminOrLocal, async (_req,res)=>{ try {
  const projects = await loadProjects();
  await applyRouting(projects);
@@ -4232,7 +4396,518 @@ app.post(BASE + '/api/setup/cli/install', requireAdmin, async (req,res)=>{ try {
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
  const { stdout, stderr } = await sh('npm',['install','-g',`${cfg.pkg}@latest`],{timeout:300000});
  const version = await getCliVersion(cfg.bin);
+ // The memo exists to keep account management off the subprocess path, not to hide an
+ // install from the operator who just ran one.
+ invalidateCliStatusCache();
  res.json({ ok:true, version: version || 'not installed', log:(stdout+stderr).slice(-1500) });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Set or clear ONE user's stored GitHub token, with the dependent state that has to
+// move with it.
+//
+// This mirrors the token branch of PATCH /api/users/:username deliberately rather than
+// being shared with it: that route's lock section also spans rename reconciliation and
+// project.primaryUser repointing, so extracting it would mean restructuring the far
+// more delicate path. What must not drift is the EFFECT — a token change has to resync
+// the git credential of every project this person owns, or their pushes keep using the
+// old secret — so both paths call syncProjectCredentials over the same set, and
+// test/per-user-self-service.test.mjs asserts they agree.
+//
+// `token` is '' to clear. Returns the (safe-shaped) user, or a failure to surface.
+async function setUserGithubToken(username, token, githubLogin = ''){
+ return credentialDomain.withLocks(['lifecycle'], async () => {
+  const users = await loadUsers();
+  const u = users.find(x => x.username === username);
+  if(!u) return { failure: { status:404, error:`User "${username}" not found` } };
+  if(token) u.ghToken = encrypt(token); else delete u.ghToken;
+  // Which GitHub account the stored token actually belongs to. Known only when the
+  // token came through an authorisation we verified; a pasted one is anonymous to us,
+  // so the old label is cleared rather than left to describe a different credential.
+  if(token && githubLogin) u.ghLogin = githubLogin; else delete u.ghLogin;
+  await saveUsers(users);
+  try {
+   const projects = await loadProjects();
+   for(const p of projects){ if(p.primaryUser === u.username) await syncProjectCredentials(p); }
+  } catch(e){
+   throw new Error(`your token was stored, but resyncing the git credential of the projects you own failed: ${e?.message || e}. Retry, or ask an administrator to re-save it.`);
+  }
+  return { user: u };
+ });
+}
+
+// ============================================================================
+// "My CLI sign-ins" — the one page a NON-admin needs.
+//
+// Everything else about identity lives behind Settings, which only an admin can open.
+// That left a developer able to see that their Copilot did not work but not why, and
+// unable to do anything about it without asking someone: the diagnosis (a token type
+// Copilot refuses) and both remedies (replace the token, or clear it and sign in) were
+// admin-only. This page is that missing surface, and it is strictly about the viewer —
+// every route it calls is self-scoped and takes no username.
+// ============================================================================
+const mePageCss = `.meWrap{max-width:860px;margin:0 auto;padding:26px 20px 60px;display:flex;flex-direction:column;gap:16px}
+.meHead{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap}
+.meHead h1{margin:0;font-size:1.45rem}
+.meHead .meWho{color:var(--dim);font-size:.9rem}
+.meHead .meWho b{color:var(--text)}
+.meLead{color:var(--dim);margin:0;font-size:.92rem;line-height:1.55}
+.meCard{background:linear-gradient(180deg,var(--panel),#0a1120);border:1px solid var(--line);border-radius:14px;padding:16px 18px}
+.meCard h2{margin:0 0 4px;font-size:1.02rem}
+.meCard .meNote{color:var(--faint);font-size:.82rem;margin:.35rem 0 0;line-height:1.5}
+.meRow{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:11px 0;border-bottom:1px solid var(--line)}
+.meRow:last-child{border-bottom:0}
+.meRow .meName{font-weight:600;min-width:9.5rem}
+.meRow .meVer{color:var(--faint);font-size:.78rem;font-family:var(--mono)}
+.meRow .meGrow{flex:1}
+.mePill{font-size:.76rem;border-radius:999px;padding:1px .6rem;border:1px solid var(--line2);color:var(--dim);white-space:nowrap}
+.mePill.ok{color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)}
+.mePill.bad{color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)}
+.mePill.warn{color:#fde68a;border-color:#854d0e;background:rgba(251,191,36,.1)}
+.meBtn{background:var(--blue);color:#fff;border:0;border-radius:8px;padding:.42rem .7rem;font:inherit;font-size:.83rem;cursor:pointer}
+.meBtn.secondary{background:#374151}
+.meBtn.link{background:none;color:var(--cyan);padding:.42rem .2rem;text-decoration:underline dotted;font-size:.8rem}
+.meBtn.link:hover{text-decoration-style:solid}
+.meBtn:disabled{opacity:.5;cursor:not-allowed}
+.meWhy{width:100%;color:var(--faint);font-size:.82rem;line-height:1.5;margin:.15rem 0 0}
+.meTok{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-top:.7rem}
+.meTok input{flex:1 1 20rem;background:#0a1120;border:1px solid var(--line);border-radius:8px;color:var(--text);padding:.45rem .6rem;font:inherit;font-size:.85rem;font-family:var(--mono)}
+.meStatus{font-size:.85rem;min-height:1.2em;color:#bbf7d0}
+.meStatus.err{color:#fca5a5}
+.meBack{color:var(--cyan);text-decoration:none;font-size:.85rem}
+.meBack:hover{text-decoration:underline}`;
+
+const mePageScript = (base) => `<script>(function(){
+const list=document.getElementById('meClis'),tokBox=document.getElementById('meTokBox'),colorBox=document.getElementById('meColorBox'),st=document.getElementById('meStatus');
+const esc=s=>String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function setStatus(t,bad){st.textContent=t||'';st.classList.toggle('err',!!bad)}
+function pill(tone,text){return '<span class="mePill '+(tone||'')+'">'+esc(text)+'</span>'}
+/* Every label, tone and explanation comes from the SERVER (resolveCliAuthCell), the
+   same call the admin Users table renders from — so the two can never tell different
+   stories about whether you are signed in. */
+function render(s){
+ list.innerHTML='';
+ if(!s.clis.length){list.innerHTML='<p class="meNote">No assistants are enabled on this workbench yet.</p>'}
+ for(const c of s.clis){
+  const row=document.createElement('div');row.className='meRow';
+  row.innerHTML='<span class="meName">'+esc(c.label)+'</span><span class="meVer">'+esc(c.version)+'</span><span class="meGrow"></span>'+pill(c.auth.tone,c.auth.label);
+  if(c.auth.canSelfSignIn&&s.canOpenTerminal){
+   /* Owed vs merely possible: signing in for the first time is the task, so it gets a
+      button; re-authenticating something that already works is a quiet link. */
+   const b=document.createElement('button');b.type='button';
+   b.className=c.auth.needsSignIn?'meBtn':'meBtn link';
+   b.textContent=c.auth.needsSignIn?'Sign in':'Sign in again';
+   b.onclick=async()=>{b.disabled=true;setStatus('Opening a terminal for the sign-in…');
+    try{const r=await fetch('${base}/api/me/cli-login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();
+     if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+     setStatus('Running '+j.command+' in '+j.project+' — finish it in the terminal that just opened.');
+     window.open(j.url,'_blank','noopener');
+    }catch(e){setStatus(e.message||String(e),true)}finally{b.disabled=false;setTimeout(load,1500)}};
+   row.appendChild(b);
+  }
+  const w=document.createElement('p');w.className='meWhy';w.textContent=c.auth.detail;row.appendChild(w);
+  list.appendChild(row);
+ }
+ /* My own colour: what my tabs are marked with in every cockpit, and the mapping
+    nobody could otherwise look up. Claimed colours are shown as taken rather than
+    silently refused on save. */
+ const col=s.color;
+ colorBox.innerHTML='<h2>My tab colour</h2><p class="meNote">Terminal tabs running on your account are marked with this in the cockpit, so it is visible whose seat a tab is spending. '
+  +(col.chosen?'You chose <b>'+esc(col.name)+'</b>.':'You were assigned <b>'+esc(col.name)+'</b> automatically \u2014 pick one to make it yours.')+'</p><div class="cPick" id="meColorPick"></div>';
+ const pick=document.getElementById('meColorPick');
+ function renderPick(sel){
+  pick.innerHTML='';
+  const auto=document.createElement('button');auto.type='button';auto.className='auto'+(sel?'':' sel');
+  auto.textContent='Automatic';auto.onclick=()=>save('');pick.appendChild(auto);
+  for(const c of col.palette){
+   const b=document.createElement('button');b.type='button';b.style.background=c.css;
+   const holder=col.claims[c.name];const taken=holder&&holder!==s.username;
+   b.className=(c.name===sel?'sel':'')+(taken?' taken':'');
+   b.title=taken?(c.name+' \u2014 already held by '+holder):c.name;
+   if(!taken)b.onclick=()=>save(c.name);
+   pick.appendChild(b);
+  }
+ }
+ async function save(color){
+  setStatus('Saving\u2026');
+  try{const r=await fetch('${base}/api/me/tab-color',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({color})});const j=await r.json();
+   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+   setStatus(color?('Your tabs are now '+color+'.'):'Your colour is automatic again.');load()}
+  catch(e){setStatus(e.message||String(e),true)}
+ }
+ renderPick(col.chosen);
+ const g=s.github;
+ tokBox.innerHTML='<h2>My GitHub token</h2><p class="meNote">Used for your git pushes, and it is also what authenticates Copilot — a stored token takes precedence over any Copilot sign-in. It is stored encrypted and is never shown back to you or to anyone else.</p>'
+  +'<div class="meTok"><span>'+(g.hasToken?pill(g.kind==='classic'||g.kind==='unreadable'?'bad':'ok','stored · '+g.kind):pill('','none stored'))+'</span>'
+  +'<input id="meTokInput" type="password" autocomplete="off" placeholder="Paste a new token to replace it (fine-grained, with Copilot Requests)">'
+  +'<button class="meBtn" id="meTokSave" type="button">Save</button>'
+  +(g.hasToken?'<button class="meBtn secondary" id="meTokClear" type="button">Clear</button>':'')+'</div>'
+  +'<p class="meNote">Clearing it lets a Copilot sign-in take effect, but your git pushes from projects you own will have no credential until you store a new one.</p>'
+  +(g.login?'<p class="meNote">Authorised as GitHub user <b>'+esc(g.login)+'</b>.</p>':'')
+  +((g.cli||g.oauth)?'<div class="meTok"><button class="meBtn" id="meGhStart" type="button">'+(g.cli?'Sign in with the GitHub CLI':'Authorise with GitHub')+'</button><span class="meNote">Recommended: an authorisation grants what it grants, instead of a hand-made token that pushes but Copilot refuses, or the reverse.</span></div><div id="meGhStep"></div>':'<p class="meNote">Neither the GitHub CLI nor an OAuth app is available here, so pasting a token is the only option. An administrator can install gh.</p>');
+ const ghStartBtn=document.getElementById('meGhStart');
+ if(ghStartBtn){
+  const step=document.getElementById('meGhStep');
+  let deadline=0;
+  const poll=(ms)=>setTimeout(async()=>{
+   if(Date.now()>deadline){setStatus('That code expired before it was authorised \u2014 start again.',true);return}
+   try{
+    const r=await fetch('${base}/api/github-oauth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(j.ok&&j.status==='pending'){setStatus('Waiting for the authorisation on github.com\u2026');return poll(j.intervalMs||ms)}
+    if(!j.ok){setStatus(j.error||'That authorisation did not complete.',true);return}
+    step.innerHTML='<p class="meNote">Connected as <b>'+esc(j.login)+'</b>. Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>';
+    setStatus('Done.');load();
+   }catch(e){setStatus(e.message||String(e),true)}
+  },ms);
+  /* gh stores the token itself, so this watches for THAT rather than polling GitHub. */
+  const pollCapture=(ms)=>setTimeout(async()=>{
+   if(Date.now()>deadline){setStatus('Gave up waiting. Your terminal is still open \u2014 finish it there, then press the button again to pick it up.',true);return}
+   try{
+    const r=await fetch('${base}/api/github-cli/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(j.ok&&j.status==='pending'){setStatus('Waiting for you to finish gh auth login\u2026');return pollCapture(ms)}
+    if(!j.ok){setStatus(j.error||'Could not read what gh stored.',true);return}
+    step.innerHTML='<p class="meNote">Connected as <b>'+esc(j.login)+'</b>. Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>';
+    setStatus('Done.');load();
+   }catch(e){setStatus(e.message||String(e),true)}
+  },ms);
+  ghStartBtn.onclick=async()=>{
+   ghStartBtn.disabled=true;setStatus('Working\u2026');
+   try{
+    if(g.cli){
+     const r=await fetch('${base}/api/github-cli/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+     const j=await r.json();
+     if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+     deadline=Date.now()+15*60*1000;
+     step.innerHTML='<p class="meNote">A terminal opened in <b>'+esc(j.project)+'</b> running <code>'+esc(j.command)+'</code>. Follow its prompts \u2014 gh prints a one-time code and a URL. <a href="'+esc(j.url)+'" target="_blank" rel="noopener">Open that terminal \u2197</a></p>';
+     setStatus('Waiting for you to finish gh auth login\u2026');
+     pollCapture(3000);
+     return;
+    }
+    setStatus('Asking GitHub for a code\u2026');
+    const r=await fetch('${base}/api/github-oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});
+    const j=await r.json();
+    if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+    deadline=Date.now()+(j.expiresInMs||900000);
+    step.innerHTML='<div class="gh-code">'+esc(j.userCode)+'</div><p class="meNote">Open <a href="'+esc(j.verificationUri)+'" target="_blank" rel="noopener">'+esc(j.verificationUri)+'</a> and enter that code. Any device will do.</p>';
+    setStatus('Waiting for the authorisation on github.com\u2026');
+    poll(j.intervalMs||5000);
+   }catch(e){setStatus(e.message||String(e),true)}finally{ghStartBtn.disabled=false}
+  };
+ }
+ document.getElementById('meTokSave').onclick=async()=>{
+  const v=document.getElementById('meTokInput').value.trim();if(!v){setStatus('Paste a token first.',true);return}
+  setStatus('Saving…');try{const r=await fetch('${base}/api/me/github-token',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:v})});const j=await r.json();
+   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));setStatus('Stored ('+j.github.kind+').');load()}catch(e){setStatus(e.message||String(e),true)}};
+ const cb=document.getElementById('meTokClear');
+ if(cb)cb.onclick=async()=>{if(!confirm('Clear your stored GitHub token?\\n\\nA Copilot sign-in can then take effect, but git pushes from projects you own will have no credential until you store a new token.'))return;
+  setStatus('Clearing…');try{const r=await fetch('${base}/api/me/github-token',{method:'DELETE'});const j=await r.json();
+   if(!j.ok)throw new Error(j.error||('HTTP '+r.status));setStatus('Cleared.');load()}catch(e){setStatus(e.message||String(e),true)}};
+}
+async function load(){try{const r=await fetch('${base}/api/me/cli-status',{cache:'no-store'});const j=await r.json();
+ if(!j.ok)throw new Error(j.error||'could not load');render(j)}catch(e){setStatus(e.message||String(e),true)}}
+load();})();</script>`;
+
+app.get(BASE + '/me', requireAuth, async (req,res)=>{
+ if(req.user.implicit) return res.redirect(BASE + '/login?next=' + encodeURIComponent(BASE + '/me'));
+ const [claudeVersion, updateStamp] = await Promise.all([
+  getCliVersion('claude').then(v => v || 'not installed').catch(()=> 'unknown'),
+  getClaudeUpdateStamp().catch(()=> 'unknown'),
+ ]);
+ const back = await lastProjectForUser(req.user.username).catch(()=> '');
+ const backLink = back ? `<a class="meBack" href="${BASE}/term/${encodeURIComponent(back)}/">← back to ${esc(back)}</a>` : `<a class="meBack" href="${BASE}/">← back to the dashboard</a>`;
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>My CLI sign-ins — Workbench</title><style>${designTokensCss}${landingCss}${mePageCss}${statusBarCss}${colorPickCss}${deviceCodeCss}</style></head><body class="landing"><div class="meWrap">${backLink}<div class="meHead"><h1>My CLI sign-ins</h1><span class="meWho">signed in as <b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></div><p class="meLead">Which assistants this workbench offers is set by an administrator. <b>Being signed in to one is yours</b> — these are your own credentials, kept in your own configuration directory, and used by the terminals you open.</p><div class="meCard"><div id="meClis"></div></div><div class="meCard" id="meColorBox"></div><div class="meCard" id="meTokBox"></div><div class="meStatus" id="meStatus"></div></div>${mePageScript(BASE)}${statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE })}</body></html>`);
+});
+
+// CLI statuses, memoised briefly.
+//
+// getCliStatuses() spawns `<bin> --version` for every supported CLI, each with its own
+// timeout. That was fine while only the Settings page asked; the Users table asks too
+// now, and per-request subprocess spawns on a route that manages accounts is the wrong
+// trade — a slow or wedged binary would show up as slow user management. The window is
+// short enough that an operator never sees a stale version, and an install invalidates
+// it immediately so the UI reflects what it just did.
+let cliStatusCache = { at: 0, value: null };
+const CLI_STATUS_TTL_MS = 30000;
+async function getCliStatusesCached(){
+ const now = Date.now();
+ if(cliStatusCache.value && now - cliStatusCache.at < CLI_STATUS_TTL_MS) return cliStatusCache.value;
+ const value = await getCliStatuses();
+ cliStatusCache = { at: now, value };
+ return value;
+}
+function invalidateCliStatusCache(){ cliStatusCache = { at: 0, value: null }; }
+
+// The CLIs this workbench offers a PERSON: enabled by the operator and actually
+// installed. Anything else cannot have a sign-in state worth showing — an unenabled CLI
+// is not on offer, and an uninstalled one has nothing to sign in to.
+//
+// Degrades to NO columns rather than propagating a failure: these are informational,
+// and the route that carries them also manages accounts. An unreadable workbench.json
+// must not be able to take down user management — which is exactly what it did the first
+// time this was wired straight through.
+async function offeredClis(){
+ try {
+  const [settings, statuses] = await Promise.all([loadWorkbenchSettings(), getCliStatusesCached()]);
+  const enabled = new Set(settings.enabledClis || []);
+  return Object.values(statuses)
+   .filter(c => enabled.has(c.key))
+   .map(c => ({ key:c.key, label:c.label, installed:!!c.installed, version:c.version,
+    userAuthSupported: !!SUPPORTED_CLIS[c.key]?.userAuthCmd }));
+ } catch(e){
+  console.warn(`[cli-auth] could not determine which CLIs this workbench offers; showing no sign-in columns: ${e?.message || e}`);
+  return [];
+ }
+}
+// One person's CLI identity state: the per-CLI cells both surfaces render from
+// (resolveCliAuthCell, so they cannot disagree), plus the plain claudeSignedIn boolean
+// that GET /api/users has always reported.
+async function userCliState(user, clis){
+ const off = () => Object.fromEntries(clis.map(c => [c.key, resolveCliAuthCell({ cli:c.key, perUserEnabled:false, installed:c.installed, userAuthSupported:c.userAuthSupported })]));
+ // Null, not false, while the feature is off: there is no per-person identity to be
+ // signed in as, and `false` would read as "this person has not got round to it".
+ if(!PER_USER_CLAUDE) return { claudeSignedIn: null, cells: off() };
+ const signIn = await userCliSignIn(user.username);
+ const copilot = userCopilotAuth(user, signIn.copilot);
+ return {
+  claudeSignedIn: signIn.claude,
+  cells: Object.fromEntries(clis.map(c => [c.key, resolveCliAuthCell({
+   cli: c.key, perUserEnabled: true, installed: c.installed, userAuthSupported: c.userAuthSupported,
+   claudeSignedIn: signIn.claude, copilotState: copilot.state, copilotOverridesLogin: copilot.overridesLogin,
+  })])),
+ };
+}
+
+// My own CLI sign-in state. Self-only by construction: there is no username
+// parameter, so this cannot be used to enumerate anybody else's credentials.
+app.get(BASE + '/api/me/cli-status', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const [clis, users, settings] = await Promise.all([offeredClis(), loadUsers(), loadWorkbenchSettings().catch(()=> ({}))]);
+ const me = users.find(u => u.username === req.user.username) || { username: req.user.username };
+ const { cells } = await userCliState(me, clis);
+ const colorMap = mergeUserTabColors(users, settings.userTabColors);
+ // Only the fields a person needs in order to decide what to do — never authCmd/pkg,
+ // which stay internal (the same trimming getCliStatuses already does).
+ const out = clis.map(c => ({ ...c, auth: cells[c.key] }));
+ res.json({
+  ok:true, perUserClaude: PER_USER_CLAUDE, username: req.user.username, role: req.user.role,
+  canOpenTerminal: TERMINAL_ROLES.has(req.user.role),
+  // The KIND of their own token, never the token. Knowing it is a classic PAT is the
+  // difference between "sign in again" and "this can never work until it is replaced".
+  github: {
+   hasToken: !!me.ghToken,
+   kind: me.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(me.ghToken)); } catch { return 'unreadable'; } })() : 'none',
+   login: me.ghLogin || '',
+   oauth: GITHUB_OAUTH.enabled,
+   cli: await ghCliAvailable(),
+  },
+  // chosen is '' when the colour was assigned automatically; name/css is what it is.
+  color: {
+   chosen: me.tabColor || '',
+   name: resolveUserTabColor(me.username, colorMap),
+   css: userTabColorCss(resolveUserTabColor(me.username, colorMap)),
+   palette: userTabPaletteList(),
+   claims: userTabColorClaims(users, settings.userTabColors),
+  },
+  clis: out,
+ });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// ── GitHub via the gh CLI, per person ───────────────────────────────────────
+//
+// The better of the two routes, and the one to prefer when gh is installed: gh IS an app
+// GitHub trusts, so `gh auth login` needs no client id from us and produces the one kind
+// of token that has always done both jobs here — pushing and Copilot.
+//
+// PW does not implement any of the OAuth. It opens a terminal running the login AS THAT
+// PERSON (so gh writes into their own GH_CONFIG_DIR), and then reads back what gh stored.
+// The person completes the flow in their own browser, which is the only part that cannot
+// be automated and the reason to use gh rather than fake it.
+async function ghCliAvailable(){ return !!(await getCliVersion('gh')); }
+
+app.post(BASE + '/api/github-cli/connect', requireTerminalRole, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity to connect.'});
+ if(!PER_USER_CLAUDE) return res.status(409).json({ok:false,error:'Per-user credentials are off, so every terminal shares one gh login. Enable PW_PER_USER_CLAUDE first.'});
+ if(!await ghCliAvailable()) return res.status(409).json({ok:false,error:'The GitHub CLI is not installed. An administrator runs deploy/install-gh.sh (see Settings → System & Updates → Readiness checklist).'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ const users = await loadUsers();
+ const targetUser = users.find(u => u.username === target);
+ if(!targetUser) return res.status(404).json({ok:false,error:`User "${target}" not found`});
+ // The tab must run as the TARGET, not as whoever pressed the button, or gh would write
+ // into the presser's config dir and authorise the wrong person. That is only possible
+ // when tabs are keyed to a person at all.
+ if(target !== req.user.username && !PER_LAUNCHER_CLAUDE){
+  return res.status(409).json({ok:false,error:'Connecting on somebody else\'s behalf needs per-launcher credentials (PW_PER_LAUNCHER_CLAUDE), because the terminal has to run as them. They can do it from their own /me page instead.'});
+ }
+ const projects = filterProjectsForUser(await loadProjects(), targetUser);
+ if(!projects.length) return res.status(409).json({ok:false,error:`${target} has access to no projects, and the sign-in runs inside a project terminal. Grant a project first.`});
+ const preferred = await lastProjectForUser(target);
+ const project = projects.find(p => p.name === preferred) || projects[0];
+ const command = ghLoginCommand({ scopes: GH_DEFAULT_SCOPES });
+ const index = await newTmuxWindow(project, 'GitHub login', command, target);
+ await audit('github_cli_connect_started', { target, startedBy: req.user.username, project: project.name }, req);
+ res.json({ ok:true, target, project: project.name, windowIndex: index, command,
+  url: `${BASE}/term/${encodeURIComponent(project.name)}/` });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Read back what gh stored and adopt it as this person's credential. Polled while they
+// finish in their browser, so "nothing yet" is the normal answer rather than a failure.
+app.post(BASE + '/api/github-cli/capture', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first.'});
+ if(!PER_USER_CLAUDE) return res.status(409).json({ok:false,error:'Per-user credentials are off.'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ const token = await readUserGhToken({
+  base: USER_CRED_BASE, username: target,
+  owner: await terminalOwner(), currentUid: process.getuid?.() ?? null,
+  runJob: runCredentialJob, execFile: execFileAsync,
+ });
+ if(!token) return res.json({ ok:true, status:'pending' });
+ // Verified before it is adopted: which account it belongs to is what the row shows, and
+ // a token GitHub will not identify is not one to pin as a push credential.
+ const who = await verifyToken({ fetchImpl: fetch, config: GITHUB_OAUTH, token });
+ const stored = await setUserGithubToken(target, token, who.login);
+ if(stored.failure) return res.status(stored.failure.status).json({ok:false,error:stored.failure.error});
+ invalidateTabColorCache();
+ await audit('github_cli_connect_completed', { target, githubLogin: who.login, scopes: who.scopes }, req);
+ res.json({ ok:true, status:'ok', target, login: who.login, scopes: who.scopes, ...describeTokenCapability(who.scopes) });
+} catch(e){ res.status(502).json({ok:false,error:e.message||String(e)}); }});
+
+// ── GitHub OAuth, per person ────────────────────────────────────────────────
+//
+// A stored GitHub token here has to push (it is pinned as the credential of every repo
+// its owner owns) AND authenticate Copilot. A hand-made PAT satisfies one and fails the
+// other with dreary regularity — both directions have now happened on this box — so a
+// person authorising an app, and getting whatever that authorisation grants, removes the
+// class of problem rather than another instance of it.
+//
+// Device flow, because the alternative needs an inbound redirect URL and this is a LAN
+// host behind a private CA. The person reads a code off the modal and types it into
+// github.com themselves; nothing needs to reach this box.
+const GITHUB_OAUTH = githubOauthConfig(process.env);
+// Pending authorisations, in memory only, keyed by the user the token will be stored
+// for. Not persisted on purpose: the device code is a secret that collects a token, it
+// is worthless after ~15 minutes, and a dashboard restart mid-flow should cancel the
+// flow rather than resurrect it.
+const pendingGithubOauth = new Map();
+function pruneGithubOauth(){
+ const now = Date.now();
+ for(const [k,v] of pendingGithubOauth) if(v.expiresAt <= now) pendingGithubOauth.delete(k);
+}
+// Who may authorise for whom: yourself always; anybody, if you are an admin. An admin
+// starting it on someone else's row is a real workflow (sitting with them while they
+// authorise on their own phone), which is exactly why the GitHub login the token turns
+// out to belong to is verified and shown afterwards — see verifyToken.
+function oauthTargetUser(req){
+ const asked = String(req.body?.username || '').trim();
+ if(!asked || asked === req.user.username) return { target: req.user.username };
+ if(req.user.role !== 'admin') return { error: 'You can only connect your own GitHub account.' };
+ return { target: asked };
+}
+
+app.post(BASE + '/api/github-oauth/start', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity to connect.'});
+ if(!GITHUB_OAUTH.enabled) return res.status(409).json({ok:false,error:'No GitHub OAuth app is configured. An administrator sets PW_GITHUB_OAUTH_CLIENT_ID to an OAuth app with Device Flow enabled (GitHub → Settings → Developer settings → OAuth Apps). Until then, paste a token instead.'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ const users = await loadUsers();
+ if(!users.some(u => u.username === target)) return res.status(404).json({ok:false,error:`User "${target}" not found`});
+ pruneGithubOauth();
+ const flow = await startDeviceFlow({ fetchImpl: fetch, config: GITHUB_OAUTH });
+ pendingGithubOauth.set(target, {
+  deviceCode: flow.deviceCode, intervalMs: flow.intervalMs,
+  expiresAt: Date.now() + flow.expiresInMs, startedBy: req.user.username,
+ });
+ await audit('github_oauth_started', { target, startedBy: req.user.username }, req);
+ // The device code itself is NOT returned: it is the secret that collects the token.
+ res.json({ ok:true, target, userCode: flow.userCode, verificationUri: flow.verificationUri,
+  intervalMs: flow.intervalMs, expiresInMs: flow.expiresInMs });
+} catch(e){ res.status(502).json({ok:false,error:e.message||String(e)}); }});
+
+app.post(BASE + '/api/github-oauth/poll', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first.'});
+ if(!GITHUB_OAUTH.enabled) return res.status(409).json({ok:false,error:'No GitHub OAuth app is configured.'});
+ const { target, error } = oauthTargetUser(req);
+ if(error) return res.status(403).json({ok:false,error});
+ pruneGithubOauth();
+ const pending = pendingGithubOauth.get(target);
+ if(!pending) return res.status(409).json({ok:false,error:'That authorisation is no longer in progress — start it again.'});
+ const out = await pollDeviceFlow({ fetchImpl: fetch, config: GITHUB_OAUTH, deviceCode: pending.deviceCode });
+ if(out.status === 'pending') return res.json({ ok:true, status:'pending' });
+ if(out.status === 'slow-down'){ pending.intervalMs = out.intervalMs; return res.json({ ok:true, status:'pending', intervalMs: out.intervalMs }); }
+ if(out.status !== 'ok'){
+  pendingGithubOauth.delete(target);
+  return res.json({ ok:false, status: out.status,
+   error: out.status === 'denied' ? 'The authorisation was declined on GitHub.' : 'That code expired before it was authorised — start again.' });
+ }
+ // One authorisation, one use.
+ pendingGithubOauth.delete(target);
+ const who = await verifyToken({ fetchImpl: fetch, config: GITHUB_OAUTH, token: out.token });
+ const stored = await setUserGithubToken(target, out.token, who.login);
+ if(stored.failure) return res.status(stored.failure.status).json({ok:false,error:stored.failure.error});
+ invalidateTabColorCache();
+ // The token is never returned, logged or echoed; the GitHub login and the scopes are,
+ // because those are what make a mis-binding or a missing permission visible.
+ await audit('github_oauth_completed', { target, startedBy: pending.startedBy, githubLogin: who.login, scopes: who.scopes }, req);
+ res.json({ ok:true, status:'ok', target, login: who.login, scopes: who.scopes, ...describeTokenCapability(who.scopes) });
+} catch(e){ res.status(502).json({ok:false,error:e.message||String(e)}); }});
+
+// Choose MY OWN tab colour.
+//
+// Self-service for the same reason the rest of this page is: a colour is how a team
+// refers to each other's terminals, and the person whose tabs they are is the obvious
+// one to pick it. Refused when somebody else already holds it — two people in one
+// colour undoes the only thing it is for — and '' hands the choice back to the
+// automatic assignment.
+app.post(BASE + '/api/me/tab-color', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const color = normalizeUserTabColorChoice(req.body?.color);
+ if(color === null) return res.status(400).json({ok:false,error:'Unknown tab colour'});
+ const result = await credentialDomain.withLocks(['lifecycle'], async () => {
+  const users = await loadUsers();
+  const u = users.find(x => x.username === req.user.username);
+  if(!u) return { failure: { status:404, error:'Your user record no longer exists.' } };
+  const holder = tabColorClaimedBy(users, await loadWorkbenchSettings().catch(()=> ({})), u.username, color);
+  if(holder) return { failure: { status:409, error:`"${color}" is already ${holder}'s colour. Pick another.` } };
+  if(color) u.tabColor = color; else delete u.tabColor;
+  await saveUsers(users);
+  return { color };
+ });
+ if(result.failure) return res.status(result.failure.status).json({ok:false,error:result.failure.error});
+ invalidateTabColorCache();
+ await audit('self_tab_color_set', { color: result.color || 'automatic' }, req);
+ res.json({ ok:true, color: result.color });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+// Replace or clear MY OWN stored GitHub token.
+//
+// Self-service on purpose. Copilot reads a stored token ahead of any login, so a token
+// Copilot refuses (a classic ghp_ PAT) makes `copilot login` unable to take effect —
+// and until now the only way out was to ask an admin. A person being able to fix their
+// own credential is the difference between self-service sign-in working and it being
+// advice. It is their credential, used for their own attribution; it grants nothing on
+// this box, and every change is audited.
+app.post(BASE + '/api/me/github-token', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const token = String(req.body?.token || '').trim();
+ if(!token) return res.status(400).json({ok:false,error:'No token supplied. Use DELETE to clear the stored one.'});
+ if(token.length > 512) return res.status(400).json({ok:false,error:'That does not look like a GitHub token (too long).'});
+ if(/\s/.test(token)) return res.status(400).json({ok:false,error:'A GitHub token contains no spaces — check for a stray newline or a partial paste.'});
+ const result = await setUserGithubToken(req.user.username, token);
+ if(result.failure) return res.status(result.failure.status).json({ok:false,error:result.failure.error});
+ // The token itself never reaches the audit log; its TYPE is what an operator would
+ // need to understand a later Copilot failure.
+ await audit('self_github_token_set', { kind: classifyGithubToken(token) }, req);
+ res.json({ ok:true, github:{ hasToken:true, kind: classifyGithubToken(token) } });
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+app.delete(BASE + '/api/me/github-token', requireAuth, async (req,res)=>{ try {
+ if(req.user.implicit) return res.status(409).json({ok:false,error:'Sign in to the dashboard first — an anonymous session has no identity.'});
+ const result = await setUserGithubToken(req.user.username, '');
+ if(result.failure) return res.status(result.failure.status).json({ok:false,error:result.failure.error});
+ await audit('self_github_token_cleared', {}, req);
+ res.json({ ok:true, github:{ hasToken:false, kind:'none' } });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 // Sign THIS person in to a CLI, as themselves.
@@ -4281,9 +4956,14 @@ app.post(BASE + '/api/me/cli-login', requireTerminalRole, async (req,res)=>{ try
  res.json({ ok:true, cli, command: cfg.userAuthCmd, project: target.name, windowIndex: index, url: `${BASE}/term/${encodeURIComponent(target.name)}/` });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
+// Sign in the SHARED box identity. Kept for the mode where that identity is genuinely
+// everybody's — PW_PER_USER_CLAUDE off, which is the upstream default — and refused
+// when it is not, because then it signs in an identity that runs nobody's terminals and
+// the honest answer is per person (POST /api/me/cli-login).
 app.post(BASE + '/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
  const cli = String(req.body?.cli || '');
  const cfg = SUPPORTED_CLIS[cli]; if(!cfg) return res.status(400).json({ok:false,error:'Unknown CLI'});
+ if(PER_USER_CLAUDE) return res.status(409).json({ok:false,error:'Per-user credentials are on, so this shared login runs nobody\'s project terminals — it is only the seed a per-user config dir is created from. Sign in per person from Settings → Users.'});
  const ready = await ensureSetupTerminal();
  if(!ready) return res.status(503).json({ok:false,error:'Setup terminal failed to start. Check `systemctl status project-setup-terminal.service`.'});
  await tmux(['send-keys','-t',setupTmuxSession,cfg.authCmd,'Enter']);
@@ -4313,18 +4993,48 @@ app.get(BASE + '/agents.md', async (_req,res) => {
 // ============================================================================
 function statusBarHtml({ claudeVersion, updateStamp, user, enforce }){
  const u = user && !user.implicit
-  ? `<span class="sb-user"><b>${esc(user.username)}</b> · ${esc(user.role)}</span>`
+  ? `<a class="sb-user" href="${BASE}/me" title="My CLI sign-ins"><b>${esc(user.username)}</b> · ${esc(user.role)}</a>`
   : `<span class="sb-user subtle">anonymous (enforce ${enforce ? 'on' : 'off'})</span>`;
  const enforceTag = enforce ? '<span class="sb-tag warn">enforce</span>' : '<span class="sb-tag">soft</span>';
  return `<footer id="pwStatusBar"><span class="sb-item sb-version">Release: <b>${esc(RELEASE_VERSION)}</b></span><span class="sb-sep">·</span><span class="sb-item">Claude Code: <b>${esc(claudeVersion)}</b></span><span class="sb-sep">·</span><span class="sb-item">Last update check: <b>${esc(updateStamp)}</b></span><span class="sb-sep">·</span><span class="sb-item">Auth: ${enforceTag}</span><span class="sb-grow"></span>${u}</footer>`;
 }
-const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);border-top:1px solid #1f2937;color:#94a3b8;font:12px system-ui,-apple-system,Segoe UI,sans-serif;padding:5px 14px;display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);z-index:50;overflow:hidden;white-space:nowrap}#pwStatusBar b{color:#e5e7eb;font-weight:600}#pwStatusBar .sb-sep{opacity:.45}#pwStatusBar .sb-grow{flex:1}#pwStatusBar .sb-tag{padding:1px 7px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:11px;border:1px solid #334155}#pwStatusBar .sb-tag.warn{color:#fde68a;border-color:#854d0e;background:#3b2e0a}#pwStatusBar .sb-version{white-space:nowrap}body{padding-bottom:32px}body.pw-cockpit{padding-bottom:0}body.pw-cockpit #shell{height:calc(100% - 32px)}`;
+/* The colour picker, shared by Settings -> Users and a person's own page: the palette as
+   swatches plus an explicit automatic option. A native select cannot show a colour, and a
+   colour you cannot see is not a choice. Defined once because two copies of the same
+   control drifting apart is how one of them ends up lying. */
+// Shared by the Users modal and a person's own page, for the same reason the colour
+// picker is: one definition, so the two cannot drift.
+const deviceCodeCss = `.gh-code{font:700 1.5rem/1.2 ui-monospace,Menlo,monospace;letter-spacing:.18em;background:#020617;border:1px solid var(--line);border-radius:10px;padding:.6rem 1rem;text-align:center;color:#fde68a;user-select:all;margin:.6rem 0}`;
+const colorPickCss = `.cPick{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:.3rem}
+.cPick button{width:22px;height:22px;border-radius:6px;border:2px solid transparent;cursor:pointer;padding:0}
+.cPick button.sel{border-color:#e5e7eb;box-shadow:0 0 0 2px rgba(148,163,184,.35)}
+.cPick button.taken{opacity:.35;cursor:not-allowed}
+.cPick .auto{width:auto;height:22px;padding:0 .5rem;background:#1f2937;border:2px solid #334155;color:#cbd5e1;font:inherit;font-size:.74rem;border-radius:6px}
+.cPick .auto.sel{border-color:#e5e7eb}`;
+const statusBarCss = `#pwStatusBar{height:32px;box-sizing:border-box;position:fixed;left:0;right:0;bottom:0;background:rgba(15,23,42,.92);border-top:1px solid #1f2937;color:#94a3b8;font:12px system-ui,-apple-system,Segoe UI,sans-serif;padding:5px 14px;display:flex;align-items:center;gap:10px;backdrop-filter:blur(8px);z-index:50;overflow:hidden;white-space:nowrap}#pwStatusBar b{color:#e5e7eb;font-weight:600}#pwStatusBar .sb-sep{opacity:.45}#pwStatusBar .sb-grow{flex:1}#pwStatusBar .sb-tag{padding:1px 7px;border-radius:999px;background:#1f2937;color:#cbd5e1;font-size:11px;border:1px solid #334155}#pwStatusBar .sb-tag.warn{color:#fde68a;border-color:#854d0e;background:#3b2e0a}#pwStatusBar .sb-version{white-space:nowrap}#pwStatusBar a.sb-user{color:inherit;text-decoration:none;border-bottom:1px dotted #475569}#pwStatusBar a.sb-user:hover{color:#e5e7eb;border-bottom-color:#94a3b8}body{padding-bottom:32px}body.pw-cockpit{padding-bottom:0}body.pw-cockpit #shell{height:calc(100% - 32px)}`;
 
 // ============================================================================
 // Settings page (admin-only). Tabbed surface — primary settings destination.
 // Setup Wizard still exists as a focused guided modal launched from here.
 // ============================================================================
-const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.tok-row{padding:.55rem 0;border-bottom:1px solid #1f2937}.tok-row:last-child{border-bottom:0}.tok-row.revoked{opacity:.55}.tok-tag{font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;background:#7f1d1d;color:#fecaca;border-radius:3px;padding:1px 5px;vertical-align:middle}.tok-new{margin:.6rem 0;padding:.6rem .7rem;border:1px solid #a16207;border-radius:6px;background:#1c1917}.tok-new pre{margin:.35rem 0;padding:.45rem .5rem;background:#0b0f19;border-radius:4px;overflow-x:auto;font-size:.8rem;color:#fde68a;user-select:all}#tokScopes{border:1px solid #334155;border-radius:6px;padding:.4rem .6rem;margin:.5rem 0}#tokScopes legend{padding:0 .3rem;font-size:.8rem;color:#94a3b8}#tokScopes label{display:block;font-weight:400;margin:.2rem 0}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}/* display:flex above outranks the UA [hidden] rule, so a hidden field stays visible unless this re-asserts it — the same trap as .tabMenu vs .projLinks[hidden]. */.t-grid label[hidden]{display:none}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-agentrow{display:flex;align-items:center;gap:.6rem;margin:.5rem 0 .2rem;font-size:.85rem;color:#cbd5e1}.t-agentrow label{display:flex;align-items:center;gap:.35rem}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
+const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:0;background:#0f172a;color:#e5e7eb}.s-header{display:flex;align-items:center;gap:1rem;padding:1rem 1.5rem;border-bottom:1px solid #1f2937;background:#0b1220}.s-header h1{margin:0;font-size:1.2rem}.s-header .back{color:#bfdbfe;text-decoration:none;border:1px solid #334155;border-radius:999px;padding:5px 12px;background:#0f172a;font-size:.85rem}.s-header .back:hover{background:#1e293b;color:#fff}.s-header .grow{flex:1}.s-header .who{font-size:.85rem;color:#cbd5e1}.s-header .who b{color:#fff}.s-layout{display:grid;grid-template-columns:230px minmax(0,1fr);gap:0;min-height:calc(100vh - 60px - 32px)}.s-tabs{border-right:1px solid #1f2937;padding:1rem .5rem;background:#0b1220}.s-tabs button{display:block;width:100%;text-align:left;background:transparent;color:#cbd5e1;border:0;padding:.55rem .85rem;border-radius:8px;font:inherit;cursor:pointer;margin:1px 0}.s-tabs button:hover{background:#1e293b;color:#fff}.s-tabs button.active{background:#1e3a8a;color:#fff;font-weight:600}.s-main{padding:1.5rem 2rem;overflow:auto;min-width:0}.s-main section{display:none}.s-main section.active{display:block}.s-main h2{margin:0 0 .25rem;font-size:1.3rem}.s-main .lead{margin:0 0 1.25rem;color:#94a3b8;font-size:.92rem}.s-card{background:#111827;border:1px solid #334155;border-radius:12px;padding:1.1rem 1.25rem;margin-bottom:1rem}.tok-row{padding:.55rem 0;border-bottom:1px solid #1f2937}.tok-row:last-child{border-bottom:0}.tok-row.revoked{opacity:.55}.tok-tag{font-size:.7rem;text-transform:uppercase;letter-spacing:.04em;background:#7f1d1d;color:#fecaca;border-radius:3px;padding:1px 5px;vertical-align:middle}.tok-new{margin:.6rem 0;padding:.6rem .7rem;border:1px solid #a16207;border-radius:6px;background:#1c1917}.tok-new pre{margin:.35rem 0;padding:.45rem .5rem;background:#0b0f19;border-radius:4px;overflow-x:auto;font-size:.8rem;color:#fde68a;user-select:all}#tokScopes{border:1px solid #334155;border-radius:6px;padding:.4rem .6rem;margin:.5rem 0}#tokScopes legend{padding:0 .3rem;font-size:.8rem;color:#94a3b8}#tokScopes label{display:block;font-weight:400;margin:.2rem 0}.s-card h3{margin:0 0 .5rem;font-size:1.05rem;color:#bfdbfe}.s-card .muted{color:#94a3b8;font-size:.85rem}.button{display:inline-block;background:#2563eb;color:#fff;padding:.55rem .85rem;border-radius:8px;text-decoration:none;border:0;cursor:pointer;font:inherit}.button.secondary{background:#374151}.button.danger{background:#991b1b}.button:hover{filter:brightness(1.1)}.button:disabled{opacity:.5;cursor:not-allowed}input,select{background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;font:inherit;box-sizing:border-box}input[type=text],input[type=password]{width:100%}.row-form{display:grid;grid-template-columns:minmax(140px,1fr) minmax(140px,1fr) minmax(140px,2fr) minmax(140px,1fr) auto;gap:.5rem;align-items:end}.row-form label{display:flex;flex-direction:column;gap:.25rem;font-size:.78rem;color:#cbd5e1;min-width:0}.utable-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch}.utable{width:100%;border-collapse:collapse;font-size:.9rem}.utable th{text-align:left;padding:.55rem .55rem;border-bottom:1px solid #1f2937;color:#94a3b8;font-weight:600;font-size:.78rem;letter-spacing:.02em;text-transform:uppercase}.utable td{padding:.6rem .55rem;border-bottom:1px solid #1f2937;vertical-align:middle}.utable tr:hover td{background:rgba(30,41,59,.4)}.utable td.actions{text-align:right;white-space:nowrap}.utable .role-pill{display:inline-block;white-space:nowrap;padding:1px 8px;border-radius:999px;background:#1f2937;border:1px solid #334155;color:#cbd5e1;font-size:.74rem}.utable .role-pill.admin{color:#fde68a;border-color:#854d0e;background:#3b2e0a}.utable .role-pill.developer{color:#bbf7d0;border-color:#166534;background:#0b291a}.utable .role-pill.content_editor{color:#bfdbfe;border-color:#1e3a8a;background:#0b1a3a}.utable .role-pill.viewer{color:#cbd5e1;border-color:#334155;background:#1f2937}.utable .grants{font:11px ui-monospace,Menlo,monospace;color:#94a3b8;word-break:break-word;max-width:380px;display:inline-block;margin-right:6px}.tiny{padding:3px 9px;font-size:.78rem;margin:0 2px}
+/* An action that lives INSIDE a status cell. A block button next to a pill doubled the
+   row height and read as the point of the cell, when the status is the point. */
+/* The colour a person's terminal tabs are drawn in, shown next to their name. This IS
+   the legend: the mapping is only useful if it is written down somewhere people look. */
+.uSwatch{display:inline-block;width:10px;height:10px;border-radius:3px;margin-right:.45rem;vertical-align:baseline;border:1px solid rgba(255,255,255,.25)}
+.uColorName{color:#64748b;font-size:.72rem;margin-left:.4rem}
+.cellAct{background:none;border:0;padding:0;margin-left:.45rem;color:#7dd3fc;font:inherit;font-size:.74rem;cursor:pointer;text-decoration:underline dotted;white-space:nowrap}
+/* The device code is the one thing a person has to carry to another device, so it is the
+   largest thing in the modal and selectable in one click. */
+.gh-step{margin:.8rem 0}
+.gh-code{font:700 1.7rem/1.2 ui-monospace,Menlo,monospace;letter-spacing:.18em;background:#020617;border:1px solid #334155;border-radius:10px;padding:.7rem 1rem;text-align:center;color:#fde68a;user-select:all}
+.gh-where{margin:.6rem 0 0;font-size:.9rem}
+.gh-where a{color:#7dd3fc}
+.gh-hint{color:#94a3b8;font-size:.82rem;margin:.5rem 0 0;line-height:1.5}
+.gh-ok{color:#86efac}
+.cellAct:hover{color:#bae6fd;text-decoration-style:solid}
+.cellAct:disabled{opacity:.5;cursor:not-allowed;text-decoration:none}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}/* display:flex above outranks the UA [hidden] rule, so a hidden field stays visible unless this re-asserts it — the same trap as .tabMenu vs .projLinks[hidden]. */.t-grid label[hidden]{display:none}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-agentrow{display:flex;align-items:center;gap:.6rem;margin:.5rem 0 .2rem;font-size:.85rem;color:#cbd5e1}.t-agentrow label{display:flex;align-items:center;gap:.35rem}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
 .um-form{display:flex;flex-direction:column;gap:.9rem}.um-form label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.um-form label.inline{flex-direction:row;align-items:center;gap:.45rem}.um-form label.inline input[type=checkbox]{width:auto;margin:0}.proj-picker{border:1px solid #1f2937;border-radius:8px;padding:.5rem .65rem;background:#0b1220}.proj-picker .star{display:flex;align-items:center;gap:.45rem;color:#fde68a;font-size:.85rem;padding-bottom:.45rem;border-bottom:1px solid #1f2937;margin-bottom:.45rem}.proj-picker .star input{width:auto;margin:0}.proj-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.3rem .85rem;max-height:240px;overflow-y:auto}.proj-list.disabled{opacity:.45;pointer-events:none}.proj-list label{flex-direction:row;align-items:center;gap:.4rem;font-size:.82rem;color:#cbd5e1;padding:.2rem 0;cursor:pointer}.proj-list label input{width:auto;margin:0}.proj-list .empty{color:#94a3b8;font-style:italic;font-size:.82rem}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}`;
 
 const settingsScript = `<script>(function(){const tabs=document.querySelectorAll('.s-tabs button');const sections=document.querySelectorAll('.s-main section');function activate(id){tabs.forEach(b=>b.classList.toggle('active',b.dataset.tab===id));sections.forEach(s=>s.classList.toggle('active',s.id==='tab-'+id));try{history.replaceState(null,'','#'+id)}catch{}}tabs.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));const init=(location.hash||'#users').slice(1);activate(['users','clis','env','deployment','tasks','tokens','system','firstrun'].includes(init)?init:'users');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(el,t,err){if(!el)return;el.textContent=t||'';el.classList.toggle('err',!!err)}
@@ -4332,35 +5042,179 @@ const settingsScript = `<script>(function(){const tabs=document.querySelectorAll
 const uTable=document.getElementById('uTable');const uStatus=document.getElementById('uStatus');const uAddBtn=document.getElementById('uAddBtn');
 // Project list cache for the picker — admins see all projects via /api/projects/status.
 let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});const j=await r.json();if(j?.ok)pwProjects=(j.projects||[]).map(p=>p.name).sort((a,b)=>a.localeCompare(b))}catch{}}
-/* Who the viewer is, from the same response rather than a second round trip or an
-   injected template value: the sign-in button is self-service, so the table has to
-   know which row is yours. */
-let PW_ME='';
-async function loadUsers(){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '9' : '8'}" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '9' : '8'}" class="muted">'+esc(e.message)+'</td></tr>'}}
+/* Who the viewer is and which CLIs have columns, both from the same response rather
+   than a second round trip or an injected template value: the sign-in means is
+   self-service, so the table has to know which row is yours. */
+function uColspan(){return 6+PW_CLIS.length+${DEPLOY_CENTRE ? '1' : '0'}}
+async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};PW_GH_OAUTH=!!j.githubOauth;PW_GH_CLI=!!j.githubCli;renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
 function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
-function tokenCellHtml(u){return u.hasToken?'<td><span class="role-pill" style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)">✓ token</span></td>':'<td><span class="role-pill">none</span></td>'}
-/* Copilot's per-person auth state. It is NOT just "signed in or not", because the
-   stored GitHub token overrides any login (Copilot reads GH_TOKEN first), and a
-   classic ghp_ PAT is a token Copilot refuses — which fails ONLY for inference, so it
-   otherwise looks perfectly configured. Each state therefore says what will actually
-   happen and what to do about it. */
-const COPILOT_CELL={'via-token':['✓ via token','#86efac','#166534','Their own stored GitHub token authenticates Copilot. Nothing else to do.'],'token-rejected':['✗ token type','#fca5a5','#7f1d1d','Copilot CLI does not accept this token type (classic ghp_ PATs are not supported). It also overrides any sign-in. Replace it with a fine-grained token carrying the "Copilot Requests" permission, or clear it so they can sign in.'],'token-unknown':['? token type','#fde68a','#854d0e','This token is not a recognised GitHub token type, and it overrides any sign-in. Replace or clear it.'],'signed-in':['✓ signed in','#86efac','#166534','They completed their own copilot login; the credential is in their own COPILOT_HOME.'],'none':['not yet','','','No stored token and no sign-in: Copilot will ask them to authenticate the first time they open a Copilot tab.'],'unreadable':['! token unreadable','#fca5a5','#7f1d1d','Their stored GitHub token could not be decrypted, so it is unclear what Copilot would use. Replace it.']};
-function copilotCellHtml(u){const st=u.copilotAuth;if(!st)return '<td><span class="muted" title="Per-user credentials are off (PW_PER_USER_CLAUDE), so every terminal shares one Copilot identity">·</span></td>';const c=COPILOT_CELL[st]||['?','','','Unrecognised state'];const extra=u.copilotOverridesLogin?' Their own sign-in exists but is being ignored because the token takes precedence.':'';const title=esc(c[3]+extra);if(!c[1])return '<td><span class="muted" title="'+title+'">'+c[0]+'</span></td>';return '<td><span class="role-pill" style="color:'+c[1]+';border-color:'+c[2]+';background:rgba(0,0,0,.15)" title="'+title+'">'+c[0]+'</span></td>'}
-/* Sign-in buttons, on YOUR row only — the route is self-service, because a tab opened
-   for someone else would carry the clicker's credentials and sign the wrong person in.
-   Copilot's button appears only in the states where a login could actually take effect:
-   a stored token overrides it, so offering it otherwise sends you round a loop that
-   cannot succeed (the cell already explains what to fix instead). */
-function signInButtonsHtml(u){
- if(u.username!==PW_ME)return '';
- let html='';
- if(u.claudeSignedIn!==null)html+='<button class="button secondary tiny" data-signin="claude" title="Open a tab in one of your projects running claude /login, so the login lands in YOUR config dir">Sign in Claude</button>';
- if(u.copilotAuth==='none'||u.copilotAuth==='signed-in')html+='<button class="button secondary tiny" data-signin="copilot" title="Open a tab in one of your projects running copilot login, so the login lands in YOUR own COPILOT_HOME">Sign in Copilot</button>';
- return html;
+/* A stored token was previously write-only from this table: an empty field meant "keep
+   what is there", so there was no way to REMOVE one. That matters because a token
+   Copilot refuses overrides any sign-in, making "clear it, then sign in" the only fix —
+   and it was unreachable. The server already accepted ghToken:'' as a clear; this is
+   the control that sends it. */
+function tokenCellHtml(u){
+ if(!u.hasToken)return '<td><span class="role-pill">none</span><button class="cellAct" data-ghoauth="'+esc(u.username)+'" title="Authorise GitHub through GitHub itself, instead of pasting a token">connect</button></td>';
+ const bad=u.tokenKind==='classic'||u.tokenKind==='unreadable';
+ const style=bad?'color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)':'color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)';
+ const title=u.tokenKind==='classic'?'A classic personal access token. Fine for git, but Copilot CLI refuses this type — and it overrides any Copilot sign-in.'
+  :u.tokenKind==='unreadable'?'This stored token could not be decrypted. Replace it.'
+  :'Stored encrypted; used for their git pushes and, if the type allows, for Copilot.';
+ return '<td><span class="role-pill" style="'+style+'" title="'+esc(title)+'">'+esc(u.tokenKind)+'</span>'
+  +(u.ghLogin?'<span class="uColorName" title="The GitHub account this token was authorised as">'+esc(u.ghLogin)+'</span>':'')
+  +'<button class="cellAct" data-ghoauth="'+esc(u.username)+'" title="Authorise GitHub through GitHub itself, instead of pasting a token">connect</button>'
+  +'<button class="cellAct" data-cleartok="'+esc(u.username)+'" title="Remove this stored token. Needed when Copilot refuses its type, because a stored token overrides any sign-in.">clear</button></td>'
 }
-function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="${DEPLOY_CENTRE ? '9' : '8'}" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th><th>Claude</th><th>Copilot</th><th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td><b>'+esc(u.username)+'</b></td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+'<td>'+(u.claudeSignedIn===true?'<span class="signed-in" title="This user completed their own Claude login">✓ signed in</span>':(u.claudeSignedIn===false?'<span class="muted" title="Owner has not completed their Claude login yet — they run claude once in a project they own">not yet</span>':'<span class="muted" title="Per-user Claude login is off (PW_PER_USER_CLAUDE)">·</span>'))+'</td>'+copilotCellHtml(u)+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions">'+signInButtonsHtml(u)+'<button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
-uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.signin){
+/* GitHub authorisation, per person, in a modal.
+   Device flow: the dashboard gets a code, the PERSON types it into github.com in their own
+   browser, and this polls for the result. Nothing has to reach this box, which is what
+   makes it work on a LAN host behind a private CA. */
+const ghBackdrop=document.getElementById('ghBackdrop'),ghTitle=document.getElementById('ghTitle'),ghStep=document.getElementById('ghStep'),ghStatus=document.getElementById('ghStatus'),ghStart=document.getElementById('ghStart'),ghIntro=document.getElementById('ghIntro');
+let ghTarget='',ghTimer=null,ghDeadline=0,PW_GH_OAUTH=false,PW_GH_CLI=false;
+function ghSet(t,err){ghStatus.textContent=t||'';ghStatus.classList.toggle('err',!!err)}
+function ghStop(){if(ghTimer){clearTimeout(ghTimer);ghTimer=null}}
+function ghCloseFn(){ghStop();ghBackdrop.classList.add('hidden');loadUsers()}
+document.getElementById('ghClose').onclick=ghCloseFn;document.getElementById('ghCancel').onclick=ghCloseFn;
+ghBackdrop.addEventListener('click',e=>{if(e.target===ghBackdrop)ghCloseFn()});
+function ghOpen(username){
+ ghTarget=username;ghStop();
+ ghTitle.textContent='Connect GitHub \u2014 '+username;
+ ghStep.innerHTML='';ghSet('');ghStart.disabled=!(PW_GH_CLI||PW_GH_OAUTH);
+ /* Prefer gh when it is installed: it needs no OAuth app of our own, and the token it
+    produces is the one kind that has always done both jobs here — pushing and Copilot. */
+ ghIntro.textContent=PW_GH_CLI
+  ?'Authorise GitHub for this person with the GitHub CLI. A terminal opens running gh auth login; they complete it in their own browser, and the token is then stored encrypted, becomes the push credential for every project they own, and authenticates Copilot.'
+  :(PW_GH_OAUTH
+   ?'Authorise GitHub for this person. The token is stored encrypted, becomes the push credential for every project they own, and authenticates Copilot in their terminals.'
+   :'Neither the GitHub CLI nor an OAuth app is available on this workbench. An administrator installs gh (deploy/install-gh.sh) or sets PW_GITHUB_OAUTH_CLIENT_ID. Until then, paste a token in the Edit form instead.');
+ ghStart.textContent=PW_GH_CLI?'Open a terminal and start':'Start authorisation';
+ ghBackdrop.classList.remove('hidden');
+}
+async function ghPoll(intervalMs){
+ ghStop();
+ if(Date.now()>ghDeadline){ghSet('That code expired before it was authorised \u2014 start again.',true);return}
+ ghTimer=setTimeout(async()=>{
+  try{
+   const r=await fetch('${BASE}/api/github-oauth/poll',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+   const j=await r.json();
+   if(j.ok&&j.status==='pending'){ghSet('Waiting for the authorisation on github.com\u2026');return ghPoll(j.intervalMs||intervalMs)}
+   if(!j.ok){ghSet(j.error||'That authorisation did not complete.',true);return}
+   /* WHICH GitHub account it turned out to be is the point of showing this: an admin can
+      start the flow on somebody else's row, and whoever is signed into github.com in that
+      browser is the account that gets authorised. */
+   ghStep.innerHTML='<p class="gh-where gh-ok">Connected as <b>'+esc(j.login)+'</b></p>'
+    +'<p class="gh-hint">Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>'
+    +'<p class="gh-hint">Stored for <b>'+esc(j.target)+'</b>. The push credential of every project they own has been updated.</p>';
+   ghSet('Done.');
+  }catch(e){ghSet(e.message||String(e),true)}
+ },intervalMs);
+}
+/* The gh route: PW opens the terminal and then watches for what gh stored. It does not
+   implement, proxy or scrape the OAuth — the person does that part in their browser. */
+async function ghPollCapture(intervalMs){
+ ghStop();
+ if(Date.now()>ghDeadline){ghSet('Gave up waiting. The terminal is still open if they want to finish it \u2014 then press Start again to pick it up.',true);return}
+ ghTimer=setTimeout(async()=>{
+  try{
+   const r=await fetch('${BASE}/api/github-cli/capture',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+   const j=await r.json();
+   if(j.ok&&j.status==='pending'){ghSet('Waiting for them to finish gh auth login\u2026');return ghPollCapture(intervalMs)}
+   if(!j.ok){ghSet(j.error||'Could not read what gh stored.',true);return}
+   ghStep.innerHTML='<p class="gh-where gh-ok">Connected as <b>'+esc(j.login)+'</b></p>'
+    +'<p class="gh-hint">Scopes: '+esc((j.scopes||[]).join(', ')||'(none reported)')+'<br>'+esc(j.pushNote||'')+'</p>'
+    +'<p class="gh-hint">Stored for <b>'+esc(j.target)+'</b>. The push credential of every project they own has been updated, and gh itself stays signed in for their terminals.</p>';
+   ghSet('Done.');
+  }catch(e){ghSet(e.message||String(e),true)}
+ },intervalMs);
+}
+async function ghStartViaCli(){
+ ghSet('Opening a terminal\u2026');
+ const r=await fetch('${BASE}/api/github-cli/connect',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+ const j=await r.json();
+ if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+ ghDeadline=Date.now()+15*60*1000;
+ ghStep.innerHTML='<p class="gh-where">A terminal opened in <b>'+esc(j.project)+'</b> running:</p>'
+  +'<div class="gh-code" style="font-size:.95rem;letter-spacing:0">'+esc(j.command)+'</div>'
+  +'<p class="gh-hint">'+esc(ghTarget)+' follows the prompts there \u2014 gh prints a one-time code and a URL to enter it at. They must be signed in to GitHub as themselves.</p>'
+  +'<p class="gh-where"><a href="'+esc(j.url)+'" target="_blank" rel="noopener">Open that terminal \u2197</a></p>';
+ ghSet('Waiting for them to finish gh auth login\u2026');
+ ghPollCapture(3000);
+}
+ghStart.onclick=async()=>{
+ ghStart.disabled=true;ghSet('Working\u2026');
+ try{
+  if(PW_GH_CLI){ await ghStartViaCli(); return; }
+  ghSet('Asking GitHub for a code\u2026');
+  const r=await fetch('${BASE}/api/github-oauth/start',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({username:ghTarget})});
+  const j=await r.json();
+  if(!j.ok)throw new Error(j.error||('HTTP '+r.status));
+  ghDeadline=Date.now()+(j.expiresInMs||900000);
+  ghStep.innerHTML='<div class="gh-code">'+esc(j.userCode)+'</div>'
+   +'<p class="gh-where">Open <a href="'+esc(j.verificationUri)+'" target="_blank" rel="noopener">'+esc(j.verificationUri)+'</a> and enter that code.</p>'
+   +'<p class="gh-hint">Whoever is signed into GitHub in that browser is the account being authorised, so '+esc(ghTarget)+' should do this themselves, on any device. This page notices when it is done.</p>';
+  ghSet('Waiting for the authorisation on github.com\u2026');
+  ghPoll(j.intervalMs||5000);
+ }catch(e){ghSet(e.message||String(e),true)}finally{ghStart.disabled=false}
+};
+/* The colour picker, shared by the Add and Edit forms. PW_CLAIMS names who already holds
+   each colour so a duplicate cannot be chosen by accident — the server refuses it too,
+   but a disabled swatch explains itself better than an error does. */
+let PW_PALETTE=[],PW_CLAIMS={};
+function renderColorPick(el,selected,username){
+ el.innerHTML='';
+ const auto=document.createElement('button');auto.type='button';auto.className='auto'+(selected?'':' sel');
+ auto.textContent='Automatic';auto.title='Pick a stable colour from whatever nobody has chosen';
+ auto.onclick=()=>{el.dataset.color='';renderColorPick(el,'',username)};
+ el.appendChild(auto);
+ for(const c of PW_PALETTE){
+  const b=document.createElement('button');b.type='button';b.style.background=c.css;
+  const holder=PW_CLAIMS[c.name];
+  const taken=holder&&holder!==username;
+  b.className=(c.name===selected?'sel':'')+(taken?' taken':'');
+  b.title=taken?(c.name+' — already held by '+holder):c.name;
+  if(!taken)b.onclick=()=>{el.dataset.color=c.name;renderColorPick(el,c.name,username)};
+  el.appendChild(b);
+ }
+ el.dataset.color=selected||'';
+}
+/* One column per CLI the workbench offers, one cell per person per CLI. The cell is
+   resolved on the SERVER (resolveCliAuthCell) so this table and each person's own
+   sign-ins page cannot tell different stories about who is signed in. */
+let PW_CLIS=[];
+let PW_ME='';
+function cliCellHtml(u,cli){
+ const cell=(u.cliAuth||{})[cli.key];
+ if(!cell)return '<td><span class="muted">·</span></td>';
+ const tone=cell.tone==='ok'?'style="color:#86efac;border-color:#166534;background:rgba(16,185,129,.12)"'
+  :cell.tone==='bad'?'style="color:#fca5a5;border-color:#7f1d1d;background:rgba(248,113,113,.1)"'
+  :cell.tone==='warn'?'style="color:#fde68a;border-color:#854d0e;background:rgba(251,191,36,.1)"':'';
+ /* Every state renders as a pill, including the neutral ones: a column that mixes pills
+    with bare text reads as though only some rows have a real answer. */
+ const pill='<span class="role-pill"'+(tone?' '+tone:'')+' title="'+esc(cell.detail)+'">'+esc(cell.label)+'</span>';
+ /* The action appears only when one is OWED (needsSignIn), and only on your own row.
+    NOT when already signed in: a "Sign in" button beside a cell reading "signed in"
+    makes a reader doubt the status. Re-authenticating is still possible, from your own
+    page, where it is not sitting in a list of everybody else's states. And never on
+    someone else's row — the sign-in runs in a terminal carrying the presser's
+    credentials, so it would sign in the presser. Where the fix is an admin one (a token
+    Copilot refuses) the Git-token column is that means. */
+ const mine=u.username===PW_ME;
+ const act=(mine&&cell.needsSignIn)
+  ? '<button class="cellAct" data-signin="'+esc(cli.key)+'" title="Open a tab in one of your projects running this login, so the credential lands in YOUR own config dir">sign in</button>'
+  : '';
+ return '<td>'+pill+act+'</td>';
+}
+function renderUsers(users){if(!users.length){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">no users yet — click + Add user above</td></tr>';return}window._pwUsers=users;uTable.innerHTML='<tr><th>Username</th><th>Role</th><th>Git token</th>'+PW_CLIS.map(c=>'<th>'+esc(c.label.replace(/ CLI$/,''))+'</th>').join('')+'<th>Projects</th>${DEPLOY_CENTRE ? '<th>Deploy PW</th>' : ''}<th>Last login</th><th></th></tr>'+users.map(u=>'<tr data-u="'+esc(u.username)+'"><td>'+(u.tabColorCss?'<span class="uSwatch" style="background:'+esc(u.tabColorCss)+'" title="'+esc(u.tabColorName+(u.tabColor?' (chosen)':' (assigned automatically)'))+'"></span>':'')+'<b>'+esc(u.username)+'</b>'+(u.tabColorName?'<span class="uColorName">'+esc(u.tabColorName)+(u.tabColor?'':' · auto')+'</span>':'')+'</td><td><span class="role-pill '+esc(u.role)+'">'+esc(u.role)+'</span></td>'+tokenCellHtml(u)+PW_CLIS.map(c=>cliCellHtml(u,c)).join('')+'<td>'+projectsCellHtml(u.projects)+'</td>'+deployPwCellHtml(u)+'<td class="muted">'+esc(u.lastLoginAt||'never')+'</td><td class="actions"><button class="button secondary tiny" data-edit="'+esc(u.username)+'">Edit</button><button class="button secondary tiny" data-pw="'+esc(u.username)+'">Password</button><button class="button danger tiny" data-del="'+esc(u.username)+'">Delete</button></td></tr>').join('')}
+uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.ghoauth){
+ ghOpen(t.dataset.ghoauth);
+}else if(t.dataset.cleartok){
+ if(!confirm('Clear the stored GitHub token for "'+t.dataset.cleartok+'"?\\n\\nA Copilot sign-in can then take effect for them, but git pushes from projects they own will have no credential until a new token is stored.'))return;
+ t.disabled=true;setStatus(uStatus,'Clearing…');
+ try{const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.cleartok),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify({ghToken:''})});const j=await r.json();
+  if(!j.ok)throw new Error(j.error||('HTTP '+r.status));setStatus(uStatus,'Token cleared for '+t.dataset.cleartok+'.');loadUsers()}
+ catch(err){setStatus(uStatus,err.message||String(err),true);t.disabled=false}
+}else if(t.dataset.signin){
  /* Deliberately self-service: the route acts only for the signed-in user, because a
     tab opened on an admin's behalf would carry the ADMIN's credentials and sign the
     wrong person in. That is why the button renders on your own row only. */
@@ -4372,23 +5226,30 @@ uTable.addEventListener('click',async e=>{const t=e.target;if(t.dataset.signin){
  }catch(err){setStatus(uStatus,err.message||String(err),true)}finally{t.disabled=false}
 }else if(t.dataset.del){if(!confirm('Delete user "'+t.dataset.del+'"? Their active sessions will be revoked.'))return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.del),{method:'DELETE'});const j=await r.json();setStatus(uStatus,j.ok?'Deleted '+t.dataset.del:'Error: '+j.error,!j.ok);loadUsers()}else if(t.dataset.pw){const p=prompt('New password for "'+t.dataset.pw+'" (≥8 chars):');if(!p)return;const r=await fetch('${BASE}/api/users/'+encodeURIComponent(t.dataset.pw)+'/password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:p})});const j=await r.json();setStatus(uStatus,j.ok?'Password reset for '+t.dataset.pw:'Error: '+j.error,!j.ok)}else if(t.dataset.edit){const u=(window._pwUsers||[]).find(x=>x.username===t.dataset.edit);if(u)umOpen('edit',u)}});
 // --- User modal (used for both Add and Edit) ---
-const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
+const umBackdrop=document.getElementById('umBackdrop');const umTitle=document.getElementById('umTitle');const umUsername=document.getElementById('umUsername');const umRole=document.getElementById('umRole');const umProjStar=document.getElementById('umProjStar');const umProjList=document.getElementById('umProjList');const umPassword=document.getElementById('umPassword');const umPwLabel=document.getElementById('umPwLabel');const umGhToken=document.getElementById('umGhToken');const umColor=document.getElementById('umColor');${DEPLOY_CENTRE ? "const umDeployPw=document.getElementById('umDeployPw');" : ''}const umStatus=document.getElementById('umStatus');const umSave=document.getElementById('umSave');const umCancel=document.getElementById('umCancel');const umClose=document.getElementById('umClose');let umMode='add';let umOriginalUsername=null;
 function renderProjList(selected){if(!pwProjects.length){umProjList.innerHTML='<span class="empty">No projects in <code>projects.json</code> yet — add one from the dashboard\\'s Manage page first.</span>';return}const sel=new Set(Array.isArray(selected)?selected:[]);umProjList.innerHTML=pwProjects.map(p=>'<label><input type="checkbox" value="'+esc(p)+'"'+(sel.has(p)?' checked':'')+'>'+esc(p)+'</label>').join('')}
 function syncStarDisabled(){umProjList.classList.toggle('disabled',umProjStar.checked)}
 umProjStar.addEventListener('change',syncStarDisabled);
-function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';umGhToken.value='';umGhToken.placeholder=user?.hasToken?'(stored — leave blank to keep)':'ghp_… (optional)';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
+function umOpen(mode,user){umMode=mode;umOriginalUsername=user?.username||null;umTitle.textContent=mode==='add'?'Add user':('Edit user — '+user.username);umUsername.value=user?.username||'';umRole.value=user?.role||'developer';const isStar=user?.projects==='*';umProjStar.checked=isStar;renderProjList(isStar?[]:user?.projects);syncStarDisabled();umPassword.value='';umPwLabel.style.display=mode==='add'?'':'none';umPassword.required=mode==='add';umGhToken.value='';umGhToken.placeholder=user?.hasToken?'(stored — leave blank to keep)':'ghp_… (optional)';${DEPLOY_CENTRE ? "umDeployPw.value='';umDeployPw.placeholder=user?.hasDeployPassword?'(stored — leave blank to keep)':'optional';" : ''}renderColorPick(umColor,user?.tabColor||'',user?.username||'');setStatus(umStatus,'');umBackdrop.classList.remove('hidden');setTimeout(()=>umUsername.focus(),30)}
 function umCloseFn(){umBackdrop.classList.add('hidden')}
 umCancel.addEventListener('click',umCloseFn);umClose.addEventListener('click',umCloseFn);umBackdrop.addEventListener('click',e=>{if(e.target===umBackdrop)umCloseFn()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!umBackdrop.classList.contains('hidden'))umCloseFn()});
 uAddBtn.addEventListener('click',()=>{if(!pwProjects.length){loadProjectList().then(()=>umOpen('add',null))}else{umOpen('add',null)}});
-umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects};const ghToken=umGhToken.value.trim();if(ghToken)body.ghToken=ghToken;${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();" : ''}if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={};if(ghToken)patchBody.ghToken=ghToken;if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
+umSave.addEventListener('click',async()=>{const username=umUsername.value.trim();if(!/^[A-Za-z0-9._-]+$/.test(username)){setStatus(umStatus,'Username must be letters, digits, dot, dash, underscore (no spaces).',true);return}const role=umRole.value;const projects=umProjStar.checked?'*':[...umProjList.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.value);const body={username,role,projects,tabColor:umColor.dataset.color||''};const ghToken=umGhToken.value.trim();if(ghToken)body.ghToken=ghToken;${DEPLOY_CENTRE ? "const deployPassword=umDeployPw.value.trim();" : ''}if(umMode==='add'){if(umPassword.value.length<8){setStatus(umStatus,'Password must be at least 8 characters.',true);return}body.password=umPassword.value}${DEPLOY_CENTRE ? "if(deployPassword)body.deployPassword=deployPassword;" : ''}umSave.disabled=true;setStatus(umStatus,'Saving…');try{let r,j;if(umMode==='add'){r=await fetch('${BASE}/api/users',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}else{const patchBody={tabColor:umColor.dataset.color||''};if(ghToken)patchBody.ghToken=ghToken;if(username!==umOriginalUsername)patchBody.username=username;if(role!==undefined)patchBody.role=role;patchBody.projects=projects;${DEPLOY_CENTRE ? "if(deployPassword)patchBody.deployPassword=deployPassword;" : ''}r=await fetch('${BASE}/api/users/'+encodeURIComponent(umOriginalUsername),{method:'PATCH',headers:{'Content-Type':'application/json'},body:JSON.stringify(patchBody)})}j=await r.json();if(!j.ok)throw new Error(j.error||'save failed');setStatus(uStatus,(umMode==='add'?'Added ':'Updated ')+username);umCloseFn();loadUsers()}catch(e){setStatus(umStatus,e.message,true)}finally{umSave.disabled=false}});
 loadProjectList();loadUsers();
 // --- CLIs + Environment + System tabs (reuse existing /api/setup/* endpoints) ---
-const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('${BASE}/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';
+const cliRows=document.getElementById('cliRows');const cliStatus=document.getElementById('cliStatus');const permMode=document.getElementById('permMode');const mcpMode=document.getElementById('mcpMode');const envStatus=document.getElementById('envStatus');const envSave=document.getElementById('envSave');const healNginx=document.getElementById('healNginxBtn');const healDirs=document.getElementById('healDirsBtn');const healOut=document.getElementById('healOut');const sysVer=document.getElementById('sysVer');const sysChecks=document.getElementById('sysChecks');const authFrame=document.getElementById('authFrame');const authHint=document.getElementById('authHint');let state=null;async function loadState(){try{const r=await fetch('${BASE}/api/setup/state',{cache:'no-store'});state=await r.json();if(!state.ok)throw new Error(state.error||'load failed');renderClis();renderEnv()}catch(e){setStatus(cliStatus,e.message,true)}}async function loadSystem(){try{const r=await fetch('${BASE}/api/system/status',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'status failed');sysVer.innerHTML='Claude Code <b>'+esc(j.claudeVersion)+'</b> · Last updater run: <b>'+esc(j.updateStamp)+'</b> · Users: <b>'+j.userCount+'</b>';const c=j.checks;const items=[['claudeInstalled','Claude Code CLI installed'],['claudeAuthenticated','Claude Code signed in'],['atLeastOneAdmin','At least one admin user defined'],['atLeastOneEnabledCli','At least one CLI enabled in settings'],['wrapperEnvPresent','Wrapper env (/etc/project-workbench/claude-wrapper.env) present'],['ghInstalled','GitHub CLI (gh) installed — deploy/install-gh.sh'],['authEnforce','Auth enforce mode ON (PW_AUTH_ENFORCE=true)']];sysChecks.innerHTML=items.map(([k,label])=>{const ok=!!c[k];const cls=k==='authEnforce'&&!ok?'warn':(ok?'ok':'err');const icon=ok?'✓':(k==='authEnforce'?'⚠':'✗');return '<li class="'+cls+'">'+icon+' '+esc(label)+'</li>'}).join('')}catch(e){sysChecks.innerHTML='<li class="err">'+esc(e.message)+'</li>'}}function renderClis(){cliRows.innerHTML='';
 /* Same point as the wizard's: with per-user credentials on, the login on this page is
    the SEED identity, not the one that runs anybody's project terminal. */
 const lead=document.getElementById('cliLead');
-if(lead&&state.perUserClaude)lead.innerHTML='Install or update each assistant here \u2014 that part is a property of the machine. The sign-in below is the <b>shared seed identity</b>: what a new per-user config dir is created from, and what a project with no owner falls back to. It is <b>not</b> how a person signs in; each person signs in from their own terminal, and the <b>Users</b> tab shows who has.';
-const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated?'<span class="signed-in" title="'+(state.perUserClaude?'The SHARED box identity is signed in — this is not your own login. Per-person status is in the Users tab.':'Credentials detected on disk')+'">'+(state.perUserClaude?'Shared login':'Signed in')+'</span>':'')+'<span class="cli-checked'+(c.lastUpdateOk===false?' bad':'')+'" title="When the auto-updater last checked this CLI">'+(c.lastUpdate==='never'?'never checked':(c.lastUpdateOk===false?'check failed \u00b7 ':'checked ')+esc(c.lastUpdate))+'</span>'+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button><button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+(state.perUserClaude?' shared':'')+'</button></div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};row.querySelector('.auth').onclick=async()=>{const btn=row.querySelector('.auth');btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);loadState();loadSystem();const tokLabel=document.getElementById('tokLabel');const tokScopes=document.getElementById('tokScopes');const tokCreate=document.getElementById('tokCreate');const tokList=document.getElementById('tokList');const tokStatus=document.getElementById('tokStatus');const tokNew=document.getElementById('tokNew');const tokNewVal=document.getElementById('tokNewVal');const tokCopy=document.getElementById('tokCopy');function fmtWhen(v){if(!v)return 'never';try{return new Date(v).toLocaleString()}catch(e){return v}}async function loadTokens(){try{const r=await fetch('${BASE}/api/tokens',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');if(!tokScopes.dataset.built){tokScopes.innerHTML='<legend>Scopes</legend>'+(j.scopes||[]).map(sc=>'<label><input type="checkbox" class="tokScope" value="'+esc(sc)+'">'+esc(sc)+'</label>').join('');tokScopes.dataset.built='1'}const ts=j.tokens||[];if(!ts.length){tokList.innerHTML='<span class="empty">No tokens yet.</span>';return}tokList.innerHTML=ts.map(t=>'<div class="tok-row'+(t.disabled?' revoked':'')+'">'+'<div><b>'+esc(t.label||'(unlabelled)')+'</b>'+(t.disabled?' <span class="tok-tag">revoked</span>':'')+'</div>'+'<div class="muted">scopes: '+esc((t.scopes||[]).join(', ')||'none')+'</div>'+'<div class="muted">created '+esc(fmtWhen(t.createdAt))+(t.createdBy?' by '+esc(t.createdBy):'')+' | last used '+esc(fmtWhen(t.lastUsedAt))+'</div>'+(t.disabled?'':'<button class="button secondary tiny tokRevoke" data-id="'+esc(t.id)+'" type="button">Revoke</button>')+'</div>').join('');tokList.querySelectorAll('.tokRevoke').forEach(b=>{b.onclick=async()=>{if(!confirm('Revoke this token? Any client using it stops working immediately.'))return;b.disabled=true;try{const rr=await fetch('${BASE}/api/tokens/'+encodeURIComponent(b.dataset.id)+'/revoke',{method:'POST'});const jj=await rr.json();if(!jj.ok)throw new Error(jj.error||'revoke failed');setStatus(tokStatus,'Token revoked.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true);b.disabled=false}}})}catch(e){tokList.innerHTML='';setStatus(tokStatus,e.message,true)}}tokCreate.onclick=async()=>{const scopes=[...tokScopes.querySelectorAll('.tokScope')].filter(c=>c.checked).map(c=>c.value);tokCreate.disabled=true;setStatus(tokStatus,'Creating...');tokNew.hidden=true;try{const r=await fetch('${BASE}/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:tokLabel.value,scopes})});const j=await r.json();if(!j.ok)throw new Error(j.error||'create failed');tokNewVal.textContent=j.token;tokNew.hidden=false;tokLabel.value='';tokScopes.querySelectorAll('.tokScope').forEach(c=>{c.checked=false});setStatus(tokStatus,'Token created. Copy it now.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true)}finally{tokCreate.disabled=false}};tokCopy.onclick=async()=>{try{await navigator.clipboard.writeText(tokNewVal.textContent);setStatus(tokStatus,'Copied to clipboard.')}catch(e){setStatus(tokStatus,'Copy failed; select it manually.',true)}};loadTokens();
+const shCard=document.getElementById('sharedAuthCard');
+if(state.perUserClaude){
+ /* Signing in is per person here, so this page is about the MACHINE only. The shared
+    login still exists as the seed a per-user config dir is created from, but it is not
+    something anyone signs in to from this page any more. */
+ if(shCard)shCard.remove();
+ if(lead)lead.innerHTML='Install, update and enable each assistant \u2014 that is a property of the machine. <b>Signing in is per person:</b> see the <b>Users</b> tab, which shows each user\\'s status for every installed assistant and lets each person sign themselves in.';
+}
+const enabled=new Set(state.settings.enabledClis||[]);const upd=new Set(state.settings.updateClis||[]);for(const c of Object.values(state.clis)){const row=document.createElement('div');row.className='cli-row';row.dataset.cli=c.key;row.innerHTML='<div class="meta"><span class="label">'+esc(c.label)+'</span><span class="version'+(c.installed?' installed':'')+'">'+esc(c.version)+'</span>'+(c.authenticated&&!state.perUserClaude?'<span class="signed-in" title="Credentials detected on disk">Signed in</span>':'')+'<span class="cli-checked'+(c.lastUpdateOk===false?' bad':'')+'" title="When the auto-updater last checked this CLI">'+(c.lastUpdate==='never'?'never checked':(c.lastUpdateOk===false?'check failed \u00b7 ':'checked ')+esc(c.lastUpdate))+'</span>'+'</div><div class="checks"><label><input type="checkbox" class="en"'+(enabled.has(c.key)?' checked':'')+'>Enable</label><label><input type="checkbox" class="up"'+(upd.has(c.key)?' checked':'')+'>Auto-update</label></div><div class="actions"><button class="button secondary tiny inst">'+(c.installed?'Update':'Install')+'</button>'+(state.perUserClaude?'':'<button class="button tiny auth">'+(c.authenticated?'Reauthenticate':'Sign in')+'</button>')+'</div><div class="note">'+esc(c.notes)+'</div>';row.querySelector('.inst').onclick=async()=>{const btn=row.querySelector('.inst');btn.disabled=true;btn.textContent='Installing…';setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'install failed');setStatus(cliStatus,c.label+': '+j.version);loadState();loadSystem()}catch(e){setStatus(cliStatus,e.message,true);loadState()}};const authBtn=row.querySelector('.auth');if(authBtn)authBtn.onclick=async()=>{const btn=authBtn;btn.disabled=true;setStatus(cliStatus,'');try{const r=await fetch('${BASE}/api/setup/cli/auth',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cli:c.key})});const j=await r.json();if(!j.ok)throw new Error(j.error||'auth start failed');if(authFrame.src.indexOf('${BASE}/pty/_setup/')<0)authFrame.src='${BASE}/pty/_setup/';authFrame.classList.remove('hidden');authHint.textContent='Running: '+j.command+' — complete the prompts in the terminal below.'}catch(e){setStatus(cliStatus,e.message,true)}finally{btn.disabled=false}};cliRows.appendChild(row)}}const PERM_HELP={prompt:'Claude pauses and asks before each tool use (file edit, shell command, etc.). Safest default.',skip:'<b>Warning:</b> passes <code>--dangerously-skip-permissions</code>. Claude runs every tool unattended. Anyone with dashboard access effectively has shell on this box.'};const MCP_HELP={inherit:'Use the MCP servers configured on your Anthropic account.',isolated:'Use an empty MCP config so no external MCP servers load.',custom:'Use a custom MCP JSON via <code>PW_MCP_CONFIG</code>.'};function renderEnv(){permMode.value=state.settings.permissionMode||'prompt';mcpMode.value=state.settings.mcpMode||'isolated';renderEnvHelp()}function renderEnvHelp(){document.getElementById('permHelp').innerHTML=PERM_HELP[permMode.value]||'';document.getElementById('permHelp').classList.toggle('warn',permMode.value==='skip');document.getElementById('mcpHelp').innerHTML=MCP_HELP[mcpMode.value]||''}permMode.addEventListener('change',renderEnvHelp);mcpMode.addEventListener('change',renderEnvHelp);envSave.onclick=async()=>{envSave.disabled=true;setStatus(envStatus,'Saving…');try{const enabledClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.en').checked).map(r=>r.dataset.cli);const updateClis=[...cliRows.querySelectorAll('.cli-row')].filter(r=>r.querySelector('.up').checked).map(r=>r.dataset.cli);const r=await fetch('${BASE}/api/setup/state',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({permissionMode:permMode.value,mcpMode:mcpMode.value,enabledClis,updateClis})});const j=await r.json();setStatus(envStatus,j.ok?'Saved.':'Error: '+j.error,!j.ok)}catch(e){setStatus(envStatus,e.message,true)}finally{envSave.disabled=false}};async function heal(url,btn){btn.disabled=true;healOut.className='heal-out show';healOut.textContent='Working…';try{const r=await fetch(url,{method:'POST'});const j=await r.json();if(!j.ok)throw new Error(j.error||'failed');healOut.textContent=j.message||'OK';healOut.className='heal-out show'}catch(e){healOut.textContent=e.message;healOut.className='heal-out show err'}finally{btn.disabled=false;loadSystem()}}healNginx.onclick=()=>heal('${BASE}/api/setup/heal/nginx',healNginx);healDirs.onclick=()=>heal('${BASE}/api/setup/heal/dirs',healDirs);const healLabels=document.getElementById('healLabelsBtn');if(healLabels)healLabels.onclick=()=>heal('${BASE}/api/setup/heal/session-labels',healLabels);loadState();loadSystem();const tokLabel=document.getElementById('tokLabel');const tokScopes=document.getElementById('tokScopes');const tokCreate=document.getElementById('tokCreate');const tokList=document.getElementById('tokList');const tokStatus=document.getElementById('tokStatus');const tokNew=document.getElementById('tokNew');const tokNewVal=document.getElementById('tokNewVal');const tokCopy=document.getElementById('tokCopy');function fmtWhen(v){if(!v)return 'never';try{return new Date(v).toLocaleString()}catch(e){return v}}async function loadTokens(){try{const r=await fetch('${BASE}/api/tokens',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');if(!tokScopes.dataset.built){tokScopes.innerHTML='<legend>Scopes</legend>'+(j.scopes||[]).map(sc=>'<label><input type="checkbox" class="tokScope" value="'+esc(sc)+'">'+esc(sc)+'</label>').join('');tokScopes.dataset.built='1'}const ts=j.tokens||[];if(!ts.length){tokList.innerHTML='<span class="empty">No tokens yet.</span>';return}tokList.innerHTML=ts.map(t=>'<div class="tok-row'+(t.disabled?' revoked':'')+'">'+'<div><b>'+esc(t.label||'(unlabelled)')+'</b>'+(t.disabled?' <span class="tok-tag">revoked</span>':'')+'</div>'+'<div class="muted">scopes: '+esc((t.scopes||[]).join(', ')||'none')+'</div>'+'<div class="muted">created '+esc(fmtWhen(t.createdAt))+(t.createdBy?' by '+esc(t.createdBy):'')+' | last used '+esc(fmtWhen(t.lastUsedAt))+'</div>'+(t.disabled?'':'<button class="button secondary tiny tokRevoke" data-id="'+esc(t.id)+'" type="button">Revoke</button>')+'</div>').join('');tokList.querySelectorAll('.tokRevoke').forEach(b=>{b.onclick=async()=>{if(!confirm('Revoke this token? Any client using it stops working immediately.'))return;b.disabled=true;try{const rr=await fetch('${BASE}/api/tokens/'+encodeURIComponent(b.dataset.id)+'/revoke',{method:'POST'});const jj=await rr.json();if(!jj.ok)throw new Error(jj.error||'revoke failed');setStatus(tokStatus,'Token revoked.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true);b.disabled=false}}})}catch(e){tokList.innerHTML='';setStatus(tokStatus,e.message,true)}}tokCreate.onclick=async()=>{const scopes=[...tokScopes.querySelectorAll('.tokScope')].filter(c=>c.checked).map(c=>c.value);tokCreate.disabled=true;setStatus(tokStatus,'Creating...');tokNew.hidden=true;try{const r=await fetch('${BASE}/api/tokens',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({label:tokLabel.value,scopes})});const j=await r.json();if(!j.ok)throw new Error(j.error||'create failed');tokNewVal.textContent=j.token;tokNew.hidden=false;tokLabel.value='';tokScopes.querySelectorAll('.tokScope').forEach(c=>{c.checked=false});setStatus(tokStatus,'Token created. Copy it now.');loadTokens()}catch(e){setStatus(tokStatus,e.message,true)}finally{tokCreate.disabled=false}};tokCopy.onclick=async()=>{try{await navigator.clipboard.writeText(tokNewVal.textContent);setStatus(tokStatus,'Copied to clipboard.')}catch(e){setStatus(tokStatus,'Copy failed; select it manually.',true)}};loadTokens();
 /* ---- scheduled tasks ---- */
 const tRows=document.getElementById('taskRows'),tStatus=document.getElementById('taskStatus');
 const tF={id:'tId',name:'tName',window:'tWindow',kind:'tKind',at:'tAt',every:'tEvery',tz:'tTz',weekdays:'tWeekdays',enabled:'tEnabled',target:'tTarget',pick:'tPick',cmd:'tCmd',prompt:'tPrompt',agent:'tAgent'};
@@ -4483,9 +5344,9 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
  const claudeVersion = await getClaudeVersion();
  const updateStamp = await getClaudeUpdateStamp();
  const footer = statusBarHtml({ claudeVersion, updateStamp, user: req.user, enforce: AUTH_ENFORCE });
- res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">CLIs &amp; Sign-in</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
-<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed. When per-user Claude is enabled (<code>PW_PER_USER_CLAUDE</code>), the <b>Claude</b> column shows whether a user has completed their own Claude login — used automatically for the projects they own (their <code>primaryUser</code> assignment).</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><table class="utable" id="uTable" style="margin-top:1rem"></table><div class="status-line" id="uStatus"></div></div></section>
-<section id="tab-clis"><h2>CLIs &amp; Sign-in</h2><p class="lead" id="cliLead">Install or update each assistant, then sign in. Credentials land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card"><h3>Shared identity terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
+ res.type('html').send(`<!doctype html><html><head><meta charset="utf-8">${forceMotionScript}<meta name="viewport" content="width=device-width,initial-scale=1"><title>Settings — Project Workbench</title><style>${settingsCss}${statusBarCss}${modalBaseCss}${wizardCss}${colorPickCss}</style></head><body><header class="s-header"><a class="back" href="${BASE}/">← Dashboard</a><h1>Settings</h1><span class="grow"></span><span class="who"><b>${esc(req.user.username)}</b> · ${esc(req.user.role)}</span></header><div class="s-layout"><nav class="s-tabs"><button data-tab="users" class="active">Users &amp; Roles</button><button data-tab="clis">${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</button><button data-tab="env">Environment</button><button data-tab="deployment">Deployment</button><button data-tab="tasks">Scheduled tasks</button><button data-tab="tokens">API tokens</button><button data-tab="system">System &amp; Updates</button><button data-tab="firstrun">First Run</button></nav><main class="s-main">
+<section id="tab-users" class="active"><h2>Users &amp; Roles</h2><p class="lead">Manage who can sign in and which projects they can see. Users live in <code>/etc/project-workbench/users.json</code>; passwords are hashed with scrypt and never displayed.${PER_USER_CLAUDE ? ' There is a column per installed assistant showing whether <b>that person</b> has signed in to it — hover a cell for what it means and what to do. A sign-in runs in a terminal carrying the signer\'s own credentials, so the <b>sign in</b> action appears on your own row only, and only when something is outstanding; each person can also reach their own from the <b>' + esc('/me') + '</b> page linked by their name in the status bar.' : ''}</p><div class="s-card"><div style="display:flex;justify-content:space-between;align-items:center;gap:1rem"><h3 style="margin:0">Current users</h3><button class="button" id="uAddBtn" type="button">+ Add user</button></div><div class="utable-wrap" style="margin-top:1rem"><table class="utable" id="uTable"></table></div><div class="status-line" id="uStatus"></div></div></section>
+<section id="tab-clis"><h2>${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</h2><p class="lead" id="cliLead">Install or update each assistant, then sign in. Credentials land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card" id="sharedAuthCard"><h3>Shared identity terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
 ${renderDeploymentSettings(BASE)}
 <section id="tab-tasks"><h2>Scheduled tasks</h2><p class="lead">Run a command in your projects on a clock. Each run opens a named tab in the project's terminal, so you can read what it did afterwards.</p>
@@ -4507,10 +5368,11 @@ ${renderDeploymentSettings(BASE)}
 <label class="t-cmd">Shell commands <em style="text-transform:none;font-style:normal;font-weight:400">(optional — run first)</em><textarea id="tCmd" rows="7" spellcheck="false" placeholder="Runs in each project&#39;s workspace. One command per line."></textarea></label><div class="t-agentrow"><label>Agent<select id="tAgent"></select></label><span class="pmHelp">Used only if the prompt below is filled in.</span></div><label class="t-cmd">Agent prompt <em style="text-transform:none;font-style:normal;font-weight:400">(optional — runs after the shell commands)</em><textarea id="tPrompt" rows="5" spellcheck="false" placeholder="Plain English. Wrapped as: claude -p &#39;…&#39;"></textarea></label>
 <div class="t-actions"><button class="button" id="tSave" type="button">Save task</button><button class="button secondary" id="tReset" type="button">Clear form</button><button class="button secondary" id="tGit" type="button">Use the guarded git template</button></div>
 <p class="muted">The git template skips clean repos, skips detached HEAD, commits locally when there is no upstream, and never force-pushes.</p>
-</div></section><section id="tab-tokens"><h2>API tokens</h2><p class="lead">Bearer credentials for the machine API, so a script or an agent on another machine can register a project without an interactive sign-in. A token carries only the scopes you grant it &mdash; it is <b>not</b> an admin session and cannot reach user management, permission modes, or CLI installs.</p><div class="s-card"><h3>Create a token</h3><label>Label<input id="tokLabel" placeholder="e.g. laptop-copilot" maxlength="80"></label><fieldset id="tokScopes"><legend>Scopes</legend></fieldset><button class="button" id="tokCreate" type="button">Create token</button><div id="tokNew" class="tok-new" hidden><p><b>Copy this now &mdash; it is shown once and cannot be retrieved again.</b></p><pre id="tokNewVal"></pre><button class="button secondary tiny" id="tokCopy" type="button">Copy</button></div><div id="tokStatus" class="muted"></div></div><div class="s-card"><h3>Existing tokens</h3><p class="muted">Revoking disables a token immediately; the record is kept so the audit trail outlives it. Sensitive events are logged to <code>/var/log/project-workbench/audit.log</code>.</p><div id="tokList" class="muted">loading&hellip;</div></div></section><section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button><pre class="heal-out" id="healOut"></pre></div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
+</div></section><section id="tab-tokens"><h2>API tokens</h2><p class="lead">Bearer credentials for the machine API, so a script or an agent on another machine can register a project without an interactive sign-in. A token carries only the scopes you grant it &mdash; it is <b>not</b> an admin session and cannot reach user management, permission modes, or CLI installs.</p><div class="s-card"><h3>Create a token</h3><label>Label<input id="tokLabel" placeholder="e.g. laptop-copilot" maxlength="80"></label><fieldset id="tokScopes"><legend>Scopes</legend></fieldset><button class="button" id="tokCreate" type="button">Create token</button><div id="tokNew" class="tok-new" hidden><p><b>Copy this now &mdash; it is shown once and cannot be retrieved again.</b></p><pre id="tokNewVal"></pre><button class="button secondary tiny" id="tokCopy" type="button">Copy</button></div><div id="tokStatus" class="muted"></div></div><div class="s-card"><h3>Existing tokens</h3><p class="muted">Revoking disables a token immediately; the record is kept so the audit trail outlives it. Sensitive events are logged to <code>/var/log/project-workbench/audit.log</code>.</p><div id="tokList" class="muted">loading&hellip;</div></div></section><section id="tab-system"><h2>System &amp; Updates</h2><p class="lead">Self-repair, version info, and a readiness checklist.</p><div class="s-card"><h3>Versions</h3><div id="sysVer" class="muted">loading…</div></div><div class="s-card"><h3>Readiness checklist</h3><ul class="check-list" id="sysChecks"><li class="muted">loading…</li></ul></div><div class="s-card"><h3>Heal</h3><p class="muted">Regenerate the nginx config from <code>projects.json</code>, or re-create runtime dirs / wrapper symlink if something looks broken.</p><button class="button" id="healNginxBtn" type="button">Regenerate nginx + reload</button> <button class="button secondary" id="healDirsBtn" type="button">Verify runtime dirs / wrapper</button>${PER_USER_CLAUDE ? ' <button class="button secondary" id="healLabelsBtn" type="button">Label existing terminals</button>' : ''}<pre class="heal-out" id="healOut"></pre>${PER_USER_CLAUDE ? '<p class="muted" style="margin-top:.6rem">A terminal opened before per-person identity existed runs on good credentials but never recorded whose, so its tabs show uncoloured. Labelling writes that record in place &mdash; it is a tmux option, so nothing running is disturbed. Only sessions whose stamped credentials still match their owner are labelled; anything that cannot be proven is skipped and named.</p>' : ''}</div><div class="s-card"><h3>Audit log</h3><p class="muted">Sensitive events are appended as JSONL to <code>/var/log/project-workbench/audit.log</code>. Tail it from a shell: <code>sudo tail -F /var/log/project-workbench/audit.log</code></p></div></section>
 <section id="tab-firstrun"><h2>First Run / Rerun Setup Wizard</h2><p class="lead">A guided walkthrough that installs and signs in a CLI, then sets the permission and MCP policy. Use this on first install or to repair a broken instance.</p><div class="s-card"><button class="button" id="rerunWizardBtn" type="button">Open Setup Wizard</button></div></section>
 </main></div>
-<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
+<div id="ghBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:520px"><header><h2 id="ghTitle">Connect GitHub</h2><button class="modal-close" id="ghClose" aria-label="Close" type="button">&times;</button></header><div class="body"><p class="muted" id="ghIntro"></p><div id="ghStep" class="gh-step"></div><div class="status-line" id="ghStatus"></div></div><footer><button class="button secondary" id="ghCancel" type="button">Close</button><button class="button" id="ghStart" type="button">Start authorisation</button></footer></div></div>
+<div id="umBackdrop" class="modal-backdrop hidden" role="dialog" aria-modal="true"><div class="modal-box" style="max-width:560px"><header><h2 id="umTitle">Add user</h2><button class="modal-close" id="umClose" aria-label="Close" type="button">×</button></header><div class="body"><form id="umForm" class="um-form" onsubmit="return false"><label>Username<input type="text" id="umUsername" required pattern="[A-Za-z0-9._-]+" maxlength="64" autocomplete="off"></label><label>Role<select id="umRole" required><option value="developer">developer</option><option value="content_editor">content_editor</option><option value="viewer">viewer</option><option value="admin">admin</option></select></label><label>Projects<div class="proj-picker"><label class="star inline"><input type="checkbox" id="umProjStar"> All projects (<code>*</code>) — admin behaves like this regardless of selection</label><div class="proj-list" id="umProjList"></div></div></label><label id="umPwLabel">Password (≥8 chars)<input type="password" id="umPassword" minlength="8" autocomplete="new-password"></label><label>GitHub token <span class="muted">(encrypted; optional)</span><input type="password" id="umGhToken" autocomplete="new-password" placeholder="ghp_… (leave blank to keep)"></label><label>Terminal tab colour <span class="muted">(how their tabs are marked in the cockpit)</span><div class="cPick" id="umColor"></div></label>${DEPLOY_CENTRE ? '<label>Deploy password <span class="muted">(encrypted; optional)</span><input type="password" id="umDeployPw" autocomplete="new-password" placeholder="optional"></label>' : ''}<div class="status-line" id="umStatus"></div></form></div><footer><button class="button secondary" id="umCancel" type="button">Cancel</button><button class="button" id="umSave" type="button">Save</button></footer></div></div>
 ${wizardModalHtml}${wizardScript}${settingsScript}${deploymentSettingsScript(BASE)}${footer}</body></html>`);
 });
 
@@ -4704,18 +5566,36 @@ app.post(BASE + '/api/tokens/:id/revoke', requireAdmin, async (req,res) => {
 app.get(BASE + '/api/users', requireAdmin, async (req,res) => {
  try {
   const users = await loadUsers();
-  // Both CLIs' per-person state, resolved in one privilege-dropped job per user.
-  // Null (not false) while the feature is off: there is no per-person identity to be
-  // signed in as, and a column of crosses would read as "everyone is broken".
+  // One column per CLI this workbench offers, and one resolved cell per user per CLI,
+  // so the table reads as "who is signed in to what" rather than as two special cases.
+  const clis = await offeredClis();
+  // The colour each person's tabs actually get, resolved the same way the cockpit
+  // resolves it, plus the palette and who holds what — which together are the answer to
+  // "whose colour is whose", and the data a picker needs.
+  const settings = await loadWorkbenchSettings().catch(()=> ({}));
+  const colorMap = mergeUserTabColors(users, settings.userTabColors);
+  const claims = userTabColorClaims(users, settings.userTabColors);
   const out = await Promise.all(users.map(async u => {
-   if(!PER_USER_CLAUDE) return { ...safeUserShape(u), claudeSignedIn: null, copilotAuth: null, copilotOverridesLogin: false };
-   const signIn = await userCliSignIn(u.username);
-   const copilot = userCopilotAuth(u, signIn.copilot);
-   return { ...safeUserShape(u), claudeSignedIn: signIn.claude, copilotAuth: copilot.state, copilotOverridesLogin: copilot.overridesLogin };
+   const state = await userCliState(u, clis);
+   return {
+   ...safeUserShape(u),
+   // Retained alongside the per-CLI cells: it is the field this endpoint has always
+   // reported, and dropping it would break a consumer to save a boolean.
+   claudeSignedIn: state.claudeSignedIn,
+   cliAuth: state.cells,
+   // The KIND of their token, never the token. A classic PAT is the difference between
+   // "sign in" and "this can never work until it is replaced", so an admin has to see it.
+   tokenKind: u.ghToken ? (()=>{ try { return classifyGithubToken(decrypt(u.ghToken)); } catch { return 'unreadable'; } })() : 'none',
+   // tabColor is what they CHOSE ('' = automatic); tabColorName/Css is what they GET.
+   ghLogin: u.ghLogin || '',
+   tabColor: u.tabColor || '',
+   tabColorName: resolveUserTabColor(u.username, colorMap),
+   tabColorCss: userTabColorCss(resolveUserTabColor(u.username, colorMap)),
+   };
   }));
-  // `me` drives the self-service sign-in button. Empty for the implicit admin of an
+  // `me` drives the self-service sign-in buttons. Empty for the implicit admin of an
   // auth-disabled instance: it is a placeholder, not one of these people.
-  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), users: out });
+  res.json({ ok:true, perUserClaude: PER_USER_CLAUDE, me: req.user?.implicit ? '' : (req.user?.username || ''), clis, palette: userTabPaletteList(), colorClaims: claims, githubOauth: GITHUB_OAUTH.enabled, githubCli: await ghCliAvailable(), users: out });
  }
  catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
 });
@@ -4728,6 +5608,16 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   const ghToken = typeof req.body?.ghToken === 'string' ? req.body.ghToken.trim() : '';
   const deployPassword = DEPLOY_CENTRE && typeof req.body?.deployPassword === 'string' ? req.body.deployPassword.trim() : '';
   if(!validNewUsername(username)) return res.status(400).json({ ok:false, error:'Invalid username (letters/digits/._- only, max 64)' });
+  // '' means "assign one automatically" — the normal case, and what every user created
+  // before this existed has. A new user therefore always HAS a colour; choosing is how
+  // you override the one they were given.
+  const tabColor = normalizeUserTabColorChoice(req.body?.tabColor);
+  if(tabColor === null) return res.status(400).json({ ok:false, error:'Unknown tab colour' });
+  if(tabColor){
+   const [existing, settings] = await Promise.all([loadUsers(), loadWorkbenchSettings().catch(()=> ({}))]);
+   const holder = tabColorClaimedBy(existing, settings, username, tabColor);
+   if(holder) return res.status(409).json({ ok:false, error:`"${tabColor}" is already ${holder}'s colour. Pick another.` });
+  }
   if(!ROLES.includes(role)) return res.status(400).json({ ok:false, error:`role must be one of: ${ROLES.join(', ')}` });
   if(AUTH_MODE !== 'ldap' && password.length < 8) return res.status(400).json({ ok:false, error:'Password must be at least 8 characters' });
   let projects;
@@ -4739,6 +5629,9 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
   const now = new Date().toISOString();
   const id = 'u-' + crypto.randomBytes(6).toString('base64url');
   const rec = { id, username, role, projects, createdAt: now, lastLoginAt: null };
+  // Only stored when chosen: an absent tabColor is what "automatic" looks like on disk,
+  // so it stays automatic if the palette or the roster changes later.
+  if(tabColor) rec.tabColor = tabColor;
   if(passwordHash) rec.passwordHash = passwordHash;
   if(ghToken) rec.ghToken = encrypt(ghToken);
   if(deployPassword) rec.deployPassword = encrypt(deployPassword);
@@ -4756,6 +5649,7 @@ app.post(BASE + '/api/users', requireAdmin, async (req,res) => {
    return { ok:true };
   });
   if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  if(tabColor) invalidateTabColorCache();
   await audit('user_create', { username, role, projects, hasToken: !!ghToken }, req);
   res.json({ ok:true, user: safeUserShape(rec) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
@@ -4803,6 +5697,8 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   const newRole = req.body?.role !== undefined ? String(req.body.role) : undefined;
   const newProjects = req.body?.projects !== undefined ? req.body.projects : undefined;
   const newToken = req.body?.ghToken !== undefined ? String(req.body.ghToken || '').trim() : undefined;
+  const newTabColor = req.body?.tabColor !== undefined ? normalizeUserTabColorChoice(req.body.tabColor) : undefined;
+  if(newTabColor === null) return res.status(400).json({ ok:false, error:'Unknown tab colour' });
   const newDeployPw = DEPLOY_CENTRE && req.body?.deployPassword !== undefined ? String(req.body.deployPassword || '').trim() : undefined;
 
   // The ENTIRE operation — validating, mutating users.json, repointing
@@ -4847,6 +5743,13 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
    if(newRole !== undefined) u.role = newRole;
    if(newProjects !== undefined) u.projects = projectsResolved;
    if(newToken !== undefined){ if(newToken) u.ghToken = encrypt(newToken); else delete u.ghToken; }
+   if(newTabColor !== undefined){
+    // Refused rather than silently shared: two people in one colour undoes the only
+    // thing the colour is for.
+    const holder = tabColorClaimedBy(users, await loadWorkbenchSettings().catch(()=> ({})), u.username, newTabColor);
+    if(holder) return { failure: { status:409, error:`"${newTabColor}" is already ${holder}'s colour. Pick another, or clear theirs first.` } };
+    if(newTabColor) u.tabColor = newTabColor; else delete u.tabColor;
+   }
    if(newDeployPw !== undefined){ if(newDeployPw) u.deployPassword = encrypt(newDeployPw); else delete u.deployPassword; }
    if(isNewRename){
     // Chain from any UNFINISHED prior rename's original fromUsername (and
@@ -4897,6 +5800,7 @@ app.patch(BASE + '/api/users/:username', requireAdmin, async (req,res) => {
   });
 
   if(result.failure) return res.status(result.failure.status).json({ ok:false, error: result.failure.error });
+  if(req.body?.tabColor !== undefined) invalidateTabColorCache();
   await audit('user_update', { target, before: result.before, after: { username: result.after.username, role: result.after.role, projects: result.after.projects, hasToken: !!result.after.ghToken }, pendingCredentialSync: result.pending }, req);
   res.json({ ok:true, user: safeUserShape(result.after) });
  } catch(e){ res.status(500).json({ ok:false, error: e.message || String(e) }); }
@@ -5057,6 +5961,13 @@ app.get(BASE + '/api/system/status', requireAdmin, async (_req,res) => {
    atLeastOneEnabledCli: (settings.enabledClis || []).length > 0,
    authEnforce: AUTH_ENFORCE,
    wrapperEnvPresent: await fs.access(wrapperEnvPath).then(() => true).catch(() => false),
+   // gh has now gone missing more than once WITHOUT anything noticing: the Containerfile
+   // installs it, but the running image predated that layer, and every runtime install
+   // since was thrown away with the container's writable layer on the next recreate. An
+   // agent then discovered it mid-task. A missing tool that nothing reports is the part
+   // worth fixing — deploy/install-gh.sh puts it on the persistent mount, and this line
+   // is what says so if it ever evaporates again.
+   ghInstalled: !!(await getCliVersion('gh')),
   };
   const firstRunNeeded = !checks.claudeInstalled || !checks.claudeAuthenticated || !checks.atLeastOneAdmin;
   res.json({ ok:true, claudeVersion, updateStamp, userCount: users.length, settings:publicWorkbenchSettings(settings), checks, firstRunNeeded });

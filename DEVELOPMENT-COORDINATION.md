@@ -3195,3 +3195,309 @@ symlink planted at that path reads as not-signed-in (pinned in
 would write the shared one. `CODEX_HOME` looks like the analogue of `COPILOT_HOME` but is
 unverified against the CLI (Codex is not installed on this host), so the route refuses Codex
 with that reason instead of guessing. Install/update from Settings is unaffected.
+
+---
+
+## GOA — 2026-09-21 (3) — sign-in leaves the CLIs page entirely; Users gets a column per CLI
+
+Correction to the entry above, at GOA's request after seeing it live. Relabelling the shared
+sign-in was not enough: a control that authenticates an identity the presser does not use
+should not be on that page at all.
+
+**Settings → CLIs is now install / update / enable only** when `PW_PER_USER_CLAUDE` is on.
+The button, the badge and the shared-terminal section are removed (not captioned), and
+`POST /api/setup/cli/auth` refuses in that mode. **With the feature OFF everything comes
+back unchanged** — that is deliberate and matters for PVI/upstream: where the box login IS
+everybody's login, that page is the right place to sign in, so the capability is gated on the
+mode rather than deleted. The shared setup terminal itself (`ensureSetupTerminal`, the
+`/pty/_setup/` nginx location, `scripts/setup-terminal-start`, the systemd unit) is
+deliberately UNTOUCHED — decommissioning it would reach into nginx generation, the save/restore
+scripts and a host unit, which is a separate change on request rather than a side effect.
+
+**Settings → Users now has one column per OFFERED CLI** (enabled by the operator AND
+installed), replacing the two hardcoded Claude/Copilot columns. Each cell is resolved by
+`resolveCliAuthCell()` in `app/cli-auth-status.js` — one pure function, rendered by both the
+admin table and the person's own page, so the two cannot disagree about who is signed in.
+`canSelfSignIn` (not "is signed in") gates the means, because a Copilot login cannot take
+effect while a stored token overrides it.
+
+**The Git-token column shows the token TYPE and can CLEAR it.** It was write-only: an empty
+field meant "keep what is there", so a stored token could never be removed — and clearing is
+the only fix when Copilot refuses the type. The server already accepted `ghToken:''`; only
+the control was missing.
+
+**New self-service surface `/me`** ("My CLI sign-ins"), linked from the status-bar user chip
+on every page including the cockpit, because Settings is admin-only and a developer could
+otherwise see Copilot fail without seeing why. Routes, all self-scoped with NO username
+parameter: `GET /api/me/cli-status`, `POST|DELETE /api/me/github-token`,
+`POST /api/me/cli-login`. Self token management is the load-bearing part: a token Copilot
+refuses overrides any login, so without it the "sign in yourself" path was advice, not a
+means. Audited; the token never appears in a response, the audit log, or a pane's argv.
+`setUserGithubToken()` mirrors the PATCH route's token branch — deliberately not shared,
+because that route's lock section also spans rename reconciliation — and both resync the git
+credential of every project the person owns, which
+`test/per-user-cli-signin.test.mjs` pins end to end (clear → sign-in now possible → store a
+fine-grained one → cell goes green).
+
+---
+
+## GOA — 2026-09-21 (4) — labelling terminals that already exist, without recycling them
+
+Last piece of the per-launcher work. Sessions created before per-window identity stamps
+render uncoloured: they are on good per-user credentials but never recorded whose. Recycling
+fixes it by killing everything running in the session, which is an absurd price for a label.
+
+`POST /api/setup/heal/session-labels` (admin, audited; button in Settings → System → Heal)
+backfills the stamp on LIVE sessions. A stamp is a tmux window OPTION, so nothing running is
+disturbed — `test/session-label-backfill.test.mjs` asserts the pane PID is identical
+afterwards.
+
+The whole risk here is epistemic rather than technical: writing a name that is not true. So
+it labels only what it can PROVE, and skips the rest by name:
+
+- the session's stamped fingerprint must equal what its `primaryUser` resolves to TODAY
+  (that is the proof the panes really run on that person's credentials);
+- a window that already carries a label is never overwritten — per-launcher credentials mean
+  one session legitimately holds several identities;
+- stale stamp → skipped, reported as "recycle to migrate" (its panes are on older
+  credentials; the current owner's name would be a guess). Unreadable stamp, unresolvable
+  owner, no primaryUser, feature off → skipped and named.
+
+Idempotent; a second run reports everything as already labelled.
+
+**Known non-retrofit:** `COPILOT_HOME` cannot be backfilled — a pane's environment is fixed at
+creation — so a pre-upgrade terminal keeps using the shared `~/.copilot` until recycled. The
+label stays accurate about whose ACCOUNT the tab spends (`GH_TOKEN` + `CLAUDE_CONFIG_DIR` are
+per-user in those panes); only Copilot's session/history storage is still pooled. Documented
+rather than hidden.
+
+---
+
+## GOA — 2026-09-21 (5) — tab colours: a visible legend, and a choosable colour
+
+Two gaps GOA found by using it: nothing said whose colour was whose, and choosing one meant
+hand-editing a root-owned `workbench.json`.
+
+- **`tabColor` on the user record** is now the primary source. It travels with the record
+  through a rename or a delete, which the `workbench.json` map never did.
+- Resolution: **own choice → operator map (`workbench.json.userTabColors`) → stable hash of
+  the unclaimed colours.** The operator map is deliberately still honoured — it is how this
+  was configured before there was a UI, and dropping it would silently change colours a team
+  had already agreed on. `mergeUserTabColors()` folds both into one map so the hash cannot
+  land on a claimed colour.
+- **The legend is Settings → Users**: a swatch and colour name beside every username. `/me`
+  shows a person their own and is where they change it.
+- **Choosing**: admins in the Add/Edit form, people themselves via `POST /api/me/tab-color`.
+  A colour someone else holds is REFUSED (409, naming them) and shown as taken in the picker
+  — two people in one colour undoes the only thing the colour is for. Only EXPLICIT claims
+  block: a hashed colour steps aside for a deliberate choice rather than blocking it.
+- Every user always has a colour (assigned when unset), so no tab is ever colourless, and
+  "Automatic" hands the choice back.
+
+The picker CSS is defined once (`colorPickCss`) and included by both pages rather than
+duplicated — two copies of one control drifting apart is how one of them starts lying.
+
+Small thing worth knowing for anyone editing these pages: a **backtick** in a client-side
+comment ends the server's template literal, and a **typographic apostrophe** trips the
+"ASCII string delimiters" guard. Both bit this change; both are caught by the
+compile-every-inline-script tests.
+
+---
+
+## GOA — 2026-09-21 (6) — read-only in somebody else's tab (client-side guardrail)
+
+GOA asked whether a session can be locked to the person it belongs to, readable by others but
+not typeable. **tmux cannot express that**: `attach -r` makes a whole CLIENT read-only and
+there is no per-window notion of writability (`client_readonly` is a client property; no
+window option exists). Verified against tmux 3.3a rather than assumed.
+
+So the options were: a client-side guard (accident prevention), per-person tmux sessions per
+project with `attach -r` for other people's (real enforcement at the web layer, but it touches
+ttyd, nginx routing, the tab strip, hibernation, save/restore and scheduled tasks), or nothing.
+**GOA chose the client-side guard**, knowing what it is and is not.
+
+Implemented in `app/terminal-preload.js` — the script nginx `sub_filter`s into every ttyd page
+— in front of the websocket, which is the only chokepoint that covers keystrokes, paste, IME
+and xterm's own handlers in one place:
+
+- INPUT frames (`'0'`-prefixed, `0x30` as bytes) are dropped while the ACTIVE window's
+  `@pw_cred_user` is somebody else. Resize, pause and ttyd's handshake keep flowing — gating
+  those would break the terminal instead of making it read-only.
+- `__pwSendToTerminal` (the file drawer and paste path) writes straight to the native send, so
+  it is gated separately rather than assumed to pass through `ws.send`.
+- A red bar names whose tab it is and what to do instead. A swallowed keystroke with no
+  explanation reads as a broken terminal.
+- **It FAILS OPEN** — unreadable window list, unresolved identity, anonymous session, or no
+  `fetch` at all leaves everything writable. A guardrail that locks someone out of their own
+  terminal on a failed poll is worse than the accident it prevents. Pinned in
+  `test/terminal-readonly-guard.test.mjs`.
+
+**Not a security boundary, and the code says so:** devtools bypasses it, and `tmux attach` from
+a shell bypasses everything — which is already true of every pane here, since they all run as
+one OS account. Also unchanged: multiple clients attached to one session share the same active
+window, so two people in a project still move each other's tab selection. Per-person sessions
+would fix both; that remains the real design if enforcement is ever wanted.
+
+---
+
+## GOA — 2026-09-21 (7) — the backfill now labels from the PANE, not from a hash comparison
+
+GOA asked why one user's projects did not heal when the others did. Cause, confirmed from
+disk: **clearing that user's GitHub token changed their credential fingerprint**
+(`sha256(username \0 configDir \0 ghToken)`), so every session stamped with the old one
+stopped matching its owner and the backfill skipped them as stale — correctly by its own rule,
+and uselessly in practice, because those panes plainly still run on that person's directory.
+
+A hash cannot distinguish "the token rotated" from "the primaryUser was reassigned". The pane
+can: `pane_start_command` carries `CLAUDE_CONFIG_DIR=<PW_USER_CRED_BASE>/<encoded>/claude`,
+which NAMES the person. `encodeUserName` is injective and reversible by design, so the segment
+decodes unambiguously; the decoded name is then checked against the current roster.
+
+So the order of evidence is now: **the pane's own credential directory first**, the
+owner-fingerprint match only as a fallback for panes whose start command was never recorded
+(a restored session). This is strictly better in the case the old strictness existed to
+protect: with a reassigned owner, the pane names the PREVIOUS owner — which is true — instead
+of being skipped or labelled with the new one. The skip case narrows to "no credential
+directory in the pane AND a stamp that does not vouch", which is a real "cannot tell".
+
+Note on trust: a start command is what tmux recorded at pane creation, so it is authoritative
+for what the pane was GIVEN. Anyone with a shell could create a pane with a crafted
+`CLAUDE_CONFIG_DIR` — and could equally just type in any tab — so this is attribution, same
+as everything else here, not a boundary.
+
+Pinned in `test/session-label-backfill.test.mjs`: the owner's token is cleared behind a live
+session's back and the label still lands; and the narrowed skip case (a pane with no
+credential dir plus a corrupt stamp) still refuses.
+
+**Also fixed here:** the read-only guard was fetching `/api/auth/check` for the viewer's
+identity — that is the nginx `auth_request` subrequest, which answers 200/401 with no identity
+in the body. The right route is `/api/auth/me`. It survived review because the test's fetch
+stub answered the same wrong URL, written from the same wrong assumption; the stub now THROWS
+on any URL it does not recognise, so a wrong endpoint fails the test instead of passing it.
+
+---
+
+## GOA — 2026-09-21 (8) — GitHub OAuth device flow, per user, from the Users page
+
+Context, because this is a fix for a class rather than a feature request out of nowhere: a
+stored GitHub token here does TWO unrelated jobs — it is the push credential pinned into every
+repo its owner owns (`syncProjectCredentials`) and it authenticates Copilot in that person's
+terminals. A hand-made PAT satisfies one and fails the other, and both directions happened
+here in one afternoon: a classic `ghp_` that pushed and Copilot refused, then a fine-grained
+PAT that Copilot took and returned `403 Write access to repository not granted` on push.
+
+**Settings → Users → _connect_** (and the same on a person's own `/me`) now runs GitHub's
+**device flow**: `POST /api/github-oauth/start` → the person enters the shown code at
+github.com on any device → `POST /api/github-oauth/poll` until GitHub answers. Device flow
+rather than web flow because the web flow needs an inbound redirect URL and this is a LAN host
+behind a private CA — the same reason `gh auth login` uses it here.
+
+Protocol lives in `app/github-oauth.js` with fetch injected, so the state machine is tested
+without a network (`test/github-oauth.test.mjs`, which also drives the whole thing end to end
+against a stub GitHub over HTTP).
+
+Three properties worth reviewing deliberately:
+
+- **The device code never reaches the browser.** It is the secret that COLLECTS the token, so
+  it is kept in an in-memory map keyed by target user and only the `user_code` is returned.
+  Not persisted: it is worthless after ~15 minutes, and a restart mid-flow should cancel
+  rather than resurrect. Asserted in the tests.
+- **Who may authorise for whom:** yourself always, anybody if you are an admin. An admin
+  starting it on someone else's row is a real workflow (sitting with them while they authorise
+  on their phone), so the resulting token is VERIFIED with `GET /user` and the GitHub login is
+  stored (`ghLogin`) and shown on the row. Whoever is signed into github.com in that browser
+  is who gets authorised, and showing it is what makes a mis-binding visible rather than silent.
+- **Capability is reported as what the token CARRIES, never as a promise.** Scopes are shown
+  with a note about `repo`; the note says "wherever this account already has write access",
+  because a token with `repo` still cannot push where its account cannot — which is precisely
+  the failure that prompted all this. Copilot acceptance is not a scope at all (it depends on
+  the app the token came from), so it is not guessed at.
+
+**`PW_GITHUB_OAUTH_CLIENT_ID` has NO default, deliberately, and PVI should weigh in.** The two
+ways to fill it are not equivalent: an org-registered OAuth app is accountable and pushes fine,
+but GitHub gates Copilot API access and a self-registered app is not on that list; the GitHub
+CLI's public client id yields a token Copilot documents it accepts (which is why the one
+token that does both jobs on this box is of that kind), at the cost of authorising as another
+vendor's app. That is an operator's call, so unset disables the button with an actionable
+message instead of falling back to either.
+
+---
+
+## GOA — 2026-09-21 (9) — why "gh isn't installed" keeps coming back, and the fix
+
+GOA: "this has been done several times yet I always run into 'gh isn't installed' issues, so
+whatever way we install it it needs to be hardened and permanent."
+
+**The recipe was never the problem.** The Containerfile has installed gh since 5ec4bf0
+(2026-09-09), correctly: `set -eux`, checksum-free but version-resolved via the
+releases/latest redirect, and a closing `gh --version` so a partial download fails the layer.
+Two other things went wrong instead:
+
+1. **The running image predates that layer.** Everything in its `/usr/local/bin` is dated
+   2026-08-21 — the dotnet toolchain build — twelve days before the gh layer was committed.
+   An image is only rebuilt deliberately, and nobody had.
+2. **Every runtime install since went into the container's writable layer**, which the next
+   `podman run` discards. Same failure as the deploy toolchain before it was baked in.
+
+`deploy/install-gh.sh` installs into **`/opt/npm-global/bin`** — a real host filesystem
+(rootvg-srvlv) bind-mounted into the containers, already first on a pane's PATH, and the
+reason sqlcmd has survived every recreate. It refuses tmpfs/overlay destinations outright,
+verifies the tarball against GitHub's published SHA-256 (a missing or mismatched checksum
+aborts), installs atomically under a temporary name, and runs `gh --version` before claiming
+success. Proven in-container before shipping: gh 2.101.0 downloads, verifies, runs, and
+`gh auth token` exists — which is the capability the per-user GitHub work needs.
+
+The Containerfile layer STAYS. Belt and braces: whichever exists, PATH finds one, and they are
+the same tool.
+
+**The part that actually stops the recurrence** is that the dashboard now reports it:
+`ghInstalled` in `/api/system/status` and a line in Settings → System & Updates → Readiness
+checklist, naming `deploy/install-gh.sh` as the remedy. Each previous disappearance was found
+by an agent failing mid-task; a missing tool that nothing surfaces is the defect worth fixing.
+Pinned in `test/gh-install.test.mjs` — including that the image layer keeps its fail-loud
+shape and that the installer keeps refusing an ephemeral destination.
+
+**Still open (PVI relevant):** the running image is a month stale relative to `main`. That is
+a separate, disruptive job — recreating the **pw-tmux** container kills every live tmux session
+— so it is deliberately not bundled here. The bind-mount install makes gh available without it.
+
+---
+
+## GOA — 2026-09-21 (10) — per-user GitHub auth via `gh auth login` (the better route)
+
+GOA asked the right question about the previous entry: "if gh auth login is what gave me my
+oauth, then why not facilitate that?" It is the better design and it is now the preferred
+route — PW implements no OAuth for it at all.
+
+**Settings → Users → connect** (and `/me`) opens a terminal AS THAT PERSON running
+`gh auth login --hostname github.com --git-protocol https --web --insecure-storage --scopes
+repo,read:org,workflow`, then reads back what gh stored and adopts it. No client id: gh is
+itself an app GitHub trusts, and its token is the one kind that has always done both jobs here.
+
+Three things carry the correctness, each measured against gh 2.101.0 rather than assumed:
+
+1. **`GH_CONFIG_DIR` is per person** (`<cred root>/gh`, created with the rest of the tree,
+   0700) and exported into panes. Otherwise every login overwrites one shared `hosts.yml` and
+   PW cannot tell whose token it is reading.
+2. **The tab runs as the TARGET** (`newTmuxWindow(..., target)`), because gh writes into the
+   config dir of the account the pane runs as. Doing it for somebody else therefore requires
+   `PW_PER_LAUNCHER_CLAUDE` and is refused otherwise rather than writing into the wrong tree.
+3. **`gh auth token` ECHOES AN AMBIENT `GH_TOKEN`** — and per-user credentials export one into
+   every pane. An unsanitised read therefore returns the token PW already had and reports a
+   fresh login that never happened: a silent no-op that looks like success. `ghReadEnv()` strips
+   `GH_TOKEN`/`GITHUB_TOKEN`/`GH_ENTERPRISE_TOKEN`/`GITHUB_ENTERPRISE_TOKEN` before asking.
+   With nothing stored gh writes to stderr and leaves stdout EMPTY, so the answer is decided by
+   the SHAPE of stdout, never the exit code. Both behaviours are pinned, including against the
+   real binary when it is installed (`test/gh-cli-auth.test.mjs`).
+
+`--insecure-storage` is deliberate, not a downgrade: gh uses an OS credential store when it
+finds one and plain text otherwise, and this container has no keyring — being explicit makes
+the result deterministic and readable by `gh auth token` rather than dependent on a keyring's
+continued absence. 0600 inside the person's own 0700 directory.
+
+The read-back goes through the SAME privilege-dropped helper as every other access to that tree
+(new `gh-token` action in `credential-writer.mjs`): the config dir belongs to the pane account,
+and running gh as root against it would be the same confused deputy in a different hat.
+
+The device flow from the previous entry stays as the fallback for a box without gh, and the
+modal picks the gh route whenever the tool is present.

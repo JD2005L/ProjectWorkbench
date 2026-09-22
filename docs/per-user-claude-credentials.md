@@ -112,19 +112,133 @@ on, every grandfathered session refused to open a new tab at all
 ### Tab colours
 
 The cockpit colours each tab by whose account it runs on, and names them in the
-tooltip. An **uncoloured** tab is the shared box login.
+tooltip. An **uncoloured** tab is the shared box login; a coloured one is somebody's.
 
-Colours are assigned in `workbench.json`, so a team can agree what means whom:
+**Whose colour is whose** is written down in two places, because a mapping nobody can
+look up is not a mapping:
 
-```json
-{ "userTabColors": { "james.levac": "orange", "kevin.charlebois": "yellow" } }
+* **Settings → Users** shows each person's swatch and colour name beside their username
+  — that table is the legend;
+* **`/me`** shows a person their own colour, and is where they change it.
+
+**Choosing.** Every user always has a colour — a new one is assigned automatically, so
+no tab is ever colourless — and the assignment can be overridden:
+
+* a person picks their own on `/me` (`POST /api/me/tab-color`);
+* an admin picks it for them in the Add/Edit user form (`tabColor` on the user record).
+
+A colour already held by somebody else is **refused**, naming them, and shown as taken
+in the picker: two people in one colour undoes the only thing the colour is for.
+Choosing **Automatic** hands it back to the assignment.
+
+Resolution order, and why each layer exists:
+
+1. **the person's own stored choice** (`tabColor` on their record) — deliberate, and it
+   travels with the record through a rename or a delete;
+2. **the operator map** in `workbench.json` (`userTabColors`) — how this was configured
+   before there was a UI, kept working rather than silently discarded;
+3. **a stable hash** of the username, drawn only from colours nobody has claimed in 1 or
+   2, so a new teammate is never colourless and never collides with an agreed colour.
+
+Palette: `orange`, `yellow`, `violet`, `green`, `pink`, `blue`, `teal`, `lime`, `red`,
+`sky` (`app/user-colors.js`). With more people than colours, later arrivals share a
+hashed colour — an explicit choice always wins over a hashed one.
+
+The mapping is resolved on every poll, so a change repaints the strip within seconds
+without recycling any terminal.
+
+### Authorising GitHub per person (instead of pasting a token)
+
+Two routes exist. **Prefer the GitHub CLI one** — it needs no OAuth app of our own,
+because gh *is* an app GitHub trusts, and the token it issues is the one kind that has
+always done both jobs on this workbench: pushing and Copilot.
+
+#### Via `gh auth login` (recommended)
+
+Settings → Users → **connect** opens a terminal **as that person**, running:
+
+```
+gh auth login --hostname github.com --git-protocol https --web --insecure-storage --scopes repo,read:org,workflow
 ```
 
-Valid names are the palette in `app/user-colors.js` (`orange`, `yellow`, `violet`,
-`green`, `pink`, `blue`, `teal`, `lime`, `red`, `sky`). Anyone unmapped gets a
-stable colour hashed from their username, drawn from the colours nobody has claimed.
-The mapping is resolved on every poll, so changing it repaints the strip without
-recycling any terminal. It is also settable through `POST /api/setup/state` (admin).
+They follow gh's prompts — it prints a one-time code and a URL — in their own browser.
+The modal then reads back what gh stored and adopts it: the token becomes the push
+credential of every project they own and is exported as `GH_TOKEN` in their terminals,
+and **gh itself stays signed in** for their own `gh pr` / `gh api` use.
+
+Three things make that work:
+
+* **`GH_CONFIG_DIR` is per person** (`<cred root>/gh`), so a login writes into their own
+  tree rather than overwriting one shared `hosts.yml` — and PW can tell whose token it is
+  reading back.
+* **The terminal runs as the target**, not as whoever pressed the button. Doing it for
+  somebody else therefore needs per-launcher credentials, and is refused rather than
+  silently writing into the presser's directory.
+* **The read-back strips `GH_TOKEN` and friends from the environment.** `gh auth token`
+  *echoes an ambient token* — measured against gh 2.101.0 — and every pane already has
+  one, so an unsanitised read would return the token PW already had and report a fresh
+  login that never happened. With nothing stored, gh writes to stderr and leaves stdout
+  empty, so the answer is decided by the shape of stdout and never by the exit code.
+
+`--insecure-storage` is deliberate: gh uses an OS credential store when it finds one and
+plain text otherwise, and this container has no keyring — so being explicit makes the
+result land where `gh auth token` can always read it, instead of depending on the
+continued absence of a keyring. The file is `0600` inside the person's own `0700`
+directory.
+
+If `gh` is missing, the modal says so and names `deploy/install-gh.sh`. Note that gh has
+disappeared here before — see the readiness checklist entry.
+
+#### Via our own device flow (fallback)
+
+
+
+One stored token per person has to do two unrelated jobs here: it is the **push
+credential** pinned into every repository that person owns, and it is what
+**authenticates Copilot** in their terminals. A hand-made PAT reliably satisfies one and
+fails the other — both directions have happened on this workbench:
+
+* a classic `ghp_` PAT pushed perfectly and Copilot refused the type;
+* replacing it with a fine-grained PAT satisfied Copilot and returned
+  `403 Write access to repository not granted` on push.
+
+**Settings → Users → _connect_** opens a modal that runs GitHub's **device flow**: the
+dashboard asks GitHub for a code, the person enters that code at
+`github.com/login/device` in their own browser (any device), and the dashboard polls for
+the result. A person can do the same for themselves from **`/me`**. Nothing needs to
+reach this box inbound, which is why the device flow and not the web flow — this is a LAN
+host behind a private CA.
+
+What the result gives you:
+
+* the token is stored encrypted, becomes the push credential of every project that
+  person owns (`syncProjectCredentials` runs immediately), and is exported as `GH_TOKEN`
+  in their terminals;
+* the **GitHub account that actually authorised** is verified through `GET /user` and
+  shown on the row. That matters because an admin may start the flow on somebody else's
+  row — a real workflow when sitting with them — and whoever is signed into GitHub in
+  that browser is who gets authorised. Showing the login makes a mis-binding visible
+  instead of silent;
+* the granted **scopes** are shown, with a plain note about whether `repo` is present.
+  That is deliberately phrased as what the token *carries*, never as a promise that a
+  push will succeed: a token with `repo` still cannot push where its account has no
+  write access, which is exactly the failure that prompted this.
+
+The device code never reaches the browser (it is the secret that collects the token), the
+token never appears in a response or the audit log, and each authorisation is single-use.
+
+**From a shell instead of the UI:** `tools/pw-connect-github.py <username>` does the same
+thing for people who would rather run a command — it signs in to the dashboard as you,
+starts the flow for that user, prints the code they must enter, and waits. The
+authorisation itself still has to be done by that person in a browser signed in as
+themselves; no script can stand in for it, which is the point of using OAuth at all.
+
+**Configuration is required and has no default** — see `PW_GITHUB_OAUTH_CLIENT_ID` in
+[DEPLOY.md](../DEPLOY.md). Briefly: an org-registered OAuth app is the accountable
+choice and pushes fine, but GitHub gates Copilot access and a self-registered app is not
+on that list; the GitHub CLI's public client id yields a token Copilot documents it
+accepts, at the cost of authorising as another vendor's app. That is an operator's
+decision, so an unset value disables the button with a message rather than guessing.
 
 ### Prerequisites for Copilot specifically
 
@@ -145,67 +259,146 @@ the repository's own pinned credential, not `GH_TOKEN`.
 
 ## Who signs in, and where
 
-Two different questions get asked in the same place, and they have different answers:
+Two different questions used to be answered in the same place. They are now separated,
+because they have different answers and different owners:
 
-| Question | Scope | Where it is answered |
+| Question | Scope | Where |
 |---|---|---|
-| Which assistants does this box offer, at which version? | the machine | Settings → CLIs (install / update / auto-update) |
-| Is *this person* signed in to one? | a person | Settings → **Users** (Claude and Copilot columns) |
+| Which assistants does this box offer, at which version? | the machine | Settings → **CLIs** (enable / install / update) |
+| Is *this person* signed in to one? | a person | Settings → **Users** (a column per offered CLI), and **`/me`** for the person themselves |
 
-The **"Sign in" button on the CLIs page authenticates the box's own shared identity**,
-by sending the login command into one shared setup terminal (`/pty/_setup/`) that
-carries no per-user credential environment. With per-user credentials on, that identity
-does not run anybody's project terminals any more. It is still load-bearing, but as a
-**seed**: a new per-user config dir is created from it (`.claude.json`'s MCP servers,
-`settings.json`'s infrastructure keys, `CLAUDE.md`, `copilot-instructions.md`,
-`mcp-config.json`), and a project with no `primaryUser` still falls back to it. Both
-sign-in surfaces say so when the feature is on, and the green badge reads **"Shared
-login"** rather than "Signed in", because it is not yours.
+### The CLIs page has no sign-in when identity is per person
 
-### How a person signs themselves in
+With `PW_PER_USER_CLAUDE` on, Settings → CLIs is install/update/enable only. The
+sign-in button, the "Signed in" badge and the shared setup terminal section are all
+removed, and `POST /api/setup/cli/auth` refuses — because that control authenticates the
+box's own identity, which runs nobody's project terminals. Pressing it would have signed
+in an identity the presser does not use.
 
-Opening a CLI tab is usually all it takes: the pane already carries that person's
-`CLAUDE_CONFIG_DIR` and `COPILOT_HOME`, so an unauthenticated CLI prompts them and the
-credential lands in their own directory.
+With the feature **off**, all of it comes back and behaves exactly as before: in that
+mode the box's login genuinely is everybody's, so it is the right place to sign in. The
+shared identity still matters either way as the **seed** a new per-user config dir is
+created from (`.claude.json`'s MCP servers, `settings.json`'s infrastructure keys,
+`CLAUDE.md`, `copilot-instructions.md`, `mcp-config.json`) and as the fallback for a
+project with no `primaryUser` — it just is not something anybody signs in to from that
+page any more.
 
-`POST /api/me/cli-login {cli}` does the same thing deliberately, and is what the
-**Sign in Claude** button on your own row in Settings → Users calls. It picks a project
-you can already reach (your last-viewed one, else the first) and opens a tab running
-that CLI's login command **as you**.
+### Settings → Users: a column per offered CLI
 
-It is **self-service by construction — it takes no username.** An admin pressing it for
-someone else would create the tab on the *admin's* credentials and sign the wrong
-person in, so the identity comes from the session and nowhere else. That is also why
-the button renders only on your own row.
-
-### What the Users columns mean
-
-**Claude** is a plain "has this person completed `claude /login`" — read from their own
-config dir via the privilege-dropped helper.
-
-**Copilot** is not a boolean, because a stored GitHub token *overrides* any login
-(Copilot reads `COPILOT_GITHUB_TOKEN` / `GH_TOKEN` / `GITHUB_TOKEN` first) and not
-every token type is accepted:
+"Offered" means enabled by the operator **and** installed — anything else has no
+sign-in state worth showing. Each cell is resolved server-side by
+`resolveCliAuthCell()` (`app/cli-auth-status.js`) so this table and a person's own page
+can never tell different stories:
 
 | Cell | Meaning |
 |---|---|
-| ✓ via token | their stored token authenticates Copilot; nothing else to do |
-| ✗ token type | Copilot refuses this type — a classic `ghp_` PAT. It also overrides any sign-in, so signing in cannot help until it is replaced or cleared |
-| ? token type | not a recognised GitHub token type, and it overrides any sign-in |
-| ✓ signed in | no stored token, but they completed their own `copilot login` |
-| not yet | neither — Copilot will ask them on their first Copilot tab |
-| ! token unreadable | their stored token would not decrypt; an admin must replace it |
+| signed in | that person completed their own login; it lives in their own config dir |
+| not signed in | they have not yet; opening a tab for it will ask them |
+| ready · own token | *(Copilot)* their stored GitHub token authenticates it — nothing to sign in to |
+| token type refused | *(Copilot)* a classic `ghp_` PAT. Copilot refuses the type, **and** a stored token overrides any sign-in, so signing in cannot help until it is replaced or cleared |
+| token type unknown | *(Copilot)* an unrecognised token type, also overriding any sign-in |
+| token unreadable | their stored token would not decrypt; it needs replacing |
+| not personal yet | the CLI has no per-user config dir (Codex today), so a "personal" login would write the shared one |
+| not installed | fix the machine first |
+| shared login | per-user credentials are off; there is no personal sign-in to do |
 
-A sign-in is offered only when it could take effect. Everything else returns the reason
-instead of opening a terminal that silently changes nothing.
+The **Git token** column now shows the token's *type* rather than a bare tick, and has a
+**Clear** control. It was previously write-only — an empty field meant "keep what is
+there" — so a token could never be removed, which mattered because clearing is the only
+fix when Copilot refuses the type.
+
+### The sign-in means is self-service, and appears only when something is owed
+
+A sign-in runs in a terminal, and a terminal carries the credentials of whoever opened
+it. So the **sign in** action only appears on **your own row**: pressing it for someone
+else would create the tab on *your* credentials and sign *you* in again.
+
+It also only appears when there is an action outstanding — `needsSignIn`, not merely
+"a login would work". A control beside a cell that already reads *signed in* makes a
+reader doubt the status, so a signed-in row shows the status alone. Re-authenticating
+something that already works (an expired or revoked credential still reads as signed in
+on disk) is available from your own `/me` page, where it is not sitting in a list of
+everybody else's states. And it never appears where a stored token would override the
+login, because that is a loop that cannot succeed.
+
+Both in-cell actions — **sign in** and the token's **clear** — are compact inline links
+rather than buttons, so a status column reads as a status column.
+
+For everyone else's rows, the admin's lever is the token: replace it, or clear it so the
+person can sign in.
+
+### `/me` — the page a non-admin needs
+
+Settings is admin-only, so a developer would otherwise be able to see that their Copilot
+did not work but not why, and not act. **`/me`** ("My CLI sign-ins") is linked from the
+user chip in the status bar on every page, including the cockpit. It shows that person
+their own per-CLI status and detail, a **Sign in** button where it applies, and their own
+GitHub token controls:
+
+* `POST /api/me/github-token` — store/replace their own token;
+* `DELETE /api/me/github-token` — clear it;
+* `POST /api/me/cli-login` — open a tab running that CLI's login as them.
+
+All three are self-scoped: none of them takes a username, so none can be used to touch
+or enumerate another person's credentials. Every change is audited, and the token itself
+never appears in a response, in the audit log, or in a pane's command line.
+
+Letting a person manage their own token is deliberate: because a stored token overrides
+a Copilot login, a person whose token Copilot refuses could not sign in at all without
+an admin — the self-service path would have been advice rather than a means. Storing a
+new one is offered alongside clearing, so they are not left without git credentials.
+Their token grants nothing on this workbench; it is their own identity, used for their
+own attribution.
+
+### Upgrading terminals that already exist
+
+A session created before per-window identity stamps existed runs on perfectly good
+per-user credentials — it simply never recorded whose, so the cockpit shows its tabs
+uncoloured. **Settings → System & Updates → Heal → "Label existing terminals"**
+(`POST /api/setup/heal/session-labels`, admin) fills that record in.
+
+It writes a tmux window option, which is metadata: the pane's process is not signalled,
+restarted or otherwise disturbed, and the test for this asserts the pane PID is
+unchanged afterwards. That is the point — recycling would also fix the label, by killing
+everything running in the session.
+
+The care is all in what it refuses to label, because a wrong name is worse than none:
+
+| Situation | What happens |
+|---|---|
+| the pane's start command names a credential directory | labelled with **that** person — the strongest evidence there is, and it survives a rotated token or a reassigned owner |
+| no credential directory in the pane, but the session's stamp matches its owner | labelled with the owner (the weaker, fallback rule) |
+| a window already carries a label | left alone — with per-launcher credentials a session legitimately holds several identities, and the owner is not all of them |
+| neither: no credential directory **and** a stamp that does not match | **skipped and named**, with "recycle to migrate" — nothing establishes whose account those panes spend |
+| owner cannot be resolved, or the stamp cannot be read | skipped and named |
+| project has no `primaryUser`, or the feature is off | skipped: there is no per-person identity to record |
+
+**Why the pane, not the fingerprint.** The fingerprint is
+`sha256(username \0 configDir \0 ghToken)`, so *clearing or rotating a token changes it* —
+and every session stamped with the old one stops matching, even though those panes plainly
+still run on that person's directory. That happened here: clearing one user's GitHub
+token made the backfill skip all of their projects as stale. A hash cannot tell "the
+token changed" from "the owner was reassigned", but the pane's own start command can: it
+carries `CLAUDE_CONFIG_DIR=<base>/<encoded-username>/claude`, which names the person
+directly. The encoding is reversible by design (see `encodeUserName`), and the decoded
+name is checked against the current roster before it is used.
+
+It is idempotent — a second run reports everything as already labelled — so it is safe
+to press again after recycling something.
+
+One thing a label does **not** retrofit: `COPILOT_HOME`. A pane's environment is fixed
+by tmux when the pane is created, so a terminal that predates that variable keeps using
+the shared `~/.copilot` until it is recycled. The label is still accurate about **whose
+account the tab spends** — that follows `GH_TOKEN` and `CLAUDE_CONFIG_DIR`, which those
+panes do carry — but Copilot's sessions and history stay pooled until a recycle.
 
 ### Codex
 
 Not wired for per-user identity: there is no per-user Codex config directory, so a
 "login" would write the shared one. `CODEX_HOME` looks like the analogue of
 `COPILOT_HOME` but has not been verified against the CLI, so the per-user sign-in route
-refuses Codex with that reason rather than pretending. Installing and updating Codex
-from Settings is unaffected.
+refuses Codex with that reason rather than pretending, and its cell reads "not personal
+yet". Installing and updating Codex from Settings is unaffected.
 
 ## Threat model: what this feature is and is not
 
@@ -227,7 +420,7 @@ Concretely:
 | Git/Copilot actions attributed to the right person | yes |
 | Secrets hidden from a *remote* user with no terminal | yes |
 | Secrets hidden from another user **who has a terminal on this box** | **no** |
-| A tab's colour prevents someone typing into another person's tab | **no** — the tmux session is shared; the colour is awareness, not a fence |
+| A tab's colour prevents someone typing into another person's tab | **no** — the colour is awareness only. Anyone with a terminal can type into anyone's tab, and nothing in the browser could change that while every pane runs as one OS account |
 | Root compromise from a terminal | no — see below |
 
 Real cross-user isolation would require one OS account per person, which is a

@@ -13,6 +13,7 @@
 //          "sharedSettings":…,"sharedClaudeMd":…,"sharedCopilotHome":…}
 //         {"action":"prune","base":…,"keep":[…]}
 //         {"action":"status","base":…,"username":…}   -> {signedIn, copilotSignedIn}
+//         {"action":"gh-token","base":…,"username":…}  -> {token} ('' when none stored)
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
 //
 // The job travels on stdin specifically so the GitHub token never appears in
@@ -22,13 +23,18 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
-import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn } from './user-credentials.js';
+import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir } from './user-credentials.js';
+import { readStoredGhToken } from './gh-cli.js';
+import { execFile as execFileCb } from 'node:child_process';
+import { promisify } from 'node:util';
+
+const execFileAsync = promisify(execFileCb);
 import { runGitCredentialJob, remediateGitCredentials, nodeJobDeps, nodeRunGit } from './git-credentials.js';
 
 // Jobs that operate on the per-user credential TREE are addressed by `base`.
 // The git-credential job addresses a project REPOSITORY instead, so it carries
 // a workspace root and a project path and has no `base` at all.
-const TREE_ACTIONS = new Set(['ensure', 'prune', 'status']);
+const TREE_ACTIONS = new Set(['ensure', 'prune', 'status', 'gh-token']);
 
 async function readStdin() {
   const chunks = [];
@@ -84,6 +90,15 @@ async function main() {
       })
       : job.action === 'prune'
       ? await pruneUserCredentials({ fsp, base: job.base, keep: Array.isArray(job.keep) ? job.keep : [] })
+      : job.action === 'gh-token'
+      // Running `gh auth token` as the account that owns the config dir, with the
+      // ambient GH_TOKEN stripped — see gh-cli.js for why that stripping is the whole
+      // correctness of this call.
+      ? { token: await readStoredGhToken({
+        execFile: execFileAsync,
+        ghConfigDir: userGhConfigDir(job.base, job.username),
+        env: process.env,
+      }) }
       : job.action === 'status'
       // Both CLIs in one job: the Users table asks per user per request, and each job
       // is a privilege-dropped process spawn.

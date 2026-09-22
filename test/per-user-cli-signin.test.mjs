@@ -27,9 +27,10 @@ import { fileURLToPath } from 'node:url';
 
 import {
   GITHUB_TOKEN_KINDS, COPILOT_AUTH_STATES,
-  classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect,
+  classifyGithubToken, resolveCopilotAuthState, copilotLoginWouldTakeEffect, resolveCliAuthCell,
 } from '../app/cli-auth-status.js';
 import { userCopilotSignedIn, userCopilotConfigDir, spawnCredentialJob } from '../app/user-credentials.js';
+import vm from 'node:vm';
 import { withCockpit } from './cockpit-instance-fixture.mjs';
 
 const APP_DIR = fileURLToPath(new URL('../app/', import.meta.url));
@@ -92,6 +93,73 @@ test('a sign-in is only offered when it could actually take effect', () => {
   }
   // The rejected-token reason must name the actual remedy, not just the problem.
   assert.match(copilotLoginWouldTakeEffect(COPILOT_AUTH_STATES.tokenRejected).reason, /Copilot Requests|clear it/);
+});
+
+test('an action is offered only where one is OWED, not merely possible', () => {
+  // The distinction the Users table needs: a signed-in row has nothing outstanding, so
+  // it gets no control, while re-authenticating remains possible from a person's own
+  // page. Conflating the two put a "Sign in" button next to "signed in".
+  const claude = (signedIn) => resolveCliAuthCell({ cli: 'claude', perUserEnabled: true, userAuthSupported: true, claudeSignedIn: signedIn });
+  assert.equal(claude(false).needsSignIn, true, 'not signed in is an outstanding action');
+  assert.equal(claude(true).needsSignIn, false, 'signed in owes nothing');
+  assert.equal(claude(true).canSelfSignIn, true, 'but re-authenticating is still possible');
+
+  const copilot = (state) => resolveCliAuthCell({ cli: 'copilot', perUserEnabled: true, userAuthSupported: true, copilotState: state });
+  assert.equal(copilot(COPILOT_AUTH_STATES.none).needsSignIn, true);
+  assert.equal(copilot(COPILOT_AUTH_STATES.signedIn).needsSignIn, false);
+  assert.equal(copilot(COPILOT_AUTH_STATES.viaToken).needsSignIn, false, 'a working token owes nothing either');
+  assert.equal(copilot(COPILOT_AUTH_STATES.tokenRejected).needsSignIn, false,
+    'and a refused token needs the TOKEN fixed, not a sign-in that cannot take effect');
+
+  // Nothing owed where there is no per-person identity to sign in at all.
+  for (const cell of [
+    resolveCliAuthCell({ cli: 'claude', perUserEnabled: true, userAuthSupported: true, installed: false }),
+    resolveCliAuthCell({ cli: 'claude', perUserEnabled: false, userAuthSupported: true }),
+    resolveCliAuthCell({ cli: 'codex', perUserEnabled: true, userAuthSupported: false }),
+  ]) assert.equal(cell.needsSignIn, false);
+});
+
+test('one person + one CLI resolves to one cell, and the same one for both surfaces', () => {
+  // The admin table and a person's own page render from THIS function, so a
+  // disagreement between them is impossible by construction rather than by review.
+  const cell = (over) => resolveCliAuthCell({ cli: 'claude', perUserEnabled: true, userAuthSupported: true, ...over });
+
+  assert.equal(cell({ claudeSignedIn: true }).label, 'signed in');
+  assert.equal(cell({ claudeSignedIn: true }).tone, 'ok');
+  assert.equal(cell({ claudeSignedIn: false }).canSelfSignIn, true, 'not signed in is exactly when signing in helps');
+
+  // An uninstalled CLI has nothing to sign in to; the machine has to be fixed first.
+  assert.equal(cell({ installed: false }).label, 'not installed');
+  assert.equal(cell({ installed: false }).canSelfSignIn, false);
+
+  // With the feature off, a per-person answer would be a fiction: every terminal runs
+  // on the one shared login, so the cell says which mode is in force instead.
+  const shared = resolveCliAuthCell({ cli: 'claude', perUserEnabled: false, userAuthSupported: true });
+  assert.equal(shared.label, 'shared login');
+  assert.equal(shared.canSelfSignIn, false);
+
+  // A CLI with no per-user config dir (Codex today) must not offer a "personal" login
+  // that would actually write the shared one.
+  const notWired = resolveCliAuthCell({ cli: 'codex', perUserEnabled: true, userAuthSupported: false });
+  assert.equal(notWired.label, 'not personal yet');
+  assert.equal(notWired.canSelfSignIn, false);
+});
+
+test('the Copilot cell carries the precedence rule into the UI', () => {
+  const cell = (copilotState, over) => resolveCliAuthCell({
+    cli: 'copilot', perUserEnabled: true, userAuthSupported: true, copilotState, ...over,
+  });
+  assert.equal(cell(COPILOT_AUTH_STATES.viaToken).tone, 'ok');
+  assert.equal(cell(COPILOT_AUTH_STATES.viaToken).canSelfSignIn, false, 'nothing to sign in to');
+  assert.equal(cell(COPILOT_AUTH_STATES.tokenRejected).tone, 'bad');
+  assert.equal(cell(COPILOT_AUTH_STATES.tokenRejected).canSelfSignIn, false, 'a login here cannot take effect');
+  assert.match(cell(COPILOT_AUTH_STATES.tokenRejected).detail, /Copilot Requests/, 'the remedy, not just the problem');
+  assert.equal(cell(COPILOT_AUTH_STATES.none).canSelfSignIn, true);
+  assert.equal(cell(COPILOT_AUTH_STATES.signedIn).canSelfSignIn, true, 're-signing in is allowed');
+  // An ignored login is stated, because "sign in" would otherwise look like the fix.
+  assert.match(cell(COPILOT_AUTH_STATES.tokenRejected, { copilotOverridesLogin: true }).detail, /being ignored/);
+  // An unrecognised state degrades visibly rather than silently reading as fine.
+  assert.equal(cell('something-new').tone, 'warn');
 });
 
 // ---------------------------------------------------------------------------
@@ -221,6 +289,14 @@ async function seedUsers(dir, { ghToken = '' } = {}) {
     kevin,
   ] }, null, 2));
 }
+// The fixture starts with the shipped default (claude only), so a test that wants a
+// Copilot column has to say so — the table only shows CLIs the operator has enabled.
+function setEnabledClis(dir, keys) {
+  const file = path.join(dir, 'workbench.json');
+  let current = {};
+  try { current = JSON.parse(fs.readFileSync(file, 'utf8')); } catch { /* fixture starts with none */ }
+  fs.writeFileSync(file, JSON.stringify({ ...current, enabledClis: keys, updateClis: [] }, null, 2));
+}
 function setPrimaryUser(dir, name, owner) {
   const file = path.join(dir, 'projects.json');
   const projects = JSON.parse(fs.readFileSync(file, 'utf8'));
@@ -321,18 +397,209 @@ test('SECURITY: the Copilot column decrypts a token to classify it and still nev
   // That is the only reason it is decrypted, and the classification is the only thing
   // allowed out — so the response is checked as RAW TEXT, not as a parsed object with
   // known keys, which is what would miss a token riding along in an unexpected field.
+  // clis: these assert how a stored credential is CLASSIFIED for a CLI, and the dashboard only
+  // classifies what it can see installed (getCliVersion runs `<bin> --version`). Without the
+  // stubs every cell collapses to 'not installed' on a machine without the GitHub Copilot CLI,
+  // which is exactly how these passed for their author and failed on CI.
   await withCockpit(async ({ base, dir }) => {
     await seedUsers(dir, { ghToken: 'ghp_CLASSIC_NOT_SUPPORTED' });
+    setEnabledClis(dir, ['claude', 'copilot']);
     const admin = await login(base, 'james.levac');
     const raw = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).text();
     for (const secret of ['ghp_CLASSIC_NOT_SUPPORTED', 'gho_OWNER']) {
       assert.equal(raw.includes(secret), false, `the users response must not carry ${secret.slice(0, 4)}… material`);
     }
     const body = JSON.parse(raw);
+    // A column per offered CLI, and a resolved cell per user per CLI.
+    assert.deepEqual(body.clis.map((c) => c.key).sort(), ['claude', 'copilot']);
     const kevin = body.users.find((u) => u.username === 'kevin.charlebois');
-    assert.equal(kevin.copilotAuth, 'token-rejected', 'the classification itself must still be reported');
+    assert.equal(kevin.cliAuth.copilot.label, 'token type refused', 'the diagnosis itself must still be reported');
+    assert.equal(kevin.cliAuth.copilot.canSelfSignIn, false, 'and a sign-in that the token would override is not offered');
+    assert.match(kevin.cliAuth.copilot.detail, /Copilot Requests|cleared/, 'the cell must carry the remedy');
+    assert.equal(kevin.tokenKind, 'classic', 'the TYPE is what an admin needs in order to act');
     assert.equal(kevin.hasToken, true, 'and the existing has-a-token boolean is unchanged');
     assert.equal(body.me, 'james.levac', 'the viewer is named so the table can offer self-service sign-in');
+  }, { clis: ['claude', 'copilot'], env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('a developer has a page of their own, reachable without Settings', { timeout: 120000 }, async () => {
+  // Everything else about identity lives behind Settings, which a developer cannot
+  // open. Without this page they could see Copilot fail and not why, and could not act.
+  await withCockpit(async ({ base, name, dir }) => {
+    await seedUsers(dir, { ghToken: 'ghp_CLASSIC_NOT_SUPPORTED' });
+    setEnabledClis(dir, ['claude', 'copilot']);
+    setPrimaryUser(dir, name, 'james.levac');
+    const cookie = await login(base, 'kevin.charlebois');
+
+    const page = await fetch(`${base}/me`, { headers: { cookie } });
+    assert.equal(page.status, 200, 'a developer must be able to open it');
+    assert.match(await page.text(), /My CLI sign-ins/);
+
+    const st = await (await fetch(`${base}/api/me/cli-status`, { headers: { cookie } })).json();
+    assert.equal(st.ok, true);
+    assert.equal(st.username, 'kevin.charlebois');
+    const copilot = st.clis.find((c) => c.key === 'copilot');
+    assert.equal(copilot.auth.label, 'token type refused', 'the diagnosis an admin sees, shown to the person who has the problem');
+    assert.equal(st.github.kind, 'classic', 'and the token TYPE, which is the actionable part');
+    // Never the token itself, on the page or in the API.
+    const raw = JSON.stringify(st);
+    assert.equal(raw.includes('ghp_CLASSIC_NOT_SUPPORTED'), false);
+  }, { clis: ['claude', 'copilot'], env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('REGRESSION: every inline script on the rendered /me page compiles', { timeout: 120000 }, async () => {
+  // These pages are assembled as template literals, where \n and \' are escapes the
+  // TEMPLATE consumes — so a client-side string written with them arrives holding a real
+  // newline or a bare quote and the whole script dies at parse time, with the server
+  // perfectly healthy. That is not hypothetical: it happened to this page and to the
+  // Settings page in the same change, which is why both are now compiled in CI.
+  await withCockpit(async ({ base, dir }) => {
+    await seedUsers(dir, { ghToken: 'ghp_CLASSIC_NOT_SUPPORTED' });
+    setEnabledClis(dir, ['claude', 'copilot']);
+    const cookie = await login(base, 'kevin.charlebois');
+    const html = await (await fetch(`${base}/me`, { headers: { cookie } })).text();
+    const scripts = [...html.matchAll(/<script>([\s\S]*?)<\/script>/g)].map((m) => m[1]);
+    assert.ok(scripts.length >= 1, 'the page must actually carry its client script');
+    scripts.forEach((src, i) => {
+      assert.doesNotThrow(() => new vm.Script(src), `inline script #${i} on /me does not compile`);
+    });
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('REGRESSION: user management survives workbench settings it cannot read', { timeout: 120000 }, async () => {
+  // The CLI columns need to know which CLIs are enabled, which means reading
+  // workbench.json — and that file ships root-only. Reading it straight through made
+  // GET /api/users 500, taking account management down with an informational column.
+  // The columns are what degrade now, not the route.
+  await withCockpit(async ({ base, dir }) => {
+    await seedUsers(dir);
+    fs.writeFileSync(path.join(dir, 'workbench.json'), '{ this is not json');
+    const admin = await login(base, 'james.levac');
+    const r = await fetch(`${base}/api/users`, { headers: { cookie: admin } });
+    assert.equal(r.status, 200, 'the user list must still load');
+    const body = await r.json();
+    assert.deepEqual(body.clis, [], 'with no readable settings there are no CLI columns');
+    assert.equal(body.users.length, 2, 'and every user is still listed');
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('a person can escape the Copilot dead end themselves: clear, then sign in', { timeout: 120000 }, async () => {
+  // This is the whole point of the self-service token controls. A token Copilot refuses
+  // overrides any login, so before this existed the ONLY way out was to ask an admin.
+  await withCockpit(async ({ base, name, dir }) => {
+    await seedUsers(dir, { ghToken: 'ghp_CLASSIC_NOT_SUPPORTED' });
+    setEnabledClis(dir, ['claude', 'copilot']);
+    setPrimaryUser(dir, name, 'james.levac');
+    const cookie = await login(base, 'kevin.charlebois');
+
+    const blocked = await signIn(base, cookie, 'copilot');
+    assert.equal(blocked.ok, false, 'sanity: the stored token blocks a sign-in');
+
+    const cleared = await (await fetch(`${base}/api/me/github-token`, { method: 'DELETE', headers: { cookie } })).json();
+    assert.equal(cleared.ok, true, `clearing must be possible: ${JSON.stringify(cleared)}`);
+    assert.equal(cleared.github.hasToken, false);
+
+    const after = await (await fetch(`${base}/api/me/cli-status`, { headers: { cookie } })).json();
+    assert.equal(after.clis.find((c) => c.key === 'copilot').auth.canSelfSignIn, true,
+      'with the blocking token gone, signing in is now possible');
+    const now = await signIn(base, cookie, 'copilot');
+    assert.equal(now.ok, true, `and actually works: ${JSON.stringify(now)}`);
+
+    // And they can store a working one themselves rather than losing git auth for good.
+    const set = await (await fetch(`${base}/api/me/github-token`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie },
+      body: JSON.stringify({ token: 'github_pat_11FINEGRAINED' }),
+    })).json();
+    assert.equal(set.ok, true);
+    assert.equal(set.github.kind, 'fine-grained');
+    const final = await (await fetch(`${base}/api/me/cli-status`, { headers: { cookie } })).json();
+    assert.equal(final.clis.find((c) => c.key === 'copilot').auth.tone, 'ok');
+  }, { clis: ['claude', 'copilot'], env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('the self token routes are self-scoped and reject junk', { timeout: 120000 }, async () => {
+  await withCockpit(async ({ base, dir }) => {
+    await seedUsers(dir);
+    const cookie = await login(base, 'kevin.charlebois');
+    const post = (body) => fetch(`${base}/api/me/github-token`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify(body),
+    }).then((r) => r.json().then((j) => ({ status: r.status, ...j })));
+
+    assert.equal((await post({ token: '' })).ok, false, 'an empty token is a clear, not a store');
+    assert.equal((await post({ token: 'gho_has space' })).ok, false, 'a pasted newline or partial paste is caught');
+    assert.equal((await post({ token: 'x'.repeat(600) })).ok, false, 'and an absurd length');
+    // There is no username parameter to abuse: the identity is the session's.
+    const src = SRC.slice(SRC.indexOf("app.post(BASE + '/api/me/github-token'"), SRC.indexOf("app.delete(BASE + '/api/me/github-token'"));
+    assert.doesNotMatch(src, /req\.body\?\.username|req\.params/);
+    assert.match(src, /req\.user\.username/);
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('a colour can be chosen, is refused when taken, and is visible to an admin', { timeout: 120000 }, async () => {
+  // "How do we know whose colour is whose" needs the mapping written down where people
+  // look, and "can we choose" needs a colour to be settable without editing a root-owned
+  // config file. Both are checked here against a real instance.
+  await withCockpit(async ({ base, dir }) => {
+    await seedUsers(dir);
+    const kev = await login(base, 'kevin.charlebois');
+    const admin = await login(base, 'james.levac');
+    const setColor = (cookie, color) => fetch(`${base}/api/me/tab-color`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ color }),
+    }).then((r) => r.json().then((j) => ({ status: r.status, ...j })));
+
+    // A new user always HAS a colour (assigned), and the admin table reports it.
+    let users = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).json();
+    const before = users.users.find((u) => u.username === 'kevin.charlebois');
+    assert.equal(before.tabColor, '', 'nothing chosen yet');
+    assert.ok(before.tabColorName, 'but a colour is assigned, so no tab is ever colourless');
+    assert.match(before.tabColorCss, /^#[0-9a-f]{6}$/, 'and the table can draw it');
+    assert.ok(users.palette.length >= 6, 'the palette is offered for a picker');
+
+    assert.equal((await setColor(kev, 'yellow')).ok, true, 'a person can choose their own');
+    users = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).json();
+    const after = users.users.find((u) => u.username === 'kevin.charlebois');
+    assert.equal(after.tabColor, 'yellow', 'the choice is stored on their record');
+    assert.equal(after.tabColorName, 'yellow');
+    assert.equal(users.colorClaims.yellow, 'kevin.charlebois', 'and is published as a claim');
+
+    // Two people in one colour would undo the only thing the colour is for.
+    const clash = await setColor(admin, 'yellow');
+    assert.equal(clash.ok, false);
+    assert.equal(clash.status, 409);
+    assert.match(clash.error, /already kevin\.charlebois/);
+
+    // An admin can set somebody else's, and is refused the same way.
+    const patch = (body) => fetch(`${base}/api/users/kevin.charlebois`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json', cookie: admin }, body: JSON.stringify(body),
+    }).then((r) => r.json().then((j) => ({ status: r.status, ...j })));
+    assert.equal((await patch({ tabColor: 'violet' })).ok, true);
+    assert.equal((await patch({ tabColor: 'chartreuse' })).ok, false, 'a colour outside the palette is rejected');
+
+    // Handing it back to automatic is possible, and does not leave them colourless.
+    assert.equal((await setColor(kev, '')).ok, true);
+    users = await (await fetch(`${base}/api/users`, { headers: { cookie: admin } })).json();
+    const auto = users.users.find((u) => u.username === 'kevin.charlebois');
+    assert.equal(auto.tabColor, '', 'no choice stored');
+    assert.ok(auto.tabColorName, 'but still a colour');
+  }, { env: { PW_PER_USER_CLAUDE: 'true' } });
+});
+
+test('a chosen colour reaches the cockpit tab strip', { timeout: 120000 }, async () => {
+  // The point of choosing is what the tabs look like, so the choice is followed all the
+  // way to the window list the strip renders from.
+  await withCockpit(async ({ base, name, dir }) => {
+    await seedUsers(dir);
+    setPrimaryUser(dir, name, 'james.levac');
+    const cookie = await login(base, 'kevin.charlebois');
+    await fetch(`${base}/api/me/tab-color`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ color: 'teal' }),
+    });
+    const made = await (await fetch(`${base}/api/term/${encodeURIComponent(name)}/windows`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', cookie }, body: JSON.stringify({ name: 'kev-tab' }),
+    })).json();
+    const tab = made.windows.find((w) => w.name === 'kev-tab');
+    assert.equal(tab.credUser, 'kevin.charlebois');
+    assert.equal(tab.credColor, '#2dd4bf', 'the tab is drawn in the colour they chose');
   }, { env: { PW_PER_USER_CLAUDE: 'true' } });
 });
 
@@ -340,25 +607,49 @@ test('SECURITY: the Copilot column decrypts a token to classify it and still nev
 // The UI must stop describing the shared identity as a person's login
 // ---------------------------------------------------------------------------
 
-test('the shared-identity sign-in is labelled as the SEED identity, not as yours', () => {
-  assert.match(SRC, /shared seed identity/, 'the wizard must say what that login now is');
-  assert.match(SRC, /perUserClaude: PER_USER_CLAUDE \}\);/, '/api/setup/state must tell the UI which identity model is in force');
-  // Both CLI renderers (wizard modal and the Settings page) relabel the badge, so the
-  // green "Signed in" pill cannot be read as "you are signed in".
-  assert.equal((SRC.match(/'Shared login':'Signed in'/g) || []).length, 2,
-    'both renderers must distinguish the shared login from a personal one');
+test('the CLIs page carries NO sign-in once identity is per person', () => {
+  // Installing is the machine's business; signing in is a person's. With per-user
+  // credentials on, the shared login runs nobody's terminals, so a sign-in control here
+  // would authenticate an identity the presser does not use. Both surfaces remove the
+  // control, the status badge and the terminal section, rather than caption them.
+  assert.match(SRC, /perUserClaude: PER_USER_CLAUDE \}\);/, 'setup state must tell the UI which identity model is in force');
+  assert.equal((SRC.match(/state\.perUserClaude\?'':'<button/g) || []).length, 2,
+    'both CLI renderers must drop the sign-in button when identity is per person');
+  assert.equal((SRC.match(/c\.authenticated&&!state\.perUserClaude/g) || []).length, 2,
+    'and drop the shared-identity badge, which is not about the viewer');
+  assert.match(SRC, /if\(shSec&&state\.perUserClaude\)shSec\.remove\(\)/, "the wizard's shared-identity section is removed");
+  assert.match(SRC, /if\(shCard\)shCard\.remove\(\)/, "as is the Settings page's shared sign-in terminal");
+  // The route behind it refuses in that mode too, so the capability is gone rather than
+  // merely hidden — and it still works where the shared login IS everybody's.
+  assert.match(SRC, /Per-user credentials are on, so this shared login runs nobody/);
 });
 
-test('a sign-in button is offered only on your own row, and only where it would work', () => {
+test('a stored token can be CLEARED from the Users table', () => {
+  // It was write-only: an empty field meant "keep it", so there was no way to remove a
+  // token — which is the only fix when Copilot refuses its type, because a stored token
+  // overrides any sign-in. The server already accepted ghToken:''; the control did not
+  // exist.
+  assert.match(SRC, /data-cleartok=/, 'the table needs a clear control');
+  assert.match(SRC, /JSON\.stringify\(\{ghToken:''\}\)/, 'clearing sends the empty token the server already understands');
+  assert.match(SRC, /git pushes from projects they own will have no credential/,
+    'and the confirmation must state the consequence');
+});
+
+test("the sign-in means sits in each CLI's cell, on your own row, where it would work", () => {
   // Rendering it on someone else's row would invite an admin to sign the wrong person
-  // in, and rendering Copilot's where a stored token overrides a login would invite a
-  // loop that cannot succeed — the cell says what to fix instead.
-  const start = SRC.indexOf('function signInButtonsHtml(');
-  assert.notEqual(start, -1);
+  // in (the tab would carry the admin's credentials), and rendering it where a stored
+  // token overrides a login would invite a loop that cannot succeed — canSelfSignIn is
+  // what encodes the second rule, resolved server-side.
+  const start = SRC.indexOf('function cliCellHtml(u,cli){');
+  assert.notEqual(start, -1, 'the per-CLI cell renderer must exist');
   const body = SRC.slice(start, SRC.indexOf('function renderUsers(', start));
-  assert.match(body, /u\.username!==PW_ME\)return ''/, 'other people\'s rows get no button');
-  assert.match(body, /u\.copilotAuth==='none'\|\|u\.copilotAuth==='signed-in'/,
-    'Copilot sign-in must only appear in the states where a login takes effect');
+  assert.match(body, /const mine=u\.username===PW_ME/, 'the action is gated on the row being yours');
+  // needsSignIn, NOT canSelfSignIn: an action offered beside a cell that already reads
+  // "signed in" makes the reader doubt the status. Re-authenticating lives on /me.
+  assert.match(body, /mine&&cell\.needsSignIn/, 'and on an action actually being owed');
+  assert.doesNotMatch(body, /canSelfSignIn/, 'the table must not offer a redundant re-sign-in');
+  // One column per offered CLI, rather than two hardcoded ones.
+  assert.match(SRC, /PW_CLIS\.map\(c=>cliCellHtml\(u,c\)\)/, 'every offered CLI gets a cell per user');
 });
 
 test('the per-user sign-in route is self-service by construction', () => {

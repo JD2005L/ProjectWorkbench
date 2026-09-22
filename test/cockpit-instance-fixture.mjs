@@ -30,8 +30,27 @@ async function freePort() {
   });
 }
 
+// Whether a CLI is INSTALLED is a property of the machine, not of the thing these tests examine.
+// The dashboard decides it by running `<bin> --version` (app/server.js getCliVersion), so a test
+// that asserts how a person's credential is CLASSIFIED for a CLI only passes where that CLI
+// happens to be present — which is why the Copilot sign-in cases passed locally for their author
+// and failed on CI and on any instance without the GitHub Copilot CLI. Unlike the tmux owner
+// helper above, the CLI here is not the thing under test; it is an external dependency the test
+// must not require. So: a stub that answers the one question the probe asks.
+export function installCliStubs(dir, names) {
+  const bin = path.join(dir, 'cli-bin');
+  fs.mkdirSync(bin, { recursive: true });
+  for (const name of names) {
+    if (!name || name.includes('/')) throw new Error(`installCliStubs: expected a bare CLI name, got ${JSON.stringify(name)}`);
+    const file = path.join(bin, name);
+    fs.writeFileSync(file, `#!/bin/sh\n[ "$1" = "--version" ] && { echo "${name} 0.0.0-fixture"; exit 0; }\nexit 0\n`);
+    fs.chmodSync(file, 0o755);
+  }
+  return bin;
+}
+
 /** Boot an isolated dashboard with one project, run fn({ base, name, sock }), always tear down. */
-export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = {} } = {}) {
+export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = {}, clis = [] } = {}) {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   fs.mkdirSync(path.join(dir, 'workspaces'), { recursive: true });
@@ -39,8 +58,11 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = 
   const sock = `pwcockpit-${process.pid}-${crypto.randomBytes(3).toString('hex')}`;
   startCleanTmuxServer(sock);
   const owned = ownedTmuxFixture({ socket: sock, dir, env: { PW_DEPLOY_MODE: 'container' } });
+  const cliBin = clis.length ? installCliStubs(dir, clis) : '';
   const env = {
     ...owned,
+    // after ...owned, so the stubs win the lookup that decides `installed`
+    ...(cliBin ? { PATH: `${cliBin}:${owned.PATH}` } : {}),
     HOME: process.env.HOME,
     LANG: process.env.LANG || 'C.UTF-8',
     PORT: String(port),
@@ -90,7 +112,12 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = 
     if (child.exitCode === null) child.kill('SIGKILL');
     try { await tmux(sock, ['kill-server']); } catch { /* already gone */ }
     try { fs.rmSync(path.join(process.env.TMUX_TMPDIR || '/tmp', `tmux-${process.getuid()}`, sock), { force: true }); } catch { /* fine */ }
-    fs.rmSync(dir, { recursive: true, force: true });
+    // Retry the removal: a pane the test opened can still be dying inside the tmux
+    // server while this runs, writing into the instance's credential tree — and rmSync
+    // then fails ENOTEMPTY on a directory that repopulated itself mid-walk. Observed
+    // once the sign-in tests started launching real CLI logins in a pane. The failure
+    // is in teardown, so it fails a test that already passed.
+    fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
   }
 }
 

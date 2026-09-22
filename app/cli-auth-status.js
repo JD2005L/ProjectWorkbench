@@ -103,3 +103,90 @@ export function copilotLoginWouldTakeEffect(state) {
       return { ok: false, reason: 'Your stored GitHub token could not be read, so it is unclear what Copilot would authenticate with. An administrator needs to replace it.' };
   }
 }
+
+// ---------------------------------------------------------------------------
+// One person + one CLI -> one cell
+// ---------------------------------------------------------------------------
+
+/**
+ * The per-person, per-CLI answer, resolved ONCE here and rendered by both surfaces
+ * that show it (the admin Users table and a person's own sign-ins page).
+ *
+ * It exists as a function rather than as markup in two client scripts because the two
+ * views disagreeing about whether someone is signed in is worse than either view being
+ * plain: an admin chasing a broken Copilot would be reading one answer while the person
+ * with the problem reads another.
+ *
+ * `tone` is a presentation hint only ('ok' | 'bad' | 'warn' | ''), never a decision.
+ *
+ * Two different booleans, because a table and a personal page want different answers:
+ *
+ *   needsSignIn    there is nothing usable in place yet, so signing in is an ACTION
+ *                  SOMEBODY OWES. This is what a status table offers a control for —
+ *                  a "Sign in" button beside a cell that already reads "signed in" is
+ *                  noise at best and makes the reader doubt the status at worst.
+ *   canSelfSignIn  a login by this person would take effect. Broader: it includes
+ *                  re-authenticating something already signed in, which is a real need
+ *                  (an expired or revoked credential still reads as "signed in" on
+ *                  disk) but belongs on that person's own page, not in a row of
+ *                  everybody's statuses.
+ *
+ * Neither is ever true where a stored token would override the login — see
+ * copilotLoginWouldTakeEffect.
+ */
+export function resolveCliAuthCell({
+  cli,
+  perUserEnabled = false,
+  installed = true,
+  userAuthSupported = false,
+  claudeSignedIn = false,
+  copilotState = '',
+  copilotOverridesLogin = false,
+} = {}) {
+  if (!installed) {
+    return { tone: 'warn', label: 'not installed', canSelfSignIn: false, needsSignIn: false,
+      detail: 'This assistant is not installed on the workbench yet, so there is nothing to sign in to. An administrator installs it from Settings → CLIs.' };
+  }
+  if (!perUserEnabled) {
+    // The shared box login IS everyone's login in this mode, so a per-person answer
+    // would be a fiction. Say which mode is in force instead.
+    return { tone: '', label: 'shared login', canSelfSignIn: false, needsSignIn: false,
+      detail: 'This workbench runs every terminal on one shared login, so there is no personal sign-in. An administrator signs that identity in from Settings → CLIs.' };
+  }
+  if (!userAuthSupported) {
+    return { tone: '', label: 'not personal yet', canSelfSignIn: false, needsSignIn: false,
+      detail: 'This assistant has no per-user configuration directory on this workbench, so a sign-in would be written to the shared one instead of to this person.' };
+  }
+  if (cli === 'copilot') {
+    const verdict = copilotLoginWouldTakeEffect(copilotState);
+    const byState = {
+      [COPILOT_AUTH_STATES.viaToken]: { tone: 'ok', label: 'ready · own token',
+        detail: 'Their own stored GitHub token authenticates Copilot, and it takes precedence over any sign-in, so there is nothing to sign in to.' },
+      [COPILOT_AUTH_STATES.tokenRejected]: { tone: 'bad', label: 'token type refused',
+        detail: 'Copilot CLI does not accept classic personal access tokens (ghp_…), and a stored token overrides any sign-in — so signing in cannot help until the token is replaced with a fine-grained one carrying the "Copilot Requests" permission, or cleared.' },
+      [COPILOT_AUTH_STATES.tokenUnknown]: { tone: 'warn', label: 'token type unknown',
+        detail: 'Their stored GitHub token is not a recognised GitHub token type, and it overrides any sign-in. Replace or clear it.' },
+      [COPILOT_AUTH_STATES.signedIn]: { tone: 'ok', label: 'signed in',
+        detail: 'They completed their own Copilot sign-in; the credential is in their own Copilot directory.' },
+      [COPILOT_AUTH_STATES.unreadable]: { tone: 'bad', label: 'token unreadable',
+        detail: 'Their stored GitHub token could not be decrypted, so it is unclear what Copilot would authenticate with. It needs replacing.' },
+      [COPILOT_AUTH_STATES.none]: { tone: '', label: 'not signed in',
+        detail: 'Nothing stored for them yet. Copilot will ask them the first time they open a Copilot tab.' },
+    };
+    const cell = byState[copilotState] || { tone: 'warn', label: 'unknown', detail: 'Copilot\'s authentication state could not be determined.' };
+    const overridden = copilotOverridesLogin
+      ? ' Their own sign-in exists but is being ignored, because the stored token takes precedence.'
+      : '';
+    // Signed in already counts as "nothing owed": re-authenticating is possible
+    // (canSelfSignIn) but is not an outstanding action to advertise in a table.
+    return { ...cell, detail: cell.detail + overridden, canSelfSignIn: verdict.ok,
+      needsSignIn: verdict.ok && copilotState === COPILOT_AUTH_STATES.none };
+  }
+  // Every other per-user CLI is a plain "has this person logged in" — Claude today,
+  // and anything later that gains a per-user config dir.
+  return claudeSignedIn
+    ? { tone: 'ok', label: 'signed in', canSelfSignIn: true, needsSignIn: false,
+      detail: 'Their own login is stored in their own configuration directory, and the terminals they open use it.' }
+    : { tone: '', label: 'not signed in', canSelfSignIn: true, needsSignIn: true,
+      detail: 'They have not signed in yet. Opening a tab for this assistant asks them, and the login is then kept for them alone.' };
+}
