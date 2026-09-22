@@ -26,16 +26,59 @@ export function createRunFollower(environment = globalThis) {
     return `${mark} (${took})${when}${who}${ran}\nVersion: ${run.version || (run.status === 'running' ? 'pending' : 'unknown')}`;
   }
 
+  // Log-tail scrolling: follow the bottom, but stop following the moment the
+  // reader scrolls up to look at something, and resume when they scroll back.
+  // A pane that yanks itself down while somebody is reading is worse than one
+  // that never scrolls at all.
+  function keepTail(output) {
+    if (!output || typeof output.scrollHeight !== 'number') return () => {};
+    const following = output.scrollHeight - output.scrollTop - output.clientHeight < 40;
+    return () => { if (following) output.scrollTop = output.scrollHeight; };
+  }
+
   function paint(output, run, text) {
+    if (!output) return;
+    const tail = keepTail(output);
     output.className = 'deploy-output show';
     output.textContent = `${headline(run)}\n\n${run.truncated ? '[earlier output dropped — showing the tail]\n' : ''}${text || ''}`;
+    tail();
+  }
+
+  // A slot mid-deploy is a log viewer, not a form. The class drives the CSS that
+  // hides the script, the version command, the backend select and Save — editing
+  // the script that is currently running is meaningless, and the output is the
+  // only thing worth the space. `deploy-finished` keeps the pane at the same
+  // height afterwards so the card does not jump on the last chunk.
+  function setCardState(card, state) {
+    if (!card?.classList) return;
+    card.classList[state === 'running' ? 'add' : 'remove']('deploy-running');
+    card.classList[state === 'finished' ? 'add' : 'remove']('deploy-finished');
+  }
+
+  // How the operator says "I have read it": puts the card back to a form that can
+  // deploy again, rather than leaving a spent log where the controls used to be.
+  function offerReset(card, output, label) {
+    if (!card || !document?.createElement) return;
+    let button = card.querySelector?.('.deploy-reset');
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'button secondary small deploy-reset';
+      button.addEventListener?.('click', () => {
+        setCardState(card, 'idle');
+        if (output) { output.textContent = ''; output.className = 'deploy-output'; }
+        button.remove?.();
+      });
+      card.appendChild(button);
+    }
+    button.textContent = label;
   }
 
   // Follow one slot's newest run to completion, painting as it goes. Returns the
   // terminal run (or null when the slot has never been deployed from this
   // workbench), and is safe to call on every panel open: a finished run simply
   // paints once and returns.
-  async function follow({ base, project, target, output, intervalMs = 1500, onRunning, onDone, isHidden,
+  async function follow({ base, project, target, output, card = null, intervalMs = 1500, onRunning, onDone, isHidden,
     // `requireRunning` + `until` are for the operator who just pressed Deploy:
     // wait for THEIR run to appear rather than painting the previous one, and
     // give up the moment the request they are waiting on has answered (a 401
@@ -57,8 +100,9 @@ export function createRunFollower(environment = globalThis) {
 
     let run = initial.run, text = initial.run.output || '', offset = initial.run.offset || text.length;
     if (output) paint(output, run, text);
-    if (run.status !== 'running') { onDone?.(run, text); return run; }
+    if (run.status !== 'running') { finishUp(card, output, run, text, onDone); return run; }
 
+    setCardState(card, 'running');
     onRunning?.(run);
     while (run.status === 'running') {
       // A hidden tab should not poll: a deploy takes minutes and the browser is
@@ -75,8 +119,14 @@ export function createRunFollower(environment = globalThis) {
       offset = next.offset ?? offset;
       if (output) paint(output, run, text);
     }
-    onDone?.(run, text);
+    finishUp(card, output, run, text, onDone);
     return run;
+  }
+
+  function finishUp(card, output, run, text, onDone) {
+    setCardState(card, 'finished');
+    offerReset(card, output, run.status === 'success' ? 'Deployment finished — clear this log' : 'Deployment failed — clear this log');
+    onDone?.(run, text);
   }
 
   // History drill-in: the retained output of one archived run.
@@ -104,7 +154,7 @@ export function createRunFollower(environment = globalThis) {
     });
   }
 
-  return { follow, showArchived, bindHistory, headline, paint };
+  return { follow, showArchived, bindHistory, headline, paint, setCardState, keepTail };
 }
 
 export const deployFollowClientSrc = `const pwRunFollower = (${createRunFollower.toString()})();`;

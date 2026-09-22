@@ -41,6 +41,18 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .config-section textarea{min-height:60px}
 :is(.deploy-page,#deployBackdrop) .deploy-output{margin-top:.5rem;background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
 :is(.deploy-page,#deployBackdrop) .deploy-output.show{display:block}
+/* A slot mid-deploy becomes a log viewer. The script, the version command, the
+   backend select and Save are hidden: editing the script that is currently
+   running is meaningless, and what the operator actually wants is the output —
+   which gets a taller, fixed pane so the tail stays put instead of the card
+   growing and shoving the other slot down the page. */
+:is(.deploy-page,#deployBackdrop) .target-card.deploy-running .config-section{display:none}
+:is(.deploy-page,#deployBackdrop) .target-card.deploy-running .deploy-output{max-height:none;height:20rem;border-color:#334155}
+:is(.deploy-page,#deployBackdrop) .target-card.deploy-running .deploy-btn{opacity:.75}
+:is(.deploy-page,#deployBackdrop) .deploy-reset{margin-top:.5rem}
+/* The finished log keeps its height so the card does not jump on the last chunk;
+   the reset control is how the operator says they have read it. */
+:is(.deploy-page,#deployBackdrop) .target-card.deploy-finished .deploy-output{max-height:none;height:20rem}
 :is(.deploy-page,#deployBackdrop) .log-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:.5rem}
 :is(.deploy-page,#deployBackdrop) .log-table th{text-align:left;border-bottom:2px solid #1f2937;padding:.4rem .5rem;color:#94a3b8;font-size:.78rem;text-transform:uppercase;letter-spacing:.02em}
 :is(.deploy-page,#deployBackdrop) .log-table td{border-bottom:1px solid #1f2937;padding:.4rem .5rem}

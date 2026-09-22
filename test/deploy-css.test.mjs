@@ -20,8 +20,13 @@ async function getDeployCss() {
 }
 
 // Minimal walker for this stylesheet: yields every top-level selector,
-// descending into @media blocks. (No nesting/comments in this CSS.)
-function collectSelectors(css) {
+// descending into @media blocks. (No nesting in this CSS.)
+//
+// Comments are stripped first. They used to be assumed absent, so the first rule
+// documented in place was reported as an unscoped selector — a scoping guard that
+// fails on an explanation is a guard people delete the explanation to satisfy.
+function collectSelectors(rawCss) {
+  const css = rawCss.replace(/\/\*[\s\S]*?\*\//g, '');
   const out = [];
   let buf = '';
   for (let i = 0; i < css.length; i++) {

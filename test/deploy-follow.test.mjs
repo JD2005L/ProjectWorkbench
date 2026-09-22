@@ -103,3 +103,99 @@ test('History drill-in renders a retained run, and says so when it is gone', asy
   await gone.follower.showArchived({ base: '', project: 'demo', id: 'zzz', into });
   assert.match(into.textContent, /no longer retained/);
 });
+
+// While a deploy runs, the slot stops being a form. The screenshot that prompted
+// this had the live log wedged above a script textarea, a version-check input and
+// a Save button — three controls that cannot be used on a run already in flight.
+function fakeCard() {
+  const classes = new Set();
+  const children = [];
+  return {
+    children,
+    classList: { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name) },
+    querySelector: selector => children.find(child => child.className?.includes(selector.slice(1))) || null,
+    appendChild: child => children.push(child),
+  };
+}
+
+function fakeDocument() {
+  return {
+    hidden: false,
+    addEventListener() {},
+    createElement: () => {
+      const element = { type: '', className: '', textContent: '', handlers: {} };
+      element.addEventListener = (type, fn) => { element.handlers[type] = fn; };
+      element.remove = () => { element.removed = true; };
+      return element;
+    },
+  };
+}
+
+function scrollableOutput(visible = 100) {
+  return { className: '', textContent: '', scrollTop: 0, clientHeight: visible,
+    get scrollHeight() { return visible + this.textContent.length; } };
+}
+
+test('a running slot becomes a log viewer, and hands back its controls when the operator clears it', async () => {
+  const running = { id: 'abc123', status: 'running', startedAt: '2026-09-22T21:43:29.000Z', user: 'james.levac', offset: 6, output: '[1/5]\n' };
+  const { output, follower, environment } = (() => {
+    const responses = [
+      { body: { ok: true, run: running } },
+      { body: { ok: true, run: { ...running, status: 'success', duration: '61.0', version: 'V1.26.0922.2145' }, chunk: '[5/5] done\n', offset: 18 } },
+    ];
+    const environment = { ...fakeDocument(), setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+      async fetch() { const next = responses.shift(); return { status: 200, ok: true, json: async () => next.body }; } };
+    environment.document = environment;
+    return { output: scrollableOutput(), follower: createRunFollower(environment), environment };
+  })();
+  const card = fakeCard();
+
+  const states = [];
+  await follower.follow({ base: '', project: 'demo', target: 'prod', output, card,
+    onRunning: () => states.push(card.classList.contains('deploy-running')) });
+
+  assert.deepEqual(states, [true], 'the card is in log-viewer mode while the script runs');
+  assert.equal(card.classList.contains('deploy-running'), false, 'and out of it when the run ends');
+  assert.equal(card.classList.contains('deploy-finished'), true, 'but the pane keeps its height so the card does not jump');
+
+  const reset = card.children.find(child => child.className.includes('deploy-reset'));
+  assert.ok(reset, 'a finished run offers a way back to a card that can deploy again');
+  assert.match(reset.textContent, /finished/);
+  reset.handlers.click();
+  assert.equal(card.classList.contains('deploy-finished'), false, 'clearing restores the ordinary card');
+  assert.equal(output.textContent, '');
+  assert.equal(output.className, 'deploy-output', 'and hides the spent log');
+  assert.equal(reset.removed, true);
+  void environment;
+});
+
+test('the pane follows the tail, and stops following the moment the reader scrolls up', async () => {
+  const environment = { ...fakeDocument(), setTimeout: fn => { fn(); return 0; }, clearTimeout() {} };
+  environment.document = environment;
+  const follower = createRunFollower(environment);
+  const output = scrollableOutput();
+
+  const run = { id: 'abc', status: 'running', startedAt: '2026-09-22T21:43:29.000Z', user: 'kev' };
+  follower.paint(output, run, 'line one\n');
+  assert.equal(output.scrollTop, output.scrollHeight, 'a pane at the bottom stays at the bottom');
+
+  // The reader scrolls up to read something earlier.
+  output.scrollTop = 0;
+  follower.paint(output, run, 'line one\nline two\n');
+  assert.equal(output.scrollTop, 0, 'new output must not yank the view away from what they are reading');
+
+  // Scrolling back to the bottom resumes following.
+  output.scrollTop = output.scrollHeight;
+  follower.paint(output, run, 'line one\nline two\nline three\n');
+  assert.equal(output.scrollTop, output.scrollHeight);
+});
+
+test('a failed run says so on the control that clears it', async () => {
+  const failed = { id: 'def', status: 'failed', startedAt: '2026-09-22T21:43:29.000Z', user: 'kev', duration: '0.8', offset: 3, output: 'no\n' };
+  const environment = { ...fakeDocument(), setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+    async fetch() { return { status: 200, ok: true, json: async () => ({ ok: true, run: failed }) }; } };
+  environment.document = environment;
+  const card = fakeCard();
+  await createRunFollower(environment).follow({ base: '', project: 'demo', target: 'prod', output: scrollableOutput(), card });
+  assert.match(card.children.find(child => child.className.includes('deploy-reset')).textContent, /failed/);
+});

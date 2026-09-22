@@ -3007,7 +3007,7 @@ const deployModalScript = `<script>(function(){
   container.querySelectorAll('.target-card[data-project]').forEach(card=>{
    if(card.dataset.managed==='1')return;
    const out=card.querySelector('.deploy-output');const btn=card.querySelector('.deploy-btn');
-   pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,
+   pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,card,
     isHidden:()=>document.hidden,
     onRunning:()=>{if(btn){btn.disabled=true;btn.textContent='Deploying…'}},
     onDone:(run)=>{
@@ -3038,7 +3038,7 @@ const deployModalScript = `<script>(function(){
     /* The POST does not answer until the script is done, so follow the run it
        starts: that is where "[2/5] Stopping IIS..." comes from while you wait. */
     const pending=runDeploy('',false);
-    pwRunFollower.follow({base:'${BASE}',project,target,output,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
+    pwRunFollower.follow({base:'${BASE}',project,target,output,card,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
     let j=await pending;
     if(!j.ok&&j.needPassword){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
@@ -3048,7 +3048,7 @@ const deployModalScript = `<script>(function(){
     }
     if(j.running&&j.run){
      output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
-     await pwRunFollower.follow({base:'${BASE}',project,target,output,isHidden:()=>document.hidden});
+     await pwRunFollower.follow({base:'${BASE}',project,target,output,card,isHidden:()=>document.hidden});
      return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
@@ -3098,7 +3098,7 @@ const deployScript = `<script>
  document.querySelectorAll('.target-card[data-project]').forEach(card=>{
   if(card.dataset.managed==='1')return;
   const out=card.querySelector('.deploy-output');const btn=card.querySelector('.deploy-btn');
-  pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,
+  pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,card,
    isHidden:()=>document.hidden,
    onRunning:()=>{if(btn){btn.disabled=true;btn.textContent='Deploying…'}},
    onDone:(run)=>{
@@ -3163,7 +3163,7 @@ const deployScript = `<script>
     // it no longer verifies. Prompting up-front here is what made a stored
     // password useless on this page.
     const pending=runDeploy('',false);
-    pwRunFollower.follow({base:'${BASE}',project,target,output,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
+    pwRunFollower.follow({base:'${BASE}',project,target,output,card,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
     let j=await pending;
     if(!j.ok&&j.needPassword){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
@@ -3174,7 +3174,7 @@ const deployScript = `<script>
     }
     if(j.running&&j.run){
      output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
-     await pwRunFollower.follow({base:'${BASE}',project,target,output,isHidden:()=>document.hidden});
+     await pwRunFollower.follow({base:'${BASE}',project,target,output,card,isHidden:()=>document.hidden});
      return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
