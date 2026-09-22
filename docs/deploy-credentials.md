@@ -1,7 +1,13 @@
 # Deploy credentials: instance-level, per target, overridable per project
 
-Status: **spec, not built.** Decisions needed from the operator are collected at
-the end; everything before that is implementable as written.
+Status: **spec, not built.** Implementable as written; the decisions still open
+are collected at the end.
+
+Chosen configuration (operator, 2026-09-22): **no AD service accounts are
+available on this domain**, so the instance credential will be `GOA\james.levac`
+for both targets. That choice needs no repository change in any project and no new
+SQL grant — see "What the projects have to change: nothing" — and its four
+consequences are worked through in "The configuration actually chosen".
 
 ## Why
 
@@ -51,9 +57,13 @@ Three levels, most specific first:
 | **Instance default** | Settings ▸ Deployment (admin only) | every project, one target (`dev` or `prod`) |
 | **Operator credential** | Settings ▸ Users ▸ the person's own row | whoever clicked, as today |
 
-`dev` and `prod` are configured separately and never share a credential: a
-production account must not be usable from a development slot, which is the whole
-point of having two.
+`dev` and `prod` are always configured as separate fields, so the two can diverge
+the day two accounts exist without any code change. They MAY hold the same account
+— which is what this instance will do initially — and an operator choosing that
+should know they are choosing it: a dev slot then authenticates with an account
+that also has production rights, so a mistake in a dev slot script can reach
+production. The fields staying separate is what makes that a decision rather than
+an assumption.
 
 ### Resolution
 
@@ -156,6 +166,7 @@ keeps `runAsRoot` alive today.
 | `GET` | `/api/deploy/credentials` | — | admin only; returns `{dev,prod}` state + `user` + `note`, never a password |
 | `POST` | `/api/deploy/credentials` | `{target, user, password?, note?}` | admin only; empty `password` keeps the stored one; `{clear:true}` removes |
 | `POST` | `/api/deploy/config` | `…, deployCredential:{user,password}\|null` | existing route, extended; `null` clears the override |
+| `POST` | `/api/deploy/credentials/test` | `{target, project?}` | admin only; resolves the identity for that slot and verifies it against the directory. Returns `{ok, user, source}` or a reason — never the secret. The answer to "did James's password change?" without running a deploy |
 
 All three are mutating-origin-checked like the rest of the Deploy Centre, and
 each writes an audit record: `deploy_credential_set` /
@@ -207,26 +218,38 @@ password into a prompt for a `svc-` deploy will reasonably wonder what it is for
 borrowed-credential fallback: with an instance credential configured, every
 operator sees real versions, and no probe ever runs as a colleague.
 
-## What this lets the projects do
+## What the projects have to change: nothing
 
-AITDataHub and SponsorPortal can pin their migration principal to the **service
-account** instead of a person:
+This is the part that makes the chosen configuration attractive. If the instance
+credential is `GOA\james.levac` — the account those two projects already pin —
+then `DEPLOY_USER` arrives as exactly the name their guard demands, whoever
+pressed Deploy:
+
+```bash
+DB_MIGRATION_PRINCIPAL='GOA\james.levac'   # unchanged, and now satisfied for every operator
+```
+
+No repository edit, no new SQL grant, no DBA request, and no handoff-doc revision.
+AITDataHub and SponsorPortal keep their fail-fast guard and their existing
+migrator-role grant; Kevin's deploys stop being refused because they are no longer
+running as Kevin. TeamCanadaStrong's `deploy-dev.sh` accepts any well-formed GOA
+account and refuses only the runtime app-pool identity (`GOA\AIT-DBService.S`),
+so it is satisfied too.
+
+The service-account variant below stays the better end state, but it is an
+upgrade, not a prerequisite.
+
+### Later, if service accounts become available
+
+Pin the guard to the non-human principal instead:
 
 ```bash
 DB_MIGRATION_PRINCIPAL='GOA\svc-pw-deploy-prod'
 ```
 
-One SQL grant per database, to one non-human principal, and every authorised
-operator can deploy — no personal `CREATE TABLE` on production, no repo edit when
-staff change. TeamCanadaStrong's `deploy-dev.sh` already refuses the *runtime*
-app-pool account (`GOA\AIT-DBService.S`); the deploy service account must be a
-third identity, distinct from both the humans and the runtime account, so a
-compromised web app still cannot migrate its own schema.
-
-## Accounts and grants to request (operator/DBA work, outside this workbench)
-
-Two AD accounts, non-interactive, password non-expiring or rotated on a schedule
-PW can follow:
+One SQL grant per database to one non-human principal, no person's password stored
+anywhere, and a compromised web app still cannot migrate its own schema. Two AD
+accounts would be needed, non-interactive, one per target, with:
 
 | Need | Why |
 |---|---|
@@ -236,18 +259,62 @@ PW can follow:
 | SQL: the project's migrator role on each database it deploys | step 3c, `dbo.__SchemaVersions` + DDL |
 | **Not** interactive logon, **not** local admin, **not** the runtime app-pool identity | blast-radius containment |
 
-Dev and prod accounts must be separate, and the prod account must have no rights
-in dev or vice versa.
+## The configuration actually chosen: an operator's own account
+
+**Decided 2026-09-22: no AD service accounts can be created here, so the instance
+credential is `GOA\james.levac` for both targets.** Everything above works
+unchanged — the resolver does not care whether the account it resolves is human —
+but four consequences follow from it, and the design has to answer each.
+
+**1. Attribution moves entirely into PW.** On the app servers, in the IIS logs and
+in SQL, every deploy becomes `GOA\james.levac` regardless of who pressed it. PW's
+audit record and `DEPLOY_OPERATOR` are then the *only* evidence of who actually
+deployed, which makes `/var/log/project-workbench/audit.log` load-bearing rather
+than merely useful: it needs to be retained and readable, and every slot script
+worth its salt should print `DEPLOY_OPERATOR` into its own output so the Deploy
+panel's history shows the human next to the run.
+
+**2. One password expiry breaks every project at once.** A personal account's
+password rotates on the domain schedule, and on the day it does, every deploy on
+the instance starts failing inside SMB/WinRM with a bare authentication error
+rather than anything an operator can act on. Therefore:
+
+- `POST /api/deploy/credentials/test` (below) so an admin can confirm the stored
+  credential still authenticates, without running a deploy.
+- When a deploy fails and the stored instance credential no longer verifies
+  against the directory, say so explicitly: *"The workbench's stored deployment
+  credential for GOA\james.levac no longer authenticates — an administrator must
+  re-enter it in Settings ▸ Deployment."* One re-entry fixes every project, which
+  is the one operational advantage of the shared arrangement.
+
+**3. Anyone who can press Deploy acts as that account, for whatever the slot
+script does.** With a service account the blast radius is "what that account may
+do"; with a personal operator account it is "what that person may do", which is
+broader by construction. Slot scripts are editable by PW admins only, so the
+authoring path is already admin-gated, but the *triggering* path is every user
+with a project grant. Mitigations, in the order they are worth applying:
+`reauth: true` on prod slots (proof the human is present, verified against *their
+own* password); project grants kept tight; and — the narrowest option — setting the
+credential as a **per-project override on just AITDataHub and SponsorPortal**
+instead of an instance default, leaving the other projects running as whoever
+clicks. That last one is a one-field difference in this design, not a redesign.
+
+**4. It is a stored shared password, and worth naming as such.** A human
+credential held by the workbench and used on behalf of others is a different
+governance posture from a service account, and GoA password-handling policy has
+opinions about shared credentials. The storage itself is unchanged from what PW
+already does with per-user deploy passwords (AES-256-GCM under a 0600 key, never
+rendered, never logged), but the *sharing* is new. Flagging it once here so the
+decision is recorded, not to relitigate it.
 
 ## Security caveats, stated plainly
 
 - **An instance prod credential is a privilege grant to everyone who can press
   Deploy on any project with a prod slot.** That is the trade: fewer personal
-  grants, but a wider set of people able to act as one powerful account.
-  Mitigations already available: project grants decide who sees a slot at all;
-  `reauth: true` forces a fresh password prompt per prod deploy; the audit log
-  names the operator; a project can override with a narrower account. Consider
-  requiring `reauth` on any prod slot that resolves to an instance credential.
+  grants, but a wider set of people able to act as one account. With a *human*
+  account as that credential the radius is wider still — see "The configuration
+  actually chosen" for the four consequences and the mitigations in the order
+  they are worth applying.
 - **Config backups carry the ciphertext.** `deploy/promote-app.sh` tars
   `/etc/project-workbench` before an app promote. Those tars must stay 0600, and
   a `.secret-key` rotation invalidates every stored credential at once — which
@@ -276,19 +343,25 @@ in dev or vice versa.
 1. **Resolver + storage + env** (`DEPLOY_OPERATOR`, `DEPLOY_IDENTITY_SOURCE`).
    No behaviour change until a credential is saved: with none configured, every
    slot resolves to the operator exactly as today.
-2. **Settings ▸ Deployment UI** and the two API routes. At this point one AD
-   account per target unblocks every operator on projects whose scripts pin the
-   service account.
-3. **Per-project override** in the slot config section.
-4. Hand the project agents the one-line `DB_MIGRATION_PRINCIPAL` change, once the
-   SQL grants are in place. Order matters: grant first, then relax the guard —
-   the reverse turns a clean pre-flight refusal into a mid-deploy failure that
-   leaves SponsorPortal's site stopped (`deploy-dev.sh:207-208`).
+2. **Settings ▸ Deployment UI**, the credential routes and the test route. With
+   `GOA\james.levac` saved as the instance credential for both targets, this is
+   the step that unblocks every operator on AITDataHub and SponsorPortal — no AD
+   request, no SQL grant, no project repository change stands in front of it.
+3. **Per-project override** in the slot config section. Also the narrower way to
+   deploy the whole feature: set the credential on just those two projects and
+   leave everything else running as whoever clicks.
+4. Only if service accounts ever exist: hand the project agents the one-line
+   `DB_MIGRATION_PRINCIPAL` change. Order matters then — grant first, relax the
+   guard second. The reverse turns a clean pre-flight refusal into a mid-deploy
+   failure that leaves SponsorPortal's site stopped (`deploy-dev.sh:207-208`).
 
 ## Decisions needed before implementation
 
-1. **Account names.** `GOA\svc-pw-deploy-dev` / `GOA\svc-pw-deploy-prod`, or
-   names your AD naming standard dictates? Who requests them?
+1. **Instance default, or override on just the two projects?** The instance
+   default is what was asked for and is one field per target; the override-only
+   variant confines the shared account to AITDataHub and SponsorPortal, the only
+   two projects that actually need it, and leaves the other eleven deploying as
+   the person who clicked. Both are in this design; the second is narrower.
 2. **Operator fallback: keep or retire?** Keeping it is back-compatible and
    covers slots with no shared account; retiring it (fail with "no deploy
    credential is configured for this target") removes the last path where a
@@ -297,4 +370,12 @@ in dev or vice versa.
 3. **Who may set a project override** — admin only, as specced, or also a
    project's own maintainer?
 4. **Force `reauth` on prod slots** that resolve to the instance credential?
-   Recommendation: yes, and make it the default for new prod slots.
+   Recommendation: yes, and make it the default for new prod slots. With a human
+   account as the shared credential this stops being a nicety: it is the only
+   check that the person pressing a production deploy is present and is who the
+   session says, since the app server can no longer tell them apart.
+5. **Password rotation drill.** When that account's domain password changes, one
+   admin re-entry in Settings ▸ Deployment fixes every project — but until it
+   happens, every deploy fails. Worth deciding now who does it and whether PW
+   should warn before expiry (it cannot read expiry from the directory today; the
+   cheap version is the test route plus a note on the Deployment settings card).

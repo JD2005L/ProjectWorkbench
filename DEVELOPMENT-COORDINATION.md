@@ -3622,3 +3622,32 @@ Open for the operator, not for implementation: service-account names, whether th
 operator fallback is retired once every target has a credential, who may set a project
 override, and whether `reauth` becomes mandatory on prod slots that resolve to the
 instance credential.
+
+### GOA — 2026-09-22 (addendum) — the credential will be a PERSON, not a service account
+
+The operator's answer: no AD service accounts can be created on this domain, so the
+instance credential is `GOA\james.levac` for both targets. `docs/deploy-credentials.md`
+is updated accordingly; the resolver is unchanged (it does not care whether the account
+it resolves is human), but three things change around it.
+
+* **Nothing in any project repository has to change.** The two projects that pin
+  `DB_MIGRATION_PRINCIPAL='GOA\james.levac'` are satisfied for every operator the
+  moment that name is what `DEPLOY_USER` carries. No SQL grant, no DBA request, no
+  handoff-doc revision — the whole external dependency evaporates, which is the reason
+  the choice is a good one despite the rest of this entry.
+* **Attribution becomes PW's job alone.** Every deploy looks like one person on the app
+  servers and in SQL, so the audit log and the new `DEPLOY_OPERATOR` are the only record
+  of who pressed Deploy. That argues for `reauth: true` on prod slots not as a nicety
+  but as the only proof-of-presence left, and for slot scripts printing
+  `DEPLOY_OPERATOR` into their own output.
+* **One password expiry breaks every project at once**, with a bare SMB/WinRM
+  authentication error. The spec adds `POST /api/deploy/credentials/test` so an admin
+  can check the stored credential without running a deploy, and a specific failure
+  message pointing at Settings ▸ Deployment rather than at the person's own password.
+
+Also recorded rather than glossed: `dev` and `prod` stay separate FIELDS even when they
+hold the same account, so the day two accounts exist nothing needs rewriting — and an
+operator putting one account in both is choosing to let a dev slot authenticate with
+production rights, which is a decision, not a default. The narrower alternative is in
+the spec too: set the credential as a per-project override on AITDataHub and
+SponsorPortal only, and leave the other eleven projects deploying as whoever clicked.
