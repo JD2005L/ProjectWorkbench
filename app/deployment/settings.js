@@ -18,8 +18,23 @@ export const DEFAULT_DEPLOY_CREDENTIALS = Object.freeze({
 // interpolated into SMB paths and WinRM sessions by every slot script on the box.
 const DEPLOY_ACCOUNT = /^(?:[A-Za-z0-9._-]{1,64}\\)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 
-export function validateDeployAccount(user) {
+// Windows domains are case-insensitive, and slot scripts are not: AITDataHub's
+// identity gate matched `^GOA\\...` literally, so a credential saved as
+// `goa\james.levac` — which is what an administrator naturally types — blocked
+// every deploy of that project with "not an explicit GOA Windows account". Fixing
+// that per script means fixing it in every generated repository forever, so the
+// domain is canonicalised HERE, once, in the one function both saving and loading
+// already pass through. The account name is left exactly as entered: scripts that
+// compare it do so case-insensitively, and `GOA\JAMES.LEVAC` would be a
+// gratuitous change to something an operator reads.
+export function canonicalDeployAccount(user) {
   const value = typeof user === 'string' ? user.trim() : '';
+  const split = value.lastIndexOf('\\');
+  return split < 0 ? value : `${value.slice(0, split).toUpperCase()}${value.slice(split)}`;
+}
+
+export function validateDeployAccount(user) {
+  const value = canonicalDeployAccount(user);
   if (!DEPLOY_ACCOUNT.test(value)) {
     throw new DeploymentError('A deploy account must be a Windows account name, optionally DOMAIN\\user.', 400, 'deploy_account_invalid');
   }

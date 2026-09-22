@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { makeDeployIdentity, readStoredDeployPassword, resolveDeployIdentity } from '../app/deploy-credential.js';
 import {
   createWorkbenchSettingsStore, publicDeployCredentials, publicWorkbenchSettings, savedDeployCredentials,
+  validateDeployAccount,
 } from '../app/deployment/settings.js';
 
 // Reversible, so a test can tell "decrypted" from "passed through", and shaped
@@ -197,4 +198,32 @@ test('deployCredential() reports the state the resolver needs, not a boolean', a
   const wrongKey = store(JSON.stringify({ deployCredentials: { dev: { user: 'GOA\\a', password: 'enc:b3RoZXI', note: '' } } }));
   const unreadable = await wrongKey.api.deployCredential('dev');
   assert.deepEqual([unreadable.state, unreadable.password], ['unreadable', '']);
+});
+
+test('the domain is canonicalised, because a slot script matched GOA literally and blocked every deploy', async () => {
+  // AITDataHub's identity gate tested `^GOA\\...` case-sensitively, so a
+  // credential saved the way an administrator types it — `goa\james.levac` —
+  // blocked every deploy of that project. Fixing it per script means fixing it in
+  // every generated repository forever, so PW hands out one canonical form.
+  assert.equal(validateDeployAccount('goa\\james.levac'), 'GOA\\james.levac');
+  assert.equal(validateDeployAccount('Goa\\james.levac'), 'GOA\\james.levac');
+  assert.equal(validateDeployAccount(' goa\\james.levac '), 'GOA\\james.levac');
+  // The account name is NOT touched: scripts compare it case-insensitively, and
+  // an operator reads this value back in the UI.
+  assert.equal(validateDeployAccount('goa\\AIT-DBService.S'), 'GOA\\AIT-DBService.S');
+  assert.equal(validateDeployAccount('james.levac'), 'james.levac', 'a bare account name is left for the script to qualify');
+
+  // Both storage paths, not just the one that happens to be validated: a
+  // lowercase value already saved resolves canonically without a re-save...
+  const saved = store(JSON.stringify({ deployCredentials: { prod: { user: 'goa\\james.levac', password: encrypt('p'), note: '' } } }));
+  assert.equal((await saved.api.deployCredential('prod')).user, 'GOA\\james.levac');
+  await saved.api.updateDeployCredential({ target: 'prod', user: 'goa\\james.levac' });
+  assert.equal(saved.writes.at(-1).deployCredentials.prod.user, 'GOA\\james.levac', '...and is stored canonically once touched');
+
+  // ...and a hand-edited slot override, which never passes through the settings
+  // validator at all, still reaches the script in the same form.
+  const identity = makeDeployIdentity({ decrypt, instanceCredential: async () => ({ state: 'none', source: 'instance', user: '', password: '' }) });
+  const resolved = await identity.resolve({ deployCredential: { user: 'goa\\svc-project', password: encrypt('s') } }, 'prod', operator);
+  assert.equal(resolved.user, 'GOA\\svc-project');
+  assert.equal(identity.env(resolved, 'kev').DEPLOY_USER, 'GOA\\svc-project');
 });

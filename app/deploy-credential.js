@@ -24,6 +24,8 @@ export function readStoredDeployPassword(user, decrypt) {
   return password ? { state: 'stored', password } : { state: 'unreadable', password: '' };
 }
 
+import { canonicalDeployAccount } from './deployment/settings.js';
+
 // Which identity a deploy runs as: the first CONFIGURED level wins.
 //
 // Candidates arrive most-specific-first (project override, instance default for
@@ -61,7 +63,11 @@ export function makeDeployIdentity({ decrypt, instanceCredential }) {
     const override = slotConfig?.deployCredential;
     if (override && (override.user || override.password)) {
       const read = readStoredDeployPassword({ deployPassword: override.password }, decrypt);
-      candidates.push({ state: read.state, source: 'project', user: override.user || '', password: read.password });
+      // A slot override is hand-edited in deploy-config.json, so it never passes
+      // through the settings validator that canonicalises the domain. Do it here
+      // rather than leave one level able to hand a script `goa\` when the other
+      // hands it `GOA\`.
+      candidates.push({ state: read.state, source: 'project', user: canonicalDeployAccount(override.user || ''), password: read.password });
     }
     if (instanceCredential) candidates.push(await instanceCredential(target));
     if (operatorRecord) {
