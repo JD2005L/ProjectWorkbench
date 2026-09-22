@@ -43,11 +43,14 @@ function assertManifestSource(manifest, source, target) {
 
 export function buildDeploymentJob({
   project, target, snapshot, config, manifest = null, selection = null, option = '',
-  execution, deployUser = '', deployPassword = '', requestId = crypto.randomUUID(),
+  execution, deployUser = '', deployPassword = '', deployOperator = '', identitySource = '',
+  requestId = crypto.randomUUID(),
 }) {
   assertManifestSource(manifest, snapshot.source, target);
   const recipe = validateRecipe(manifest?.execution ?? config.execution ?? execution);
   const environment = { DEPLOY_PROJECT: project, DEPLOY_TARGET: target,
+    ...(deployOperator ? { DEPLOY_OPERATOR: deployOperator } : {}),
+    ...(identitySource ? { DEPLOY_IDENTITY_SOURCE: identitySource } : {}),
     ...(manifest ? selection?.env : { DEPLOY_OPTION: option }) };
   // Legacy slots received their option as $1. Transfer it as data, never splice
   // an operator's selection into shell text.

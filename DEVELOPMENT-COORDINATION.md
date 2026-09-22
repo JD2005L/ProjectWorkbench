@@ -3694,3 +3694,15 @@ Two test-isolation fixes ride along: `test/smoke.test.mjs` and (earlier)
 `test/deploy-route.test.mjs` now point `PW_WORKBENCH_SETTINGS` at their own temp dirs.
 Without it both read the HOST's `/etc/project-workbench/workbench.json` and answer 503
 `deployment_settings_invalid` for anyone running the suite as a non-root account.
+
+## Hermes-James — 2026-09-22 — fail-closed deploy identity and publication repair
+
+Review of exact `main` head `14ffa857889d553adc4405b0c3fb43d217f2418f`
+found three release blockers. Partial instance or project credentials could fall
+through to another account, external jobs omitted the human operator and identity
+source promised to slot scripts, and the generated pushed-commit gate trusted a
+stale remote-tracking ref when `git fetch` failed. This repair rejects incomplete
+credential pairs, preserves `DEPLOY_OPERATOR` and `DEPLOY_IDENTITY_SOURCE` across
+external dispatch, and blocks publication whenever the remote cannot be refreshed.
+Regression tests cover all three boundaries. `app/VERSION` advances to
+`1.26.0922.2035` because the repaired candidate changes deployable application code.

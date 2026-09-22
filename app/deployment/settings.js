@@ -114,6 +114,7 @@ export function savedDeployCredentials(settings) {
       const user = slot.user === undefined || slot.user === '' ? '' : validateDeployAccount(slot.user);
       const password = slot.password === undefined ? '' : slot.password;
       if (typeof password !== 'string' || (password && !/^enc:[A-Za-z0-9+/]+={0,2}$/.test(password))) throw settingsError();
+      if (!!user !== !!password) throw settingsError();
       const note = slot.note === undefined ? '' : slot.note;
       if (typeof note !== 'string' || note.length > 200) throw settingsError();
       result[target] = { user, password, note };
@@ -267,7 +268,9 @@ export function createWorkbenchSettingsStore({
         } else if (Object.hasOwn(draft, 'password') && typeof draft.password !== 'string') {
           throw new DeploymentError('A deploy password must be text.', 400, 'deploy_credential_invalid');
         }
-        if (slot.password && !slot.user) throw new DeploymentError('A deploy credential needs an account name as well as a password.', 400, 'deploy_credential_invalid');
+        if (!!slot.user !== !!slot.password) throw new DeploymentError(
+          slot.user ? 'A deploy credential needs a password as well as an account name.' : 'A deploy credential needs an account name as well as a password.',
+          400, 'deploy_credential_invalid');
       }
       return { ...current, deployCredentials: { ...credentials, [draft.target]: slot } };
     });

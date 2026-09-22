@@ -243,7 +243,11 @@ GATE_BODY = {
         'fi',
     ],
     'pushed': [
-        '_pw_git fetch --quiet origin || echo "WARNING: could not reach the remote; comparing against the last fetched state." >&2',
+        'if ! _pw_git fetch --quiet origin; then',
+        '  echo "DEPLOY BLOCKED - could not reach the remote, so the pushed commit cannot be verified. Nothing was published." >&2',
+        '  echo "NEEDED: restore repository access, then deploy again." >&2',
+        '  exit 1',
+        'fi',
         'if [ "$(_pw_git rev-parse HEAD)" != "$(_pw_git rev-parse "origin/$_pw_publish")" ]; then',
         '  {',
         '    echo "DEPLOY BLOCKED - ${DEPLOY_PROJECT:-this project} has commits on $_pw_publish that are not on the remote, and a deployed build has to be reproducible from the repository. Nothing was published."',
