@@ -125,6 +125,14 @@ test('the CLONE uses the same credential the pushes will', () => {
   assert.match(body, /if\(push\.set\) p\.pushToken = encrypt\(push\.token\)/);
 });
 
+test('a new project with only its own push credential pins it after clone', () => {
+  // A project override is valid without a primaryUser. The clone uses the override,
+  // and the same credential must then be installed for later pull/push operations.
+  const start = SRC.indexOf('const addProjectHandler = async (req,res,next)=>{');
+  const body = SRC.slice(start, SRC.indexOf("app.post(BASE + '/manage/add'", start));
+  assert.match(body, /if\(added\?\.primaryUser \|\| added\?\.pushToken\)\{ await syncProjectCredentials\(added\); \}/);
+});
+
 test('the credential repair treats an override as authoritative too', () => {
   // Before, a project with no primaryUser was reported as having "no authoritative
   // token to rewrite from" — which would now be wrong for a project that carries its

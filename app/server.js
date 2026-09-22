@@ -3794,7 +3794,10 @@ const addProjectHandler = async (req,res,next)=>{ try {
  // Outside the projects lock on purpose: this is a SHORT ordered transition
  // (lifecycle > projects > credential) and must not be reached while the clone
  // above is still running, or every login waits behind the network.
- if(added?.primaryUser){ await syncProjectCredentials(added); }
+ // A project-level push credential is authoritative even without a primaryUser.
+ // Pin it after clone too, or the clone succeeds with the override but subsequent
+ // pulls/pushes have no workspace credential until the next boot repair.
+ if(added?.primaryUser || added?.pushToken){ await syncProjectCredentials(added); }
  await applyDefaultProjectFlag(null, name, req.body.defaultProject);
  // The value is never audited — only that the project carries one, which is the fact
  // an operator needs when a push authenticates as an unexpected account.

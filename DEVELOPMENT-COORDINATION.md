@@ -3550,6 +3550,18 @@ never a pane environment. `app/project-push-token.js` resolves it, shared by
 `syncProjectCredentials` and the boot credential repair so those two cannot disagree
 about which token is authoritative.
 
+## Hermes-James — 2026-09-22 — pin an override-only project immediately after clone
+
+Review of the project push-credential split found one narrow creation-path gap. A
+project may carry its own push credential without choosing a `primaryUser`; the clone
+correctly used that override, but the post-clone credential sync was still conditional
+on `primaryUser`. The project could therefore clone successfully and then have no
+workspace credential for its next pull or push until boot repair ran.
+
+The post-clone sync now runs when either a git identity or a project push credential is
+present. `test/project-push-credential.test.mjs` pins the override-only case so clone and
+subsequent git operations cannot drift apart again.
+
 Three decisions in it that are not obvious:
 
 * **A broken override refuses; it does not fall back.** An override exists precisely
