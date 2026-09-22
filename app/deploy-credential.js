@@ -23,3 +23,72 @@ export function readStoredDeployPassword(user, decrypt) {
   // "unreadable" sends the operator to the same, correct remedy.
   return password ? { state: 'stored', password } : { state: 'unreadable', password: '' };
 }
+
+// Which identity a deploy runs as: the first CONFIGURED level wins.
+//
+// Candidates arrive most-specific-first (project override, instance default for
+// the target, then the operator's own saved credential) and each carries the
+// state readStoredDeployPassword() produced plus a `source` name for messages and
+// for the audit line.
+//
+// The asymmetry is the whole point: **absent falls through, unreadable does not.**
+// A level that was never configured is not an opinion, so the next level answers.
+// A level that WAS configured but cannot be decrypted is a misconfiguration, and
+// quietly using the next identity would mean a production deploy running as
+// somebody other than the account an administrator chose — or, if it fell all the
+// way through, as an empty password, which is the collapse that had a slot script
+// reporting "no password supplied" for a credential the Users screen showed as set.
+export function resolveDeployIdentity(candidates) {
+  for (const candidate of candidates) {
+    if (!candidate || candidate.state === 'none') continue;
+    return candidate;              // 'stored' runs; 'unreadable' is the caller's to refuse
+  }
+  return { state: 'none', source: 'none', user: '', password: '' };
+}
+
+// The identity seam, with its two dependencies injected: how to decrypt, and how
+// to read the workbench's default for a target. One object so the route source
+// has a single name to call and the route harness has a single thing to stub —
+// the precedence rule itself lives here, in one place, and is unit-tested
+// directly rather than re-implemented in a fixture.
+export function makeDeployIdentity({ decrypt, instanceCredential }) {
+  // A slot's own override (admin-edited in deploy-config.json, deliberately not
+  // a UI field yet — the same treatment `runAsRoot` gets, because it is a
+  // privilege grant), then the workbench default for the target, then the
+  // operator's own saved credential.
+  async function resolve(slotConfig, target, operatorRecord) {
+    const candidates = [];
+    const override = slotConfig?.deployCredential;
+    if (override && (override.user || override.password)) {
+      const read = readStoredDeployPassword({ deployPassword: override.password }, decrypt);
+      candidates.push({ state: read.state, source: 'project', user: override.user || '', password: read.password });
+    }
+    if (instanceCredential) candidates.push(await instanceCredential(target));
+    if (operatorRecord) {
+      const own = readStoredDeployPassword(operatorRecord, decrypt);
+      candidates.push({ state: own.state, source: 'operator',
+        user: operatorRecord.deployUser || operatorRecord.username || '', password: own.password });
+    }
+    return resolveDeployIdentity(candidates);
+  }
+
+  // DEPLOY_USER/DEPLOY_PASSWORD keep their meaning — the account the deploy
+  // authenticates as — so no slot script has to change to benefit.
+  // DEPLOY_OPERATOR carries the human who pressed the button, which is the only
+  // place that name survives once a shared account is in use.
+  function env(identity, operator) {
+    if (identity?.state !== 'stored') return null;
+    return { DEPLOY_USER: identity.user, DEPLOY_PASSWORD: identity.password,
+      DEPLOY_IDENTITY_SOURCE: identity.source, ...(operator ? { DEPLOY_OPERATOR: operator } : {}) };
+  }
+
+  // Read-only version probes: an unreadable or unreadable-settings credential
+  // yields no probe rather than an error page. The deploy route refuses loudly
+  // instead, because publishing under the wrong identity is the harm.
+  async function probeEnv(slotConfig, target, operatorRecord, operator) {
+    try { return env(await resolve(slotConfig, target, operatorRecord), operator); }
+    catch { return null; }
+  }
+
+  return { resolve, env, probeEnv };
+}

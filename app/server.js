@@ -13,7 +13,7 @@ import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
 import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth, REAUTH_UNREADABLE } from './deploy-reauth.js';
-import { readStoredDeployPassword } from './deploy-credential.js';
+import { readStoredDeployPassword, makeDeployIdentity } from './deploy-credential.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
@@ -1113,6 +1113,22 @@ async function authenticate(rawUsername, password){
  return (await verifyPassword(password, u.passwordHash)) ? u : null;
 }
 
+// Does this Windows account and password still authenticate? Used by the deploy
+// credential test button, never on a deploy path.
+//
+// Deliberately NOT authenticate(): that binds and then resolves a PW user record,
+// so a perfectly good domain account with no workbench login would come back as
+// "wrong password". This binds and stops. The domain prefix is dropped because
+// ldapBind() appends the configured suffix to a bare name, and no password or
+// ciphertext is ever returned to the caller — only a reason string.
+async function verifyDeployAccount(account, password){
+ if(AUTH_MODE !== 'ldap') return { ok:false, reason:'This workbench authenticates against local accounts, so a Windows account cannot be verified here. A deploy is still the real test.' };
+ const bare = String(account || '').split('\\').pop();
+ if(!bare || !password) return { ok:false, reason:'No account and password are saved for this target.' };
+ try { await ldapBind(bare, password); return { ok:true }; }
+ catch(error){ return { ok:false, reason: error?.message || 'The directory rejected this account and password.' }; }
+}
+
 // Cross-process serialized, exactly like users.json's withUsersLock: no
 // process-local cache (a process-local cache is precisely what made the
 // original in-process-only sessionsLock lose sessions across processes — two
@@ -1437,7 +1453,7 @@ function validName(name){ return /^[A-Za-z0-9._-]+$/.test(String(name || '')); }
 // the exact same implementation, not a second hand-copied one that could
 // silently drift from it.
 const { encrypt, decrypt } = makeSecretCrypto({ secretKeyPath: SECRET_KEY_PATH });
-const workbenchSettingsStore = createWorkbenchSettingsStore({ filePath:workbenchSettingsPath, defaults:defaultWorkbenchSettings, encrypt, decrypt });
+const workbenchSettingsStore = createWorkbenchSettingsStore({ filePath:workbenchSettingsPath, defaults:defaultWorkbenchSettings, encrypt, decrypt, readCredentialState:readStoredDeployPassword });
 const deploymentService = createDeploymentService({
  settingsStore: workbenchSettingsStore,
  snapshot: async workspace => exportWorkspaceSnapshot({
@@ -1537,18 +1553,23 @@ async function deploymentHistory(project, states, backends){
   .map(entry => ({ ...entry, backend:entry.backend || 'local' }));
  return [...local, ...external].sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || '')));
 }
-// The version probe authenticates to the app server as a Windows account. It used
-// to fall back to "the first user who happens to have a deploy password saved",
-// which ran the probe as SOMEONE ELSE's domain account — invisible in the audit
-// log, which records the viewer, and indistinguishable at the far end from that
-// person working. A project that gates database migrations on DEPLOY_USER
-// (AITDataHub does) has to be able to trust the name is the operator's own, so:
-// no credential of the viewer's own, no probe.
-function getDeployEnv(user){
- const stored = readStoredDeployPassword(user, decrypt);
- if(stored.state !== 'stored') return null;
- return { DEPLOY_USER: user.deployUser || user.username, DEPLOY_PASSWORD: stored.password };
-}
+// WHICH ACCOUNT A SLOT RUNS AS. docs/deploy-credentials.md.
+//
+// Most specific first: this project's override for this target, the workbench's
+// default for this target, then the operator's own saved credential — the only
+// level that existed before, so an instance with nothing configured behaves
+// exactly as it did.
+//
+// The version probe authenticates to the app server as a Windows account too. It
+// used to fall back to "the first user who happens to have a deploy password
+// saved", which ran the probe as SOMEONE ELSE's domain account — invisible in the
+// audit log, which records the viewer. That is gone: a shared credential is now
+// something an administrator configures deliberately, not something the code
+// borrows, and a project that gates database migrations on DEPLOY_USER
+// (AITDataHub and SponsorPortal do) can trust the name it is handed.
+const deployIdentity = makeDeployIdentity({
+ decrypt, instanceCredential: target => workbenchSettingsStore.deployCredential(target),
+});
 const DEFAULT_DEPLOY_SLOTS = { dev:{ label:'Development', icon:'🧪' }, prod:{ label:'Production', icon:'🚀' } };
 function deploySlot(project, target){
  const d = DEFAULT_DEPLOY_SLOTS[target] || { label:target, icon:'' };
@@ -6083,7 +6104,7 @@ app.get(BASE + '/api/system/firstrun', async (_req,res) => {
 
 mountDeploymentRoutes(app, {
  base:BASE, service:deploymentService, requireAuth, requireAdmin, requireProjectAccess,
- loadProjects, filterProjectsForUser, audit, publicHealth:false,
+ loadProjects, filterProjectsForUser, audit, publicHealth:false, verifyDeployAccount,
 });
 
 if(DEPLOY_CENTRE){
@@ -6171,7 +6192,10 @@ if(DEPLOY_CENTRE){
   </div>`;
  }
 
- async function deployModalCard(p, cfg, isAdmin, deployEnv, states){
+ // `envFor(target)` resolves the probe identity for ONE slot (see
+ // deployIdentity.resolve): dev and prod can authenticate as different accounts, so
+ // a single env for the whole card would be wrong.
+ async function deployModalCard(p, cfg, isAdmin, envFor, states){
   states ||= await getProjectDeployStates(p, cfg);
   const backends = await Promise.all(states.map(effectiveDeployBackend));
   const external = backends.includes('external');
@@ -6182,8 +6206,8 @@ if(DEPLOY_CENTRE){
   const devOptSel = deployOptionSelect(devSlot); const prodOptSel = deployOptionSelect(prodSlot);
   const independent = usesIndependentVersions(states);
   const [devVersion, prodVersion, localVersion, allLog] = await Promise.all([
-   devState.managed ? null : getDeployedVersion(p.name,'dev',cfg,deployEnv,backends[0]),
-   prodState.managed ? null : getDeployedVersion(p.name,'prod',cfg,deployEnv,backends[1]),
+   devState.managed || !envFor ? null : envFor('dev').then(env => getDeployedVersion(p.name,'dev',cfg,env,backends[0])),
+   prodState.managed || !envFor ? null : envFor('prod').then(env => getDeployedVersion(p.name,'prod',cfg,env,backends[1])),
    independent || external ? null : getLocalVersion(p.path || workspacePath(p.name)),
    deploymentHistory(p.name, states, backends)
   ]);
@@ -6192,8 +6216,8 @@ if(DEPLOY_CENTRE){
   // credential of their own. Explain the empty answer instead of showing a bare
   // dash — conditional on both, because a version check can equally be a local
   // command that needs no credential at all.
-  const versionHint = (state, version) => !version && !deployEnv && !state.managed && state.config?.versionCmd
-   ? ' title="No version reported. If this check signs in to the app server, it needs your own deployment credential saved in Settings &gt; Users."' : '';
+  const versionHint = (state, version) => !version && !state.managed && state.config?.versionCmd
+   ? ' title="No version reported. If this check signs in to the app server, it needs a deployment credential: one for this target in Settings &gt; Deployment, or your own in Settings &gt; Users."' : '';
   const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
   const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(e.backend||'local')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
@@ -6297,10 +6321,12 @@ if(DEPLOY_CENTRE){
    const cfg = await loadDeployConfig();
    const states = await Promise.all(projects.map(p => getProjectDeployStates(p, cfg)));
    const backends = await Promise.all(states.map(slots => Promise.all(slots.map(effectiveDeployBackend))));
-   let deployEnv = null;
+   // Per project AND per target now: dev and prod can hold different accounts,
+   // and a project can override either, so one env per request would be wrong.
+   let operatorRecord = null;
    if(states.some((slots, projectIndex) => slots.some((state, slotIndex) => backends[projectIndex][slotIndex] === 'local' && !state.managed && state.config.versionCmd))){
     const users = await loadUsers();
-    deployEnv = getDeployEnv(users.find(u => u.username === req.user?.username));
+    operatorRecord = users.find(u => u.username === req.user?.username) || null;
    }
    const status = await Promise.all(projects.map(async (p, index) => {
     const targets = await Promise.all(['dev','prod'].map(async (target, i) => {
@@ -6313,7 +6339,7 @@ if(DEPLOY_CENTRE){
      }
      return state.managed
       ? { version:null, backend, configured:!!state.manifest, managed:true, manifest:state.manifest, error:state.error?.message }
-      : { version:await getDeployedVersion(p.name,target,cfg,deployEnv,backend), backend, configured:!!state.config.script };
+      : { version:await getDeployedVersion(p.name,target,cfg,await deployIdentity.probeEnv(cfg?.[p.name]?.[target],target,operatorRecord,req.user?.username),backend), backend, configured:!!state.config.script };
     }));
     return { name:p.name, dev:targets[0], prod:targets[1] };
    }));
@@ -6346,14 +6372,28 @@ if(DEPLOY_CENTRE){
   const currentUser = users.find(u => u.username === req.user?.username);
   const submitted = req.body?.password || '';
   const storedCredential = readStoredDeployPassword(currentUser, decrypt);
-  // A saved-but-unreadable credential must never travel on as DEPLOY_PASSWORD='':
-  // the slot script cannot tell that apart from "nothing saved", so it aborts
-  // claiming no password was supplied while the operator is looking at a Users
-  // screen that lists the credential as set. Ask for it instead — the existing
-  // prompt path re-encrypts under the current key, which repairs the record.
-  // Slots that need no password at all are untouched: state 'none' still runs.
-  if(!submitted && storedCredential.state === 'unreadable'){
-   await audit('deploy_credential_unreadable', { project, target }, req);
+  // Which account this slot runs as, before anything is published.
+  let identity;
+  try { identity = await deployIdentity.resolve(tc, target, currentUser); }
+  catch(error) { return deploymentFailure(res, error); }
+  // A SHARED credential that cannot be decrypted is an administrator's problem,
+  // not this operator's: prompting them for their own password would neither
+  // repair the record nor produce the account the slot is supposed to run as.
+  // Refuse, name the scope, and say who can fix it.
+  if(identity.state === 'unreadable' && identity.source !== 'operator'){
+   await audit('deploy_credential_unreadable', { project, target, scope: identity.source }, req);
+   return res.status(503).json({ ok:false, code:'deploy_credential_invalid',
+    error: identity.source === 'project'
+     ? `The deployment credential saved for ${project}/${target} cannot be read on this server. An administrator must re-enter it.`
+     : `The workbench's ${target} deployment credential cannot be read on this server. An administrator must re-enter it in Settings > Deployment.` });
+  }
+  // The operator's OWN saved credential, unreadable, is still worth a prompt: the
+  // existing path re-encrypts under the current key and repairs the record. It
+  // must never travel on as DEPLOY_PASSWORD='' — a slot script cannot tell that
+  // apart from "nothing saved", so it aborts claiming no password was supplied
+  // while the Users screen still lists the credential as set.
+  if(!submitted && identity.source === 'operator' && storedCredential.state === 'unreadable'){
+   await audit('deploy_credential_unreadable', { project, target, scope:'operator' }, req);
    return res.status(401).json({ ok:false, needPassword:true, staleStored:true, unreadableStored:true, error: REAUTH_UNREADABLE });
   }
   const storedPw = storedCredential.password;
@@ -6397,8 +6437,14 @@ if(DEPLOY_CENTRE){
    if(allowedOpts.length){ if(!option) option = allowedOpts[0]; if(!allowedOpts.includes(option)) return res.status(400).json({ok:false,error:'Invalid option for this slot'}); }
    else option = '';
   }
-  const deployPassword = effectivePassword || '';
-  const deployUser = currentUser?.deployUser || currentUser?.username || req.user?.username || '';
+  // `reauth` verified the OPERATOR (that is what proof-of-presence means); the
+  // account the deploy authenticates as is whatever deployIdentity.resolve chose.
+  // Those two were the same value before only because there was one level.
+  const shared = identity.state === 'stored' && identity.source !== 'operator';
+  const deployPassword = shared ? identity.password : (effectivePassword || '');
+  const deployUser = shared ? identity.user : (currentUser?.deployUser || currentUser?.username || req.user?.username || '');
+  const identitySource = shared ? identity.source : (deployPassword ? 'operator' : 'none');
+  const operatorName = req.user?.username || '';
   try {
    const client = await deploymentClientForBackend(backend);
    if(client) return await requireDeploymentOrigin(req, res, async () => {
@@ -6416,6 +6462,7 @@ if(DEPLOY_CENTRE){
   } catch(error) { return deploymentFailure(res, error); }
   if(!tc.script) return res.status(400).json({ok:false,error:'This recipe requires the external deployment backend; no local script is configured.'});
   const executionEnv = { ...process.env, DEPLOY_PROJECT:project, DEPLOY_TARGET:target, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword,
+   DEPLOY_OPERATOR:operatorName, DEPLOY_IDENTITY_SOURCE:identitySource,
    ...(manifest ? selection.env : { DEPLOY_OPTION:option }) };
   if(manifest) delete executionEnv.DEPLOY_OPTION;
   const start = Date.now();
@@ -6453,12 +6500,14 @@ if(DEPLOY_CENTRE){
     output += '\n' + error.message;
    }
   } else if(tc.versionCmd){
-   try { const { stdout } = await deployExec(tc, ['bash','-c',tc.versionCmd], {...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPTION:option}, 30000); version = stdout.trim()||null; } catch {}
+   try { const { stdout } = await deployExec(tc, ['bash','-c',tc.versionCmd], {...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPERATOR:operatorName, DEPLOY_IDENTITY_SOURCE:identitySource, DEPLOY_OPTION:option}, 30000); version = stdout.trim()||null; } catch {}
   }
   const selectionLog = manifest ? { inputs:selection.inputs, currentVersion:selection.currentVersion, targetVersion:selection.targetVersion, manifestRevision:manifest.revision } : {};
-  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, version, user: req.user?.username||'unknown', status, duration, outputSnippet: output.slice(0,500) };
+  // With a shared credential every deploy looks like one account on the app
+  // server, so PW's own records are the only place the human survives: keep both.
+  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, outputSnippet: output.slice(0,500) };
   await appendDeployLog(logEntry);
-  await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration }, req);
+  await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource }, req);
   // Report the recomputed comparison rather than leaving the client to redo it:
   // the badge is now wrong the instant a deploy lands, and the server is the only
   // side that knows how a release stamp is ordered.
@@ -6502,7 +6551,7 @@ if(DEPLOY_CENTRE){
     if(!tc?.versionCmd) return res.json({ok:true, backend, version:null, configured:false});
     const users = await loadUsers();
     const currentUser = users.find(u => u.username === req.user?.username);
-    const deployEnv = getDeployEnv(currentUser);
+    const deployEnv = await deployIdentity.probeEnv(cfg?.[project]?.[target], target, currentUser, req.user?.username);
     const version = await getDeployedVersion(project, target, cfg, deployEnv, backend);
     return res.json({ok:true, backend, version, configured:true});
    }
@@ -6513,7 +6562,7 @@ if(DEPLOY_CENTRE){
    if(!tc?.versionCmd) return res.json({ok:true, version:null, configured:false});
    const users = await loadUsers();
    const currentUser = users.find(u => u.username === req.user?.username);
-   const deployEnv = getDeployEnv(currentUser);
+   const deployEnv = await deployIdentity.probeEnv(cfg?.[project]?.[target], target, currentUser, req.user?.username);
    const version = await getDeployedVersion(project, target, cfg, deployEnv);
    res.json({ok:true, version, configured:true});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
@@ -6528,12 +6577,13 @@ if(DEPLOY_CENTRE){
    const cfg = await loadDeployConfig();
    const states = await getProjectDeployStates(p, cfg);
    const backends = await Promise.all(states.map(effectiveDeployBackend));
-   let deployEnv = null;
+   let envFor = null;
    if(states.some((state, index) => backends[index] === 'local' && !state.managed && state.config.versionCmd)){
     const users = await loadUsers();
-    deployEnv = getDeployEnv(users.find(u => u.username === req.user?.username));
+    const operatorRecord = users.find(u => u.username === req.user?.username) || null;
+    envFor = target => deployIdentity.probeEnv(cfg?.[projectName]?.[target], target, operatorRecord, req.user?.username);
    }
-   res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, deployEnv, states)});
+   res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, envFor, states)});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
 }

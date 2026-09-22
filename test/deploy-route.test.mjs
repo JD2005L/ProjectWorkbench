@@ -419,3 +419,123 @@ test('REGRESSION: a version check never borrows another user\'s deployment crede
     assert.equal(await versionAs('kev'), 'none', 'a user with no credential of their own must not probe as someone else');
   });
 });
+
+// The workbench-level deploy identity, end to end through the real route.
+//
+// The point of the feature is that the account a deploy AUTHENTICATES as stops
+// being the account of whoever pressed the button — while the person who pressed
+// it stays recorded, because with one shared account on the wire PW's own log is
+// the only place that name survives. docs/deploy-credentials.md.
+test('REGRESSION: an instance deploy credential runs the slot, and the operator is still recorded', { timeout: 30000 }, async () => {
+  const port = 3917;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7823 }], null, 2));
+  // Reports the identity without ever printing the secret: a test that echoed
+  // DEPLOY_PASSWORD would put it in the deploy log this suite also reads.
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({ demo: { dev: { script: [
+    'printf "user=%s operator=%s source=%s\\n" "$DEPLOY_USER" "$DEPLOY_OPERATOR" "$DEPLOY_IDENTITY_SOURCE"',
+    '[ "$DEPLOY_PASSWORD" = "shared-secret" ] && echo PASSWORD_IS_THE_SHARED_ONE',
+  ].join('\n') } } }));
+
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  const secretKey = fs.readFileSync(inst.env.PW_SECRET_KEY_PATH, 'utf8').trim();
+  // The operator has a perfectly good credential of their own. It must not be
+  // what the deploy uses once the workbench has one for this target.
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-kev', username: 'kev', role: 'admin', projects: '*', passwordHash,
+      deployUser: 'GOA\\kev.own', deployPassword: encryptToken(secretKey, 'kevs-own-secret') },
+  ] }, null, 2));
+  fs.writeFileSync(inst.env.PW_WORKBENCH_SETTINGS, JSON.stringify({
+    deployCredentials: { dev: { user: 'GOA\\svc-pw-deploy-dev', password: encryptToken(secretKey, 'shared-secret'), note: 'dev IIS + dev SQL' } },
+  }, null, 2));
+
+  await withServer(inst, port, async (base) => {
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'kev', password }),
+    });
+    assert.equal((await login.json()).ok, true, 'sanity: login must succeed');
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+
+    const deploy = await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    });
+    const body = await deploy.json();
+    assert.equal(body.ok, true, `deploy must run: ${JSON.stringify(body)}`);
+    assert.match(body.output, /user=GOA\\svc-pw-deploy-dev/, 'the slot authenticates as the workbench account');
+    assert.match(body.output, /operator=kev/, 'and the human who pressed Deploy reaches the script');
+    assert.match(body.output, /source=instance/);
+    assert.match(body.output, /PASSWORD_IS_THE_SHARED_ONE/);
+    assert.equal(/GOA\\kev\.own/.test(body.output), false, "the operator's own account must not be used");
+
+    // PW's own record has to carry both, since the app server now only ever sees one.
+    const log = await (await fetch(`${base}/api/deploy/demo/log`, { headers: { Cookie: cookie } })).json();
+    const entry = log.log.at(-1);
+    assert.equal(entry.user, 'kev', 'who pressed it');
+    assert.equal(entry.deployUser, 'GOA\\svc-pw-deploy-dev', 'what it ran as');
+    assert.equal(entry.identitySource, 'instance');
+    assert.equal(JSON.stringify(log).includes('shared-secret'), false, 'no secret in the deploy log');
+  });
+});
+
+test('REGRESSION: the credential API is admin-only and never returns a password, in any state', { timeout: 30000 }, async () => {
+  const port = 3918;
+  const inst = makeInstance(port);
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([], null, 2));
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  const secretKey = fs.readFileSync(inst.env.PW_SECRET_KEY_PATH, 'utf8').trim();
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-boss', username: 'boss', role: 'admin', projects: '*', passwordHash },
+    { id: 'u-dev', username: 'dev', role: 'developer', projects: '*', passwordHash },
+  ] }, null, 2));
+  fs.writeFileSync(inst.env.PW_WORKBENCH_SETTINGS, JSON.stringify({
+    deployCredentials: { prod: { user: 'GOA\\svc-pw-deploy-prod', password: encryptToken(secretKey, 'prod-secret'), note: '' } },
+  }, null, 2));
+
+  await withServer(inst, port, async (base) => {
+    const signIn = async username => {
+      const login = await fetch(`${base}/api/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      assert.equal((await login.json()).ok, true, `sanity: ${username} must be able to log in`);
+      return login.headers.get('set-cookie').split(';')[0];
+    };
+
+    const developer = await signIn('dev');
+    for (const [method, body] of [['GET', undefined], ['PUT', JSON.stringify({ target: 'prod', user: 'GOA\\attacker', password: 'x' })]]) {
+      const denied = await fetch(`${base}/api/deploy-service/credentials`, {
+        method, headers: { 'Content-Type': 'application/json', Cookie: developer, Origin: base }, body,
+      });
+      assert.equal(denied.status, 403, `a developer must not ${method} the deploy credential`);
+    }
+
+    const admin = await signIn('boss');
+    const shown = await fetch(`${base}/api/deploy-service/credentials`, { headers: { Cookie: admin } });
+    const text = await shown.text();
+    assert.equal(shown.status, 200);
+    assert.match(text, /GOA\\\\svc-pw-deploy-prod/, 'the account name is not a secret and the admin needs to see it');
+    assert.equal(text.includes('prod-secret'), false, 'the password never leaves the server');
+    assert.equal(text.includes('enc:'), false, 'not even the ciphertext');
+    assert.equal(JSON.parse(text).credentials.prod.hasPassword, true);
+
+    // Blank password keeps the stored one; clearing is explicit.
+    const kept = await fetch(`${base}/api/deploy-service/credentials`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: admin, Origin: base },
+      body: JSON.stringify({ target: 'prod', user: 'GOA\\svc-pw-deploy-prod', password: '', note: 'prod IIS + SQL' }),
+    });
+    const keptBody = await kept.json();
+    assert.equal(keptBody.credentials.prod.hasPassword, true, 'a blank field is not a removal');
+    assert.equal(keptBody.credentials.prod.note, 'prod IIS + SQL');
+
+    const cleared = await fetch(`${base}/api/deploy-service/credentials`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json', Cookie: admin, Origin: base },
+      body: JSON.stringify({ target: 'prod', clear: true }),
+    });
+    assert.deepEqual((await cleared.json()).credentials.prod, { user: '', note: '', hasPassword: false });
+  });
+});

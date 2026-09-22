@@ -28,6 +28,10 @@ function makeInstance(port, extraEnv = {}) {
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'),
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
+    // Without this the instance reads the HOST's workbench.json, and the
+    // deploy-configured cockpit case answered 503 deployment_settings_invalid for
+    // anyone running this suite from an account that cannot read that file.
+    PW_WORKBENCH_SETTINGS: path.join(dir, 'workbench.json'),
     ...extraEnv,
   };
   return { dir, env };

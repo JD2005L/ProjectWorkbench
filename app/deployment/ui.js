@@ -105,6 +105,55 @@ function settingsBrowser(base, makeApi) {
     } catch (error) { say(error.message); }
     finally { button.disabled = false; }
   });
+  for (const target of ['dev', 'prod']) {
+    const credForm = element(`dc-form-${target}`);
+    if (!credForm) continue;
+    const credStatus = element(`dc-status-${target}`);
+    const tell = message => { credStatus.textContent = message; };
+    const showCredential = value => {
+      element(`dc-user-${target}`).value = value.user || '';
+      element(`dc-note-${target}`).value = value.note || '';
+      element(`dc-password-${target}`).value = '';
+      element(`dc-state-${target}`).textContent = value.hasPassword
+        ? 'A password is saved for this account. Its value is never returned — leave the field blank to keep it.'
+        : 'No password is saved, so deploys on this target run as the person who pressed Deploy.';
+    };
+    const refresh = () => api('/credentials').then(value => showCredential(value.credentials[target]));
+    refresh().catch(error => tell(error.message));
+    credForm.addEventListener('submit', async event => {
+      event.preventDefault();
+      const button = element(`dc-save-${target}`); button.disabled = true;
+      try {
+        const value = await api('/credentials', { method: 'PUT', body: JSON.stringify({ target,
+          user: element(`dc-user-${target}`).value, password: element(`dc-password-${target}`).value,
+          note: element(`dc-note-${target}`).value }) });
+        showCredential(value.credentials[target]);
+        tell(`Saved. Every ${target} slot without its own override now deploys as this account.`);
+      } catch (error) { tell(error.message); }
+      finally { button.disabled = false; }
+    });
+    element(`dc-test-${target}`).addEventListener('click', async event => {
+      event.currentTarget.disabled = true;
+      tell('Checking this account against the directory…');
+      try {
+        const value = await api('/credentials/test', { method: 'POST', body: JSON.stringify({ target }) });
+        tell(!value.tested ? value.reason
+          : value.verified ? `${value.user} still authenticates. Nothing was deployed.`
+          : `${value.user} did NOT authenticate: ${value.reason} Re-enter the password above.`);
+      } catch (error) { tell(error.message); }
+      finally { event.currentTarget.disabled = false; }
+    });
+    element(`dc-clear-${target}`).addEventListener('click', async event => {
+      if (!confirm(`Remove the saved ${target} deploy account? Every ${target} slot then runs as the person who presses Deploy.`)) return;
+      event.currentTarget.disabled = true;
+      try {
+        const value = await api('/credentials', { method: 'PUT', body: JSON.stringify({ target, clear: true }) });
+        showCredential(value.credentials[target]);
+        tell(`Cleared. ${target} deploys run as whoever presses Deploy.`);
+      } catch (error) { tell(error.message); }
+      finally { event.currentTarget.disabled = false; }
+    });
+  }
   element('ds-test-connection').addEventListener('click', async event => {
     event.currentTarget.disabled = true;
     try {
@@ -116,9 +165,28 @@ function settingsBrowser(base, makeApi) {
   });
 }
 
+function credentialCard(target, title, hint) {
+  return `<div class="s-card"><form id="dc-form-${target}">
+<h3>${escape(title)} deploy account</h3>
+<p class="muted">${escape(hint)}</p>
+<label for="dc-user-${target}">Windows account</label><input id="dc-user-${target}" type="text" maxlength="128" autocomplete="off" placeholder="GOA\\account.name" spellcheck="false">
+<label for="dc-password-${target}">Password (leave blank to keep)</label><input id="dc-password-${target}" type="password" maxlength="256" autocomplete="new-password">
+<label for="dc-note-${target}">Note (optional)</label><input id="dc-note-${target}" type="text" maxlength="200" autocomplete="off" placeholder="what this account may reach">
+<p id="dc-state-${target}" class="muted"></p>
+<button id="dc-save-${target}" class="button" type="submit">Save ${escape(target)} account</button>
+<button id="dc-test-${target}" class="button secondary" type="button">Test</button>
+<button id="dc-clear-${target}" class="button secondary" type="button">Clear</button>
+<p id="dc-status-${target}" role="status" aria-live="polite"></p></form></div>`;
+}
+
 export function renderDeploymentSettings(base) {
   return `<section id="tab-deployment"><h2>Deployment</h2>
 <p class="lead">Choose execution once for the whole workbench. New projects inherit it automatically; repositories describe recipes and targets, never service credentials. Deployments remain human-triggered.</p>
+<h3>What deploys run as</h3>
+<p class="lead">Set the Windows account each target authenticates with — file copy, IIS, and database migrations. Every project uses it unless its slot overrides it; with nothing saved here, a deploy runs as the account of whoever pressed the button, as it always has. The person who pressed it is always recorded, and reaches the script as <code>DEPLOY_OPERATOR</code>.</p>
+${credentialCard('dev', 'Development', 'Used by every dev slot. Keep it to dev hosts and dev databases.')}
+${credentialCard('prod', 'Production', 'Used by every prod slot. Anyone who can press Deploy on a project with a prod slot acts as this account, so keep project grants tight.')}
+<h3>Execution backend</h3>
 <div class="s-card"><form id="ds-backend-form">
 <label for="ds-backend">Execution backend</label><select id="ds-backend"><option value="local">CURRENT / LOCAL (backward-compatible default)</option><option value="external">EXTERNAL deployment service</option></select>
 <p>External failures never run the script locally. Source must be a clean, committed Git workspace; only the pinned commit is transferred in memory.</p>

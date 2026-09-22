@@ -3651,3 +3651,46 @@ operator putting one account in both is choosing to let a dev slot authenticate 
 production rights, which is a decision, not a default. The narrower alternative is in
 the spec too: set the credential as a per-project override on AITDataHub and
 SponsorPortal only, and leave the other eleven projects deploying as whoever clicked.
+
+## GOA — 2026-09-22 — BUILT: the account a deploy runs as is now the workbench's, not the clicker's
+
+`docs/deploy-credentials.md` is implemented at the instance level. Settings ▸ Deployment
+now carries a card per target: Windows account, password (blank keeps, Clear removes),
+a note, and a **Test** button that binds the saved account against the directory —
+the one question a shared credential makes urgent, because one password expiry breaks
+every project at once with nothing but an SMB/WinRM authentication error to show for it.
+
+The resolver is `makeDeployIdentity()` in `app/deploy-credential.js`: project override,
+then the instance default for that target, then the operator's own saved credential.
+Decisions a reviewer should look at:
+
+* **Absent falls through, unreadable does not** — and the two failures differ on
+  purpose. A shared credential that will not decrypt is an administrator's problem, so
+  the deploy answers 503 naming the scope; the operator's OWN unreadable credential
+  still answers 401 needPassword, because that path re-encrypts under the current key
+  and repairs the record. Neither ever becomes `DEPLOY_PASSWORD=''`.
+* **`DEPLOY_USER` keeps its meaning** (the account the deploy authenticates as), so no
+  slot script changed. The human arrives as `DEPLOY_OPERATOR`, with
+  `DEPLOY_IDENTITY_SOURCE` saying which level resolved, and both are written into the
+  deploy log and the audit line — with one account on the wire, PW's own records are
+  the only place the person survives.
+* **Per target, per project — not once per request.** `/api/deploy/status` and the
+  modal card used to resolve one credential for everything on the page; dev and prod
+  can hold different accounts and a project can override either, so the card now takes
+  an `envFor(target)` resolver and probes lazily.
+* **The identity decision is a seam, not a free function**, so the route harness stubs
+  one object instead of re-implementing precedence in a fixture
+  (`test/deploy-manifest-harness.mjs` builds the real `makeDeployIdentity`).
+* **`app/deployment/settings.js` must not import from above its own directory** — the
+  standalone deployment service ships `app/deployment/**` only, and
+  `test/deploy-service-container-package.test.mjs` caught the first attempt. The
+  credential-state reader is injected instead.
+
+Chosen configuration, recorded: the instance credential will be `GOA\james.levac` for
+both targets (no AD service accounts on this domain), and prod deploys stay frictionless
+— `reauth` is still per-slot and still verifies the operator, but nothing forces it.
+
+Two test-isolation fixes ride along: `test/smoke.test.mjs` and (earlier)
+`test/deploy-route.test.mjs` now point `PW_WORKBENCH_SETTINGS` at their own temp dirs.
+Without it both read the HOST's `/etc/project-workbench/workbench.json` and answer 503
+`deployment_settings_invalid` for anyone running the suite as a non-root account.

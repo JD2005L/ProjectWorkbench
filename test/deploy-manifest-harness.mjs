@@ -10,7 +10,7 @@ import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from '../app/deploy-inputs.js';
 import { deployCss } from '../app/deploy-css.js';
 import { resolveDeployReauth, REAUTH_UNREADABLE } from '../app/deploy-reauth.js';
-import { readStoredDeployPassword } from '../app/deploy-credential.js';
+import { makeDeployIdentity, readStoredDeployPassword } from '../app/deploy-credential.js';
 import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
 import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
 import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
@@ -76,6 +76,15 @@ export function deployRouteHarness(root, options = {}) {
  const context = {
   BASE: '/pw', DEPLOY_CENTRE: true, deployCss, deployInputsClientSrc,
   DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth, readStoredDeployPassword, REAUTH_UNREADABLE,
+  deployIdentity: makeDeployIdentity({
+   decrypt: value => value.replace(/^sealed:/, ''),
+   instanceCredential: async target => {
+    const saved = (options.deployCredentials || {})[target];
+    if (!saved) return { state: 'none', source: 'instance', user: '', password: '' };
+    const read = readStoredDeployPassword({ deployPassword: saved.password }, value => value.replace(/^sealed:/, ''));
+    return { state: read.state, source: 'instance', user: saved.user || '', password: read.password };
+   },
+  }),
   deployInputNotice, describeDeploySelection, renderDeployInputs, agentSpawnDrop,
   deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin, DeploymentError, validateRecipe,
   deploymentService: options.deploymentService || { client: async () => null },
@@ -133,7 +142,7 @@ export function deployRouteHarness(root, options = {}) {
  vm.createContext(context);
  const helpers = [
   functionSource('esc'), functionSource('validName'), functionSource('deployExec'),
-  functionSource('getDeployedVersion'), functionSource('getDeployEnv'),
+  functionSource('getDeployedVersion'),
   functionSource('deploymentHistory'),
   functionSource('reclaimWorkspaceOwnership'),
   section('const DEFAULT_DEPLOY_SLOTS = ', 'async function getLocalVersion('),

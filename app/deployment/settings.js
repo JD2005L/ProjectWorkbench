@@ -5,6 +5,27 @@ import { DeploymentError, fields, record, validateEndpoint } from './protocol.js
 
 export const DEFAULT_DEPLOYMENT_SETTINGS = Object.freeze({ backend: 'local', endpoint: '', credential: '' });
 
+// The Windows account a deploy RUNS AS, per target, for the whole workbench.
+// See docs/deploy-credentials.md. `dev` and `prod` are always separate fields
+// even when an operator puts the same account in both: the day two accounts
+// exist, nothing here has to change.
+export const DEPLOY_TARGETS = Object.freeze(['dev', 'prod']);
+export const DEFAULT_DEPLOY_CREDENTIALS = Object.freeze({
+  dev: Object.freeze({ user: '', password: '', note: '' }),
+  prod: Object.freeze({ user: '', password: '', note: '' }),
+});
+// `DOMAIN\user` or a bare account name. Deliberately narrow: this value is
+// interpolated into SMB paths and WinRM sessions by every slot script on the box.
+const DEPLOY_ACCOUNT = /^(?:[A-Za-z0-9._-]{1,64}\\)?[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
+
+export function validateDeployAccount(user) {
+  const value = typeof user === 'string' ? user.trim() : '';
+  if (!DEPLOY_ACCOUNT.test(value)) {
+    throw new DeploymentError('A deploy account must be a Windows account name, optionally DOMAIN\\user.', 400, 'deploy_account_invalid');
+  }
+  return value;
+}
+
 export function validateConsoleUrl(value) {
   if (typeof value !== 'string' || value.length > 2048 || /[\0-\x20\x7f\\%]/.test(value)) {
     throw new DeploymentError('The service console URL must be a public HTTPS URL.');
@@ -62,6 +83,45 @@ export function savedDeploymentSettings(settings) {
   }
 }
 
+export function savedDeployCredentials(settings) {
+  if (!record(settings)) throw settingsError();
+  if (!Object.hasOwn(settings, 'deployCredentials')) return structuredClone(DEFAULT_DEPLOY_CREDENTIALS);
+  const value = settings.deployCredentials;
+  try {
+    if (!record(value)) throw settingsError();
+    fields(value, DEPLOY_TARGETS, 'deploy credentials');
+    const result = structuredClone(DEFAULT_DEPLOY_CREDENTIALS);
+    for (const target of DEPLOY_TARGETS) {
+      if (!Object.hasOwn(value, target)) continue;
+      const slot = value[target];
+      if (!record(slot)) throw settingsError();
+      fields(slot, ['user', 'password', 'note'], `${target} deploy credential`);
+      const user = slot.user === undefined || slot.user === '' ? '' : validateDeployAccount(slot.user);
+      const password = slot.password === undefined ? '' : slot.password;
+      if (typeof password !== 'string' || (password && !/^enc:[A-Za-z0-9+/]+={0,2}$/.test(password))) throw settingsError();
+      const note = slot.note === undefined ? '' : slot.note;
+      if (typeof note !== 'string' || note.length > 200) throw settingsError();
+      result[target] = { user, password, note };
+    }
+    return result;
+  } catch (error) {
+    if (error instanceof DeploymentError) {
+      if (error.code === 'deployment_settings_invalid') throw error;
+      // A malformed credential block must never read as "no credential
+      // configured": that would silently deploy as whoever pressed the button.
+      throw settingsError('Saved deploy credentials are invalid. Deployment is disabled until an administrator repairs them in Settings > Deployment.');
+    }
+    throw error;
+  }
+}
+
+export function publicDeployCredentials(settings) {
+  const value = savedDeployCredentials(settings);
+  return Object.fromEntries(DEPLOY_TARGETS.map(target => [target, {
+    user: value[target].user, note: value[target].note, hasPassword: !!value[target].password,
+  }]));
+}
+
 export function publicDeploymentSettings(settings) {
   const value = savedDeploymentSettings(settings);
   return { backend: value.backend, endpoint: value.endpoint, hasCredential: !!value.credential,
@@ -69,13 +129,18 @@ export function publicDeploymentSettings(settings) {
 }
 
 export function publicWorkbenchSettings(settings) {
-  return { ...settings, deployment: publicDeploymentSettings(settings) };
+  return { ...settings, deployment: publicDeploymentSettings(settings), deployCredentials: publicDeployCredentials(settings) };
 }
 
 // Both the old settings forms and the new backend form share the same lock.
 // A general settings save cannot overwrite a concurrently rotated service token.
 export function createWorkbenchSettingsStore({
   filePath, defaults = {}, encrypt, decrypt,
+  // (record, decrypt) -> { state: 'none'|'stored'|'unreadable', password }. Injected
+  // rather than imported: app/deploy-credential.js is part of the workbench app,
+  // and this module also ships inside the standalone deployment service, which
+  // carries app/deployment/** and nothing above it.
+  readCredentialState = null,
   readFile = fs.readFile, writeAtomic = writeFileAtomic, withLock = withLifecycleLock,
 }) {
   async function load() {
@@ -92,7 +157,7 @@ export function createWorkbenchSettingsStore({
       throw error;
     }
     if (!record(value) || Object.keys(value).some(key => ['__proto__', 'constructor', 'prototype'].includes(key))) throw settingsError();
-    return { ...structuredClone(defaults), ...value, deployment: savedDeploymentSettings(value) };
+    return { ...structuredClone(defaults), ...value, deployment: savedDeploymentSettings(value), deployCredentials: savedDeployCredentials(value) };
   }
 
   async function mutate(change) {
@@ -100,6 +165,7 @@ export function createWorkbenchSettingsStore({
       const current = await load();
       const next = await change(current);
       savedDeploymentSettings(next);
+      savedDeployCredentials(next);
       try { await writeAtomic(filePath, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600 }); }
       catch { throw new DeploymentError('Workbench settings could not be saved.', 503, 'deployment_settings_write_failed'); }
       return next;
@@ -111,7 +177,9 @@ export function createWorkbenchSettingsStore({
     return mutate(current => {
       const next = { ...current };
       for (const key of Object.keys(defaults)) {
-        if (key !== 'deployment' && Object.hasOwn(patch, key)) next[key] = patch[key];
+        // Neither sub-store is reachable from a general settings save: a wizard
+        // page posting its own form must not be able to blank a credential.
+        if (key !== 'deployment' && key !== 'deployCredentials' && Object.hasOwn(patch, key)) next[key] = patch[key];
       }
       return next;
     });
@@ -158,6 +226,53 @@ export function createWorkbenchSettingsStore({
     return next;
   }
 
+  // One target's account+password, under the same lock as the backend settings:
+  // a credential rotation and a backend save cannot clobber each other.
+  async function updateDeployCredential(draft) {
+    if (!record(draft)) throw settingsError();
+    fields(draft, ['target', 'user', 'password', 'note', 'clear'], 'deploy credential update');
+    if (!DEPLOY_TARGETS.includes(draft.target)) throw new DeploymentError('Deploy credential target must be dev or prod.', 400, 'deploy_credential_target_invalid');
+    if (Object.hasOwn(draft, 'clear') && typeof draft.clear !== 'boolean') throw new DeploymentError('clear must be boolean.', 400, 'deploy_credential_invalid');
+    if (draft.clear && (draft.password || draft.user)) throw new DeploymentError('Choose either a replacement credential or Clear.', 400, 'deploy_credential_invalid');
+    const next = await mutate(current => {
+      const credentials = savedDeployCredentials(current);
+      const slot = { ...credentials[draft.target] };
+      if (draft.clear) Object.assign(slot, { user: '', password: '', note: '' });
+      else {
+        if (Object.hasOwn(draft, 'user')) slot.user = draft.user === '' ? '' : validateDeployAccount(draft.user);
+        if (Object.hasOwn(draft, 'note')) {
+          if (typeof draft.note !== 'string' || draft.note.length > 200) throw new DeploymentError('A deploy credential note must be text of at most 200 characters.', 400, 'deploy_credential_invalid');
+          slot.note = draft.note.trim();
+        }
+        // Blank means KEEP: the form never receives the stored secret, so an
+        // empty field cannot be read as "remove it". Clearing is explicit.
+        if (typeof draft.password === 'string' && draft.password) {
+          try { slot.password = encrypt(draft.password); }
+          catch { throw new DeploymentError('The deploy credential could not be encrypted. Check the workbench encryption key.', 503, 'deploy_credential_invalid'); }
+        } else if (Object.hasOwn(draft, 'password') && typeof draft.password !== 'string') {
+          throw new DeploymentError('A deploy password must be text.', 400, 'deploy_credential_invalid');
+        }
+        if (slot.password && !slot.user) throw new DeploymentError('A deploy credential needs an account name as well as a password.', 400, 'deploy_credential_invalid');
+      }
+      return { ...current, deployCredentials: { ...credentials, [draft.target]: slot } };
+    });
+    return publicDeployCredentials(next);
+  }
+
+  // The identity itself, for the deploy path. Mirrors the per-user reader's
+  // vocabulary — none / stored / unreadable — because the resolver in
+  // app/deploy-credential.js treats those three states differently on purpose.
+  async function deployCredential(target) {
+    if (!DEPLOY_TARGETS.includes(target)) return { state: 'none', source: 'instance', user: '', password: '', note: '' };
+    const saved = savedDeployCredentials(await load())[target];
+    if (!saved.user && !saved.password) return { state: 'none', source: 'instance', user: '', password: '', note: '' };
+    // A configured credential with no way to read it is a wiring fault, and must
+    // not be reported as "none": that would deploy as whoever pressed the button.
+    if (!readCredentialState) throw new DeploymentError('This build cannot read stored deploy credentials.', 503, 'deploy_credential_invalid');
+    const read = readCredentialState({ deployPassword: saved.password }, decrypt);
+    return { state: read.state, source: 'instance', user: saved.user, password: read.password, note: saved.note };
+  }
+
   async function updateDeployment(draft) {
     const next = await mutate(async current => ({ ...current, deployment: await applyDraft(current, draft, { persist: true }) }));
     return publicDeploymentSettings(next);
@@ -179,5 +294,5 @@ export function createWorkbenchSettingsStore({
     return { endpoint: value.endpoint, token: decryptCredential(value.credential) };
   }
 
-  return { load, updateGeneral, updateDeployment, connection, externalConnection };
+  return { load, updateGeneral, updateDeployment, updateDeployCredential, deployCredential, connection, externalConnection };
 }

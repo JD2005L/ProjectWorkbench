@@ -1,5 +1,5 @@
 import { DeploymentError, fields, projectName, targetName, TERMINAL_STATES, consoleSelectorQuery } from './protocol.js';
-import { publicDeploymentSettings } from './settings.js';
+import { publicDeploymentSettings, publicDeployCredentials, DEPLOY_TARGETS } from './settings.js';
 import { deploymentFailure, requireDeploymentOrigin } from './pw.js';
 import { renderDeploymentPage } from './ui.js';
 import { JOB_STATES } from './client.js';
@@ -16,6 +16,9 @@ export async function sendDeploymentHealth(service, res) {
 export function mountDeploymentRoutes(app, {
   base, service, requireAuth, requireAdmin, requireProjectAccess,
   loadProjects, filterProjectsForUser, audit, publicHealth = true,
+  // Injected so this module never learns how the instance authenticates:
+  // (account, password) -> { ok, reason? }, a directory bind and nothing else.
+  verifyDeployAccount = null,
 }) {
   const api = `${base}/api/deploy-service`;
   const route = handler => async (req, res, next) => {
@@ -61,6 +64,33 @@ export function mountDeploymentRoutes(app, {
     const deployment = await service.settingsStore.updateDeployment(req.body);
     await audit('deploy_service_backend_update', { backend: deployment.backend }, req);
     res.json({ ok: true, deployment });
+  }));
+  // The Windows account deploys RUN AS, per target, for the whole workbench.
+  // docs/deploy-credentials.md. Admin-only in both directions, and the response
+  // carries state and the account name — never the password, in any state.
+  app.get(`${api}/credentials`, requireAdmin, route(async (_req, res) => {
+    res.json({ ok: true, credentials: publicDeployCredentials(await service.settingsStore.load()) });
+  }));
+  app.put(`${api}/credentials`, requireAdmin, requireDeploymentOrigin, route(async (req, res) => {
+    const target = req.body?.target;
+    const credentials = await service.settingsStore.updateDeployCredential(req.body || {});
+    await audit(req.body?.clear ? 'deploy_credential_cleared' : 'deploy_credential_set',
+      { scope: 'instance', target, user: credentials[target]?.user || '' }, req);
+    res.json({ ok: true, credentials });
+  }));
+  // "Did that account's password change?" without running a deploy — the one
+  // question a shared credential makes urgent, because one expiry breaks every
+  // project at once with nothing but an SMB/WinRM authentication error.
+  app.post(`${api}/credentials/test`, requireAdmin, requireDeploymentOrigin, route(async (req, res) => {
+    const target = req.body?.target;
+    if (!DEPLOY_TARGETS.includes(target)) throw new DeploymentError('Deploy credential target must be dev or prod.', 400, 'deploy_credential_target_invalid');
+    const credential = await service.settingsStore.deployCredential(target);
+    if (credential.state === 'none') return res.json({ ok: true, tested: false, reason: `No ${target} deployment credential is saved for this workbench.` });
+    if (credential.state === 'unreadable') return res.json({ ok: true, tested: false, user: credential.user, reason: `The saved ${target} credential cannot be decrypted on this server. Re-enter it.` });
+    if (!verifyDeployAccount) return res.json({ ok: true, tested: false, user: credential.user, reason: 'This instance cannot verify a Windows account against a directory.' });
+    const result = await verifyDeployAccount(credential.user, credential.password);
+    await audit('deploy_credential_test', { scope: 'instance', target, user: credential.user, verified: !!result.ok }, req);
+    res.json({ ok: true, tested: true, verified: !!result.ok, user: credential.user, ...(result.ok ? {} : { reason: result.reason || 'The directory rejected this account and password.' }) });
   }));
   app.post(`${api}/connection/test`, requireAdmin, requireDeploymentOrigin, route(async (req, res) => {
     const client = await service.client(req.body || {});

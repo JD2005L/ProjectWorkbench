@@ -1,7 +1,11 @@
 # Deploy credentials: instance-level, per target, overridable per project
 
-Status: **spec, not built.** Implementable as written; the decisions still open
-are collected at the end.
+Status: **built** for the instance level (2026-09-22). The resolver, storage,
+`DEPLOY_OPERATOR`/`DEPLOY_IDENTITY_SOURCE`, the admin-only credential API with its
+directory test, and the two Settings ▸ Deployment cards are in. Per-project
+overrides are honoured by the resolver but have no UI yet — an administrator sets
+one in `deploy-config.json`, the same treatment `runAsRoot` gets, because it is a
+privilege grant. Behaviour is unchanged on any instance with no credential saved.
 
 Chosen configuration (operator, 2026-09-22): **no AD service accounts are
 available on this domain**, so the instance credential will be `GOA\james.levac`
@@ -357,11 +361,10 @@ decision is recorded, not to relitigate it.
 
 ## Decisions needed before implementation
 
-1. **Instance default, or override on just the two projects?** The instance
-   default is what was asked for and is one field per target; the override-only
-   variant confines the shared account to AITDataHub and SponsorPortal, the only
-   two projects that actually need it, and leaves the other eleven deploying as
-   the person who clicked. Both are in this design; the second is narrower.
+1. ~~**Instance default, or override on just the two projects?**~~ — decided
+   2026-09-22: **instance default for `dev` and `prod`.** The narrower
+   override-only route stays available (the resolver checks overrides first) if
+   the shared account should later be confined to the projects that need it.
 2. **Operator fallback: keep or retire?** Keeping it is back-compatible and
    covers slots with no shared account; retiring it (fail with "no deploy
    credential is configured for this target") removes the last path where a
@@ -369,11 +372,12 @@ decision is recorded, not to relitigate it.
    target has a credential.
 3. **Who may set a project override** — admin only, as specced, or also a
    project's own maintainer?
-4. **Force `reauth` on prod slots** that resolve to the instance credential?
-   Recommendation: yes, and make it the default for new prod slots. With a human
-   account as the shared credential this stops being a nicety: it is the only
-   check that the person pressing a production deploy is present and is who the
-   session says, since the app server can no longer tell them apart.
+4. ~~**Force `reauth` on prod slots**~~ — decided 2026-09-22: **no**, prod stays
+   frictionless. `reauth: true` remains available per slot and still verifies the
+   operator's own password; nothing forces it. Worth revisiting if the audit log
+   ever has to answer for a production change, because it is the only check that
+   the person pressing Deploy is who the session says once one account is on the
+   wire for everyone.
 5. **Password rotation drill.** When that account's domain password changes, one
    admin re-entry in Settings ▸ Deployment fixes every project — but until it
    happens, every deploy fails. Worth deciding now who does it and whether PW
