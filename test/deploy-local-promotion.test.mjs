@@ -312,7 +312,15 @@ function makeStage({ seed = 'empty' } = {}) {
   return stage;
 }
 
-const cleanup = (stage) => fs.rmSync(stage.root, { recursive: true, force: true });
+const cleanup = (stage) => fs.rmSync(stage.root, {
+  recursive: true,
+  force: true,
+  // Git has just finished using this disposable checkout. Loaded Linux runners
+  // can briefly report its now-empty .git directory as ENOTEMPTY; Node only
+  // retries that transient when maxRetries is set.
+  maxRetries: 5,
+  retryDelay: 100,
+});
 
 /**
  * Run the real deploy-local.sh in one of its three shapes, against the stage
