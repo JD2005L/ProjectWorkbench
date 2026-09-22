@@ -14,8 +14,10 @@ import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-
 import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth, REAUTH_UNREADABLE } from './deploy-reauth.js';
 import { readStoredDeployPassword, makeDeployIdentity } from './deploy-credential.js';
+import { createDeployRuns } from './deploy-runs.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
+import { deployFollowClientSrc } from './deploy-follow.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
 import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken } from './user-credentials.js';
@@ -58,6 +60,7 @@ const DEPLOY_CENTRE = ['true','1'].includes(String(process.env.PW_DEPLOY_CENTRE 
 const { registryPath, isolated: ISOLATED } = resolveIsolation(process.env);
 const deployConfigPath = process.env.PW_DEPLOY_CONFIG || '/etc/project-workbench/deploy-config.json';
 const deployLogPath = process.env.PW_DEPLOY_LOG || '/etc/project-workbench/deploy-log.jsonl';
+const deployRunsDir = process.env.PW_DEPLOY_RUNS || path.join(path.dirname(deployLogPath), 'deploy-runs');
 const SECRET_KEY_PATH = process.env.PW_SECRET_KEY_PATH || '/etc/project-workbench/.secret-key';
 const workspaceRoot = process.env.PW_WORKSPACES || '/opt/project-workbench/workspaces';
 const nginxPath = process.env.PW_NGINX_CONF || '/etc/nginx/sites-available/project-workbench';
@@ -1524,6 +1527,31 @@ function deployExec(tc, argvTail, env, timeoutMs, cwd){
  const argv = [...drop, ...argvTail];
  return execFileAsync(argv[0], argv.slice(1), { timeout: timeoutMs, env: execEnv, ...(cwd ? { cwd } : {}) });
 }
+// The same exec, streamed. A local deploy is the one command on this box whose
+// progress somebody is watching, and execFileAsync only speaks at the end — so
+// the panel could not show a script's own "[2/5] Stopping IIS..." until it was
+// over, and a closed modal lost it entirely. Identical argv and privilege drop as
+// deployExec (probes stay buffered; there is nothing to watch in a version echo).
+function deployExecStream(tc, argvTail, env, timeoutMs, cwd, onChunk){
+ const drop = tc?.runAsRoot ? [] : agentSpawnDrop(TERMINAL_PRIV);
+ const execEnv = { ...env };
+ if(drop.length){ execEnv.HOME = TERMINAL_PRIV.home; execEnv.USER = TERMINAL_PRIV.user; execEnv.LOGNAME = TERMINAL_PRIV.user; }
+ const argv = [...drop, ...argvTail];
+ return new Promise((resolve) => {
+  const child = spawn(argv[0], argv.slice(1), { env: execEnv, ...(cwd ? { cwd } : {}) });
+  let out = '', killed = false;
+  const timer = setTimeout(() => { killed = true; child.kill('SIGKILL'); }, timeoutMs);
+  const take = data => { const text = String(data); out += text; try { onChunk?.(text); } catch {} };
+  child.stdout.on('data', take);
+  child.stderr.on('data', take);
+  child.on('error', error => { clearTimeout(timer); resolve({ output: out + '\n' + error.message, code: -1, failed: true }); });
+  child.on('close', code => {
+   clearTimeout(timer);
+   if(killed) out += `\nDEPLOY TIMED OUT after ${Math.round(timeoutMs/1000)}s and was killed. The app server may be mid-change.`;
+   resolve({ output: out, code, failed: killed || code !== 0 });
+  });
+ });
+}
 const DEPLOY_BACKENDS = new Set(['inherit','local','external']);
 function slotBackend(value){
  if(value === undefined) return 'inherit';
@@ -1582,6 +1610,9 @@ async function deploymentHistory(project, states, backends){
 // something an administrator configures deliberately, not something the code
 // borrows, and a project that gates database migrations on DEPLOY_USER
 // (AITDataHub and SponsorPortal do) can trust the name it is handed.
+// Retained detail for local deploys: an id, live output, and the last run still
+// there when the panel is reopened. See app/deploy-runs.js.
+const deployRuns = createDeployRuns({ dir: deployRunsDir });
 const deployIdentity = makeDeployIdentity({
  decrypt, instanceCredential: target => workbenchSettingsStore.deployCredential(target),
 });
@@ -2941,6 +2972,7 @@ const deployModalHtml = `<div id="deployBackdrop" class="modal-backdrop hidden" 
 const deployModalScript = `<script>(function(){
  ${deployInputsClientSrc}
  ${deploymentSubmitClientSrc}
+ ${deployFollowClientSrc}
  const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;
  const title=document.getElementById('deployModalTitle'),body=document.getElementById('deployModalBody'),closeBtn=document.getElementById('deployCloseBtn');
  let loadGeneration=0,opener=null;
@@ -2969,6 +3001,23 @@ const deployModalScript = `<script>(function(){
  }
  function bindDeployActions(container){
   deployInputs.bind(container);
+  /* Reattach to whatever each slot is doing, every time the panel opens. The run
+     lives on the server, so closing the modal mid-deploy no longer loses it — and
+     a slot that finished hours ago still shows its result instead of an empty box. */
+  container.querySelectorAll('.target-card[data-project]').forEach(card=>{
+   if(card.dataset.managed==='1')return;
+   const out=card.querySelector('.deploy-output');const btn=card.querySelector('.deploy-btn');
+   pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,
+    isHidden:()=>document.hidden,
+    onRunning:()=>{if(btn){btn.disabled=true;btn.textContent='Deploying…'}},
+    onDone:(run)=>{
+     if(btn){btn.disabled=false;btn.textContent='Deploy'}
+     const vEl=card.querySelector('.current-version');if(vEl&&run.version)vEl.textContent=run.version;
+     const ldEl=card.querySelector('.last-deploy-info');
+     if(ldEl&&run.startedAt)ldEl.textContent=String(run.startedAt).replace('T',' ').replace(/\..*/,' UTC')+' by '+(run.user||'unknown')+(run.status==='success'?'':' — FAILED');
+    }}).catch(()=>{});
+  });
+  pwRunFollower.bindHistory({base:'${BASE}',root:container});
   container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{
    container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');
    container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');
@@ -2986,12 +3035,21 @@ const deployModalScript = `<script>(function(){
     return r.json();
    }
    try{
-    let j=await runDeploy('',false);
+    /* The POST does not answer until the script is done, so follow the run it
+       starts: that is where "[2/5] Stopping IIS..." comes from while you wait. */
+    const pending=runDeploy('',false);
+    pwRunFollower.follow({base:'${BASE}',project,target,output,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
+    let j=await pending;
     if(!j.ok&&j.needPassword){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
      if(!pw){output.textContent='Deployment cancelled.';return}
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
      output.textContent='Running deployment script…';j=await runDeploy(pw,save);
+    }
+    if(j.running&&j.run){
+     output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
+     await pwRunFollower.follow({base:'${BASE}',project,target,output,isHidden:()=>document.hidden});
+     return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
@@ -3032,8 +3090,25 @@ const deployScript = `<script>
 (function(){
  ${deployInputsClientSrc}
  ${deploymentSubmitClientSrc}
+ ${deployFollowClientSrc}
  deployInputs.bind(document);
  function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]))}
+ /* Same reattachment as the cockpit modal: this page is a reload away from losing
+    a deploy it started, and the run is on the server precisely so it does not. */
+ document.querySelectorAll('.target-card[data-project]').forEach(card=>{
+  if(card.dataset.managed==='1')return;
+  const out=card.querySelector('.deploy-output');const btn=card.querySelector('.deploy-btn');
+  pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,
+   isHidden:()=>document.hidden,
+   onRunning:()=>{if(btn){btn.disabled=true;btn.textContent='Deploying…'}},
+   onDone:(run)=>{
+    if(btn){btn.disabled=false;btn.textContent='Deploy'}
+    const vEl=card.querySelector('.current-version');if(vEl&&run.version)vEl.textContent=run.version;
+    const ldEl=card.querySelector('.last-deploy-info');
+    if(ldEl&&run.startedAt)ldEl.textContent=String(run.startedAt).replace('T',' ').replace(/\..*/,' UTC')+' by '+(run.user||'unknown')+(run.status==='success'?'':' — FAILED');
+   }}).catch(()=>{});
+ });
+ pwRunFollower.bindHistory({base:'${BASE}'});
  document.querySelectorAll('.save-config').forEach(btn=>{
   btn.onclick=async()=>{
    const card=btn.closest('.target-card');
@@ -3087,13 +3162,20 @@ const deployScript = `<script>
     // saved password itself and answers needPassword only when there is none or
     // it no longer verifies. Prompting up-front here is what made a stored
     // password useless on this page.
-    let j=await runDeploy('',false);
+    const pending=runDeploy('',false);
+    pwRunFollower.follow({base:'${BASE}',project,target,output,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
+    let j=await pending;
     if(!j.ok&&j.needPassword){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
      if(!pw){output.textContent='Deployment cancelled.';return}
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
      output.textContent='Running deployment script…';
      j=await runDeploy(pw,save);
+    }
+    if(j.running&&j.run){
+     output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
+     await pwRunFollower.follow({base:'${BASE}',project,target,output,isHidden:()=>document.hidden});
+     return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
@@ -3130,7 +3212,7 @@ const deployScript = `<script>
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log');
     const j=await r.json();if(!j.ok)throw new Error(j.error);
     if(!j.log.length){logDiv.innerHTML='<p class="muted">No deployments yet.</p>'}
-    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':e.active?'':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td></tr>').join('')+'</tbody></table>'}
+    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th><th>Output</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':e.active?'':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td><td>'+(e.runId?'<button type="button" class="button secondary small run-detail" data-run="'+esc(e.runId)+'" data-run-project="'+esc(project)+'">Output</button>':'<span class="muted">—</span>')+'</td></tr>').join('')+'</tbody></table><pre class="run-detail-output" hidden aria-label="Retained deployment output"></pre>'}
     logDiv.style.display='block';btn.textContent='Hide history';
    }catch(e){logDiv.innerHTML='<p class="muted">Error: '+esc(e.message)+'</p>';logDiv.style.display='block'}
   };
@@ -6235,7 +6317,9 @@ if(DEPLOY_CENTRE){
    ? ' title="No version reported. If this check signs in to the app server, it needs a deployment credential: one for this target in Settings &gt; Deployment, or your own in Settings &gt; Users."' : '';
   const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
-  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(e.backend||'local')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
+  // A retained run gets a drill-in: the table used to show a result with no way
+  // to reach the output that produced it.
+  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(e.backend||'local')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td><td>${e.runId?`<button type="button" class="button secondary small run-detail" data-run="${esc(e.runId)}" data-run-project="${esc(p.name)}">Output</button>`:'<span class="muted">—</span>'}</td></tr>`).join('');
   return `${renderDeploymentNotice(BASE, p.name, !!external)}<div class="deploy-tabs"><button class="deploy-tab active" data-tab="deploy-panel">Deploy</button><button class="deploy-tab" data-tab="history-panel">History</button></div>
    <div id="deploy-panel" class="deploy-tab-panel">
    ${deploySourceSummary(localVersion, independent)}
@@ -6274,7 +6358,7 @@ if(DEPLOY_CENTRE){
    </div>
    <div id="history-panel" class="deploy-tab-panel" style="display:none">
     ${external ? `<p><a href="${BASE}/deploy-service?project=${encodeURIComponent(p.name)}">Open durable service history, job details, and live logs</a></p>` : ''}
-    ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Backend</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th></tr></thead><tbody>${historyRows}</tbody></table>` : `<p class="muted">No deployment history yet.</p>`}
+    ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Backend</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th><th>Output</th></tr></thead><tbody>${historyRows}</tbody></table><pre class="run-detail-output" hidden aria-label="Retained deployment output"></pre>` : `<p class="muted">No deployment history yet.</p>`}
    </div>`;
  }
 
@@ -6481,13 +6565,23 @@ if(DEPLOY_CENTRE){
    ...(manifest ? selection.env : { DEPLOY_OPTION:option }) };
   if(manifest) delete executionEnv.DEPLOY_OPTION;
   const start = Date.now();
+  // The run is registered BEFORE the script starts, so the panel can be reopened
+  // (or opened by somebody else) mid-deploy and find it. One per slot: two
+  // operators pressing Deploy on the same target used to race each other's script.
+  const claim = deployRuns.start({ project, target, user: req.user?.username || 'unknown',
+   deployUser, identitySource, option: option || null,
+   describe: describeDeploySelection(manifest ? { inputs:selection.inputs, targetVersion:selection.targetVersion } : { option }) || null });
+  if(!claim.started){
+   return res.status(409).json({ ok:false, code:'deploy_in_flight', running:true, run:claim.run,
+    error:`${project}/${target} is already deploying (started by ${claim.run.user || 'someone'} at ${claim.run.startedAt.replace('T',' ').replace(/\..*/,' UTC')}). Watch that run rather than starting a second one.` });
+  }
+  const runId = claim.id;
   let output = '', status = 'success', version = null, freshManifest = null, manifestError = '', staleManifest = false;
-  try {
-   const result = await deployExec(tc, ['bash','-c',tc.script,'pw-deploy',...(manifest ? [] : [option])], executionEnv, 300000, manifest ? state.workspace : undefined);
-   output = (result.stdout || '') + (result.stderr || '');
-  } catch(e) {
-   status = 'failed';
-   output = (e.stdout || '') + (e.stderr || '') + '\n' + (e.message || '');
+  {
+   const result = await deployExecStream(tc, ['bash','-c',tc.script,'pw-deploy',...(manifest ? [] : [option])],
+    executionEnv, 300000, manifest ? state.workspace : undefined, chunk => deployRuns.append(runId, chunk));
+   output = result.output;
+   if(result.failed) status = 'failed';
   }
   // A root deploy can leave root-owned drift in the workspace (e.g. a publish that
   // `git commit`s). Reclaim it whether the deploy passed or failed — a failed one
@@ -6520,14 +6614,17 @@ if(DEPLOY_CENTRE){
   const selectionLog = manifest ? { inputs:selection.inputs, currentVersion:selection.currentVersion, targetVersion:selection.targetVersion, manifestRevision:manifest.revision } : {};
   // With a shared credential every deploy looks like one account on the app
   // server, so PW's own records are the only place the human survives: keep both.
-  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, outputSnippet: output.slice(0,500) };
+  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
+  // Archived before the route answers: a finished run must be retrievable from
+  // History even if this process dies immediately afterwards.
+  await deployRuns.finish(runId, { status, version, duration, error: status === 'failed' ? 'the deploy script exited non-zero' : null });
   await appendDeployLog(logEntry);
   await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource }, req);
   // Report the recomputed comparison rather than leaving the client to redo it:
   // the badge is now wrong the instant a deploy lands, and the server is the only
   // side that knows how a release stamp is ordered.
   const srcNow = manifest ? null : await getLocalVersion(p.path || workspacePath(p.name));
-  res.json({ ok: status==='success', status, output: output.slice(0,5000), version, duration, user: req.user?.username,
+  res.json({ ok: status==='success', status, output: output.slice(0,5000), version, duration, user: req.user?.username, runId,
    sourceNewer: !manifest && sourceNewer(srcNow?.version, version), sourceVersion: srcNow?.version || null,
    ...(manifest ? { ...selectionLog, manifest:freshManifest, staleManifest, error:manifestError || undefined } : {}) });
  });
@@ -6548,6 +6645,37 @@ if(DEPLOY_CENTRE){
   catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
 
+ // The run a reopened panel attaches to: in flight if there is one, otherwise the
+ // last one, from this process or from the archive. `after` makes it a poller —
+ // the same shape as the external service's /jobs/:id/log, so both backends behave
+ // alike in the UI.
+ app.get(BASE + '/api/deploy/:project/:target/run', requireAuth, requireProjectAccess, async (req,res)=>{
+  try {
+   const { project, target } = req.params;
+   if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+   if(!['dev','prod'].includes(target)) return res.status(400).json({ok:false,error:'Target must be dev or prod'});
+   const run = await deployRuns.latest(project, target);
+   if(!run) return res.json({ok:true, run:null});
+   const after = Number.parseInt(req.query.after, 10);
+   if(Number.isFinite(after)){
+    const { chunk, offset, behind } = deployRuns.since(run, after);
+    const { output, ...rest } = run;
+    return res.json({ok:true, run:rest, chunk, offset, behind});
+   }
+   return res.json({ok:true, run});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+ // One archived run by id, for History's drill-in. Scoped to the project the
+ // caller was already authorised for; an id from another project does not resolve.
+ app.get(BASE + '/api/deploy/:project/run/:id', requireAuth, requireProjectAccess, async (req,res)=>{
+  try {
+   const { project, id } = req.params;
+   if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+   const run = await deployRuns.byId(project, id);
+   if(!run) return res.status(404).json({ok:false,error:'That deployment run is no longer retained.'});
+   res.json({ok:true, run});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
  app.get(BASE + '/api/deploy/:project/:target/version', requireAuth, requireProjectAccess, async (req,res)=>{
   try {
    const { project, target } = req.params;

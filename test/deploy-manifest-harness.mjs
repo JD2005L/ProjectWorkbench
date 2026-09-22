@@ -8,9 +8,11 @@ import { promisify } from 'node:util';
 import { execFile } from 'node:child_process';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from '../app/deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from '../app/deploy-inputs.js';
+import { deployFollowClientSrc } from '../app/deploy-follow.js';
 import { deployCss } from '../app/deploy-css.js';
 import { resolveDeployReauth, REAUTH_UNREADABLE } from '../app/deploy-reauth.js';
 import { makeDeployIdentity, readStoredDeployPassword } from '../app/deploy-credential.js';
+import { createDeployRuns } from '../app/deploy-runs.js';
 import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
 import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
 import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
@@ -49,7 +51,7 @@ export function deploymentSectionCallees() {
 export function serverTemplate(name) {
  const match = new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\n').exec(serverSource);
  if (!match) throw new Error(`Server template missing: ${name}`);
- return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc });
+ return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc, deployFollowClientSrc });
 }
 
 // scripts/ is a sibling of app/ in every deployment, and server.js builds this exact path for the
@@ -102,6 +104,25 @@ export function deployRouteHarness(root, options = {}) {
    post: (url, ...handlers) => routes.set(`POST ${url}`, handlers),
   },
   ...middleware,
+  // The real run store, in the fixture's own directory: a route test should be
+  // able to assert that a run was claimed, streamed into and archived, not just
+  // that a script ran.
+  deployRuns: createDeployRuns({ dir: path.join(root, '.deploy-runs') }),
+  // Streaming is a transport detail here. Delegating to the same execFileAsync
+  // double keeps every existing assertion about `executions` true, while the
+  // route's run bookkeeping runs for real.
+  deployExecStream: async (tc, argvTail, env, timeoutMs, cwd, onChunk) => {
+   try {
+    const result = await context.deployExec(tc, argvTail, env, timeoutMs, cwd);
+    const output = (result.stdout || '') + (result.stderr || '');
+    if (output) onChunk?.(output);
+    return { output, code: 0, failed: false };
+   } catch (error) {
+    const output = (error.stdout || '') + (error.stderr || '') + '\n' + (error.message || '');
+    if (output) onChunk?.(output);
+    return { output, code: error.code ?? 1, failed: true };
+   }
+  },
   loadDeployConfig: async () => structuredClone(config),
   saveDeployConfig: async next => { config = plain(next); saves++; },
   loadProjects: async () => [project],

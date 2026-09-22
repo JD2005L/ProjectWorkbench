@@ -595,3 +595,85 @@ test('REGRESSION: a project grant alone does not let a viewer trigger a deploy',
     assert.equal(fs.existsSync(marker), true);
   });
 });
+
+// Closing the panel used to lose the deploy. The run lives on the server now, so
+// these go through the real routes: watch one mid-flight, read it back after it
+// ends, and reach the retained output from History by its id.
+test('REGRESSION: a deploy in flight is watchable, and its output is still there afterwards', { timeout: 40000 }, async () => {
+  const port = 3920;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7825 }], null, 2));
+  // Prints, waits, prints: the gap is where "closing the modal" happens.
+  const gate = path.join(inst.dir, 'let-it-finish');
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({ demo: { dev: { script: [
+    'echo "[1/2] publishing"',
+    `until [ -f ${gate} ]; do sleep 0.2; done`,
+    'echo "[2/2] done"',
+  ].join('\n') } } }));
+
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-kev', username: 'kev', role: 'admin', projects: '*', passwordHash },
+  ] }, null, 2));
+
+  await withServer(inst, port, async (base) => {
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'kev', password }),
+    });
+    assert.equal((await login.json()).ok, true, 'sanity: login must succeed');
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const get = async url => (await fetch(`${base}${url}`, { headers: { Cookie: cookie } })).json();
+
+    assert.equal((await get('/api/deploy/demo/dev/run')).run, null, 'a slot that never ran says so');
+
+    // Start it and deliberately DO NOT await: this is the panel being closed.
+    const deploying = fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    });
+
+    let live = null;
+    for (let attempt = 0; attempt < 100 && !live; attempt++) {
+      const value = await get('/api/deploy/demo/dev/run');
+      if (value.run?.status === 'running' && value.run.output.includes('[1/2]')) live = value;
+      else await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    assert.ok(live, 'a reopened panel must find the run that is in flight');
+    assert.equal(live.run.user, 'kev');
+    assert.match(live.run.output, /\[1\/2\] publishing/, 'including what it has printed so far');
+
+    // A second operator pressing Deploy is told to watch, not given a second script.
+    const second = await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    });
+    const secondBody = await second.json();
+    assert.equal(second.status, 409);
+    assert.equal(secondBody.running, true);
+    assert.equal(secondBody.run.id, live.run.id);
+
+    // Incremental poll: only what is new since the offset we already have.
+    fs.writeFileSync(gate, 'go');
+    const finished = await (await deploying).json();
+    assert.equal(finished.ok, true, `the deploy must succeed: ${JSON.stringify(finished)}`);
+    assert.ok(finished.runId, 'the response names the run so a client can keep following it');
+
+    const tail = await get(`/api/deploy/demo/dev/run?after=${live.run.offset}`);
+    assert.match(tail.chunk, /\[2\/2\] done/, 'the poller gets the rest, not the whole log again');
+    assert.equal(tail.run.status, 'success');
+    assert.equal(tail.run.output, undefined, 'an incremental read sends the chunk, not the whole buffer');
+
+    // After it ends, the panel still finds it — and so does History, by id.
+    const after = await get('/api/deploy/demo/dev/run');
+    assert.equal(after.run.id, finished.runId);
+    assert.match(after.run.output, /\[1\/2\] publishing[\s\S]*\[2\/2\] done/);
+
+    const log = await get('/api/deploy/demo/log');
+    assert.equal(log.log.at(-1).runId, finished.runId, 'History can reach the output that produced a result');
+    const archived = await get(`/api/deploy/demo/run/${finished.runId}`);
+    assert.match(archived.run.output, /\[2\/2\] done/);
+    assert.equal((await fetch(`${base}/api/deploy/demo/run/deadbeef`, { headers: { Cookie: cookie } })).status, 404);
+  });
+});
