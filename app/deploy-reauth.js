@@ -14,6 +14,11 @@
 export const REAUTH_PROMPT = 'Enter your domain password for deployment:';
 export const REAUTH_STALE = 'Your saved deployment password no longer verifies (it may have changed). Please enter your current domain password.';
 export const REAUTH_REJECTED = 'Re-authentication failed: your password did not verify.';
+// Saved, but this server cannot decrypt it (a rotated .secret-key, or a record
+// copied between instances). Kept here with the other operator-facing prompts,
+// and deliberately distinct from REAUTH_STALE: nothing is wrong with the
+// person's password, so "it may have changed" would send them the wrong way.
+export const REAUTH_UNREADABLE = 'Your saved deployment password cannot be read on this server, so it was not used. Enter your current domain password to replace it.';
 
 // Resolve to either:
 //   { ok:true,  password, save }                    -> run the deploy

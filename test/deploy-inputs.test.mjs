@@ -173,3 +173,21 @@ test('page history and modal both use the named-selection and planned-version hi
  assert.match(serverTemplate('deployScript'), /Inputs \/ anticipated/);
  assert.match(serverTemplate('deployScript'), /deployInputs\.history\(e\)/);
 });
+
+// A failed run used to leave the "Last:" line exactly as the page rendered it,
+// which on a shared instance is usually somebody ELSE's successful deploy — shown
+// directly above the failure text. Two operators read the colleague's name there
+// as the owner of their own failure. Both surfaces now name the run that ran.
+for (const surface of surfaces) {
+ test(`${surface}: a failed run names itself in the output and in the Last line`, async () => {
+  const browser = await loadDeployBrowser(surface, null, {
+   responses: [{ ok: false, duration: '0.8', version: 'V1.26.0922.1555', user: 'kevin.charlebois',
+    error: 'DEPLOY BLOCKED - only the approved principal may migrate this database.' }],
+  });
+  await browser.click();
+  assert.match(browser.card.output.textContent, /FAILED \(0\.8s\)/);
+  assert.match(browser.card.output.textContent, /kevin\.charlebois/, 'the failure text must name the run it belongs to');
+  assert.match(browser.card.last.textContent, /kevin\.charlebois/, 'the Last line must follow a failed run too');
+  assert.match(browser.card.last.textContent, /FAILED/, 'and must not keep advertising an earlier success');
+ });
+}

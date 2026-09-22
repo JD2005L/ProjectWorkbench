@@ -9,7 +9,8 @@ import { execFile } from 'node:child_process';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from '../app/deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from '../app/deploy-inputs.js';
 import { deployCss } from '../app/deploy-css.js';
-import { resolveDeployReauth } from '../app/deploy-reauth.js';
+import { resolveDeployReauth, REAUTH_UNREADABLE } from '../app/deploy-reauth.js';
+import { readStoredDeployPassword } from '../app/deploy-credential.js';
 import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
 import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
 import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
@@ -74,7 +75,7 @@ export function deployRouteHarness(root, options = {}) {
  const nativeExec = promisify(execFile);
  const context = {
   BASE: '/pw', DEPLOY_CENTRE: true, deployCss, deployInputsClientSrc,
-  DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth,
+  DeployManifestError, resolveDeployManifest, validateDeployInputs, resolveDeployReauth, readStoredDeployPassword, REAUTH_UNREADABLE,
   deployInputNotice, describeDeploySelection, renderDeployInputs, agentSpawnDrop,
   deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin, DeploymentError, validateRecipe,
   deploymentService: options.deploymentService || { client: async () => null },

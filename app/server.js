@@ -12,7 +12,8 @@ import { resolveIsolation } from './isolation.js';
 import { resolveTlsConfig, renderNginxServers } from './tls-config.js';
 import { ldapBindOnce as ldapBindOnceStaged, scavengeLdapStaging } from './ldap-staging.js';
 import { deployCss } from './deploy-css.js';
-import { resolveDeployReauth } from './deploy-reauth.js';
+import { resolveDeployReauth, REAUTH_UNREADABLE } from './deploy-reauth.js';
+import { readStoredDeployPassword } from './deploy-credential.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
@@ -1536,11 +1537,17 @@ async function deploymentHistory(project, states, backends){
   .map(entry => ({ ...entry, backend:entry.backend || 'local' }));
  return [...local, ...external].sort((a,b) => String(a.ts || '').localeCompare(String(b.ts || '')));
 }
-function getDeployEnv(users, preferredUser){
- if(preferredUser?.deployPassword) return { DEPLOY_USER: preferredUser.deployUser || preferredUser.username, DEPLOY_PASSWORD: decrypt(preferredUser.deployPassword) };
- const fallback = users.find(u => u.deployPassword);
- if(fallback) return { DEPLOY_USER: fallback.deployUser || fallback.username, DEPLOY_PASSWORD: decrypt(fallback.deployPassword) };
- return null;
+// The version probe authenticates to the app server as a Windows account. It used
+// to fall back to "the first user who happens to have a deploy password saved",
+// which ran the probe as SOMEONE ELSE's domain account — invisible in the audit
+// log, which records the viewer, and indistinguishable at the far end from that
+// person working. A project that gates database migrations on DEPLOY_USER
+// (AITDataHub does) has to be able to trust the name is the operator's own, so:
+// no credential of the viewer's own, no probe.
+function getDeployEnv(user){
+ const stored = readStoredDeployPassword(user, decrypt);
+ if(stored.state !== 'stored') return null;
+ return { DEPLOY_USER: user.deployUser || user.username, DEPLOY_PASSWORD: stored.password };
 }
 const DEFAULT_DEPLOY_SLOTS = { dev:{ label:'Development', icon:'🧪' }, prod:{ label:'Production', icon:'🚀' } };
 function deploySlot(project, target){
@@ -2953,10 +2960,15 @@ const deployModalScript = `<script>(function(){
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
-    output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');
+    /* Name whose run this is. The "Last:" line is rendered when the panel opens and
+       used to be rewritten only on success, so a failure left the previous line —
+       often another operator's successful deploy — sitting directly above this
+       failure text, and was read here as that person's deploy having failed. */
+    const who=j.user||'you';
+    output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s) — this run, by '+who+'\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');
     const vEl=card.querySelector('.current-version');if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
     const nb=card.querySelector('.src-newer-badge');if(nb&&typeof j.sourceNewer==='boolean')nb.hidden=!j.sourceNewer;
-    const ldEl=card.querySelector('.last-deploy-info');if(ldEl&&j.ok)ldEl.textContent='Just now by '+(j.user||'you')+(summary?' | '+summary:'');
+    const ldEl=card.querySelector('.last-deploy-info');if(ldEl)ldEl.textContent='Just now by '+who+(j.ok?'':' — FAILED')+(summary?' | '+summary:'');
    }catch(e){output.textContent=e.message||String(e)}
    finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
   })});
@@ -3050,8 +3062,17 @@ const deployScript = `<script>
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
-    if(!j.ok){output.textContent='❌ FAILED\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');return}
-    output.textContent='✅ SUCCESS ('+j.duration+'s)\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
+    // Same reason as the cockpit modal: name whose run this is, on failure too.
+    // The failure branch returned early and left the "Last:" line from page load
+    // — often another operator's success — immediately above this text.
+    const who=j.user||'you';
+    if(!j.ok){
+     output.textContent='❌ FAILED ('+(j.duration||'?')+'s) — this run, by '+who+'\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');
+     const fEl=card.querySelector('.last-deploy-info');
+     if(fEl)fEl.textContent='Just now by '+who+' — FAILED'+(summary?' | '+summary:'');
+     return;
+    }
+    output.textContent='✅ SUCCESS ('+j.duration+'s) — this run, by '+who+'\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
     const vEl=card.querySelector('.current-version');
     if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
     // This page keeps its badge in .version-line via markSrcNewer, so reuse that
@@ -3059,7 +3080,7 @@ const deployScript = `<script>
     // and the badge has to follow it here too.
     markSrcNewer(card, j.version||'');
     const ldEl=card.querySelector('.last-deploy-info');
-    if(ldEl)ldEl.textContent='Just now by '+j.user+(summary?' | '+summary:'');
+    if(ldEl)ldEl.textContent='Just now by '+who+(summary?' | '+summary:'');
    }catch(e){output.textContent='❌ FAILED\\n'+e.message}finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
   };
  });
@@ -5115,7 +5136,7 @@ let pwProjects=[];async function loadProjectList(){try{const r=await fetch('${BA
 function uColspan(){return 6+PW_CLIS.length+${DEPLOY_CENTRE ? '1' : '0'}}
 async function loadUsers(){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">loading…</td></tr>';try{const r=await fetch('${BASE}/api/users',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');PW_ME=j.me||'';PW_CLIS=j.clis||[];PW_PALETTE=j.palette||[];PW_CLAIMS=j.colorClaims||{};PW_GH_OAUTH=!!j.githubOauth;PW_GH_CLI=!!j.githubCli;renderUsers(j.users)}catch(e){uTable.innerHTML='<tr><td colspan="'+uColspan()+'" class="muted">'+esc(e.message)+'</td></tr>'}}
 function projectsCellHtml(p){if(p==='*')return '<span class="role-pill admin">all projects</span>';if(!Array.isArray(p)||p.length===0)return '<span class="muted">none</span>';return p.map(x=>'<code class="grants">'+esc(x)+'</code>').join('')}
-function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
+function deployPwCellHtml(u){return ${DEPLOY_CENTRE ? "(u.deployPasswordState==='unreadable'?'<td><span class=\"role-pill\" style=\"color:#fca5a5;border-color:#7f1d1d;background:rgba(239,68,68,.12)\" title=\"Saved, but this server cannot decrypt it. The next deploy will ask for it and replace it.\">unreadable</span></td>':u.hasDeployPassword?'<td><span class=\"role-pill\" style=\"color:#93c5fd;border-color:#1e40af;background:rgba(59,130,246,.12)\">set</span></td>':'<td><span class=\"role-pill\">none</span></td>')" : "''"}}
 /* A stored token was previously write-only from this table: an empty field meant "keep
    what is there", so there was no way to REMOVE one. That matters because a token
    Copilot refuses overrides any sign-in, making "clear it, then sign in" the only fix —
@@ -5573,7 +5594,13 @@ function safeUserShape(u){
   // is visible — including WHICH operation, not just that one exists — to an
   // admin rather than a hidden users.json-only field. Contains no secret.
   pendingCredentialSync: u.pendingCredentialSync ? { opId: u.pendingCredentialSync.opId, fromUsername: u.pendingCredentialSync.fromUsername, toUsername: u.pendingCredentialSync.toUsername } : null };
- if(DEPLOY_CENTRE) out.hasDeployPassword = !!u.deployPassword;
+ if(DEPLOY_CENTRE){
+  out.hasDeployPassword = !!u.deployPassword;
+  // Presence alone used to drive the "set" pill, so a record this server cannot
+  // decrypt read as a working credential while the deploy that used it failed
+  // with "no password supplied". The state name is not a secret.
+  out.deployPasswordState = readStoredDeployPassword(u, decrypt).state;
+ }
  return out;
 }
 function isAdmin(u){ return u && u.role === 'admin'; }
@@ -6160,6 +6187,13 @@ if(DEPLOY_CENTRE){
    independent || external ? null : getLocalVersion(p.path || workspacePath(p.name)),
    deploymentHistory(p.name, states, backends)
   ]);
+  // With the borrowed-credential fallback gone, a probe that signs in to the app
+  // server has nothing to sign in with for a viewer who has no deployment
+  // credential of their own. Explain the empty answer instead of showing a bare
+  // dash — conditional on both, because a version check can equally be a local
+  // command that needs no credential at all.
+  const versionHint = (state, version) => !version && !deployEnv && !state.managed && state.config?.versionCmd
+   ? ' title="No version reported. If this check signs in to the app server, it needs your own deployment credential saved in Settings &gt; Users."' : '';
   const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
   const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(e.backend||'local')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td></tr>`).join('');
@@ -6169,7 +6203,7 @@ if(DEPLOY_CENTRE){
    <div class="targets">
     ${devState.managed ? managedDeployTarget(p, 'dev', devState, devLog, backends[0] === 'external', isAdmin) : `<div class="target-card dev" data-project="${esc(p.name)}" data-target="dev" data-label="${esc(devSlot.label)}"${devCfg.reauth?' data-reauth="1"':''}>
      <h3>${devSlot.icon?esc(devSlot.icon)+' ':''}${esc(devSlot.label)}</h3>
-     <div>${backends[0] === 'external'?'Last successful version':'Version'}: <span class="version current-version">${esc(devVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, devVersion)}</div>
+     <div>${backends[0] === 'external'?'Last successful version':'Version'}: <span class="version current-version"${versionHint(devState, devVersion)}>${esc(devVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, devVersion)}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(devLog))}</span></div>
      ${deploySlotConfigured(devState, p, 'dev', backends[0] === 'external') ? `${devOptSel}<button class="button small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
      <div class="deploy-output"></div>
@@ -6184,7 +6218,7 @@ if(DEPLOY_CENTRE){
     </div>`}
     ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog, backends[1] === 'external', isAdmin) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
      <h3>${prodSlot.icon?esc(prodSlot.icon)+' ':''}${esc(prodSlot.label)}</h3>
-     <div>${backends[1] === 'external'?'Last successful version':'Version'}: <span class="version current-version">${esc(prodVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, prodVersion)}</div>
+     <div>${backends[1] === 'external'?'Last successful version':'Version'}: <span class="version current-version"${versionHint(prodState, prodVersion)}>${esc(prodVersion||'—')}</span>${sourceNewerBadge(localVersion?.version, prodVersion)}</div>
      <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(prodLog))}</span></div>
      ${deploySlotConfigured(prodState, p, 'prod', backends[1] === 'external') ? `${prodOptSel}<button class="button danger small deploy-btn" type="button">Deploy</button>` : `<span class="no-config">Not configured</span>`}
      <div class="deploy-output"></div>
@@ -6266,7 +6300,7 @@ if(DEPLOY_CENTRE){
    let deployEnv = null;
    if(states.some((slots, projectIndex) => slots.some((state, slotIndex) => backends[projectIndex][slotIndex] === 'local' && !state.managed && state.config.versionCmd))){
     const users = await loadUsers();
-    deployEnv = getDeployEnv(users, users.find(u => u.username === req.user?.username));
+    deployEnv = getDeployEnv(users.find(u => u.username === req.user?.username));
    }
    const status = await Promise.all(projects.map(async (p, index) => {
     const targets = await Promise.all(['dev','prod'].map(async (target, i) => {
@@ -6311,8 +6345,18 @@ if(DEPLOY_CENTRE){
   const users = await loadUsers();
   const currentUser = users.find(u => u.username === req.user?.username);
   const submitted = req.body?.password || '';
-  let storedPw = '';
-  if(currentUser?.deployPassword){ try { storedPw = decrypt(currentUser.deployPassword); } catch { storedPw = ''; } }
+  const storedCredential = readStoredDeployPassword(currentUser, decrypt);
+  // A saved-but-unreadable credential must never travel on as DEPLOY_PASSWORD='':
+  // the slot script cannot tell that apart from "nothing saved", so it aborts
+  // claiming no password was supplied while the operator is looking at a Users
+  // screen that lists the credential as set. Ask for it instead — the existing
+  // prompt path re-encrypts under the current key, which repairs the record.
+  // Slots that need no password at all are untouched: state 'none' still runs.
+  if(!submitted && storedCredential.state === 'unreadable'){
+   await audit('deploy_credential_unreadable', { project, target }, req);
+   return res.status(401).json({ ok:false, needPassword:true, staleStored:true, unreadableStored:true, error: REAUTH_UNREADABLE });
+  }
+  const storedPw = storedCredential.password;
   // Verify the saved password first (no prompt); the client only asks the user
   // when the server answers needPassword. See app/deploy-reauth.js.
   const decision = await resolveDeployReauth({
@@ -6458,7 +6502,7 @@ if(DEPLOY_CENTRE){
     if(!tc?.versionCmd) return res.json({ok:true, backend, version:null, configured:false});
     const users = await loadUsers();
     const currentUser = users.find(u => u.username === req.user?.username);
-    const deployEnv = getDeployEnv(users, currentUser);
+    const deployEnv = getDeployEnv(currentUser);
     const version = await getDeployedVersion(project, target, cfg, deployEnv, backend);
     return res.json({ok:true, backend, version, configured:true});
    }
@@ -6469,7 +6513,7 @@ if(DEPLOY_CENTRE){
    if(!tc?.versionCmd) return res.json({ok:true, version:null, configured:false});
    const users = await loadUsers();
    const currentUser = users.find(u => u.username === req.user?.username);
-   const deployEnv = getDeployEnv(users, currentUser);
+   const deployEnv = getDeployEnv(currentUser);
    const version = await getDeployedVersion(project, target, cfg, deployEnv);
    res.json({ok:true, version, configured:true});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
@@ -6487,7 +6531,7 @@ if(DEPLOY_CENTRE){
    let deployEnv = null;
    if(states.some((state, index) => backends[index] === 'local' && !state.managed && state.config.versionCmd)){
     const users = await loadUsers();
-    deployEnv = getDeployEnv(users, users.find(u => u.username === req.user?.username));
+    deployEnv = getDeployEnv(users.find(u => u.username === req.user?.username));
    }
    res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, deployEnv, states)});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }

@@ -24,6 +24,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { addIdentity, manifestDocument, writeJson } from './deploy-manifest-fixtures.mjs';
+import { REAUTH_UNREADABLE } from '../app/deploy-reauth.js';
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
@@ -47,6 +48,12 @@ function makeInstance(port, extraEnv = {}) {
     PW_WORKSPACES: path.join(dir, 'workspaces'),
     PW_SECRET_KEY_PATH: secretKeyPath,
     PW_DEPLOY_CONFIG: path.join(dir, 'deploy-config.json'),
+    // Without this the instance reads the HOST's /etc/project-workbench/workbench.json,
+    // which every deployment route consults first: an account that cannot read that
+    // file (any non-root run of this suite) got 503 deployment_settings_invalid from
+    // the route before it reached the behaviour under test. Every other fixture in
+    // test/ already redirects it; this one was the exception.
+    PW_WORKBENCH_SETTINGS: path.join(dir, 'workbench.json'),
     PW_DEPLOY_LOG: path.join(dir, 'deploy-log.jsonl'),
     ...extraEnv,
   };
@@ -321,5 +328,94 @@ test('managed deployment HTTP: data-only panels and fresh validated choices neve
     assert.equal(removed.status, 409, 'missing manifest must not run the old default-identity script');
     assert.equal(fs.existsSync(inst.env.PW_DEPLOY_LOG), false, 'no rejected request reaches execution/history');
     assert.equal(fs.readFileSync(inst.env.PW_DEPLOY_CONFIG, 'utf8'), configBefore);
+  });
+});
+
+// A saved deploy password that this server cannot decrypt — a rotated
+// .secret-key, or a users.json carried between instances — used to be caught and
+// turned into an empty string, which then travelled on as DEPLOY_PASSWORD=''. The
+// slot script cannot tell that apart from "nothing saved", so it aborted claiming
+// no password was supplied while the Users screen still showed the credential as
+// set, and nobody could reconcile the two. Ask for it instead, and say which of
+// the two states the record is actually in.
+test('REGRESSION: a deploy password this server cannot decrypt prompts for one instead of deploying with an empty DEPLOY_PASSWORD', { timeout: 30000 }, async () => {
+  const port = 3915;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7821 }], null, 2));
+  const marker = path.join(inst.dir, 'slot-script-ran');
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({ demo: { dev: { script: `touch ${marker}` } } }));
+
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  const foreignKey = crypto.randomBytes(32).toString('hex'); // not this instance's key
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-boss', username: 'boss', role: 'admin', projects: '*', passwordHash, deployPassword: encryptToken(foreignKey, password) },
+  ] }, null, 2));
+
+  await withServer(inst, port, async (base) => {
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'boss', password }),
+    });
+    assert.equal((await login.json()).ok, true, 'sanity: login must succeed');
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+
+    const deploy = await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    });
+    const body = await deploy.json();
+    assert.equal(deploy.status, 401, `must ask for the password: ${JSON.stringify(body)}`);
+    assert.equal(body.needPassword, true);
+    assert.equal(body.unreadableStored, true);
+    assert.equal(body.error, REAUTH_UNREADABLE);
+    assert.equal(fs.existsSync(marker), false, 'the slot script must not run with an empty DEPLOY_PASSWORD');
+
+    // The Users screen is the other half: "set" for a credential the server
+    // cannot use is what made the script's message look like a contradiction.
+    const listed = await fetch(`${base}/api/users`, { headers: { Cookie: cookie } });
+    const users = (await listed.json()).users;
+    assert.equal(users.find(u => u.username === 'boss').deployPasswordState, 'unreadable');
+  });
+});
+
+// The version probe authenticates to the app server as a Windows account. It used
+// to fall back to the first user who happened to have a deploy password saved, so
+// a viewer with none of their own silently probed as a COLLEAGUE — while the audit
+// log recorded the viewer. A project that gates its database migrations on
+// DEPLOY_USER has to be able to trust that name.
+test('REGRESSION: a version check never borrows another user\'s deployment credential', { timeout: 30000 }, async () => {
+  const port = 3916;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(proj, { recursive: true });
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7822 }], null, 2));
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({
+    demo: { dev: { script: 'echo deployed-ok', versionCmd: 'printf %s "${DEPLOY_USER:-none}"' } },
+  }));
+
+  const password = 'Sup3rSecret!23';
+  const passwordHash = await hashPassword(password);
+  const secretKey = fs.readFileSync(inst.env.PW_SECRET_KEY_PATH, 'utf8').trim();
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-boss', username: 'boss', role: 'admin', projects: '*', passwordHash,
+      deployUser: 'boss.deploy', deployPassword: encryptToken(secretKey, password) },
+    { id: 'u-kev', username: 'kev', role: 'developer', projects: '*', passwordHash },
+  ] }, null, 2));
+
+  await withServer(inst, port, async (base) => {
+    const versionAs = async (username) => {
+      const login = await fetch(`${base}/api/auth/login`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, password }),
+      });
+      assert.equal((await login.json()).ok, true, `sanity: ${username} must be able to log in`);
+      const cookie = login.headers.get('set-cookie').split(';')[0];
+      const res = await fetch(`${base}/api/deploy/demo/dev/version`, { headers: { Cookie: cookie } });
+      return (await res.json()).version;
+    };
+    assert.equal(await versionAs('boss'), 'boss.deploy', 'the probe still runs for a user with their own credential');
+    assert.equal(await versionAs('kev'), 'none', 'a user with no credential of their own must not probe as someone else');
   });
 });
