@@ -3029,6 +3029,7 @@ const deployModalScript = `<script>(function(){
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft'))&&!confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
    deployInputs.setBusy(card,true);btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};if(pw){bd.password=pw;if(save)bd.savePassword=true}
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
@@ -3151,6 +3152,7 @@ const deployScript = `<script>
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
    deployInputs.setBusy(card,true);btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};
     if(pw){bd.password=pw;if(save)bd.savePassword=true}
@@ -3212,7 +3214,7 @@ const deployScript = `<script>
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log');
     const j=await r.json();if(!j.ok)throw new Error(j.error);
     if(!j.log.length){logDiv.innerHTML='<p class="muted">No deployments yet.</p>'}
-    else{logDiv.innerHTML='<table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th><th>Output</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':e.active?'':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td><td>'+(e.runId?'<button type="button" class="button secondary small run-detail" data-run="'+esc(e.runId)+'" data-run-project="'+esc(project)+'">Output</button>':'<span class="muted">—</span>')+'</td></tr>').join('')+'</tbody></table><pre class="run-detail-output" hidden aria-label="Retained deployment output"></pre>'}
+    else{logDiv.innerHTML='<div class="history-panel"><div class="history-list"><table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th><th>Output</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':e.active?'':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td><td>'+(e.runId?'<button type="button" class="button secondary small run-detail" data-run="'+esc(e.runId)+'" data-run-project="'+esc(project)+'">Output</button>':'<span class="muted">—</span>')+'</td></tr>').join('')+'</tbody></table></div><div class="history-detail" hidden><button type="button" class="button secondary small history-back">&larr; Back to history</button><pre class="run-detail-output" aria-label="Retained deployment output"></pre></div></div>'}
     logDiv.style.display='block';btn.textContent='Hide history';
    }catch(e){logDiv.innerHTML='<p class="muted">Error: '+esc(e.message)+'</p>';logDiv.style.display='block'}
   };
@@ -6358,7 +6360,10 @@ if(DEPLOY_CENTRE){
    </div>
    <div id="history-panel" class="deploy-tab-panel" style="display:none">
     ${external ? `<p><a href="${BASE}/deploy-service?project=${encodeURIComponent(p.name)}">Open durable service history, job details, and live logs</a></p>` : ''}
-    ${allLog.length ? `<table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Backend</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th><th>Output</th></tr></thead><tbody>${historyRows}</tbody></table><pre class="run-detail-output" hidden aria-label="Retained deployment output"></pre>` : `<p class="muted">No deployment history yet.</p>`}
+    ${allLog.length ? `<div class="history-panel">
+     <div class="history-list"><table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Backend</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th><th>Output</th></tr></thead><tbody>${historyRows}</tbody></table></div>
+     <div class="history-detail" hidden><button type="button" class="button secondary small history-back">&larr; Back to history</button><pre class="run-detail-output" aria-label="Retained deployment output"></pre></div>
+    </div>` : `<p class="muted">No deployment history yet.</p>`}
    </div>`;
  }
 

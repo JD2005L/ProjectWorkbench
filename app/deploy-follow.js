@@ -36,11 +36,36 @@ export function createRunFollower(environment = globalThis) {
     return () => { if (following) output.scrollTop = output.scrollHeight; };
   }
 
-  function paint(output, run, text) {
+  // The verdict lives OUTSIDE the log pane. It used to be the pane's first line,
+  // which a tail-following log scrolls out of view within seconds — so a deploy
+  // would finish and the one thing the operator was waiting for was three hundred
+  // lines up. This element sits directly above the pane and never scrolls.
+  function ensureStatus(card, output) {
+    if (!card) return null;
+    let status = card.querySelector?.('.deploy-status');
+    if (status) return status;
+    if (!document?.createElement) return null;
+    status = document.createElement('div');
+    status.className = 'deploy-status';
+    const parent = output?.parentNode;
+    if (parent?.insertBefore) parent.insertBefore(status, output);
+    else card.appendChild?.(status);
+    return status;
+  }
+
+  function paint(output, run, text, card = null) {
+    const status = ensureStatus(card, output);
+    if (status) {
+      status.textContent = headline(run).replace('\n', ' · ');
+      status.className = `deploy-status ${run.status === 'running' ? 'running' : run.status === 'success' ? 'success' : 'failed'}`;
+    }
     if (!output) return;
     const tail = keepTail(output);
     output.className = 'deploy-output show';
-    output.textContent = `${headline(run)}\n\n${run.truncated ? '[earlier output dropped — showing the tail]\n' : ''}${text || ''}`;
+    // Without a card to hold the status line (a caller that passes a bare pane),
+    // the headline stays in the pane rather than being lost.
+    const heading = status ? '' : `${headline(run)}\n\n`;
+    output.textContent = `${heading}${run.truncated ? '[earlier output dropped — showing the tail]\n' : ''}${text || ''}`;
     tail();
   }
 
@@ -55,8 +80,10 @@ export function createRunFollower(environment = globalThis) {
     card.classList[state === 'finished' ? 'add' : 'remove']('deploy-finished');
   }
 
-  // How the operator says "I have read it": puts the card back to a form that can
-  // deploy again, rather than leaving a spent log where the controls used to be.
+  // The log view's only control, and the way back to the form. The outcome is in
+  // the headline above it, so this button says what it DOES rather than what
+  // happened — a button labelled "failed" invites the reading that pressing it
+  // does something about the failure.
   function offerReset(card, output, label) {
     if (!card || !document?.createElement) return;
     let button = card.querySelector?.('.deploy-reset');
@@ -67,6 +94,8 @@ export function createRunFollower(environment = globalThis) {
       button.addEventListener?.('click', () => {
         setCardState(card, 'idle');
         if (output) { output.textContent = ''; output.className = 'deploy-output'; }
+        const status = card.querySelector?.('.deploy-status');
+        if (status) { status.textContent = ''; status.className = 'deploy-status'; }
         button.remove?.();
       });
       card.appendChild(button);
@@ -99,7 +128,7 @@ export function createRunFollower(environment = globalThis) {
     }
 
     let run = initial.run, text = initial.run.output || '', offset = initial.run.offset || text.length;
-    if (output) paint(output, run, text);
+    paint(output, run, text, card);
     if (run.status !== 'running') { finishUp(card, output, run, text, onDone); return run; }
 
     setCardState(card, 'running');
@@ -117,7 +146,7 @@ export function createRunFollower(environment = globalThis) {
       if (next.behind) text = '';
       text += next.chunk || '';
       offset = next.offset ?? offset;
-      if (output) paint(output, run, text);
+      paint(output, run, text, card);
     }
     finishUp(card, output, run, text, onDone);
     return run;
@@ -125,13 +154,18 @@ export function createRunFollower(environment = globalThis) {
 
   function finishUp(card, output, run, text, onDone) {
     setCardState(card, 'finished');
-    offerReset(card, output, run.status === 'success' ? 'Deployment finished — clear this log' : 'Deployment failed — clear this log');
+    offerReset(card, output, 'Start a new deployment');
     onDone?.(run, text);
   }
 
   // History drill-in: the retained output of one archived run.
+  //
+  // It REPLACES the list rather than appending under it. The table runs to fifty
+  // rows, so a log nailed to the bottom meant scrolling past every other release
+  // to reach the one just clicked, and then scrolling back to find the list again.
+  // One panel, two views, and a Back button that says where it goes.
   async function showArchived({ base, project, id, into }) {
-    into.hidden = false;
+    into.hidden = false;      // harmless when the view owns visibility; needed by callers that pass a bare pre
     into.textContent = 'Loading…';
     try {
       const response = await fetch(`${base}/api/deploy/${encodeURIComponent(project)}/run/${encodeURIComponent(id)}`, { cache: 'no-store' });
@@ -142,14 +176,40 @@ export function createRunFollower(environment = globalThis) {
   }
 
   // Delegated so it keeps working when a table is re-rendered under it.
-  function bindHistory({ base, root = document, container }) {
+  function bindHistory({ base, root = document }) {
+    // Which run the list was showing when it handed over, so Back can put the
+    // keyboard where it came from instead of at the top of a fifty-row table.
+    let returnTo = null;
+    const views = anchor => {
+      const panel = anchor?.closest?.('.history-panel');
+      return { panel, list: panel?.querySelector?.('.history-list'), detail: panel?.querySelector?.('.history-detail') };
+    };
+    const show = (anchor, which) => {
+      const { list, detail } = views(anchor);
+      if (!list || !detail) return null;
+      list.hidden = which !== 'list';
+      detail.hidden = which !== 'detail';
+      return detail;
+    };
     root.addEventListener('click', event => {
+      const back = event.target.closest?.('.history-back');
+      if (back) {
+        event.preventDefault();
+        const detail = show(back, 'list');
+        const into = detail?.querySelector?.('.run-detail-output');
+        if (into) into.textContent = '';        // nothing stale behind the next click
+        returnTo?.focus?.();
+        returnTo = null;
+        return;
+      }
       const button = event.target.closest?.('[data-run]');
       if (!button) return;
       event.preventDefault();
-      const into = container?.() || button.closest('.deploy-tab-panel')?.querySelector('.run-detail-output')
-        || button.closest('.project-card')?.querySelector('.run-detail-output');
+      const detail = show(button, 'detail');
+      const into = detail?.querySelector?.('.run-detail-output');
       if (!into) return;
+      returnTo = button;
+      detail.querySelector?.('.history-back')?.focus?.();
       showArchived({ base, project: button.dataset.runProject, id: button.dataset.run, into });
     });
   }

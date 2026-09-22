@@ -41,18 +41,33 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .config-section textarea{min-height:60px}
 :is(.deploy-page,#deployBackdrop) .deploy-output{margin-top:.5rem;background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
 :is(.deploy-page,#deployBackdrop) .deploy-output.show{display:block}
-/* A slot mid-deploy becomes a log viewer. The script, the version command, the
-   backend select and Save are hidden: editing the script that is currently
-   running is meaningless, and what the operator actually wants is the output —
-   which gets a taller, fixed pane so the tail stays put instead of the card
-   growing and shoving the other slot down the page. */
-:is(.deploy-page,#deployBackdrop) .target-card.deploy-running .config-section{display:none}
-:is(.deploy-page,#deployBackdrop) .target-card.deploy-running .deploy-output{max-height:none;height:20rem;border-color:#334155}
-:is(.deploy-page,#deployBackdrop) .target-card.deploy-running .deploy-btn{opacity:.75}
+/* A slot has two shapes and never both at once: the FORM (script, version
+   command, backend, Save, Deploy) or the LOG. Deploying switches to the log and
+   STAYS there after the run ends — config reappearing under a finished log is
+   what made one card read as three stacked panes — until the operator asks for
+   the form back with "Start a new deployment", the only control the log view
+   carries. Fixed height in both states: the tail stays put while it runs, and
+   the card does not jump on the last chunk when it ends. */
+:is(.deploy-page,#deployBackdrop) .target-card:is(.deploy-running,.deploy-finished) .config-section{display:none}
+:is(.deploy-page,#deployBackdrop) .target-card:is(.deploy-running,.deploy-finished) .deploy-btn{display:none}
+:is(.deploy-page,#deployBackdrop) .target-card:is(.deploy-running,.deploy-finished) .deploy-option{display:none}
+:is(.deploy-page,#deployBackdrop) .target-card:is(.deploy-running,.deploy-finished) .deploy-output{max-height:none;height:20rem;border-color:#334155}
+/* The verdict, outside the log and above it, so a tail-following pane cannot
+   scroll the answer out of view — which is exactly what it did when this line
+   was the pane's first row. Empty when idle, so it takes no space. */
+:is(.deploy-page,#deployBackdrop) .deploy-status:empty{display:none}
+:is(.deploy-page,#deployBackdrop) .deploy-status{margin-top:.5rem;padding:.4rem .6rem;border-radius:4px;font-size:.78rem;font-weight:600;border-left:3px solid #475569;background:#0b1220;color:#e2e8f0;white-space:pre-wrap}
+:is(.deploy-page,#deployBackdrop) .deploy-status.running{border-left-color:#38bdf8}
+:is(.deploy-page,#deployBackdrop) .deploy-status.success{border-left-color:#22c55e;color:#bbf7d0}
+:is(.deploy-page,#deployBackdrop) .deploy-status.failed{border-left-color:#ef4444;color:#fca5a5}
 :is(.deploy-page,#deployBackdrop) .deploy-reset{margin-top:.5rem}
-/* The finished log keeps its height so the card does not jump on the last chunk;
-   the reset control is how the operator says they have read it. */
-:is(.deploy-page,#deployBackdrop) .target-card.deploy-finished .deploy-output{max-height:none;height:20rem}
+/* History is one panel with two views: the list, or one run's retained output.
+   Replacing rather than appending is the point — the table runs to fifty rows,
+   so a log pinned underneath meant scrolling past every other release to read
+   the one just clicked. */
+:is(.deploy-page,#deployBackdrop) .history-detail[hidden],:is(.deploy-page,#deployBackdrop) .history-list[hidden]{display:none}
+:is(.deploy-page,#deployBackdrop) .history-back{margin-bottom:.6rem}
+:is(.deploy-page,#deployBackdrop) .run-detail-output{background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;height:24rem;overflow:auto;white-space:pre-wrap;margin:0}
 :is(.deploy-page,#deployBackdrop) .log-table{width:100%;border-collapse:collapse;font-size:.8rem;margin-top:.5rem}
 :is(.deploy-page,#deployBackdrop) .log-table th{text-align:left;border-bottom:2px solid #1f2937;padding:.4rem .5rem;color:#94a3b8;font-size:.78rem;text-transform:uppercase;letter-spacing:.02em}
 :is(.deploy-page,#deployBackdrop) .log-table td{border-bottom:1px solid #1f2937;padding:.4rem .5rem}

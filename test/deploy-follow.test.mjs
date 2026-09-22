@@ -160,7 +160,7 @@ test('a running slot becomes a log viewer, and hands back its controls when the 
 
   const reset = card.children.find(child => child.className.includes('deploy-reset'));
   assert.ok(reset, 'a finished run offers a way back to a card that can deploy again');
-  assert.match(reset.textContent, /finished/);
+  assert.equal(reset.textContent, 'Start a new deployment', 'the button says what it does; the outcome is in the headline');
   reset.handlers.click();
   assert.equal(card.classList.contains('deploy-finished'), false, 'clearing restores the ordinary card');
   assert.equal(output.textContent, '');
@@ -190,12 +190,129 @@ test('the pane follows the tail, and stops following the moment the reader scrol
   assert.equal(output.scrollTop, output.scrollHeight);
 });
 
-test('a failed run says so on the control that clears it', async () => {
+test('a failed run keeps the log view, and its outcome stays in the headline not the button', async () => {
   const failed = { id: 'def', status: 'failed', startedAt: '2026-09-22T21:43:29.000Z', user: 'kev', duration: '0.8', offset: 3, output: 'no\n' };
   const environment = { ...fakeDocument(), setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
     async fetch() { return { status: 200, ok: true, json: async () => ({ ok: true, run: failed }) }; } };
   environment.document = environment;
   const card = fakeCard();
-  await createRunFollower(environment).follow({ base: '', project: 'demo', target: 'prod', output: scrollableOutput(), card });
-  assert.match(card.children.find(child => child.className.includes('deploy-reset')).textContent, /failed/);
+  const output = scrollableOutput();
+  await createRunFollower(environment).follow({ base: '', project: 'demo', target: 'prod', output, card });
+  assert.equal(card.classList.contains('deploy-finished'), true, 'a failure keeps the log in front, not the form');
+  const status = card.children.find(child => child.className.startsWith('deploy-status'));
+  assert.match(status.textContent, /❌ FAILED \(0\.8s\)/, 'the outcome is stated outside the pane, where scrolling cannot hide it');
+  assert.equal(status.className, 'deploy-status failed');
+  assert.equal(card.children.find(child => child.className.includes('deploy-reset')).textContent, 'Start a new deployment');
+});
+
+// History is one panel with two views. Appending the log under a fifty-row table
+// meant scrolling past every other release to read the run just clicked, and then
+// scrolling back to find the list — so the detail REPLACES the list, and Back
+// returns to it.
+function fakeHistoryPanel() {
+  const into = { textContent: '', hidden: false };
+  const backButton = { className: 'button secondary small history-back', focused: 0, focus() { this.focused++; } };
+  const list = { hidden: false };
+  const detail = {
+    hidden: true,
+    querySelector: selector => (selector === '.run-detail-output' ? into : selector === '.history-back' ? backButton : null),
+  };
+  const panel = { querySelector: selector => (selector === '.history-list' ? list : selector === '.history-detail' ? detail : null) };
+  const row = { dataset: { run: 'abc123', runProject: 'demo' }, focused: 0, focus() { this.focused++; },
+    closest: selector => (selector === '.history-panel' ? panel : null) };
+  backButton.closest = selector => (selector === '.history-panel' ? panel : null);
+  return { into, backButton, list, detail, row };
+}
+
+test('clicking Output swaps the list for that run, and Back swaps it back', async () => {
+  const panel = fakeHistoryPanel();
+  const handlers = {};
+  const responses = [{ ok: true, run: { id: 'abc123', status: 'success', duration: '135.5', startedAt: '2026-09-22T21:45:46.000Z', user: 'james.levac', output: 'Publish succeeded.\n' } }];
+  const environment = {
+    document: { addEventListener: (type, fn) => { handlers[type] = fn; }, createElement: () => ({ addEventListener() {} }) },
+    setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+    async fetch() { return { status: 200, ok: true, json: async () => responses.shift() }; },
+  };
+  const follower = createRunFollower(environment);
+  follower.bindHistory({ base: '/pw', root: environment.document });
+
+  // Click the row's Output button.
+  let prevented = false;
+  await handlers.click({ target: { closest: selector => (selector === '.history-back' ? null : panel.row) }, preventDefault: () => { prevented = true; } });
+  assert.equal(prevented, true, 'the button must not submit or navigate');
+  assert.equal(panel.list.hidden, true, 'the list is replaced, not pushed down');
+  assert.equal(panel.detail.hidden, false);
+  assert.equal(panel.backButton.focused, 1, 'and the keyboard lands on the way back');
+  await new Promise(resolve => setTimeout(resolve, 0));
+  assert.match(panel.into.textContent, /✅ SUCCESS \(135\.5s\)[\s\S]*Publish succeeded/);
+
+  // Click Back.
+  await handlers.click({ target: { closest: selector => (selector === '.history-back' ? panel.backButton : null) }, preventDefault() {} });
+  assert.equal(panel.list.hidden, false, 'Back returns to the list');
+  assert.equal(panel.detail.hidden, true);
+  assert.equal(panel.into.textContent, '', 'and leaves nothing stale behind the next click');
+  assert.equal(panel.row.focused, 1, 'with focus back on the row that was opened');
+});
+
+test('a click outside a history panel is ignored rather than throwing', async () => {
+  const handlers = {};
+  const environment = {
+    document: { addEventListener: (type, fn) => { handlers[type] = fn; } },
+    setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+    async fetch() { throw new Error('must not fetch'); },
+  };
+  createRunFollower(environment).bindHistory({ base: '', root: environment.document });
+  await handlers.click({ target: { closest: () => null }, preventDefault() {} });
+  const orphan = { dataset: { run: 'abc', runProject: 'demo' }, closest: () => null };
+  await handlers.click({ target: { closest: selector => (selector === '.history-back' ? null : orphan) }, preventDefault() {} });
+});
+
+// The verdict must survive the scroll. It used to be the log pane's first line,
+// which a tail-following pane pushes out of view within seconds — so a deploy
+// would finish and the answer was three hundred lines above the fold.
+test('the result is written outside the log pane, where scrolling cannot hide it', async () => {
+  const created = [];
+  const pane = { className: '', textContent: '', scrollTop: 0, clientHeight: 100,
+    get scrollHeight() { return 100 + this.textContent.length; } };
+  const inserted = [];
+  pane.parentNode = { insertBefore: (node, before) => { inserted.push([node, before === pane]); } };
+  const cardNodes = [];
+  const card = {
+    classList: { add() {}, remove() {}, contains: () => false },
+    querySelector: selector => cardNodes.find(node => node.className?.startsWith(selector.slice(1))) || null,
+    appendChild: node => cardNodes.push(node),
+  };
+  const environment = {
+    document: {
+      addEventListener() {},
+      createElement: () => { const el = { className: '', textContent: '', addEventListener() {}, remove() {} }; created.push(el); cardNodes.push(el); return el; },
+    },
+    setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+  };
+  environment.document.hidden = false;
+  const follower = createRunFollower(environment);
+
+  const running = { id: 'abc', status: 'running', startedAt: '2026-09-22T22:07:00.000Z', user: 'james.levac' };
+  follower.paint(pane, running, 'lots of output\n', card);
+  const status = created[0];
+  assert.ok(status, 'a status element is created next to the pane');
+  assert.deepEqual(inserted[0], [status, true], 'and inserted BEFORE the pane, not inside it');
+  assert.match(status.textContent, /⏳ RUNNING/);
+  assert.equal(status.className, 'deploy-status running');
+  assert.equal(pane.textContent, 'lots of output\n', 'the pane holds the script output and nothing else');
+
+  follower.paint(pane, { ...running, status: 'success', duration: '135.5', version: 'V1.26.0922.2207' }, 'lots of output\ndone\n', card);
+  assert.match(status.textContent, /✅ SUCCESS \(135\.5s\)/);
+  assert.match(status.textContent, /V1\.26\.0922\.2207/, 'with the version that was published');
+  assert.equal(status.className, 'deploy-status success');
+  assert.equal(created.length, 1, 'the status element is reused, not stacked');
+
+  follower.paint(pane, { ...running, status: 'failed', duration: '0.8' }, 'nope\n', card);
+  assert.equal(status.className, 'deploy-status failed');
+
+  // A caller with no card (a bare pane) keeps the headline in the pane rather
+  // than losing it.
+  const bare = { className: '', textContent: '' };
+  follower.paint(bare, { ...running, status: 'success', duration: '1.0' }, 'out\n');
+  assert.match(bare.textContent, /✅ SUCCESS[\s\S]*out/);
 });
