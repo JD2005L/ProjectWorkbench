@@ -3578,3 +3578,47 @@ pinned those literal strings. The safety property is unchanged — unresolved me
 report-and-leave-alone, never revoke — but it is now expressed through the shared
 resolver, so that test asserts the property in its new form and the per-case reasons are
 pinned in `test/project-push-credential.test.mjs`.
+
+## GOA — 2026-09-22 — SPEC (not built): deploy credentials per target, set at the instance
+
+`docs/deploy-credentials.md` specs what today's model cannot express: a deploy runs
+as **the person who clicked it**, so `DEPLOY_USER`/`DEPLOY_PASSWORD` are a human's
+own Windows account. Two projects here therefore pin one name —
+`DB_MIGRATION_PRINCIPAL='GOA\james.levac'` (AITDataHub, SponsorPortal) — and refuse
+every other operator before publishing, because the migration binds as the deploying
+user and only that account holds the migrator role. A second operator hit that wall
+on both projects today; the only remedies were a personal `CREATE TABLE` grant on
+production or a repository edit.
+
+The spec keeps the person in the audit trail and takes them out of the authentication
+path: an instance-level credential per target (`dev` and `prod`, never shared),
+overridable per project, with the operator's own credential as the final fallback so
+nothing changes until one is saved.
+
+Four decisions in it worth a reviewer's attention:
+
+* **Absent falls through, unreadable does not.** A credential this server cannot
+  decrypt fails loudly, naming the level it came from — it never degrades to the next
+  level and never to an empty password. That collapse is exactly what made a slot
+  script report "no password supplied" while the Users screen showed the credential as
+  set (fixed for the per-user case in 76f0a21; the resolver must not reintroduce it).
+* **`DEPLOY_USER` stays the EFFECTIVE identity**, so no slot script has to change to
+  benefit; the clicker arrives separately as the new `DEPLOY_OPERATOR`, plus
+  `DEPLOY_IDENTITY_SOURCE` so output and audit can say which level resolved.
+* **Overrides live in `deploy-config.json` (0600), not `projects.json` (0644).** The
+  UI calls it a project setting, but a credential does not belong in a file every
+  account on the box can read.
+* **`reauth` still verifies the HUMAN.** Proof-of-presence and the deploy identity
+  were the same value before only by accident; the prompt copy has to say so, or an
+  operator typing their own password for a `svc-` deploy will wonder what it bought.
+
+Stated plainly in the doc rather than buried: an instance prod credential is a
+privilege grant to everyone who can press Deploy on a project with a prod slot. The
+trade is fewer standing personal grants on production databases, and the mitigations
+(project grants, forced `reauth`, operator in the audit line, narrower per-project
+override) are listed with it.
+
+Open for the operator, not for implementation: service-account names, whether the
+operator fallback is retired once every target has a credential, who may set a project
+override, and whether `reauth` becomes mandatory on prod slots that resolve to the
+instance credential.
