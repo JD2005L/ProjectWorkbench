@@ -3893,3 +3893,51 @@ immediate `setCardState(card,'running')` for a cosmetic reason — to stop the c
 flipping a beat after the click — and did not ask what happens when the follower
 never sees a run. A cosmetic change that can strand the only way out of a state is
 not cosmetic.
+
+## GOA — 2026-09-23 — SPEC (not built): an MCP surface for driving a project session
+
+`docs/agent-mcp.md` specs what an external AI needs to close a loop through PW:
+decide, send a prompt into a named session in a named project, know when that turn
+ended, read what it produced. Six tools, plus project/session discovery.
+
+The useful finding is how much of it is already here, which changes the build from
+"add an MCP component" to "serve the one that exists and give it the missing tool":
+
+* **`app/orchestrator/mcp.js` is a complete, closed MCP adapter that nothing
+  serves** — only `test/orch-mcp.test.mjs` imports it. Its conventions are the
+  ones to follow rather than reinvent: an `ALLOWED_TOOLS` allow-list a test
+  compares against the exported set, forbidden name fragments, no path-taking
+  tool, and `sampling` deliberately unadvertised so the server can never ask its
+  client to run inference.
+* **`newTmuxWindow(project, name, cmd, launcher)`** already creates a named window
+  under a named person, spending that person's Claude/Copilot credentials — the
+  token→user correlation the request needs, already solved for the cockpit's "+".
+* **Turn completion is already solved and must not be re-guessed.** The dashboard
+  reads tmux's `window_bell_flag`; Claude rings it via
+  `preferredNotifChannel=terminal_bell`, and `scripts/pw-agent-done.sh` rings it
+  for Copilot from its `agentStop` hook. A turn record stores the bell generation
+  at injection, so `completed` means "a new bell after THIS prompt".
+
+Three decisions in the spec that are properties rather than preferences:
+
+* **`actsAs` is authority; `createdBy` is provenance.** A `sessions:*` token
+  cannot be minted without `actsAs`, and a token's reach is the INTERSECTION of
+  the token and that person — so offboarding an account revokes its robots in the
+  same instant, with no token edit.
+* **An agent types into its OWN lane.** `app/orchestrator/session.js`'s marker
+  rule, restated: a window belongs to a token only if it carries the marker this
+  code set, never because the name matches. A pane running bash turns an injected
+  "prompt" into a shell command, so unmarked (human) windows are refused unless a
+  separately-granted `sessions:prompt:any` says otherwise.
+* **A human opening the tab must not complete an agent's turn.** The cockpit's
+  unread marker and the agent's turn latch are separate state;
+  `test/completion-latch.test.mjs` already pins when acknowledgement is allowed.
+
+Stated in the doc rather than discovered later: `completed` asserts the agent
+STOPPED, not that it succeeded — a refusal, a crash, a question back to the
+operator and a finished task ring the same bell, so the caller reads the output to
+judge. And the audit line carries who/where and the injected LENGTH, never the
+prompt body, because a prompt carries whatever the sending agent had in context
+and the audit log has more readers than the pane.
+
+Six decisions are open for the operator at the end; nothing is implemented.
