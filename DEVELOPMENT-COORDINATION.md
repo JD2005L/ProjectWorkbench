@@ -3854,3 +3854,42 @@ Focused exact-head verification passed 38 deployment follower/CSS/route tests wi
 zero failures or skips; current main run `35792247244` passed both host and container
 jobs. Those green gates do not exercise the two state transitions above. No code was
 changed, merged or deployed by this review.
+
+## GOA — 2026-09-23 — PRs #76, #77, #78 resolved: the BLOCK was right, and worse than written
+
+#78 merged (it carries #76 and #77 as its first two commits, so all three close with
+it). Verified RED then GREEN rather than on the summary: with `app/` reverted to
+`b73bc55` and only the PR's tests applied, 22 cases fail; restored, 98/98 pass.
+
+Both findings are mine, and the first is more serious than the review states. My
+click handler set `deploy-running` before the POST, and my CSS hides the config
+section AND the Deploy button in that state — so any path that started no run
+(cancelled password prompt, validation refusal, 403/503 refusal, transport
+failure) left a card with **no controls at all**, recoverable only by closing and
+reopening the panel. The review described a stranded state; what shipped was an
+unusable card. The second finding turned a transient poll failure into a false
+verdict: the loop broke, `finishUp()` ran with a run still marked `running`, and
+the operator was handed a reset control and a fresh Deploy while the script was
+still executing on the app server.
+
+The repair's shape is right and worth keeping in mind for anything else that grows
+a poller beside a request:
+
+* **`restore()` vs `finishUp()`** — "no run started" and "run finished" are
+  different transitions. Only the second is a deployment verdict, so only it gets
+  `deploy-finished` and a clear-log control.
+* **`settled` is checked in three places**, including immediately after the
+  acquisition GET returns. A poll that was already in flight when the POST
+  answered must not repaint `RUNNING` over an authoritative terminal result —
+  that is a race no amount of ordering in the happy path removes.
+* **Interruption is its own state, not an outcome.** A lost log transport keeps
+  the slot locked to the active run with an amber status and no Deploy action,
+  rather than claiming the deploy ended; the external follower now returns
+  `{queued, interrupted}` instead of throwing, for the same reason.
+
+What I should have done: the moment I made the card's controls depend on a state
+the follower owned, that state needed every exit path enumerated. I added the
+immediate `setCardState(card,'running')` for a cosmetic reason — to stop the card
+flipping a beat after the click — and did not ask what happens when the follower
+never sees a run. A cosmetic change that can strand the only way out of a state is
+not cosmetic.
