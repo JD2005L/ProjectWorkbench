@@ -9,6 +9,7 @@ class Element {
   this.classList = { add: (...names) => names.forEach(name => classes.add(name)), remove: name => classes.delete(name), contains: name => classes.has(name) };
  }
  addEventListener(type, fn) { (this.events[type] ||= []).push(fn); }
+ removeEventListener(type, fn) { this.events[type] = (this.events[type] || []).filter(handler => handler !== fn); }
  async emit(type, event = {}) { for (const fn of this.events[type] || []) await fn({ target: this, ...event }); }
  async click() { if (this.disabled) return; if (this.onclick) await this.onclick(); await this.emit('click'); }
  focus() { this.ownerDocument.activeElement = this; }
@@ -91,12 +92,13 @@ export async function loadDeployBrowser(surface, initialManifest, options = {}) 
     : html.includes('<legacy-card>') ? fakeCard(document, null, options.legacyOption) : null;
   },
  });
- const window = {};
+ const window = new Element(document);
  const responses = [...(options.responses || [{ ok: true, status: 'success', runId: 'run-default', version: '2.3.5', duration: '1.0', user: 'operator', output: 'published' }])];
  const runResponses = [...(options.runResponses || [])];
  const sandbox = {
-  document, window, console,
+  document, window, console, AbortController,
   setTimeout: options.immediateTimers ? (fn => { queueMicrotask(fn); return 0; }) : (() => 0),
+  clearTimeout: () => {},
   confirm: message => { confirms.push(message); return options.confirm !== false; },
   prompt: message => { prompts.push(message); return Object.hasOwn(options, 'password') ? options.password : 'good-password'; },
   alert: message => { throw new Error(message); },
@@ -107,6 +109,9 @@ export async function loadDeployBrowser(surface, initialManifest, options = {}) 
    if (request.method === 'GET' && /\/api\/deploy\/demo\/(?:dev|prod)\/run(?:\?|$)/.test(url)) {
     const response = runResponses.shift() || { ok: true, run: null };
     return { status: response.httpStatus || 200, ok: !response.httpStatus || response.httpStatus < 400, json: async () => response };
+   }
+   if (request.method === 'GET' && /\/api\/deploy-service\/jobs\//.test(url) && options.externalPollError) {
+    throw new Error(options.externalPollError);
    }
    if (request.method === 'GET') {
     const manifest = options.loadManifest ? await options.loadManifest() : initialManifest;

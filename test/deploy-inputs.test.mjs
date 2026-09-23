@@ -206,6 +206,18 @@ for (const surface of surfaces) {
    assert.equal(browser.card.classList.contains('deploy-finished'), false);
    assert.match(browser.card.output.textContent, /network unavailable/);
   });
+
+  await t.test('external polling interruption keeps the active slot locked', async () => {
+   const job = { id: 'external-1', state: 'running', phase: 'deploying', revision: 'a'.repeat(40) };
+   const browser = await loadDeployBrowser(surface, slot, { immediateTimers: true,
+    responses: [{ ok: true, backend: 'external', queued: true, job }],
+    externalPollError: 'deployment service offline' });
+   await selected(browser);
+   assert.equal(browser.card.classList.contains('deploy-running'), true, 'a possibly active host job keeps the slot locked');
+   assert.equal(browser.card.classList.contains('deploy-finished'), false);
+   assert.ok(browser.card.querySelector('.deploy-service-job-link'), 'the durable host-job link remains available');
+   assert.match(browser.card.output.textContent, /may still be running/i);
+  });
  });
 }
 

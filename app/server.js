@@ -3056,7 +3056,7 @@ const deployModalScript = `<script>(function(){
      return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
-    if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
+    if(j.queued){output.textContent=j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j);
     else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
@@ -3187,7 +3187,7 @@ const deployScript = `<script>
      return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
-    if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
+    if(j.queued){output.textContent=j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j);
     else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
