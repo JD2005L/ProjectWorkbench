@@ -179,9 +179,67 @@ curl -fsS -b jar.txt -X POST "$HOST/api/term/AmrikPublic/windows" \
   -d '{"name":"agent-side","cmd":"claude"}'
 ```
 
-**There is no HTTP endpoint to send keystrokes into an existing window**
-in Phase 1. If you need that pattern, SSH in and use `tmux send-keys`, or
-spawn a new window per turn.
+### 4. The agent session API, or its MCP form (no shell access, no cookie)
+
+If you are an AI and you want to drive a session rather than watch one, this is
+the supported route — a bearer token, no SSH, no dashboard login. Ask an operator
+for a token with `sessions:read`, `sessions:prompt` and `sessions:create`; it will
+be bound to the account it **acts as**, and everything it does is attributed to
+that person. Its reach is the intersection of the token and that account, so it
+can never see more than the person could.
+
+```bash
+TOKEN=pwat_…                 # shown once, when an admin mints it
+API=$HOST/api/agent
+
+curl -fsS -H "Authorization: Bearer $TOKEN" "$API/projects"
+curl -fsS -H "Authorization: Bearer $TOKEN" "$API/AmrikPublic/sessions"
+
+# Send a prompt. The session is created if missing — and `cli` is then required,
+# because starting Claude and starting Copilot spend different credentials.
+TURN=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"prompt":"investigate the failing test in src/foo.test.ts","cli":"claude"}' \
+  "$API/AmrikPublic/sessions/agent-side/prompt" | jq -r .turn_id)
+
+# Wait for that turn to end (bounded; `running` means ask again, not failure)
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "$API/AmrikPublic/sessions/agent-side/turns/$TURN?wait_ms=120000"
+
+# Read what it produced
+curl -fsS -H "Authorization: Bearer $TOKEN" \
+  "$API/AmrikPublic/sessions/agent-side/output?since_turn=$TURN"
+```
+
+The same six operations are an **MCP server**, if your client speaks it:
+
+```json
+{ "mcpServers": { "project-workbench": {
+  "type": "http",
+  "url": "https://<workbench-host>/api/mcp",
+  "headers": { "Authorization": "Bearer pwat_…" }
+} } }
+```
+
+Tools: `pw_list_projects`, `pw_list_sessions`, `pw_send_prompt`, `pw_get_turn`,
+`pw_wait_for_turn`, `pw_read_session`. No tool takes a filesystem path, runs a
+command or reads a file, and the server does not advertise `sampling` — it will
+never ask your client to run inference on its behalf.
+
+Three things to know before you use it:
+
+- **You type into your OWN lane.** A session belongs to your token only if your
+  token created it. Somebody's human tab is refused, because a pane running a
+  shell would execute your "prompt" as a command. Create your own named session
+  and work there; `sessions:prompt:any` exists for the other case and is granted
+  separately.
+- **`completed` means the agent STOPPED, not that it succeeded.** A refusal, a
+  crash, a question asked back to the operator and a finished task all end a turn
+  the same way. Read the output and judge.
+- **A prompt is pasted whole**, up to 256 KB. For more than that, upload the
+  content to the project's `_inbox/` and name the path in a short prompt instead.
+
+`tmux send-keys` (option 1 above) still works if you have shell access, and
+remains the only way to reach a window your token does not own.
 
 To get an agent user with the right role:
 
@@ -273,6 +331,9 @@ sudo tail -F /var/log/project-workbench/audit.log
 | List all PW projects                       | `tmux list-sessions -F '#{session_name}'`                     |
 | List windows in a project                  | `tmux list-windows -t pw_<Name> -F '#{window_index} ...'`     |
 | Inject text into a window                  | `tmux send-keys -t 'pw_<Name>:<idx>' 'text' Enter`            |
+| Prompt a session over HTTPS (no shell)     | `POST /api/agent/<Name>/sessions/<session>/prompt`            |
+| Wait for that turn, then read it           | `GET  …/turns/<id>?wait_ms=…` then `…/output?since_turn=<id>` |
+| Add the workbench as an MCP server         | `POST /api/mcp` with `Authorization: Bearer pwat_…`           |
 | Discover live Claude sessions              | `claude agents --json`                                        |
 | One-shot reply, don't touch user's window  | `claude --resume <id> --fork-session --print 'prompt'`        |
 | Spawn a new side window via HTTP           | `POST /api/term/<Name>/windows {name, cmd}`                   |

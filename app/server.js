@@ -18,6 +18,7 @@ import { readStoredDeployPassword, makeDeployIdentity } from './deploy-credentia
 import { createDeployRuns } from './deploy-runs.js';
 import { createAgentSessions, AgentSessionError, MARKER_TOKEN, MARKER_USER } from './agent-sessions.js';
 import { createAgentTurns } from './agent-turns.js';
+import { createAgentMcp } from './agent-mcp.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { deployFollowClientSrc } from './deploy-follow.js';
@@ -1367,6 +1368,8 @@ async function withApiTokensLock(mutate){
 // interesting while somebody is waiting on it, and a dashboard restart takes the
 // panes' agents with it anyway.
 const agentTurns = createAgentTurns({});
+// The scopes that make a token a session credential at all.
+const SESSION_SCOPES = [SCOPES.SESSIONS_READ, SCOPES.SESSIONS_PROMPT, SCOPES.SESSIONS_CREATE, SCOPES.SESSIONS_PROMPT_ANY];
 const agentSessions = createAgentSessions({
  turns: agentTurns,
  authorize: async (projectName, token) => {
@@ -1428,6 +1431,10 @@ const agentSessions = createAgentSessions({
   return all.slice(Math.max(0, all.length - lines)).join('\n');
  },
  audit: (event, detail) => audit(event, detail, null),
+});
+
+const agentMcp = createAgentMcp({
+ sessions: agentSessions, tokenHasScope, serverVersion: RELEASE_VERSION,
 });
 
 // Same shape as requireScope, and deliberately a separate gate: a session call
@@ -4053,6 +4060,46 @@ app.post(BASE + '/manage/add', requireAdmin, addProjectHandler);
 // dashboard route, which is the separation app/api-tokens.js opens with. The MCP
 // façade in the next phase calls the same engine rather than these routes, so
 // neither surface can drift into being the authoritative one.
+// The MCP endpoint an external AI adds as an HTTP server (docs/agent-mcp.md).
+//
+// Deliberately NOT gated on one scope: the tools need different ones, and the
+// façade checks each call against the token it was given. The gate here is only
+// "a session credential at all" — a projects:register token has no business
+// reaching a tool surface, and saying so once beats six identical refusals.
+app.post(BASE + '/api/mcp', async (req, res) => {
+ const presented = presentedToken(req);
+ if(!presented) return res.status(401).json({ ok:false, error:'Bearer service token required' });
+ let token = null;
+ try { token = resolveToken(await loadTokens(apiTokensPath), presented); }
+ catch(e){ return res.status(500).json({ ok:false, error:'token store unreadable: '+(e.message||e) }); }
+ if(!token){
+  await audit('api_token_denied', { reason:'unknown-or-revoked', scope:'mcp' }, req);
+  return res.status(401).json({ ok:false, error:'Invalid or revoked token' });
+ }
+ if(!SESSION_SCOPES.some(scope => tokenHasScope(token, scope))){
+  await audit('api_token_denied', { reason:'missing-scope', tokenId:token.id, label:token.label, scope:'sessions:*' }, req);
+  return res.status(403).json({ ok:false, error:'This token carries no session scopes, so it cannot use the MCP tools' });
+ }
+ withApiTokensLock((tokens) => {
+  const t = tokens.find(x => x.id === token.id);
+  if(!t) return false;
+  t.lastUsedAt = new Date().toISOString();
+  return true;
+ }).catch(()=>{});
+ try {
+  // A batch is a JSON array by spec; a notification inside one produces no entry.
+  const body = req.body;
+  if(Array.isArray(body)){
+   const replies = (await Promise.all(body.map(m => agentMcp.handle(m, token)))).filter(Boolean);
+   return replies.length ? res.json(replies) : res.status(204).end();
+  }
+  const reply = await agentMcp.handle(body, token);
+  return reply ? res.json(reply) : res.status(204).end();
+ } catch(e){
+  return res.status(500).json({ jsonrpc:'2.0', id:null, error:{ code:-32603, message:e?.message || String(e) } });
+ }
+});
+
 app.get(BASE + '/api/agent/projects', ...agentRoute(SCOPES.SESSIONS_READ,
  (token) => agentSessions.projects(token)));
 

@@ -1,9 +1,10 @@
 # An MCP surface for driving a project session from an external AI
 
-Status: **phases 1–3 built.** Token model, REST engine and the turn latch are in:
-an external caller can list, prompt, wait for the turn to end and read what it
-produced. Phase 4 (the MCP façade over the same engine) is not. The operator's six
-decisions are settled — see the end.
+Status: **built** (2026-09-23). All four phases are in: the token model, the REST
+engine, the turn latch, and the MCP façade at `POST {BASE}/api/mcp`. An external
+AI can add the workbench as an HTTP MCP server and drive a project session
+end-to-end. `AGENTS.md` — the file served unauthenticated to external agents —
+documents the surface for them.
 
 ## What already exists, so this builds rather than duplicates
 
@@ -280,8 +281,12 @@ said it and where.
    `completed_by` says which signal ended it — `bell` (unambiguous) or `quiet`
    (the cadence fallback) — because those are different levels of confidence and a
    caller may care.
-4. **MCP façade** over that engine at `POST /api/mcp`, plus the config snippet
-   above in the docs.
+4. ~~**MCP façade**~~ — built: `app/agent-mcp.js` at `POST {BASE}/api/mcp`.
+   Six tools, a closed allow-list a test compares against the exported
+   definitions, closed input schemas, and `sampling` unadvertised. An engine
+   refusal comes back as a tool RESULT with `isError` rather than a JSON-RPC
+   error, so the calling model can read "that is not your lane" and adapt instead
+   of seeing an opaque transport fault.
 
 ## Decisions — settled 2026-09-23
 
