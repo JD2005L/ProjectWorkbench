@@ -47,6 +47,8 @@ export function createRunFollower(environment = globalThis) {
     if (!document?.createElement) return null;
     status = document.createElement('div');
     status.className = 'deploy-status';
+    status.setAttribute?.('role', 'status');
+    status.setAttribute?.('aria-live', 'polite');
     const parent = output?.parentNode;
     if (parent?.insertBefore) parent.insertBefore(status, output);
     else card.appendChild?.(status);
@@ -103,6 +105,52 @@ export function createRunFollower(environment = globalThis) {
     button.textContent = label;
   }
 
+  // A request that never started a run (cancelled password prompt, validation
+  // refusal, transport failure) must hand the form back immediately. It is not a
+  // deployment verdict, so it gets neither deploy-finished nor a reset button.
+  function restore(card, output, message = '') {
+    setCardState(card, 'idle');
+    card?.querySelector?.('.deploy-reset')?.remove?.();
+    const status = card?.querySelector?.('.deploy-status');
+    if (status) { status.textContent = ''; status.className = 'deploy-status'; }
+    if (output) {
+      output.textContent = message;
+      output.className = message ? 'deploy-output show' : 'deploy-output';
+    }
+  }
+
+  // The POST is authoritative when it returns a local run result before the
+  // follower managed to observe that run. Normalize that result into the same
+  // finished log shape used by reattachment and live following.
+  function finishResult(card, output, result) {
+    const run = {
+      id: result.runId || result.id || '',
+      status: result.ok === true && result.status !== 'failed' ? 'success' : 'failed',
+      startedAt: result.startedAt,
+      duration: result.duration,
+      version: result.version,
+      user: result.user,
+      deployUser: result.deployUser,
+      identitySource: result.identitySource,
+    };
+    const text = result.output || result.error || '';
+    paint(output, run, text, card);
+    finishUp(card, output, run, text);
+    return run;
+  }
+
+  // Losing the log transport is not the same thing as the server-side script
+  // ending. Keep the slot locked to the active run, expose the follower problem,
+  // and let a reopen/reattach retry without offering a conflicting deployment.
+  function interrupt(card, output, run) {
+    setCardState(card, 'running');
+    const status = ensureStatus(card, output);
+    if (status) {
+      status.textContent = `${headline(run).replace('\n', ' · ')} · Live log interrupted; reopen this panel to retry following.`;
+      status.className = 'deploy-status interrupted';
+    }
+  }
+
   // Follow one slot's newest run to completion, painting as it goes. Returns the
   // terminal run (or null when the slot has never been deployed from this
   // workbench), and is safe to call on every panel open: a finished run simply
@@ -122,6 +170,10 @@ export function createRunFollower(environment = globalThis) {
       const first = await fetch(url(''), { cache: 'no-store' });
       if (first.status === 401) return null;
       const value = await first.json().catch(() => null);
+      // The request may have completed while this GET was in flight. Its caller
+      // now owns the authoritative outcome; never repaint a stale running sample
+      // over cancellation, refusal or the terminal POST response.
+      if (requireRunning && settled) return null;
       if (value?.ok && value.run && (!requireRunning || value.run.status === 'running')) { initial = value; break; }
       if (!requireRunning || settled || attempt > 40) return null;
       await new Promise(resolve => setTimeout(resolve, 250));
@@ -137,11 +189,17 @@ export function createRunFollower(environment = globalThis) {
       // A hidden tab should not poll: a deploy takes minutes and the browser is
       // free to throttle timers anyway, so the visible reopen does the catch-up.
       await new Promise(resolve => { const timer = setTimeout(resolve, intervalMs); void timer; });
+      // A just-started LOCAL request answers only after its script has ended (or
+      // before any run starts). Once that authoritative POST settles, its caller
+      // owns the final transition. Do not let a late poll race that result and
+      // put a finished/cancelled card back into running mode.
+      if (requireRunning && settled) return run;
       if (isHidden?.()) continue;
       let next;
       try { next = await (await fetch(url(`?after=${offset}`), { cache: 'no-store' })).json(); }
       catch { continue; }                      // a dropped poll is not a failed deploy
-      if (!next || !next.ok || !next.run) break;
+      if (requireRunning && settled) return run; // the poll itself may have outlived the POST
+      if (!next || !next.ok || !next.run) { interrupt(card, output, run); return run; }
       run = next.run;
       if (next.behind) text = '';
       text += next.chunk || '';
@@ -214,7 +272,7 @@ export function createRunFollower(environment = globalThis) {
     });
   }
 
-  return { follow, showArchived, bindHistory, headline, paint, setCardState, keepTail };
+  return { follow, showArchived, bindHistory, headline, paint, setCardState, keepTail, restore, finishResult };
 }
 
 export const deployFollowClientSrc = `const pwRunFollower = (${createRunFollower.toString()})();`;

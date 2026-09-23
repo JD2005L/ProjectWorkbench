@@ -30,7 +30,8 @@ for (const surface of surfaces) {
   assert.equal(browser.confirms.length, 1);
   assert.match(browser.confirms[0], /Deploy MCP server/);
   assert.equal(browser.prompts.length, 0);
-  assert.match(browser.card.output.textContent, /SUCCESS/);
+  assert.match(browser.card.querySelector('.deploy-status').textContent, /SUCCESS/);
+  assert.match(browser.card.output.textContent, /deployed-ok/);
   assert.equal(browser.card.button.disabled, false);
   assert.deepEqual(server.history[0].inputs, {});
   assert.equal(server.history[0].target, 'prod');
@@ -90,7 +91,8 @@ for (const surface of surfaces) {
   assert.equal(browser.prompts.length, 0);
   assert.equal(browser.confirms.length, 1);
   assert.match(browser.confirms[0], /identity=alpha, bump=minor.*2\.3\.4 -> 2\.4\.0/);
-  assert.match(browser.card.output.textContent, /SUCCESS/);
+  assert.match(browser.card.querySelector('.deploy-status').textContent, /SUCCESS/);
+  assert.match(browser.card.output.textContent, /published selected identity/);
   assert.equal(browser.card.current.textContent, '2.4.0');
   assert.equal(browser.card.target.textContent, '2.5.0', 'anticipation is refreshed from newly published metadata');
   assert.equal(browser.card.button.disabled, false);
@@ -141,6 +143,70 @@ for (const surface of surfaces) {
   assert.deepEqual(posts(legacy)[0].body, { option: 'minor' });
   assert.equal(legacy.card.button.disabled, false);
  });
+
+ test(`${surface}: every request outcome leaves a truthful, usable deployment card`, async t => {
+  const { root } = manifestWorkspace(t);
+  const slot = await resolveDeployManifest(root, 'dev');
+  const selected = async browser => {
+   await browser.choose('identity', 'alpha');
+   await browser.choose('bump', 'patch');
+   await browser.click();
+  };
+
+  await t.test('immediate terminal success becomes a finished log view', async () => {
+   const browser = await loadDeployBrowser(surface, slot, {
+    responses: [{ ok: true, status: 'success', runId: 'fast-1', duration: '0.0', version: '2.3.5', user: 'operator', output: 'done' }],
+   });
+   await selected(browser);
+   assert.equal(browser.card.classList.contains('deploy-running'), false);
+   assert.equal(browser.card.classList.contains('deploy-finished'), true);
+   assert.ok(browser.card.querySelector('.deploy-reset'), 'the operator can deliberately return to the form');
+  });
+
+  await t.test('password cancellation restores the form without claiming a deployment result', async () => {
+   const browser = await loadDeployBrowser(surface, slot, {
+    password: null,
+    responses: [{ ok: false, needPassword: true, error: 'Enter your password.' }],
+   });
+   await selected(browser);
+   assert.equal(browser.card.classList.contains('deploy-running'), false);
+   assert.equal(browser.card.classList.contains('deploy-finished'), false);
+   assert.equal(browser.card.button.disabled, false);
+   assert.match(browser.card.output.textContent, /cancelled/i);
+  });
+
+  await t.test('password retry starts a second follower and terminalizes its result', async () => {
+   const browser = await loadDeployBrowser(surface, slot, {
+    responses: [
+     { ok: false, needPassword: true, error: 'Saved password is stale.' },
+     { ok: true, status: 'success', runId: 'retry-1', duration: '1.0', version: '2.3.5', user: 'operator', output: 'published' },
+    ],
+   });
+   await selected(browser);
+   const runGets = browser.requests.filter(request => request.method === 'GET' && /\/run(?:\?|$)/.test(request.url));
+   assert.equal(runGets.length, 2, 'each POST attempt gets its own chance to adopt the run it starts');
+   assert.equal(browser.card.classList.contains('deploy-running'), false);
+   assert.equal(browser.card.classList.contains('deploy-finished'), true);
+  });
+
+  await t.test('validation refusal restores the form', async () => {
+   const browser = await loadDeployBrowser(surface, slot, {
+    responses: [{ ok: false, error: 'Choices changed; reopen the deployment panel.', staleManifest: true }],
+   });
+   await selected(browser);
+   assert.equal(browser.card.classList.contains('deploy-running'), false);
+   assert.equal(browser.card.classList.contains('deploy-finished'), false);
+   assert.match(browser.card.output.textContent, /Choices changed/);
+  });
+
+  await t.test('request failure restores the form', async () => {
+   const browser = await loadDeployBrowser(surface, slot, { responses: [new Error('network unavailable')] });
+   await selected(browser);
+   assert.equal(browser.card.classList.contains('deploy-running'), false);
+   assert.equal(browser.card.classList.contains('deploy-finished'), false);
+   assert.match(browser.card.output.textContent, /network unavailable/);
+  });
+ });
 }
 
 test('modal: reopening discovers identities, resets explicit selections, and restores keyboard focus on Escape', async t => {
@@ -185,8 +251,10 @@ for (const surface of surfaces) {
     error: 'DEPLOY BLOCKED - only the approved principal may migrate this database.' }],
   });
   await browser.click();
-  assert.match(browser.card.output.textContent, /FAILED \(0\.8s\)/);
-  assert.match(browser.card.output.textContent, /kevin\.charlebois/, 'the failure text must name the run it belongs to');
+  const status = browser.card.querySelector('.deploy-status');
+  assert.match(status.textContent, /FAILED \(0\.8s\)/);
+  assert.match(status.textContent, /kevin\.charlebois/, 'the fixed verdict must name the run it belongs to');
+  assert.match(browser.card.output.textContent, /DEPLOY BLOCKED/, 'the pane remains the deployment output, not a duplicate verdict');
   assert.match(browser.card.last.textContent, /kevin\.charlebois/, 'the Last line must follow a failed run too');
   assert.match(browser.card.last.textContent, /FAILED/, 'and must not keep advertising an earlier success');
  });

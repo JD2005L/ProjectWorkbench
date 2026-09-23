@@ -14,7 +14,7 @@ class Element {
  focus() { this.ownerDocument.activeElement = this; }
  reportValidity() { this.reported = true; return !!this.value; }
  getClientRects() { return [{}]; }
- appendChild(child) { this.children.push(child); }
+ appendChild(child) { child.parentNode = this; this.children.push(child); }
  replaceChildren() { this.children = []; }
  remove() { this.removed = true; }
  querySelector() { return null; }
@@ -52,7 +52,10 @@ function fakeCard(document, manifest, legacyOption) {
   '.target-version': card.target, '.manifest-notice': card.notice, '.deploy-script': card.script,
   '.last-deploy-info': card.last, '.version-line': line,
  };
- card.querySelector = selector => elements[selector] || (selector === '.deploy-option' && !manifest ? card.option : null);
+ card.querySelector = selector => elements[selector]
+  || (selector === '.deploy-option' && !manifest ? card.option : null)
+  || card.children.find(child => !child.removed && child.className?.split(/\s+/).includes(selector.slice(1)))
+  || null;
  return card;
 }
 
@@ -89,24 +92,30 @@ export async function loadDeployBrowser(surface, initialManifest, options = {}) 
   },
  });
  const window = {};
- const responses = [...(options.responses || [{ ok: true, version: '2.3.5', duration: '1.0', user: 'operator', output: 'published' }])];
+ const responses = [...(options.responses || [{ ok: true, status: 'success', runId: 'run-default', version: '2.3.5', duration: '1.0', user: 'operator', output: 'published' }])];
+ const runResponses = [...(options.runResponses || [])];
  const sandbox = {
   document, window, console,
-  setTimeout: () => 0,
+  setTimeout: options.immediateTimers ? (fn => { queueMicrotask(fn); return 0; }) : (() => 0),
   confirm: message => { confirms.push(message); return options.confirm !== false; },
-  prompt: message => { prompts.push(message); return options.password ?? 'good-password'; },
+  prompt: message => { prompts.push(message); return Object.hasOwn(options, 'password') ? options.password : 'good-password'; },
   alert: message => { throw new Error(message); },
   fetch: async (url, init = {}) => {
    const request = { url, method: init.method || 'GET', body: init.body ? JSON.parse(init.body) : undefined, cache: init.cache };
    requests.push(request);
-   if (options.respond) return { json: async () => options.respond(request) };
+   if (options.respond) return { status: 200, ok: true, json: async () => options.respond(request) };
+   if (request.method === 'GET' && /\/api\/deploy\/demo\/(?:dev|prod)\/run(?:\?|$)/.test(url)) {
+    const response = runResponses.shift() || { ok: true, run: null };
+    return { status: response.httpStatus || 200, ok: !response.httpStatus || response.httpStatus < 400, json: async () => response };
+   }
    if (request.method === 'GET') {
     const manifest = options.loadManifest ? await options.loadManifest() : initialManifest;
-    return { json: async () => ({ ok: true, html: manifest ? `<div data-manifest="${escapeAttribute(JSON.stringify(manifest))}"></div>` : '<legacy-card>' }) };
+    return { status: 200, ok: true, json: async () => ({ ok: true, html: manifest ? `<div data-manifest="${escapeAttribute(JSON.stringify(manifest))}"></div>` : '<legacy-card>' }) };
    }
    const response = responses.shift();
    if (!response) throw new Error('Unexpected extra deployment request');
-   return { json: async () => response };
+   if (response instanceof Error) throw response;
+   return { status: response.httpStatus || 200, ok: !response.httpStatus || response.httpStatus < 400, json: async () => response };
   },
  };
  vm.createContext(sandbox);

@@ -58,6 +58,7 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .deploy-status:empty{display:none}
 :is(.deploy-page,#deployBackdrop) .deploy-status{margin-top:.5rem;padding:.4rem .6rem;border-radius:4px;font-size:.78rem;font-weight:600;border-left:3px solid #475569;background:#0b1220;color:#e2e8f0;white-space:pre-wrap}
 :is(.deploy-page,#deployBackdrop) .deploy-status.running{border-left-color:#38bdf8}
+:is(.deploy-page,#deployBackdrop) .deploy-status.interrupted{border-left-color:#f59e0b;color:#fde68a}
 :is(.deploy-page,#deployBackdrop) .deploy-status.success{border-left-color:#22c55e;color:#bbf7d0}
 :is(.deploy-page,#deployBackdrop) .deploy-status.failed{border-left-color:#ef4444;color:#fca5a5}
 :is(.deploy-page,#deployBackdrop) .deploy-reset{margin-top:.5rem}

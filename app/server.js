@@ -3035,17 +3035,20 @@ const deployModalScript = `<script>(function(){
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
     return r.json();
    }
+   function requestAndFollow(pw,save){
+    const pending=runDeploy(pw,save);
+    pwRunFollower.follow({base:'${BASE}',project,target,output,card,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
+    return pending;
+   }
    try{
     /* The POST does not answer until the script is done, so follow the run it
        starts: that is where "[2/5] Stopping IIS..." comes from while you wait. */
-    const pending=runDeploy('',false);
-    pwRunFollower.follow({base:'${BASE}',project,target,output,card,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
-    let j=await pending;
+    let j=await requestAndFollow('',false);
     if(!j.ok&&j.needPassword){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
-     if(!pw){output.textContent='Deployment cancelled.';return}
+     if(!pw){pwRunFollower.restore(card,output,'Deployment cancelled.');return}
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
-     output.textContent='Running deployment script…';j=await runDeploy(pw,save);
+     output.textContent='Running deployment script…';j=await requestAndFollow(pw,save);
     }
     if(j.running&&j.run){
      output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
@@ -3055,16 +3058,17 @@ const deployModalScript = `<script>(function(){
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
+    if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j);
+    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
     /* Name whose run this is. The "Last:" line is rendered when the panel opens and
        used to be rewritten only on success, so a failure left the previous line —
        often another operator's successful deploy — sitting directly above this
        failure text, and was read here as that person's deploy having failed. */
     const who=j.user||'you';
-    output.textContent=(j.ok?'✅ SUCCESS':'❌ FAILED')+' ('+(j.duration||'?')+'s) — this run, by '+who+'\\nVersion: '+(j.version||'unknown')+'\\n\\n'+(j.output||j.error||'');
     const vEl=card.querySelector('.current-version');if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
     const nb=card.querySelector('.src-newer-badge');if(nb&&typeof j.sourceNewer==='boolean')nb.hidden=!j.sourceNewer;
     const ldEl=card.querySelector('.last-deploy-info');if(ldEl)ldEl.textContent='Just now by '+who+(j.ok?'':' — FAILED')+(summary?' | '+summary:'');
-   }catch(e){output.textContent=e.message||String(e)}
+   }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}
    finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
   })});
   container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{
@@ -3159,20 +3163,23 @@ const deployScript = `<script>
     const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/'+target,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(bd)});
     return r.json();
    }
+   function requestAndFollow(pw,save){
+    const pending=runDeploy(pw,save);
+    pwRunFollower.follow({base:'${BASE}',project,target,output,card,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
+    return pending;
+   }
    try{
     // Request first, exactly as the cockpit modal does: the server verifies the
     // saved password itself and answers needPassword only when there is none or
     // it no longer verifies. Prompting up-front here is what made a stored
     // password useless on this page.
-    const pending=runDeploy('',false);
-    pwRunFollower.follow({base:'${BASE}',project,target,output,card,requireRunning:true,until:pending,isHidden:()=>document.hidden}).catch(()=>{});
-    let j=await pending;
+    let j=await requestAndFollow('',false);
     if(!j.ok&&j.needPassword){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
-     if(!pw){output.textContent='Deployment cancelled.';return}
+     if(!pw){pwRunFollower.restore(card,output,'Deployment cancelled.');return}
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
      output.textContent='Running deployment script…';
-     j=await runDeploy(pw,save);
+     j=await requestAndFollow(pw,save);
     }
     if(j.running&&j.run){
      output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
@@ -3182,17 +3189,17 @@ const deployScript = `<script>
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent='The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
+    if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j);
+    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
     // Same reason as the cockpit modal: name whose run this is, on failure too.
     // The failure branch returned early and left the "Last:" line from page load
     // — often another operator's success — immediately above this text.
     const who=j.user||'you';
     if(!j.ok){
-     output.textContent='❌ FAILED ('+(j.duration||'?')+'s) — this run, by '+who+'\\n'+(j.error||'deploy failed')+(j.output?'\\n\\n'+j.output:'');
      const fEl=card.querySelector('.last-deploy-info');
      if(fEl)fEl.textContent='Just now by '+who+' — FAILED'+(summary?' | '+summary:'');
      return;
     }
-    output.textContent='✅ SUCCESS ('+j.duration+'s) — this run, by '+who+'\\nVersion: '+(j.version||'unknown')+'\\n\\n'+j.output;
     const vEl=card.querySelector('.current-version');
     if(vEl&&j.version&&!selected.inputs)vEl.textContent=j.version;
     // This page keeps its badge in .version-line via markSrcNewer, so reuse that
@@ -3201,7 +3208,7 @@ const deployScript = `<script>
     markSrcNewer(card, j.version||'');
     const ldEl=card.querySelector('.last-deploy-info');
     if(ldEl)ldEl.textContent='Just now by '+who+(summary?' | '+summary:'');
-   }catch(e){output.textContent='❌ FAILED\\n'+e.message}finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
+   }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
   };
  });
  document.querySelectorAll('.toggle-log').forEach(btn=>{
