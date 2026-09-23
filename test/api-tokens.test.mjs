@@ -14,6 +14,7 @@ import path from 'node:path';
 import {
   SCOPES, mintToken, loadTokens, saveTokens, safeTokenShape,
   resolveToken, presentedToken, tokenHasScope, isKnownScope, digestToken,
+  tokenAuthority,
 } from '../app/api-tokens.js';
 
 const SCOPE = SCOPES.PROJECTS_REGISTER;
@@ -33,12 +34,69 @@ test('minting refuses an unknown scope and refuses no scopes at all', () => {
   assert.throws(() => mintToken({ label: 'x', scopes: [] }), /no scopes/i);
 });
 
-test('there is deliberately no admin scope', () => {
+test('there is deliberately no admin scope, and every scope is narrow', () => {
   // A credential that lives on a laptop must not be able to reach the dashboard's 29 admin
-  // routes. If someone adds one later, this test should be the thing that makes them argue for it.
-  assert.deepEqual(Object.values(SCOPES), [SCOPE]);
+  // routes. The list is pinned so adding a scope stays a deliberate, reviewable edit — the
+  // session scopes below were added for docs/agent-mcp.md and are narrow on purpose: reading a
+  // pane, typing into one, creating a window and typing into somebody ELSE's window are four
+  // separate grants rather than one "sessions" power.
+  assert.deepEqual(Object.values(SCOPES), [
+    'projects:register',
+    'sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any',
+  ]);
   assert.equal(isKnownScope('admin'), false);
   assert.equal(isKnownScope('*'), false);
+  assert.equal(isKnownScope('sessions'), false, 'a scope must name a verb, not a whole subsystem');
+  for (const scope of Object.values(SCOPES)) {
+    assert.match(scope, /^[a-z]+:[a-z:]+$/, `${scope} must be resource:verb`);
+    assert.doesNotMatch(scope, /(^|:)(admin|all|write|\*)$/, `${scope} is too broad to be a token scope`);
+  }
+});
+
+test('a session scope cannot be minted without the account it acts as', () => {
+  // The window's launcher, the CLI credentials it spends and the audit line all come from
+  // actsAs. There is no sensible default, and guessing one would fabricate an identity.
+  for (const scope of ['sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any']) {
+    assert.throws(() => mintToken({ label: 'bot', scopes: [scope] }), /must name the user it acts as/);
+  }
+  // projects:register acts on nobody's behalf, so it still needs nothing.
+  assert.ok(mintToken({ label: 'registrar', scopes: [SCOPE] }).record.id);
+
+  const bot = mintToken({ label: 'bot', scopes: ['sessions:prompt'], actsAs: 'kevin.charlebois',
+    createdBy: 'james.levac', projects: ['AITDataHub'] }).record;
+  assert.equal(bot.actsAs, 'kevin.charlebois', 'authority');
+  assert.equal(bot.createdBy, 'james.levac', 'provenance, kept separate');
+  assert.deepEqual(bot.projects, ['AITDataHub']);
+  assert.equal(safeTokenShape(bot).actsAs, 'kevin.charlebois', 'the dashboard shows who it acts as');
+  assert.equal(safeTokenShape(bot).digest, undefined, 'and never the digest');
+
+  assert.throws(() => mintToken({ label: 'bad', scopes: ['sessions:read'], actsAs: 'a b' }), /invalid acting user/);
+  assert.throws(() => mintToken({ label: 'bad', scopes: ['sessions:read'], actsAs: 'kev', projects: [] }),
+    /at least one project/);
+});
+
+test('authority is the INTERSECTION of the token and the person it acts as', () => {
+  const bot = mintToken({ label: 'bot', scopes: ['sessions:prompt'], actsAs: 'kev',
+    projects: ['AITDataHub', 'SponsorPortal'] }).record;
+  const kev = { username: 'kev', projects: ['AITDataHub'] };
+  const hasProjectAccess = (user, project) => user.projects === '*' || user.projects.includes(project);
+
+  const live = tokenAuthority(bot, { users: [kev], hasProjectAccess });
+  assert.equal(live.ok, true);
+  assert.equal(live.canReach('AITDataHub'), true, 'listed by the token AND reachable by the person');
+  assert.equal(live.canReach('SponsorPortal'), false, 'the token lists it; the person cannot reach it');
+  assert.equal(live.canReach('Bi-Tools'), false, 'the person could, if the token listed it');
+
+  // Offboarding must revoke the robot in the same instant, with no token edit.
+  assert.equal(tokenAuthority(bot, { users: [{ ...kev, disabled: true }], hasProjectAccess }).ok, false);
+  assert.match(tokenAuthority(bot, { users: [], hasProjectAccess }).reason, /no longer exists/);
+  assert.equal(tokenAuthority({ ...bot, disabled: true }, { users: [kev], hasProjectAccess }).ok, false);
+
+  // '*' means "whatever that person can reach" — never more.
+  const wide = mintToken({ label: 'wide', scopes: ['sessions:read'], actsAs: 'kev' }).record;
+  const wideLive = tokenAuthority(wide, { users: [kev], hasProjectAccess });
+  assert.equal(wideLive.canReach('AITDataHub'), true);
+  assert.equal(wideLive.canReach('Bi-Tools'), false, '"*" is not a grant of its own');
 });
 
 test('resolveToken matches the right token and refuses everything else', () => {

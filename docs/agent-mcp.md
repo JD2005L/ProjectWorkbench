@@ -1,6 +1,7 @@
 # An MCP surface for driving a project session from an external AI
 
-Status: **spec, not built.** Decisions for the operator are at the end.
+Status: **spec; the operator's six decisions are settled (see the end) and the
+build follows the rollout order below.**
 
 ## What already exists, so this builds rather than duplicates
 
@@ -251,21 +252,44 @@ said it and where.
 4. **MCP façade** over that engine at `POST /api/mcp`, plus the config snippet
    above in the docs.
 
-## Decisions needed
+## Decisions — settled 2026-09-23
 
-1. **Is `sessions:prompt:any` allowed to exist on this instance?** It permits an
-   agent to type into a human's tab. My recommendation: build it, grant it to
-   nobody by default, and require it to be set per token.
-2. **Default CLI for a created session** — `claude`, or follow the project's
-   configured default launcher?
-3. **One token per bot, or per bot-and-person?** `actsAs` makes a token personal;
-   two people wanting the same bot means two tokens. That is my recommendation
-   (it keeps the audit honest), but it means the bot holds several credentials.
-4. **Prompt size cap** — a sensible default is 8 KB; a pane is not a file upload.
-5. **Longest single wait** — I suggest a 10-minute ceiling per `pw_wait_for_turn`
-   call, with the agent free to call again. A deploy or a long refactor outlasts
-   any single HTTP request worth holding open.
-6. **Should `pw_read_session` be allowed on unmarked (human) windows?** Reading is
-   less dangerous than typing, but it is still somebody's screen. My
-   recommendation: yes for windows in projects the acting user can already open
-   (they can read them in the dashboard anyway), and no for anything else.
+1. **`sessions:prompt:any` exists, granted to nobody by default.** It has to be
+   set explicitly per token, so typing into a human's tab is a visible decision.
+2. **The CLI is named by the REQUEST, not configured** — `cli: "claude" | "copilot"`,
+   and it applies only when a session is being created. An existing session
+   continues with whatever it is already running; the field is ignored rather than
+   enforced, because a token cannot know (and must not change) what a live pane is.
+   A create with no `cli` is refused rather than defaulted: "start a Claude
+   session" and "start a Copilot session" spend different credentials.
+3. **One token per bot.** A bot holds a single credential and therefore acts as a
+   single person — everything it does is attributed to that `actsAs`, and two
+   people wanting separately-attributed work means two bots.
+4. **Prompt cap 256 KB**, which is roughly 40–60,000 words: "large and specific"
+   was the requirement, and the mechanism below makes it safe. Above that, send a
+   file instead (see *Sending something big*).
+5. **10-minute ceiling per `pw_wait_for_turn`**, the agent free to call again.
+6. **`pw_read_session` on human windows: allowed** where the acting user could
+   already open that project in the dashboard — they can read the pane there
+   anyway — and refused otherwise.
+
+## Sending something big, and how the text actually gets in
+
+`send-keys` is the wrong instrument for a large prompt: it types argv, and a
+several-hundred-kilobyte argument is both an ARG_MAX question and a stream of
+keystrokes into a TUI's input handling. The injection therefore uses tmux's paste
+path, which is what a human paste is:
+
+1. write the prompt to a mode-0600 temp file (the tmux server runs as root);
+2. `load-buffer -b pw-agent-<turn>` that file;
+3. `paste-buffer -d -p -b pw-agent-<turn> -t <pane>` — `-p` for bracketed paste, so
+   a CLI that collapses pastes into "[Pasted text]" sees one paste rather than
+   40,000 keystrokes, and `-d` so the buffer does not linger in the server;
+4. `send-keys -t <pane> Enter` to submit;
+5. delete the temp file, whatever happened.
+
+Beyond 256 KB the right shape is a file, not a prompt: the caller puts the content
+in the project's `_inbox/` (the upload endpoint already exists and the Files tray
+already surfaces it) and sends a short prompt naming the path. That is how a human
+hands a large document to a session, and it keeps the pane's history readable
+instead of burying it under a novel.

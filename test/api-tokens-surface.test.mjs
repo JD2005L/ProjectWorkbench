@@ -162,10 +162,17 @@ test('token creation validates label and scopes', { timeout: 60000 }, async () =
 });
 
 test('the advertised scope list contains no admin-equivalent scope', { timeout: 60000 }, async () => {
-  // If someone later adds a broad scope, this is the test that should make them justify it.
+  // If someone later adds a broad scope, this is the test that should make them justify it. The
+  // session scopes were added for docs/agent-mcp.md; each names one verb, and the list is pinned
+  // so the next addition is a deliberate edit too.
   await withDashboard(async ({ base }) => {
     const listed = await fetch(`${base}/api/tokens`).then((r) => r.json());
-    assert.deepEqual(listed.scopes, [SCOPE]);
+    assert.deepEqual(listed.scopes, [
+      SCOPE, 'sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any',
+    ]);
+    for (const scope of listed.scopes) {
+      assert.doesNotMatch(scope, /(^|:)(admin|all|write|\*)$/, `${scope} is too broad for a machine token`);
+    }
   });
 });
 

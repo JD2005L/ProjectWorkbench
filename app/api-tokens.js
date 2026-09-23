@@ -21,7 +21,27 @@ import { writeFileAtomic } from './atomic-file.js';
 /** Operation scopes. A token carries an explicit list; absence is refusal. */
 export const SCOPES = Object.freeze({
   PROJECTS_REGISTER: 'projects:register',
+  // Driving a project session from outside (docs/agent-mcp.md). Three powers, kept
+  // apart on purpose: reading somebody's pane, typing into one, and creating
+  // windows are not the same decision, and a token that only needs to watch
+  // should not be able to type.
+  SESSIONS_READ: 'sessions:read',
+  SESSIONS_PROMPT: 'sessions:prompt',
+  SESSIONS_CREATE: 'sessions:create',
+  // Typing into a window this service did NOT create — a human's tab. Separately
+  // granted, never implied by sessions:prompt, because a pane running a shell
+  // turns an injected "prompt" into a command run as the pane account.
+  SESSIONS_PROMPT_ANY: 'sessions:prompt:any',
 });
+
+/** Scopes that act on somebody's behalf, and therefore require `actsAs`. */
+export const ACTING_SCOPES = Object.freeze([
+  SCOPES.SESSIONS_READ, SCOPES.SESSIONS_PROMPT, SCOPES.SESSIONS_CREATE, SCOPES.SESSIONS_PROMPT_ANY,
+]);
+
+export function needsActingUser(scopes) {
+  return (scopes || []).some((scope) => ACTING_SCOPES.includes(scope));
+}
 
 const KNOWN_SCOPES = new Set(Object.values(SCOPES));
 
@@ -50,10 +70,34 @@ export function digestToken(plaintext) {
  * Mint a new token. Returns { plaintext, record } — the caller must surface `plaintext` exactly
  * once and persist only `record`.
  */
-export function mintToken({ label = '', scopes = [], createdBy = '' } = {}) {
+/**
+ * Mint a token.
+ *
+ * `createdBy` is PROVENANCE — who asked for this credential. `actsAs` is
+ * AUTHORITY — the account whose reach the token borrows, whose launcher a created
+ * window runs under, and whose name the audit line carries. They are deliberately
+ * separate fields: an admin minting a bot's credential is not the identity that
+ * bot acts as, and reusing one for the other would be the bug rather than a
+ * shortcut. See docs/agent-mcp.md.
+ *
+ * `projects` narrows further. `'*'` means "whatever actsAs can reach" — never more
+ * than that, because authority here is an intersection and not a parallel grant.
+ */
+export function mintToken({ label = '', scopes = [], createdBy = '', actsAs = '', projects = '*' } = {}) {
   const bad = scopes.filter((s) => !isKnownScope(s));
   if (bad.length) throw new Error(`unknown scope(s): ${bad.join(', ')}`);
   if (!scopes.length) throw new Error('a token with no scopes can do nothing; refusing to mint one');
+  const acting = String(actsAs || '').trim();
+  // A session has to run as somebody: the window's launcher, the CLI credentials
+  // it spends and the audit attribution all come from this field, so there is no
+  // sensible default and guessing one would fabricate an identity.
+  if (needsActingUser(scopes) && !acting) {
+    throw new Error('a token with session scopes must name the user it acts as');
+  }
+  if (acting && !/^[A-Za-z0-9._-]{1,64}$/.test(acting)) throw new Error('invalid acting user');
+  const scoped = projects === '*' ? '*'
+    : [...new Set((Array.isArray(projects) ? projects : []).map((name) => String(name).trim()).filter(Boolean))];
+  if (scoped !== '*' && !scoped.length) throw new Error('a project list must name at least one project, or be "*"');
 
   const plaintext = TOKEN_PREFIX + crypto.randomBytes(32).toString('base64url');
   return {
@@ -63,6 +107,8 @@ export function mintToken({ label = '', scopes = [], createdBy = '' } = {}) {
       label: String(label || '').trim().slice(0, 80),
       digest: digestToken(plaintext),
       scopes: [...new Set(scopes)],
+      actsAs: acting,
+      projects: scoped,
       createdAt: new Date().toISOString(),
       createdBy: String(createdBy || ''),
       lastUsedAt: null,
@@ -94,6 +140,8 @@ export function safeTokenShape(t) {
     id: t.id,
     label: t.label,
     scopes: t.scopes || [],
+    actsAs: t.actsAs || '',
+    projects: t.projects === '*' ? '*' : (t.projects || []),
     createdAt: t.createdAt || null,
     createdBy: t.createdBy || '',
     lastUsedAt: t.lastUsedAt || null,
@@ -127,4 +175,37 @@ export function presentedToken(req) {
 
 export function tokenHasScope(token, scope) {
   return Array.isArray(token?.scopes) && token.scopes.includes(scope);
+}
+
+/**
+ * What a token may actually reach, as an INTERSECTION of the token and the person
+ * it acts as.
+ *
+ * This is the property that makes a machine credential a delegation rather than a
+ * parallel grant: if the acting account is disabled, deleted, or loses a project,
+ * every token acting as it loses the same reach in that instant, with nobody
+ * editing a token. The alternative — a token carrying its own standing grants —
+ * means offboarding a person leaves their robots running, which is the failure
+ * this shape exists to prevent.
+ *
+ * `users` and `hasProjectAccess` are injected so this module stays free of the
+ * dashboard's user store.
+ */
+export function tokenAuthority(token, { users = [], hasProjectAccess = () => false } = {}) {
+  if (!token || token.disabled) return { ok: false, reason: 'token is revoked' };
+  const acting = String(token.actsAs || '');
+  if (!acting) return { ok: false, reason: 'token names no acting user' };
+  const user = users.find((u) => u?.username === acting);
+  if (!user) return { ok: false, reason: `the account this token acts as (${acting}) no longer exists` };
+  if (user.disabled) return { ok: false, reason: `the account this token acts as (${acting}) is disabled` };
+  return {
+    ok: true,
+    user,
+    /** Project reach: the token's list narrowed by what that person can already open. */
+    canReach(project) {
+      if (!project) return false;
+      const listed = token.projects === '*' || (token.projects || []).includes(project);
+      return listed && hasProjectAccess(user, project);
+    },
+  };
 }
