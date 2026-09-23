@@ -3058,7 +3058,7 @@ const deployModalScript = `<script>(function(){
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent=j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
-    if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j);
+    if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
     else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
     /* Name whose run this is. The "Last:" line is rendered when the panel opens and
        used to be rewritten only on success, so a failure left the previous line —
@@ -3189,7 +3189,7 @@ const deployScript = `<script>
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
     if(j.queued){output.textContent=j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.';return}
     deployInputs.applyResult(card,j);
-    if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j);
+    if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
     else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
     // Same reason as the cockpit modal: name whose run this is, on failure too.
     // The failure branch returned early and left the "Last:" line from page load

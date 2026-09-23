@@ -402,3 +402,136 @@ test('the result is written outside the log pane, where scrolling cannot hide it
   follower.paint(bare, { ...running, status: 'success', duration: '1.0' }, 'out\n');
   assert.match(bare.textContent, /✅ SUCCESS[\s\S]*out/);
 });
+
+// "Start a new deployment" has to mean it across a reopen. The panel re-reads the
+// newest run from the server every time it opens, so without a record of the
+// dismissal, putting a log away and reopening put it straight back.
+function storage() {
+  const data = new Map();
+  return { getItem: key => (data.has(key) ? data.get(key) : null), setItem: (key, value) => data.set(key, value), data };
+}
+
+function togglingEnvironment(localStorage, runs) {
+  const created = [];
+  const environment = {
+    localStorage,
+    setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+    async fetch() { return { status: 200, ok: true, json: async () => ({ ok: true, run: runs[0] }) }; },
+  };
+  environment.document = {
+    hidden: false,
+    addEventListener() {},
+    createElement: () => {
+      const element = { type: '', className: '', textContent: '', handlers: {} };
+      element.addEventListener = (type, fn) => { element.handlers[type] = fn; };
+      element.remove = () => { element.removed = true; };
+      created.push(element);
+      return element;
+    },
+  };
+  return { environment, created };
+}
+
+function togglingCard(created) {
+  const classes = new Set();
+  const children = [];
+  return {
+    children, classes,
+    classList: { add: name => classes.add(name), remove: name => classes.delete(name), contains: name => classes.has(name) },
+    querySelector: selector => children.find(child => !child.removed && child.className?.includes(selector.slice(1))) || null,
+    appendChild: child => children.push(child),
+    live: name => children.find(child => !child.removed && child.className?.includes(name)),
+    void: created,
+  };
+}
+
+const lastRun = { id: 'run9', status: 'success', startedAt: '2026-09-23T14:55:00.000Z', user: 'james.levac',
+  duration: '61.0', version: 'V1.26.0923.1455', offset: 5, output: 'done\n' };
+
+test('putting a finished log away survives closing and reopening the panel', async () => {
+  const store = storage();
+  const first = togglingEnvironment(store, [lastRun]);
+  const follower = createRunFollower(first.environment);
+  const card = togglingCard(first.created);
+  const output = { className: '', textContent: '' };
+  const slot = { base: '', project: 'demo', target: 'prod' };
+
+  // Open: the finished run paints, with the control that puts it away.
+  await follower.follow({ ...slot, output, card });
+  assert.equal(card.classList.contains('deploy-finished'), true);
+  const reset = card.live('deploy-reset');
+  assert.equal(reset.textContent, 'Start a new deployment');
+
+  reset.handlers.click();
+  assert.equal(card.classList.contains('deploy-finished'), false, 'the form comes back');
+  assert.ok(card.live('deploy-show-log'), 'and keeps a way back to the log');
+  assert.match(store.data.get('pw.deploy.dismissedRuns'), /run9/, 'the dismissal is recorded against that run id');
+
+  // Close and reopen: a fresh follower over the same storage, as a new panel is.
+  const second = togglingEnvironment(store, [lastRun]);
+  const reopened = createRunFollower(second.environment);
+  const card2 = togglingCard(second.created);
+  const output2 = { className: '', textContent: '' };
+  await reopened.follow({ ...slot, output: output2, card: card2 });
+  assert.equal(card2.classList.contains('deploy-finished'), false, 'the dismissed log does not reopen itself');
+  assert.equal(output2.textContent, '', 'and the form is not buried under it again');
+  assert.ok(card2.live('deploy-show-log'), 'the toggle is there instead');
+});
+
+test('the toggle flips back to the log on demand, and a NEWER run is never suppressed', async () => {
+  const store = storage();
+  store.setItem('pw.deploy.dismissedRuns', JSON.stringify({ 'demo\u0000prod': 'run9' }));
+
+  // Same slot, dismissed run: the form stays, and the toggle brings the log back.
+  const back = togglingEnvironment(store, [lastRun]);
+  const follower = createRunFollower(back.environment);
+  const card = togglingCard(back.created);
+  const output = { className: '', textContent: '' };
+  await follower.follow({ base: '', project: 'demo', target: 'prod', output, card });
+  const toggle = card.live('deploy-show-log');
+  assert.match(toggle.textContent, /Show last deployment log/);
+  await toggle.handlers.click();
+  assert.equal(card.classList.contains('deploy-finished'), true, 'the log is readable again');
+  assert.match(output.textContent, /done/);
+  assert.ok(card.live('deploy-reset'), 'with the control to put it away once more');
+
+  // A LATER run has a different id, so the recorded dismissal says nothing about
+  // it — the next deployment's result must never be hidden by an old dismissal.
+  const newer = { ...lastRun, id: 'run10', version: 'V1.26.0923.1600', output: 'newer\n' };
+  const next = togglingEnvironment(store, [newer]);
+  const card2 = togglingCard(next.created);
+  const output2 = { className: '', textContent: '' };
+  await createRunFollower(next.environment).follow({ base: '', project: 'demo', target: 'prod', output: output2, card: card2 });
+  assert.equal(card2.classList.contains('deploy-finished'), true, 'a newer run still shows');
+  assert.match(output2.textContent, /newer/);
+});
+
+test('storage being unavailable costs one click, not the feature', async () => {
+  const hostile = { getItem: () => { throw new Error('denied'); }, setItem: () => { throw new Error('denied'); } };
+  const env = togglingEnvironment(hostile, [lastRun]);
+  const follower = createRunFollower(env.environment);
+  const card = togglingCard(env.created);
+  const output = { className: '', textContent: '' };
+  await follower.follow({ base: '', project: 'demo', target: 'prod', output, card });
+  const reset = card.live('deploy-reset');
+  reset.handlers.click();                       // must not throw
+  assert.equal(card.classList.contains('deploy-finished'), false);
+  assert.ok(card.live('deploy-show-log'), 'the toggle still works for this view');
+});
+
+test('the CHOICE persists in both directions: bringing the log back also survives a reopen', async () => {
+  const store = storage();
+  store.setItem('pw.deploy.dismissedRuns', JSON.stringify({ 'demo\u0000prod': 'run9' }));
+  const shown = togglingEnvironment(store, [lastRun]);
+  const card = togglingCard(shown.created);
+  const output = { className: '', textContent: '' };
+  await createRunFollower(shown.environment).follow({ base: '', project: 'demo', target: 'prod', output, card });
+  await card.live('deploy-show-log').handlers.click();
+
+  const reopened = togglingEnvironment(store, [lastRun]);
+  const card2 = togglingCard(reopened.created);
+  const output2 = { className: '', textContent: '' };
+  await createRunFollower(reopened.environment).follow({ base: '', project: 'demo', target: 'prod', output: output2, card: card2 });
+  assert.equal(card2.classList.contains('deploy-finished'), true, 'the log the operator chose to see is the one that comes back');
+  assert.match(output2.textContent, /done/);
+});

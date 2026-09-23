@@ -15,6 +15,42 @@
 export function createRunFollower(environment = globalThis) {
   const { fetch, setTimeout, clearTimeout, document } = environment;
 
+  // "I have read that log" has to survive closing the panel, because the panel
+  // re-reads the newest run from the server every time it opens — so dismissing a
+  // finished run and reopening put the log straight back, which is not what
+  // "Start a new deployment" promises.
+  //
+  // Stored per slot and keyed by RUN ID, which is the whole reason this is safe:
+  // dismissing run X says nothing about run Y, so the next deployment's result
+  // still appears. One entry per slot (only the newest run can be dismissed), so
+  // this cannot grow. Browser-local on purpose: it is a per-person "seen it", not
+  // instance state, and losing it costs one click.
+  const DISMISSED_KEY = 'pw.deploy.dismissedRuns';
+  const slotKey = (project, target) => `${project}\u0000${target}`;
+  function readDismissed() {
+    try { return JSON.parse(environment.localStorage?.getItem(DISMISSED_KEY) || '{}') || {}; }
+    catch { return {}; }
+  }
+  function isDismissed(project, target, runId) {
+    if (!runId) return false;
+    return readDismissed()[slotKey(project, target)] === runId;
+  }
+  function writeDismissed(project, target, runId) {
+    if (!environment.localStorage) return;
+    try {
+      const all = readDismissed();
+      if (runId) all[slotKey(project, target)] = runId;
+      else delete all[slotKey(project, target)];
+      environment.localStorage.setItem(DISMISSED_KEY, JSON.stringify(all));
+    } catch { /* private mode, quota, disabled storage: the toggle still works for this view */ }
+  }
+  const markDismissed = (project, target, runId) => { if (runId) writeDismissed(project, target, runId); };
+  // Asking to see the log again un-dismisses it, so the CHOICE is what persists:
+  // put it away and a reopen shows the form; bring it back and a reopen shows the
+  // log. Without this, the toggle would fight the record it just wrote and paint
+  // the form it was asked to replace.
+  const clearDismissed = (project, target) => writeDismissed(project, target, null);
+
   // The one place a run's headline is written, so the panel, a reattachment and
   // History all say the same thing about the same run.
   function headline(run) {
@@ -86,7 +122,7 @@ export function createRunFollower(environment = globalThis) {
   // the headline above it, so this button says what it DOES rather than what
   // happened — a button labelled "failed" invites the reading that pressing it
   // does something about the failure.
-  function offerReset(card, output, label) {
+  function offerReset(card, output, label, context = null) {
     if (!card || !document?.createElement) return;
     let button = card.querySelector?.('.deploy-reset');
     if (!button) {
@@ -94,15 +130,43 @@ export function createRunFollower(environment = globalThis) {
       button.type = 'button';
       button.className = 'button secondary small deploy-reset';
       button.addEventListener?.('click', () => {
+        if (context?.project) markDismissed(context.project, context.target, context.run?.id);
         setCardState(card, 'idle');
         if (output) { output.textContent = ''; output.className = 'deploy-output'; }
         const status = card.querySelector?.('.deploy-status');
         if (status) { status.textContent = ''; status.className = 'deploy-status'; }
         button.remove?.();
+        // The log is put away, not thrown away: the form comes back with a way
+        // to look at it again.
+        if (context?.run) offerShowLog(card, output, context);
       });
       card.appendChild(button);
     }
     button.textContent = label;
+  }
+
+  // The other half of the toggle. Lives on the FORM view, so a dismissed run is
+  // one click from being read again — including after a reopen, where the panel
+  // would otherwise have no way back to a log the operator chose to put away.
+  function offerShowLog(card, output, context) {
+    if (!card || !document?.createElement || !context?.run) return;
+    let button = card.querySelector?.('.deploy-show-log');
+    if (!button) {
+      button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'button secondary small deploy-show-log';
+      button.addEventListener?.('click', async () => {
+        button.remove?.();
+        clearDismissed(context.project, context.target);
+        // Re-read rather than trusting a cached copy: the run may have been
+        // superseded while the form was up, and the newest is what matters.
+        const shown = await follow({ ...context, card, output }).catch(() => null);
+        if (!shown) paint(output, context.run, context.text || '', card);
+      });
+      card.appendChild(button);
+    }
+    const outcome = context.run.status === 'success' ? '✅' : context.run.status === 'running' ? '⏳' : '❌';
+    button.textContent = `${outcome} Show last deployment log`;
   }
 
   // A request that never started a run (cancelled password prompt, validation
@@ -122,7 +186,7 @@ export function createRunFollower(environment = globalThis) {
   // The POST is authoritative when it returns a local run result before the
   // follower managed to observe that run. Normalize that result into the same
   // finished log shape used by reattachment and live following.
-  function finishResult(card, output, result) {
+  function finishResult(card, output, result, context = null) {
     const run = {
       id: result.runId || result.id || '',
       status: result.ok === true && result.status !== 'failed' ? 'success' : 'failed',
@@ -135,7 +199,7 @@ export function createRunFollower(environment = globalThis) {
     };
     const text = result.output || result.error || '';
     paint(output, run, text, card);
-    finishUp(card, output, run, text);
+    finishUp(card, output, run, text, undefined, context);
     return run;
   }
 
@@ -180,8 +244,17 @@ export function createRunFollower(environment = globalThis) {
     }
 
     let run = initial.run, text = initial.run.output || '', offset = initial.run.offset || text.length;
+    const slot = { base, project, target };
+    // Reopening must not undo "Start a new deployment". A dismissal is recorded
+    // against THIS run's id, so a newer run still paints — only the one already
+    // put away stays put away, reachable from the form's toggle.
+    if (run.status !== 'running' && !requireRunning && isDismissed(project, target, run.id)) {
+      offerShowLog(card, output, { ...slot, run, text });
+      onDone?.(run, text);
+      return run;
+    }
     paint(output, run, text, card);
-    if (run.status !== 'running') { finishUp(card, output, run, text, onDone); return run; }
+    if (run.status !== 'running') { finishUp(card, output, run, text, onDone, slot); return run; }
 
     setCardState(card, 'running');
     onRunning?.(run);
@@ -206,13 +279,14 @@ export function createRunFollower(environment = globalThis) {
       offset = next.offset ?? offset;
       paint(output, run, text, card);
     }
-    finishUp(card, output, run, text, onDone);
+    finishUp(card, output, run, text, onDone, slot);
     return run;
   }
 
-  function finishUp(card, output, run, text, onDone) {
+  function finishUp(card, output, run, text, onDone, context = null) {
     setCardState(card, 'finished');
-    offerReset(card, output, 'Start a new deployment');
+    card?.querySelector?.('.deploy-show-log')?.remove?.();
+    offerReset(card, output, 'Start a new deployment', context ? { ...context, run, text } : null);
     onDone?.(run, text);
   }
 
@@ -272,7 +346,8 @@ export function createRunFollower(environment = globalThis) {
     });
   }
 
-  return { follow, showArchived, bindHistory, headline, paint, setCardState, keepTail, restore, finishResult };
+  return { follow, showArchived, bindHistory, headline, paint, setCardState, keepTail, restore, finishResult,
+    interrupt, offerShowLog, isDismissed, markDismissed, clearDismissed };
 }
 
 export const deployFollowClientSrc = `const pwRunFollower = (${createRunFollower.toString()})();`;

@@ -62,6 +62,10 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .deploy-status.success{border-left-color:#22c55e;color:#bbf7d0}
 :is(.deploy-page,#deployBackdrop) .deploy-status.failed{border-left-color:#ef4444;color:#fca5a5}
 :is(.deploy-page,#deployBackdrop) .deploy-reset{margin-top:.5rem}
+/* The form view's half of the toggle: a run the operator put away is one click
+   from being read again, including after a reopen — which is the only way back,
+   since the panel deliberately stops reopening a dismissed log by itself. */
+:is(.deploy-page,#deployBackdrop) .deploy-show-log{margin-top:.5rem;margin-left:.4rem}
 /* History is one panel with two views: the list, or one run's retained output.
    Replacing rather than appending is the point — the table runs to fifty rows,
    so a log pinned underneath meant scrolling past every other release to read
