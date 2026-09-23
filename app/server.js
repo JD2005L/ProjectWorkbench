@@ -17,6 +17,7 @@ import { resolveDeployReauth, REAUTH_UNREADABLE } from './deploy-reauth.js';
 import { readStoredDeployPassword, makeDeployIdentity } from './deploy-credential.js';
 import { createDeployRuns } from './deploy-runs.js';
 import { createAgentSessions, AgentSessionError, MARKER_TOKEN, MARKER_USER } from './agent-sessions.js';
+import { createAgentTurns } from './agent-turns.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { deployFollowClientSrc } from './deploy-follow.js';
@@ -1362,7 +1363,12 @@ async function withApiTokensLock(mutate){
 // goes through the same helpers the cockpit uses, so an agent's window is created,
 // stamped, listed and read exactly like a human's — there is no second path into
 // a pane for this feature to get wrong.
+// Turn tracking for the agent surface: in memory, because a turn is only
+// interesting while somebody is waiting on it, and a dashboard restart takes the
+// panes' agents with it anyway.
+const agentTurns = createAgentTurns({});
 const agentSessions = createAgentSessions({
+ turns: agentTurns,
  authorize: async (projectName, token) => {
   if(!validName(projectName)) return { ok:false, reason:`No such project: ${projectName}`, status:404 };
   const authority = tokenAuthority(token, { users: await loadUsers(), hasProjectAccess: userHasProjectAccess });
@@ -1402,6 +1408,18 @@ const agentSessions = createAgentSessions({
    await fs.rm(file, { force: true }).catch(()=>{});
    await tmux(['delete-buffer','-b',buffer]).catch(()=>{});
   }
+ },
+ // One tmux call for everything the latch needs. #{window_activity} is monotonic
+ // and NOT reset by viewing, which is why it carries the completion decision
+ // rather than the bell alone (see app/agent-turns.js).
+ paneMetrics: async (target) => {
+  try {
+   const { stdout } = await tmux(['display-message','-p','-t',target,
+    '#{window_activity}|#{window_bell_flag}|#{history_size}|#{pane_height}']);
+   const [activity, bell, history, rows] = String(stdout || '').trim().split('|');
+   return { activity: Number(activity) || 0, bell: bell === '1',
+    history: Number(history) || 0, rows: Number(rows) || 0 };
+  } catch { return { missing: true }; }
  },
  capturePane: async (target, { lines, scrollback }) => {
   const args = ['capture-pane','-p','-t',target,'-S',`-${scrollback ? Math.max(lines, 2000) : lines}`];
@@ -4044,8 +4062,18 @@ app.get(BASE + '/api/agent/:project/sessions', ...agentRoute(SCOPES.SESSIONS_REA
 app.get(BASE + '/api/agent/:project/sessions/:session/output', ...agentRoute(SCOPES.SESSIONS_READ,
  (token, req) => agentSessions.read(token, {
   project: req.params.project, session: req.params.session,
-  lines: req.query.lines, include_scrollback: req.query.include_scrollback === '1' || req.query.include_scrollback === 'true',
+  lines: req.query.lines, since_turn: String(req.query.since_turn || ''),
+  include_scrollback: req.query.include_scrollback === '1' || req.query.include_scrollback === 'true',
  })));
+
+app.get(BASE + '/api/agent/:project/sessions/:session/turns/:id', ...agentRoute(SCOPES.SESSIONS_READ,
+ (token, req) => (req.query.wait_ms
+  // One route, two behaviours: ?wait_ms holds the request open (bounded) so an
+  // agent does not have to poll, and without it the same answer comes back at
+  // once. A timeout answers `running`, which is "ask again", not a failure.
+  ? agentSessions.waitForTurn(token, { project: req.params.project, session: req.params.session,
+     turn_id: req.params.id, timeout_ms: req.query.wait_ms })
+  : agentSessions.turn(token, { project: req.params.project, session: req.params.session, turn_id: req.params.id }))));
 
 app.post(BASE + '/api/agent/:project/sessions/:session/prompt', ...agentRoute(SCOPES.SESSIONS_PROMPT,
  (token, req) => agentSessions.prompt(token, {

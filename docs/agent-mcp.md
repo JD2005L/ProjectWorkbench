@@ -1,9 +1,9 @@
 # An MCP surface for driving a project session from an external AI
 
-Status: **phases 1 and 2 built.** The token model (`actsAs`, project
-intersection, four session scopes) and the REST engine (list / prompt / read,
-behind the marker rule) are in. Phases 3 (turn latch) and 4 (MCP façade) are not.
-The operator's six decisions are settled — see the end.
+Status: **phases 1–3 built.** Token model, REST engine and the turn latch are in:
+an external caller can list, prompt, wait for the turn to end and read what it
+produced. Phase 4 (the MCP façade over the same engine) is not. The operator's six
+decisions are settled — see the end.
 
 ## What already exists, so this builds rather than duplicates
 
@@ -260,9 +260,26 @@ said it and where.
    curl -fsS -H "Authorization: Bearer $TOKEN" \
      'https://host/workbench/api/agent/AITCtrl/sessions/bot-lane/output?lines=120'
    ```
-3. **Turn latch**: `turn_id`, the bell-generation cursor, `pw_wait_for_turn` /
-   `pw_get_turn`, and `since_turn` on the read. This is what closes the loop the
-   feature exists for — decide, send, wait, read — so it is not a later phase.
+3. ~~**Turn latch**~~ — built: `app/agent-turns.js`, `turn_id` on every prompt,
+   and one route that answers now or holds the request open:
+
+   ```bash
+   TURN=$(curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"prompt":"run the tests and summarise failures","cli":"claude"}' \
+     https://host/workbench/api/agent/AITCtrl/sessions/bot-lane/prompt | jq -r .turn_id)
+
+   # hold the request open until it finishes (bounded; `running` means ask again)
+   curl -fsS -H "Authorization: Bearer $TOKEN" \
+     "https://host/workbench/api/agent/AITCtrl/sessions/bot-lane/turns/$TURN?wait_ms=120000"
+
+   # and read just what that turn produced
+   curl -fsS -H "Authorization: Bearer $TOKEN" \
+     "https://host/workbench/api/agent/AITCtrl/sessions/bot-lane/output?since_turn=$TURN"
+   ```
+
+   `completed_by` says which signal ended it — `bell` (unambiguous) or `quiet`
+   (the cadence fallback) — because those are different levels of confidence and a
+   caller may care.
 4. **MCP façade** over that engine at `POST /api/mcp`, plus the config snippet
    above in the docs.
 

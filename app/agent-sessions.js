@@ -63,6 +63,10 @@ export function createAgentSessions({
   pasteToWindow,         // (target, text) -> void
   capturePane,           // (target, { lines, scrollback }) -> string
   targetFor,             // (projectName, index) -> tmux target string
+  paneMetrics,           // (target) -> { activity, bell, history, rows } | { missing:true }
+  turns,                 // app/agent-turns.js store (optional; without it a prompt returns no turn)
+  sampleMs = 1500,
+  maxWaitMs = 600000,
   audit = async () => {},
   now = () => new Date(),
 } = {}) {
@@ -167,25 +171,93 @@ export function createAgentSessions({
         }
       }
 
-      await pasteToWindow(targetFor(projectName, window.index), text);
+      const tmuxTarget = targetFor(projectName, window.index);
+      // Sampled BEFORE the paste: this is what makes a pre-existing bell, or
+      // somebody else's earlier work, unable to complete the turn we are about to
+      // open. See app/agent-turns.js.
+      const before = paneMetrics ? await paneMetrics(tmuxTarget).catch(() => ({})) : {};
+      await pasteToWindow(tmuxTarget, text);
+      const turn = turns ? turns.start({
+        project: projectName, session, window: window.index,
+        tokenId: token.id, actsAs: verdict.user.username, sample: before,
+      }) : null;
       // Length, never the body: a prompt carries whatever the sending agent had in
       // context, and the audit log has more readers than the pane does.
       await audit('agent_prompt', {
         tokenId: token.id, label: token.label, actsAs: verdict.user.username,
         project: projectName, session, window: window.index, created, promptBytes: bytes,
       });
-      return { project: projectName, session, window: window.index, created, injected_chars: text.length };
+      return { project: projectName, session, window: window.index, created,
+        injected_chars: text.length, ...(turn ? { turn_id: turn.turn_id } : {}) };
     },
 
-    async read(token, { project: projectName, session, lines = DEFAULT_READ_LINES, include_scrollback = false }) {
+    /**
+     * The state of one turn, sampled now. A turn nobody is watching has no
+     * opinion until somebody looks — the same deal the cockpit's tab strip has —
+     * so every status read folds a fresh observation in.
+     */
+    async turn(token, { project: projectName, session, turn_id }) {
+      await reach(token, projectName);
+      if (!turns) refuse('Turn tracking is not enabled on this instance', 501, 'turns_unavailable');
+      const known = turns.get(turn_id);
+      if (!known || known.project !== projectName) refuse(`No such turn: ${turn_id}`, 404, 'no_such_turn');
+      const { window } = await resolveWindow(projectName, known.session);
+      const sample = window
+        ? await paneMetrics(targetFor(projectName, window.index)).catch(() => ({}))
+        : { missing: true };
+      return { turn: turns.observe(turn_id, sample) || known };
+    },
+
+    /**
+     * Wait for it, bounded. A timeout answers `running`, never an error: "ask
+     * again" is not a failure, and a deploy or a long refactor outlasts any single
+     * HTTP request worth holding open.
+     */
+    async waitForTurn(token, { project: projectName, session, turn_id, timeout_ms }) {
+      await reach(token, projectName);
+      if (!turns) refuse('Turn tracking is not enabled on this instance', 501, 'turns_unavailable');
+      const known = turns.get(turn_id);
+      if (!known || known.project !== projectName) refuse(`No such turn: ${turn_id}`, 404, 'no_such_turn');
+      const budget = Math.max(0, Math.min(maxWaitMs, Number(timeout_ms) || 60000));
+      const started = Date.now();
+      let state = known;
+      while (state.state === 'running' && Date.now() - started < budget) {
+        const { window } = await resolveWindow(projectName, known.session);
+        const sample = window
+          ? await paneMetrics(targetFor(projectName, window.index)).catch(() => ({}))
+          : { missing: true };
+        state = turns.observe(turn_id, sample) || state;
+        if (state.state !== 'running') break;
+        await new Promise((resolve) => setTimeout(resolve, sampleMs));
+      }
+      return { turn: state, waited_ms: Date.now() - started };
+    },
+
+    async read(token, { project: projectName, session, lines = DEFAULT_READ_LINES, include_scrollback = false, since_turn = '' }) {
       await reach(token, projectName);
       const { window } = await resolveWindow(projectName, session);
       if (!window) refuse(`No session "${session}" in ${projectName}`, 404, 'no_such_session');
       const wanted = Number.isFinite(Number(lines)) ? Math.trunc(Number(lines)) : DEFAULT_READ_LINES;
-      const capped = Math.max(1, Math.min(MAX_READ_LINES, wanted));
-      const text = await capturePane(targetFor(projectName, window.index), { lines: capped, scrollback: !!include_scrollback });
+      let capped = Math.max(1, Math.min(MAX_READ_LINES, wanted));
+      // `since_turn` is an APPROXIMATION and says so in the response: a pane is a
+      // screen with a scrollback, not an append-only log, so "what appeared since"
+      // is reconstructed from how much has scrolled away since the prompt went in
+      // plus what is on screen now. A redrawing TUI can repaint lines that were
+      // already there, and nothing tmux reports can separate those.
+      let approximate = false;
+      const cursor = since_turn && turns ? turns.cursor(since_turn) : null;
+      if (since_turn && !cursor) refuse(`No such turn: ${since_turn}`, 404, 'no_such_turn');
+      if (cursor) {
+        const metrics = paneMetrics ? await paneMetrics(targetFor(projectName, window.index)).catch(() => ({})) : {};
+        const scrolled = Math.max(0, (Number(metrics.history) || 0) - cursor.historyAtStart);
+        capped = Math.max(1, Math.min(MAX_READ_LINES, scrolled + (Number(metrics.rows) || DEFAULT_READ_LINES)));
+        approximate = true;
+      }
+      const text = await capturePane(targetFor(projectName, window.index), { lines: capped, scrollback: !!include_scrollback || approximate });
       await audit('agent_read', { tokenId: token.id, label: token.label, project: projectName, session, lines: capped });
-      return { project: projectName, session, window: window.index, lines: capped, truncated: wanted > capped, text };
+      return { project: projectName, session, window: window.index, lines: capped,
+        truncated: !approximate && wanted > capped, text,
+        ...(approximate ? { since_turn, approximate: true } : {}) };
     },
   };
 }

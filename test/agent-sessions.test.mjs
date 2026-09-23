@@ -180,3 +180,78 @@ test('reading is capped and says when it capped, and reports what the pane is do
 
   await fails(engine.read(BOT, { project: 'Demo', session: 'nope' }), 'no_such_session');
 });
+
+// ─── the turn lifecycle through the engine (phase 3) ────────────────────────
+
+import { createAgentTurns, TurnState } from '../app/agent-turns.js';
+
+function turnHarness({ samples = [], windows = [{ index: 2, name: 'bot-lane' }], markers = { 'pw_Demo:2|@pw_agent_token': 'tok-1' } } = {}) {
+  let clock = 5_000_000;
+  const taken = [];
+  const turns = createAgentTurns({ now: () => clock, newId: () => 'turn-1', graceMs: 1000 });
+  const queue = [...samples];
+  const engine = createAgentSessions({
+    authorize: async (project, token) => ({ ok: true, project: { name: project }, user: { username: token.actsAs } }),
+    listProjects: async () => [{ name: 'Demo' }],
+    listWindows: async () => windows,
+    targetFor: (project, index) => `pw_${project}:${index}`,
+    windowOption: async (target, option) => markers[`${target}|${option}`] || '',
+    setWindowOption: async () => {},
+    createWindow: async () => 2,
+    pasteToWindow: async () => {},
+    capturePane: async (target, opts) => { taken.push(opts); return 'output\n'; },
+    paneMetrics: async () => { clock += 1500; return queue.length ? queue.shift() : { activity: 1, working: false }; },
+    turns,
+    sampleMs: 0,
+  });
+  return { engine, turns, taken, tick: (ms) => { clock += ms; } };
+}
+
+test('a prompt opens a turn, and waiting on it reports completion once', async () => {
+  const { engine, turns } = turnHarness({ samples: [
+    { activity: 10, bell: false, history: 5, rows: 40 },   // the pre-paste sample
+    { activity: 11, bell: false, working: true },           // work starts
+    { activity: 12, bell: true, working: false },           // the bell ends it
+  ] });
+
+  const sent = await engine.prompt(BOT, { project: 'Demo', session: 'bot-lane', prompt: 'go' });
+  assert.equal(sent.turn_id, 'turn-1', 'the prompt hands back a handle to wait on');
+  assert.equal(turns.get('turn-1').state, TurnState.RUNNING);
+
+  const waited = await engine.waitForTurn(BOT, { project: 'Demo', session: 'bot-lane', turn_id: 'turn-1', timeout_ms: 30000 });
+  assert.equal(waited.turn.state, TurnState.COMPLETED);
+  assert.equal(waited.turn.completed_by, 'bell');
+});
+
+test('a wait that runs out of budget answers running, and is not an error', async () => {
+  // "Ask again" is not a failure: a deploy outlasts any single request worth
+  // holding open.
+  const { engine } = turnHarness({ samples: [{ activity: 10, history: 5, rows: 40 }] });
+  const sent = await engine.prompt(BOT, { project: 'Demo', session: 'bot-lane', prompt: 'go' });
+  const waited = await engine.waitForTurn(BOT, { project: 'Demo', session: 'bot-lane', turn_id: sent.turn_id, timeout_ms: 1 });
+  assert.equal(waited.turn.state, TurnState.RUNNING);
+  assert.ok(Number.isFinite(waited.waited_ms));
+});
+
+test('a since-read asks for what has scrolled away plus the screen, and says it is approximate', async () => {
+  const { engine, taken } = turnHarness({ samples: [
+    { activity: 10, bell: false, history: 100, rows: 40 },  // pre-paste: 100 lines had scrolled off
+    { activity: 40, bell: false, history: 160, rows: 40 },  // now: 60 more have
+  ] });
+  const sent = await engine.prompt(BOT, { project: 'Demo', session: 'bot-lane', prompt: 'go' });
+  const out = await engine.read(BOT, { project: 'Demo', session: 'bot-lane', since_turn: sent.turn_id });
+
+  assert.equal(out.approximate, true, 'a pane is a screen, not an append-only log, and the answer says so');
+  assert.equal(out.since_turn, sent.turn_id);
+  assert.equal(taken.at(-1).lines, 100, '60 scrolled away since the prompt, plus the 40 rows on screen');
+  assert.equal(taken.at(-1).scrollback, true);
+
+  await fails(engine.read(BOT, { project: 'Demo', session: 'bot-lane', since_turn: 'nope' }), 'no_such_turn');
+  await fails(engine.turn(BOT, { project: 'Demo', session: 'bot-lane', turn_id: 'nope' }), 'no_such_turn');
+});
+
+test('a turn belonging to another project does not resolve', async () => {
+  const { engine, turns } = turnHarness();
+  turns.start({ project: 'Other', session: 'bot-lane', window: 2, tokenId: 'tok-1', actsAs: 'kev', sample: {} });
+  await fails(engine.turn(BOT, { project: 'Demo', session: 'bot-lane', turn_id: 'turn-1' }), 'no_such_turn');
+});
