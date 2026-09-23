@@ -3788,3 +3788,69 @@ Also landed on main since `dd796eb`, and relevant to anyone reviewing the deploy
 panel: a running slot now hides its config section and becomes a fixed-height log
 viewer that follows the tail (`2373080`), with the reattach path using the same
 state, so reopening a panel mid-deploy shows the log rather than a form.
+
+## Hermes-James — 2026-09-22 — recent GOA deploy-panel review: state machine repair required
+
+Read-only review of exact canonical head
+`b73bc55441a53feff0a3c5904a609b857243a025` covered the deployment-panel commits
+`237308045203a3f99198bbe1cec0535ea171502a` and
+`352545a7ed3951b989d61d596602f647faadec68`, plus the tmux mouse-menu correction
+at `b73bc55441a53feff0a3c5904a609b857243a025`.
+
+**Disposition: BLOCK the deployment-panel delta pending two state-machine repairs.**
+Canonical host/container CI is green, and the intended one-card form/log experience
+is sound, but the focused tests do not cover the following observable failures.
+
+### HJ-DEPLOY-FOLLOW-1 — the card can remain permanently stuck in log mode
+
+Both deployment surfaces add `deploy-running` before the POST. The follower then
+accepts only a run it observes while `status === 'running'`. If a fast local run
+finishes before the first poll, the request is rejected before any run starts, the
+operator cancels a password prompt, or the password-retry request completes without
+a replacement follower, `follow()` returns `null` and nobody restores or finishes
+the card. CSS continues hiding the config section, option and Deploy button.
+
+A direct exact-head probe reproduced the core transition: after the card was placed
+in `deploy-running`, a settled request with no newly observed running run returned
+`null` with `deploy-running=true` and `deploy-finished=false`.
+
+**Required repair:** every POST outcome must leave the card in one deliberate state.
+A run belonging to that POST may transition to the terminal log view even when it
+finishes before polling observes the running state. Cancellation, validation/auth
+refusal and request failure must restore an actionable form or an explicit terminal
+result with a reset control. The password retry must start/follow its own request.
+Pin these paths on both the cockpit modal and standalone Deployment Centre.
+
+### HJ-DEPLOY-FOLLOW-2 — a failed poll is presented as a finished deployment
+
+Inside the running loop, a parsed response with `ok:false` or no run breaks polling.
+The function then unconditionally calls `finishUp()` using the last known run, which
+still says `running`. That applies `deploy-finished`, offers **Start a new
+deployment**, invokes `onDone`, and re-enables Deploy even though the server-side run
+may still be active. The API explicitly returns JSON `500 {ok:false}` when retained
+run reads fail, so this is a reachable path rather than a synthetic response shape.
+
+A direct exact-head probe reproduced: running run, then `500 {ok:false}` resulted in
+`returned:'running'`, `deploy-finished=true`, `deploy-running=false`, reset control
+present, and `onDone('running')`.
+
+**Required repair:** only an observed terminal run may call `finishUp()` or re-enable
+the deployment action. A transient poll failure must retry or show a non-terminal
+watch error without claiming completion. Add the adversarial running-then-500
+regression and assert no terminal class, reset control or completion callback.
+
+### Non-blocking review notes
+
+- Add `role="status"` / `aria-live="polite"` to the dynamically created status line;
+  managed deployment status already uses that pattern.
+- Generation-check archived-run requests so an older slow response cannot overwrite
+a newer selection or repopulate detail after Back.
+- The tmux right-click fix itself is **READY**: `bash -n` passed, a disposable tmux
+server retained the owner marker and `window-size=smallest`, and no mouse-triggered
+`display-menu` bindings remained. No injection, ownership or cgroup regression was
+found in that commit.
+
+Focused exact-head verification passed 38 deployment follower/CSS/route tests with
+zero failures or skips; current main run `35792247244` passed both host and container
+jobs. Those green gates do not exercise the two state transitions above. No code was
+changed, merged or deployed by this review.

@@ -91,6 +91,92 @@ test('a poller that fell behind the truncation window restarts its text instead 
   assert.equal(output.textContent.includes('tail-only'), false, 'the stale window is discarded, not concatenated');
 });
 
+test('a non-success poll interrupts following without declaring the active deployment finished', async () => {
+  const responses = [
+    { ok: true, run: runningRun },
+    { ok: false, error: 'poll temporarily unavailable' },
+  ];
+  const environment = { ...fakeDocument(), setTimeout: fn => { fn(); return 0; }, clearTimeout() {},
+    async fetch() {
+      const next = responses.shift();
+      return { status: 200, ok: true, json: async () => next };
+    } };
+  environment.document = environment;
+  const card = fakeCard();
+  const output = scrollableOutput();
+  const done = [];
+
+  const run = await createRunFollower(environment).follow({ base: '', project: 'demo', target: 'prod', output, card,
+    onDone: value => done.push(value) });
+
+  assert.equal(run.status, 'running', 'the last authoritative run is still active');
+  assert.equal(card.classList.contains('deploy-running'), true, 'the card stays locked in log-viewer mode');
+  assert.equal(card.classList.contains('deploy-finished'), false, 'a polling problem is not a deployment verdict');
+  assert.equal(card.children.some(child => child.className?.includes('deploy-reset')), false, 'no second deployment is offered');
+  assert.deepEqual(done, [], 'terminal callbacks are reserved for terminal runs');
+  const status = card.children.find(child => child.className?.startsWith('deploy-status'));
+  assert.match(status.textContent, /live log interrupted/i, 'the operator is told the follower, not the deploy, was interrupted');
+});
+
+test('a settled POST supersedes its follower before the initial GET can adopt stale running state', async () => {
+  const responses = [
+    { ok: true, run: runningRun },
+    { ok: false, error: 'must not be consumed after the POST settles' },
+  ];
+  const environment = { ...fakeDocument(), setTimeout: fn => { queueMicrotask(fn); return 0; }, clearTimeout() {},
+    async fetch() {
+      const next = responses.shift();
+      return { status: 200, ok: true, json: async () => next };
+    } };
+  environment.document = environment;
+  const card = fakeCard();
+  const output = scrollableOutput();
+  const pending = Promise.resolve({ ok: true, status: 'success', runId: runningRun.id });
+
+  const run = await createRunFollower(environment).follow({ base: '', project: 'demo', target: 'prod', output, card,
+    requireRunning: true, until: pending });
+
+  assert.equal(run, null, 'the POST caller receives sole control of the final transition');
+  assert.equal(responses.length, 1, 'no poll can overwrite the POST result after it settles');
+  assert.equal(card.classList.contains('deploy-running'), false, 'stale running state was never adopted');
+  assert.equal(card.classList.contains('deploy-finished'), false, 'the follower itself did not invent a verdict');
+});
+
+test('an in-flight stale poll cannot repaint RUNNING after the POST has painted SUCCESS', async () => {
+  let releasePoll;
+  const stalePoll = new Promise(resolve => { releasePoll = resolve; });
+  let call = 0;
+  const environment = { ...fakeDocument(), setTimeout: fn => { queueMicrotask(fn); return 0; }, clearTimeout() {},
+    async fetch() {
+      call++;
+      if (call === 1) return { status: 200, ok: true, json: async () => ({ ok: true, run: runningRun }) };
+      return { status: 200, ok: true, json: async () => stalePoll };
+    } };
+  environment.document = environment;
+  const card = fakeCard();
+  const output = scrollableOutput();
+  let resolvePost;
+  const pending = new Promise(resolve => { resolvePost = resolve; });
+  const follower = createRunFollower(environment);
+  const following = follower.follow({ base: '', project: 'demo', target: 'prod', output, card,
+    requireRunning: true, until: pending });
+  await new Promise(resolve => setImmediate(resolve));
+
+  resolvePost({ ok: true, status: 'success', runId: runningRun.id });
+  await pending;
+  follower.finishResult(card, output, { ok: true, status: 'success', runId: runningRun.id,
+    duration: '1.0', version: 'V1', user: 'operator', output: 'done\n' });
+  releasePoll({ ok: true, run: { ...runningRun }, chunk: 'stale\n', offset: 18 });
+  await following;
+
+  assert.equal(card.classList.contains('deploy-running'), false);
+  assert.equal(card.classList.contains('deploy-finished'), true);
+  const status = card.children.find(child => child.className?.startsWith('deploy-status'));
+  assert.equal(status.className, 'deploy-status success');
+  assert.match(status.textContent, /SUCCESS/);
+  assert.equal(output.textContent, 'done\n');
+});
+
 test('History drill-in renders a retained run, and says so when it is gone', async () => {
   const into = { hidden: true, textContent: '' };
   const ok = harness([{ body: { ok: true, run: { id: 'abc123', status: 'success', duration: '60.5', startedAt: '2026-09-22T18:45:00.000Z', user: 'kev', output: 'Publish succeeded.\n' } } }]);

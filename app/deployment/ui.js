@@ -57,7 +57,8 @@ export function createSubmissionFollower(terminalStates, environment = globalThi
         try { job = (await api(`/jobs/${encodeURIComponent(job.id)}`, { signal: controller.signal })).job; }
         catch (error) {
           if (stopped) break;
-          throw new Error(`${error.message} The job may still be running. Use its job link before deploying again.`);
+          return { ...result, queued: true, interrupted: true, job,
+            error: `${error.message} The job may still be running. Use its job link before deploying again.` };
         }
       }
       if (stopped) return { ...result, queued: true, job };

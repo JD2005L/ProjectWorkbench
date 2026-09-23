@@ -124,7 +124,7 @@ test('REGRESSION: neither deploy surface prompts before asking the server', asyn
       assert.notEqual(needAt, -1, 'must react to the server needPassword answer');
       assert.ok(needAt < promptAt, 'the prompt must be a REACTION to needPassword, not a precondition');
       // The first attempt carries no password at all.
-      assert.match(script, /runDeploy\('',\s*false\)/, 'must attempt the deploy with no password first');
+      assert.match(script, /requestAndFollow\('',\s*false\)/, 'must attempt and follow the deploy with no password first');
     });
   }
 });

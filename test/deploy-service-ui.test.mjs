@@ -224,12 +224,15 @@ test('UI: existing Deploy response follower keeps a durable link, polls only GET
   assert.equal(e.timers.size, 0);
 });
 
-test('UI: deployment follower does not retry a submission or silently claim success on connection loss', async () => {
+test('UI: deployment follower keeps a connection-lost host job queued without retrying or claiming success', async () => {
   const e = environment('<div id="card"></div><div id="output"></div>', { respond: async () => { throw new Error('Synthetic offline service'); } });
   const follow = createSubmissionFollower([...TERMINAL_STATES], e.sandbox);
   const promise = follow({ ok: true, backend: 'external', queued: true, job: jobFixture() }, { base: '/pw', card: e.el('card'), output: e.el('output') });
-  const rejected = assert.rejects(promise, /job may still be running/);
-  await e.tick(); await rejected;
+  await e.tick(); const result = await promise;
+  assert.equal(result.queued, true);
+  assert.equal(result.interrupted, true);
+  assert.equal(result.job.state, 'running');
+  assert.match(result.error, /job may still be running/);
   assert.equal(e.requests.length, 1);
   assert.equal(e.timers.size, 0);
   assert.equal(e.el('card').children[0].className, 'deploy-service-job-link');
