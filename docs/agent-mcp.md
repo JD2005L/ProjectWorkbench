@@ -1,7 +1,9 @@
 # An MCP surface for driving a project session from an external AI
 
-Status: **spec; the operator's six decisions are settled (see the end) and the
-build follows the rollout order below.**
+Status: **phases 1 and 2 built.** The token model (`actsAs`, project
+intersection, four session scopes) and the REST engine (list / prompt / read,
+behind the marker rule) are in. Phases 3 (turn latch) and 4 (MCP façade) are not.
+The operator's six decisions are settled — see the end.
 
 ## What already exists, so this builds rather than duplicates
 
@@ -242,10 +244,22 @@ said it and where.
 
 ## Rollout
 
-1. **Token model**: `actsAs`, `projects`, the three scopes, intersection rule, and
-   the Users/Tokens UI fields to mint one. Nothing else changes.
-2. **REST engine**: projects / send-prompt / read-session, with the marker rule and
-   the audit line. Usable immediately with curl.
+1. ~~**Token model**~~ — built (`1a602f1`): `actsAs`, `projects`, the four session
+   scopes, `tokenAuthority()`'s intersection rule, and the Settings ▸ API tokens
+   fields to mint one.
+2. ~~**REST engine**~~ — built: `app/agent-sessions.js` plus four routes under
+   `{BASE}/api/agent/`. Usable with curl today:
+
+   ```bash
+   TOKEN=pwat_…
+   curl -fsS -H "Authorization: Bearer $TOKEN" https://host/workbench/api/agent/projects
+   curl -fsS -H "Authorization: Bearer $TOKEN" https://host/workbench/api/agent/AITCtrl/sessions
+   curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+     -d '{"prompt":"summarise the last deploy failure","cli":"claude"}' \
+     https://host/workbench/api/agent/AITCtrl/sessions/bot-lane/prompt
+   curl -fsS -H "Authorization: Bearer $TOKEN" \
+     'https://host/workbench/api/agent/AITCtrl/sessions/bot-lane/output?lines=120'
+   ```
 3. **Turn latch**: `turn_id`, the bell-generation cursor, `pw_wait_for_turn` /
    `pw_get_turn`, and `since_turn` on the read. This is what closes the loop the
    feature exists for — decide, send, wait, read — so it is not a later phase.

@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import { resolveShippedHelper } from './shipped-helpers.js';
 import path from 'path';
+import os from 'os';
 import crypto from 'crypto';
 import { execFile, spawn } from 'child_process';
 import { Readable } from 'stream';
@@ -15,6 +16,7 @@ import { deployCss } from './deploy-css.js';
 import { resolveDeployReauth, REAUTH_UNREADABLE } from './deploy-reauth.js';
 import { readStoredDeployPassword, makeDeployIdentity } from './deploy-credential.js';
 import { createDeployRuns } from './deploy-runs.js';
+import { createAgentSessions, AgentSessionError, MARKER_TOKEN, MARKER_USER } from './agent-sessions.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { deployFollowClientSrc } from './deploy-follow.js';
@@ -1352,6 +1354,78 @@ async function withApiTokensLock(mutate){
   await saveTokens(apiTokensPath, tokens);
   return result;
  });
+}
+
+// ─── The agent session surface (docs/agent-mcp.md) ─────────────────────────
+//
+// One engine, and the routes below are a skin over it. Every tmux call it makes
+// goes through the same helpers the cockpit uses, so an agent's window is created,
+// stamped, listed and read exactly like a human's — there is no second path into
+// a pane for this feature to get wrong.
+const agentSessions = createAgentSessions({
+ authorize: async (projectName, token) => {
+  if(!validName(projectName)) return { ok:false, reason:`No such project: ${projectName}`, status:404 };
+  const authority = tokenAuthority(token, { users: await loadUsers(), hasProjectAccess: userHasProjectAccess });
+  if(!authority.ok) return { ok:false, reason: authority.reason, status:403 };
+  if(!authority.canReach(projectName)) return { ok:false, reason:`No such project: ${projectName}`, status:404 };
+  const project = await projectByName(projectName);
+  if(!project) return { ok:false, reason:`No such project: ${projectName}`, status:404 };
+  return { ok:true, project, user: authority.user };
+ },
+ listProjects: async () => (await loadProjects()).map(p => ({ name: p.name })),
+ listWindows: (projectName) => listTmuxWindows(projectName),
+ targetFor: (projectName, index) => `${tmuxSession(projectName)}:${index}`,
+ windowOption: async (target, option) => {
+  // -v prints the bare value; a window with the option unset exits non-zero, which
+  // is "not ours" rather than a failure.
+  try { const { stdout } = await tmux(['show-options','-w','-v','-t',target,option]); return String(stdout||'').trim(); }
+  catch { return ''; }
+ },
+ setWindowOption: async (target, option, value) => { await tmux(['set-option','-w','-t',target,option,String(value)]); },
+ createWindow: (project, name, cli, launcher) => newTmuxWindow(project, name, cli, launcher),
+ pasteToWindow: async (target, text) => {
+  // The paste path, not send-keys: see rule 3 in app/agent-sessions.js. The buffer
+  // is named per call and deleted on paste, so two concurrent prompts cannot swap
+  // payloads, and the temp file is 0600 and removed whatever happens — a prompt is
+  // somebody's content and does not belong in /tmp a moment longer than it must.
+  const buffer = `pw-agent-${crypto.randomBytes(6).toString('hex')}`;
+  const file = path.join(os.tmpdir(), `${buffer}.txt`);
+  try {
+   await fs.writeFile(file, text, { mode: 0o600 });
+   await tmux(['load-buffer','-b',buffer,file]);
+   await tmux(['paste-buffer','-d','-p','-b',buffer,'-t',target]);
+   // A beat before Enter: a TUI that is still ingesting a bracketed paste can
+   // otherwise swallow the submit and leave the prompt sitting in the composer.
+   await new Promise(r => setTimeout(r, 120));
+   await tmux(['send-keys','-t',target,'Enter']);
+  } finally {
+   await fs.rm(file, { force: true }).catch(()=>{});
+   await tmux(['delete-buffer','-b',buffer]).catch(()=>{});
+  }
+ },
+ capturePane: async (target, { lines, scrollback }) => {
+  const args = ['capture-pane','-p','-t',target,'-S',`-${scrollback ? Math.max(lines, 2000) : lines}`];
+  const { stdout } = await tmux(args);
+  const all = String(stdout || '').split('\n');
+  return all.slice(Math.max(0, all.length - lines)).join('\n');
+ },
+ audit: (event, detail) => audit(event, detail, null),
+});
+
+// Same shape as requireScope, and deliberately a separate gate: a session call
+// needs the scope AND a live acting account, and the failure modes differ enough
+// that sharing one middleware would blur "your token cannot do this" with "the
+// person your token acts as no longer can".
+function agentRoute(scope, handler){
+ return [requireScope(scope), async (req, res) => {
+  try {
+   const out = await handler(req.apiToken, req, res);
+   if(out !== undefined) res.json({ ok:true, ...out });
+  } catch(e){
+   if(e instanceof AgentSessionError) return res.status(e.status).json({ ok:false, code:e.code, error:e.message });
+   return res.status(500).json({ ok:false, error:e?.message || String(e) });
+  }
+ }];
 }
 
 // Scoped machine-surface gate. Deliberately NOT layered on requireAdmin: a service token must
@@ -3955,6 +4029,31 @@ const addProjectHandler = async (req,res,next)=>{ try {
  res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }};
 app.post(BASE + '/manage/add', requireAdmin, addProjectHandler);
+// ─── Agent session routes (docs/agent-mcp.md) ──────────────────────────────
+//
+// Bearer-token only: no cookie reaches these and no session scope reaches a
+// dashboard route, which is the separation app/api-tokens.js opens with. The MCP
+// façade in the next phase calls the same engine rather than these routes, so
+// neither surface can drift into being the authoritative one.
+app.get(BASE + '/api/agent/projects', ...agentRoute(SCOPES.SESSIONS_READ,
+ (token) => agentSessions.projects(token)));
+
+app.get(BASE + '/api/agent/:project/sessions', ...agentRoute(SCOPES.SESSIONS_READ,
+ (token, req) => agentSessions.sessions(token, req.params.project)));
+
+app.get(BASE + '/api/agent/:project/sessions/:session/output', ...agentRoute(SCOPES.SESSIONS_READ,
+ (token, req) => agentSessions.read(token, {
+  project: req.params.project, session: req.params.session,
+  lines: req.query.lines, include_scrollback: req.query.include_scrollback === '1' || req.query.include_scrollback === 'true',
+ })));
+
+app.post(BASE + '/api/agent/:project/sessions/:session/prompt', ...agentRoute(SCOPES.SESSIONS_PROMPT,
+ (token, req) => agentSessions.prompt(token, {
+  project: req.params.project, session: req.params.session,
+  prompt: req.body?.prompt, cli: String(req.body?.cli || ''),
+  create_if_missing: req.body?.create_if_missing !== false,
+ })));
+
 app.post(BASE + '/api/projects', requireScope(SCOPES.PROJECTS_REGISTER), addProjectHandler);
 
 app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
