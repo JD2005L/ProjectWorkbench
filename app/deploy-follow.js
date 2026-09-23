@@ -163,7 +163,9 @@ export function createRunFollower(environment = globalThis) {
         const shown = await follow({ ...context, card, output }).catch(() => null);
         if (!shown) paint(output, context.run, context.text || '', card);
       });
-      card.appendChild(button);
+      // Same row as Save when the operator is an admin looking at the config
+      // section; otherwise the card itself, since a non-admin has no such row.
+      (card.querySelector?.('.config-actions') || card).appendChild(button);
     }
     const outcome = context.run.status === 'success' ? '✅' : context.run.status === 'running' ? '⏳' : '❌';
     button.textContent = `${outcome} Show last deployment log`;

@@ -6274,7 +6274,7 @@ if(DEPLOY_CENTRE){
       <label>Version check command</label>
       <input class="version-cmd" placeholder="ssh devserver 'cat /app/package.json | jq -r .version'" value="${esc(devCfg.versionCmd||'')}">
       ${deployBackendSelect(devCfg)}
-      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+      <div class="config-actions"><button class="button secondary small save-config" type="button">Save</button></div>
      </div>` : ''}
     </div>`}
     ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog, backends[1] === 'external', isAdmin) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-probeable="${backends[1] === 'external'||prodCfg.versionCmd?'1':'0'}" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
@@ -6289,7 +6289,7 @@ if(DEPLOY_CENTRE){
       <label>Version check command</label>
       <input class="version-cmd" placeholder="ssh prodserver 'cat /app/package.json | jq -r .version'" value="${esc(prodCfg.versionCmd||'')}">
       ${deployBackendSelect(prodCfg)}
-      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+      <div class="config-actions"><button class="button secondary small save-config" type="button">Save</button></div>
      </div>` : ''}
     </div>`}
    </div>
@@ -6345,7 +6345,7 @@ if(DEPLOY_CENTRE){
       <label>Version check command</label>
       <input class="version-cmd" value="${esc(devCfg.versionCmd||'')}">
       ${deployBackendSelect(devCfg)}
-      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+      <div class="config-actions"><button class="button secondary small save-config" type="button">Save</button></div>
      </div>` : ''}
     </div>`}
     ${prodState.managed ? managedDeployTarget(p, 'prod', prodState, prodLog, backends[1] === 'external', isAdmin) : `<div class="target-card prod" data-project="${esc(p.name)}" data-target="prod" data-label="${esc(prodSlot.label)}"${prodCfg.reauth?' data-reauth="1"':''}>
@@ -6360,7 +6360,7 @@ if(DEPLOY_CENTRE){
       <label>Version check command</label>
       <input class="version-cmd" value="${esc(prodCfg.versionCmd||'')}">
       ${deployBackendSelect(prodCfg)}
-      <button class="button secondary small save-config" type="button" style="margin-top:.5rem">Save</button>
+      <div class="config-actions"><button class="button secondary small save-config" type="button">Save</button></div>
      </div>` : ''}
     </div>`}
    </div>

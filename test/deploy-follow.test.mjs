@@ -535,3 +535,26 @@ test('the CHOICE persists in both directions: bringing the log back also survive
   assert.equal(card2.classList.contains('deploy-finished'), true, 'the log the operator chose to see is the one that comes back');
   assert.match(output2.textContent, /done/);
 });
+
+test('the log toggle joins the Save row when there is one, and the card when there is not', async () => {
+  const store = storage();
+  store.setItem('pw.deploy.dismissedRuns', JSON.stringify({ 'demo\u0000prod': lastRun.id }));
+
+  // Admin card: the config section ships a .config-actions row holding Save, and
+  // CSS pushes the toggle to its right edge.
+  const admin = togglingEnvironment(store, [lastRun]);
+  const row = { className: 'config-actions', children: [], appendChild(child) { this.children.push(child); } };
+  const card = togglingCard(admin.created);
+  card.children.push(row);
+  await createRunFollower(admin.environment).follow({ base: '', project: 'demo', target: 'prod', output: { className: '', textContent: '' }, card });
+  assert.equal(row.children.length, 1, 'the toggle lands in the Save row');
+  assert.match(row.children[0].className, /deploy-show-log/);
+  assert.equal(card.children.filter(child => child.className?.includes('deploy-show-log')).length, 0,
+    'and not also loose on the card');
+
+  // Non-admin card: no config section at all, so the card is the only home.
+  const viewer = togglingEnvironment(store, [lastRun]);
+  const plain = togglingCard(viewer.created);
+  await createRunFollower(viewer.environment).follow({ base: '', project: 'demo', target: 'prod', output: { className: '', textContent: '' }, card: plain });
+  assert.ok(plain.live('deploy-show-log'), 'a card with no Save row still offers the toggle');
+});

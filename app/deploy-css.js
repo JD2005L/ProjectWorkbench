@@ -64,8 +64,13 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .deploy-reset{margin-top:.5rem}
 /* The form view's half of the toggle: a run the operator put away is one click
    from being read again, including after a reopen — which is the only way back,
-   since the panel deliberately stops reopening a dismissed log by itself. */
-:is(.deploy-page,#deployBackdrop) .deploy-show-log{margin-top:.5rem;margin-left:.4rem}
+   since the panel deliberately stops reopening a dismissed log by itself. It
+   shares the Save row, pushed to the right, so it reads as a view control rather
+   than a second action competing with Save. */
+:is(.deploy-page,#deployBackdrop) .config-actions{display:flex;align-items:center;gap:.5rem;margin-top:.5rem}
+:is(.deploy-page,#deployBackdrop) .config-actions .deploy-show-log{margin-left:auto}
+:is(.deploy-page,#deployBackdrop) .deploy-show-log{margin-top:.5rem}
+:is(.deploy-page,#deployBackdrop) .config-actions .deploy-show-log{margin-top:0}
 /* History is one panel with two views: the list, or one run's retained output.
    Replacing rather than appending is the point — the table runs to fifty rows,
    so a log pinned underneath meant scrolling past every other release to read
