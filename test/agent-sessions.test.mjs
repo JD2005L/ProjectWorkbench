@@ -83,31 +83,75 @@ test('a prompt into a new session creates it as the ACTING user and marks it bef
   assert.equal(JSON.stringify(detail).includes('do the thing'), false, 'the body is never audited, only its size');
 });
 
-test('an unmarked window is a human tab and is refused without sessions:prompt:any', async () => {
-  // The rule app/orchestrator/session.js is built on: a window belongs to a token
-  // only if it carries the marker THIS code set. A pane running a shell would run
-  // this text as a command.
-  const windows = [{ index: 3, name: 'eod-commit', bell: false }];
-  const { engine, calls } = harness({ windows });
-  const error = await fails(engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'hi' }), 'not_my_lane');
-  assert.equal(error.status, 403);
-  assert.match(error.message, /sessions:prompt:any/);
-  assert.equal(calls.pasted.length, 0, 'and nothing was typed while deciding');
+test('a shell pane is refused; an agent pane the token did not create is not', async () => {
+  // Ownership was never the hazard. Typing into a SHELL executes the text, and
+  // typing into a pane running on somebody else's CLI seat spends their
+  // credentials. Project access covers the rest — a token acting as somebody with
+  // access to a project may prompt the coding agents running in it, which is what
+  // "Bi-Tools is Kevin's and my token acts as Kevin" should have meant all along.
+  const shell = harness({ windows: [{ index: 3, name: 'eod-commit', paneCommand: 'bash' }] });
+  const refused = await fails(shell.engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'hi' }), 'not_an_agent_pane');
+  assert.equal(refused.status, 403);
+  assert.match(refused.message, /running bash, not a coding agent/);
+  assert.match(refused.message, /executed as a command/, 'the reason is the hazard, not "unauthorised"');
+  assert.equal(shell.calls.pasted.length, 0, 'and nothing was typed while deciding');
 
-  // Someone else's marker is still not mine.
-  const other = harness({ windows, markers: { 'pw_Demo:3|@pw_agent_token': 'tok-OTHER' } });
-  await other.engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'hi' });
-  assert.equal(other.calls.pasted.length, 1, 'any agent-owned lane is allowed; only humans are fenced off');
+  // A human's Claude tab, created by nobody's token: allowed, because the acting
+  // account can already open that project and type into it by hand.
+  const humanTab = harness({ windows: [{ index: 4, name: 'Kevin', paneCommand: 'claude' }] });
+  await humanTab.engine.prompt(BOT, { project: 'Demo', session: 'Kevin', prompt: 'hi' });
+  assert.deepEqual(humanTab.calls.pasted[0], ['pw_Demo:4', 'hi']);
 
+  // `node` is ambiguous — Claude reports it, and so does a dev server — so it
+  // counts only when PW created the window as an agent tab.
+  const bare = harness({ windows: [{ index: 5, name: 'dev', paneCommand: 'node' }] });
+  await fails(bare.engine.prompt(BOT, { project: 'Demo', session: 'dev', prompt: 'hi' }), 'not_an_agent_pane');
+  const stamped = harness({ windows: [{ index: 5, name: 'agent', paneCommand: 'node', credUser: 'kev' }] });
+  await stamped.engine.prompt(BOT, { project: 'Demo', session: 'agent', prompt: 'hi' });
+  assert.equal(stamped.calls.pasted.length, 1);
+
+  // Somebody else's CLI seat is refused: it would spend their credentials and
+  // put this token's account on their turn.
+  const theirs = harness({ windows: [{ index: 6, name: 'James', paneCommand: 'claude', credUser: 'james.levac' }] });
+  const seat = await fails(theirs.engine.prompt(BOT, { project: 'Demo', session: 'James', prompt: 'hi' }), 'other_users_credentials');
+  assert.match(seat.message, /spend their CLI credentials/);
+
+  // A hibernated session says what it needs rather than refusing vaguely.
+  const asleep = harness({ windows: [{ index: 7, name: 'old', paneCommand: 'claude-resume', hibernated: true }] });
+  const nap = await fails(asleep.engine.prompt(BOT, { project: 'Demo', session: 'old', prompt: 'hi' }), 'session_hibernated');
+  assert.match(nap.message, /resumed before it can take a prompt/);
+
+  // The override still overrides everything, which is its entire purpose.
   const elevated = { ...BOT, scopes: [...BOT.scopes, 'sessions:prompt:any'] };
-  const allowed = harness({ windows });
-  await allowed.engine.prompt(elevated, { project: 'Demo', session: 'eod-commit', prompt: 'hi' });
-  assert.deepEqual(allowed.calls.pasted[0], ['pw_Demo:3', 'hi'], 'the separate scope is what unlocks a human tab');
+  for (const windows of [[{ index: 3, name: 'sh', paneCommand: 'bash' }],
+    [{ index: 6, name: 'James', paneCommand: 'claude', credUser: 'james.levac' }]]) {
+    const any = harness({ windows });
+    await any.engine.prompt(elevated, { project: 'Demo', session: windows[0].name, prompt: 'hi' });
+    assert.equal(any.calls.pasted.length, 1, 'sessions:prompt:any unlocks the exceptional case');
+  }
+});
+
+test('the session list answers "can I prompt this" instead of leaving it to be inferred', async () => {
+  const { engine } = harness({ windows: [
+    { index: 1, name: 'Kevin', paneCommand: 'claude', credUser: 'kev' },
+    { index: 2, name: 'James', paneCommand: 'claude', credUser: 'james.levac' },
+    { index: 3, name: 'shell', paneCommand: 'bash' },
+  ] });
+  const listed = await engine.sessions(BOT, 'Demo');
+  const byName = Object.fromEntries(listed.sessions.map((sn) => [sn.session, sn]));
+
+  assert.equal(byName.Kevin.promptable, true);
+  assert.equal(byName.Kevin.running, 'claude');
+  assert.equal(byName.Kevin.not_promptable_because, undefined);
+  assert.equal(byName.James.promptable, false);
+  assert.match(byName.James.not_promptable_because, /james\.levac/);
+  assert.equal(byName.shell.promptable, false);
+  assert.match(byName.shell.not_promptable_because, /executed as a command/);
 });
 
 test('an existing session keeps its own CLI; creating one without naming a CLI is refused', async () => {
   const { engine, calls } = harness({
-    windows: [{ index: 2, name: 'bot-lane' }],
+    windows: [{ index: 2, name: 'bot-lane', paneCommand: 'claude' }],
     markers: { 'pw_Demo:2|@pw_agent_token': 'tok-1' },
   });
   // cli is ignored for a live pane: a token cannot know what it is running and
@@ -162,7 +206,7 @@ test('prompt size and session names are bounded', async () => {
 
 test('reading is capped and says when it capped, and reports what the pane is doing', async () => {
   const { engine, calls } = harness({
-    windows: [{ index: 4, name: 'bot-lane', bell: true, working: false, hibernated: false, credUser: 'kev' }],
+    windows: [{ index: 4, name: 'bot-lane', bell: true, working: false, hibernated: false, credUser: 'kev', paneCommand: 'claude' }],
     markers: { 'pw_Demo:4|@pw_agent_token': 'tok-1', 'pw_Demo:4|@pw_agent_user': 'kev' },
   });
   const out = await engine.read(BOT, { project: 'Demo', session: 'bot-lane', lines: 9999 });
@@ -173,9 +217,9 @@ test('reading is capped and says when it capped, and reports what the pane is do
 
   const listed = await engine.sessions(BOT, 'Demo');
   assert.deepEqual(listed.sessions[0], {
-    session: 'bot-lane', index: 4, working: false,
+    session: 'bot-lane', index: 4, running: 'claude', working: false,
     finished_turn: true, hibernated: false, runs_as: 'kev',
-    owned_by_this_token: true, agent_owned: true,
+    owned_by_this_token: true, agent_owned: true, promptable: true,
   });
 
   await fails(engine.read(BOT, { project: 'Demo', session: 'nope' }), 'no_such_session');

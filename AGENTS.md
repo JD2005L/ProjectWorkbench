@@ -239,11 +239,13 @@ too.
 
 Three things to know before you use it:
 
-- **You type into your OWN lane.** A session belongs to your token only if your
-  token created it. Somebody's human tab is refused, because a pane running a
-  shell would execute your "prompt" as a command. Create your own named session
-  and work there; `sessions:prompt:any` exists for the other case and is granted
-  separately.
+- **You may prompt any coding-agent session in a project you can reach**, whether
+  you created it or not. What is refused is a pane running a *shell* (your
+  "prompt" would be executed as a command), a session spending *another account's*
+  CLI credentials, and a hibernated session (resume it first).
+  `pw_list_sessions` tells you per session: `promptable`, and
+  `not_promptable_because` when it is not. `sessions:prompt:any` overrides those
+  refusals and is granted separately.
 - **`completed` means the agent STOPPED, not that it succeeded.** A refusal, a
   crash, a question asked back to the operator and a finished task all end a turn
   the same way. Read the output and judge.

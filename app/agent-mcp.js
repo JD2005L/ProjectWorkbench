@@ -113,7 +113,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: 'pw_list_sessions',
-    description: 'List the named sessions in one project. A session is a terminal window running a coding agent. `working` means it is mid-turn, `finished_turn` that it rang the done signal, and `owned_by_this_token` that this credential created it — you may only send prompts into sessions you own unless separately authorised.',
+    description: 'List the named sessions in one project. `running` is the pane\'s foreground command, `working` means mid-turn, `finished_turn` that it rang the done signal, `runs_as` whose CLI credentials it spends, and `promptable` whether you may send a prompt into it — with `not_promptable_because` naming the reason when you may not, so you do not have to infer it.',
     inputSchema: closed({ project: NAME }, ['project']),
   },
   {
@@ -122,6 +122,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
       'Send a prompt to a coding agent in a named session, as if typed by the person this credential acts as.',
       `The prompt is pasted whole (up to ${MAX_PROMPT_BYTES} bytes); for anything larger, put the content in the project's _inbox/ and name the path in the prompt instead.`,
       'If the session does not exist and create_if_missing is true, it is created — and `cli` is then REQUIRED, because starting Claude and starting Copilot spend different credentials and there is no safe default.',
+      'You may prompt any session running a coding agent in a project you can reach, including ones you did not create. Refused, with the reason: a pane running a shell (the text would be executed), a session spending another account\'s CLI credentials, and a hibernated session (resume it first).',
       'An existing session continues with whatever it is already running; `cli` is ignored for one.',
       'Returns a turn_id. Use pw_wait_for_turn to learn when that turn ends, then pw_read_session with since_turn to read what it produced.',
     ].join(' '),

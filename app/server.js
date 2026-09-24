@@ -2101,7 +2101,10 @@ function parseTmuxWindows(stdout){
    attached:Number(parts[4]) || 0, activity:Number(parts[5]) || 0,
    // Whose Claude/Copilot credentials this window's pane was created with ('' = the
    // shared box login). Stamped by stampWindowCredIdentity; see CRED_USER_OPTION.
-   windowId, panePid, credUser, hibernationMarkers,
+   // The pane's foreground command. Carried because the agent surface decides
+   // whether a prompt may be sent by what the pane IS RUNNING — typing into a
+   // shell executes the text — rather than by who created the window.
+   windowId, panePid, paneCommand, credUser, hibernationMarkers,
    placeholderInPane: hibernationMarkers && paneCommand === 'claude-resume',
    // Whether the tmux wake hooks can still resume it on their own: pw-claude-wait stops
    // advertising @pw_claude_waiting once its automatic retries are spent, and pw-claude-wake then

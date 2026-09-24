@@ -16,12 +16,15 @@
 //      — which is how the eod-commit task silently stopped being delivered once a
 //      second window shared its name (see newTmuxWindow's note in server.js). A
 //      name is what the caller asks for; an index is what we send to.
-//   2. AN AGENT TYPES INTO ITS OWN LANE. A window belongs to a token only if it
-//      carries the marker this code set, never because the name matches — the rule
-//      app/orchestrator/session.js is built on. A pane running a shell turns an
-//      injected "prompt" into a command run as the pane account, so an unmarked
-//      window (a human's tab) is refused unless the token carries
-//      sessions:prompt:any.
+//   2. A PROMPT GOES TO SOMETHING THAT TAKES PROMPTS. The first version of this
+//      refused any window the token had not created, which read as "Bi-Tools is
+//      Kevin's, my token acts as Kevin, why can I not type into it" — a fair
+//      complaint, because ownership was never the hazard. The hazard is a pane
+//      running a SHELL, where injected text is executed as a command, and a pane
+//      spending SOMEBODY ELSE's Claude/Copilot seat. So the decision is made on
+//      what the pane is running and whose credentials it carries; project access
+//      (already required) covers the rest, and sessions:prompt:any remains the
+//      override for the genuinely exceptional case.
 //   3. A PROMPT IS PASTED, NOT TYPED. send-keys types argv: a 200 KB prompt is both
 //      an ARG_MAX question and a stream of keystrokes into a TUI. The paste path is
 //      what a human paste is, and a CLI that collapses pastes sees one paste rather
@@ -36,6 +39,44 @@ export const MAX_PROMPT_BYTES = 256 * 1024;
 export const MAX_READ_LINES = 2000;
 export const DEFAULT_READ_LINES = 200;
 export const SUPPORTED_CLIS = Object.freeze(['claude', 'copilot']);
+/** Unambiguously a coding agent, so a prompt is the same act a human performs. */
+const AGENT_COMMAND = /^(claude|copilot)(\.exe)?$/i;
+/**
+ * Claude Code frequently reports its pane command as `node` (server.js says so
+ * where it kills and respawns a PVIKPBot window), and so does a dev server. An
+ * ambiguous pane is only treated as an agent when PW itself created it as one —
+ * a credential stamp or a Claude session marker — because guessing wrong here
+ * means executing a prompt in a shell.
+ */
+const AMBIGUOUS_COMMAND = /^(node|node\.exe)$/i;
+
+/**
+ * May this token put a prompt into this window? Returns null when yes, or the
+ * reason when no — and every reason names the specific thing in the way, because
+ * "not authorised" sends people to the wrong fix.
+ */
+export function promptRefusal(window, { actsAs = '', owned = false, override = false } = {}) {
+  if (override) return null;             // sessions:prompt:any is exactly this case
+  if (owned) return null;                // its own lane needs no further argument
+  if (window?.hibernated) {
+    return { code: 'session_hibernated',
+      message: 'That session is hibernated: it has to be resumed before it can take a prompt. Open it in the dashboard, or prompt a different session.' };
+  }
+  const command = String(window?.paneCommand || '').trim();
+  const isAgent = AGENT_COMMAND.test(command)
+    || (AMBIGUOUS_COMMAND.test(command) && (!!window?.credUser || !!window?.hibernationMarkers));
+  if (!isAgent) {
+    return { code: 'not_an_agent_pane',
+      message: `That session is running ${command || 'something this surface does not recognise'}, not a coding agent — a prompt typed there would be executed as a command. Create your own session, or ask an operator for sessions:prompt:any.` };
+  }
+  if (window?.credUser && actsAs && window.credUser !== actsAs) {
+    // Prompting here would spend somebody else's Claude/Copilot seat, and the
+    // audit would name your account for their turn.
+    return { code: 'other_users_credentials',
+      message: `That session runs on ${window.credUser}'s account and this token acts as ${actsAs}. Prompting it would spend their CLI credentials; that needs sessions:prompt:any.` };
+  }
+  return null;
+}
 /** An _inbox file is a document, not a disk image. */
 export const MAX_INBOX_BYTES = 8 * 1024 * 1024;
 
@@ -118,9 +159,15 @@ export function createAgentSessions({
       const sessions = [];
       for (const w of windows) {
         const mark = await ownership(targetFor(projectName, w.index));
+        const refusal = promptRefusal(w, {
+          actsAs: token.actsAs || '',
+          owned: !!mark.tokenId && mark.tokenId === token.id,
+          override: !!token.scopes?.includes('sessions:prompt:any'),
+        });
         sessions.push({
           session: w.name,
           index: w.index,
+          running: w.paneCommand || null,
           working: !!w.working,
           // The bell is how this instance already knows a turn ended; see the doc.
           finished_turn: !!w.bell,
@@ -128,6 +175,10 @@ export function createAgentSessions({
           runs_as: w.credUser || null,
           owned_by_this_token: !!mark.tokenId && mark.tokenId === token.id,
           agent_owned: mark.owned,
+          // Answered here so a caller does not have to infer it from the fields
+          // above and get it wrong in both directions.
+          promptable: !refusal,
+          ...(refusal ? { not_promptable_because: refusal.message } : {}),
         });
       }
       return { project: projectName, sessions };
@@ -171,10 +222,12 @@ export function createAgentSessions({
         created = true;
       } else {
         const mark = await ownership(targetFor(projectName, window.index));
-        if (!mark.owned && !token.scopes?.includes('sessions:prompt:any')) {
-          refuse(`"${session}" was not created by this token. A pane running a shell would execute this text as a command, so typing into somebody else's window needs the separate scope sessions:prompt:any.`,
-            403, 'not_my_lane');
-        }
+        const refusal = promptRefusal(window, {
+          actsAs: verdict.user.username,
+          owned: !!mark.tokenId && mark.tokenId === token.id,
+          override: !!token.scopes?.includes('sessions:prompt:any'),
+        });
+        if (refusal) refuse(refusal.message, 403, refusal.code);
       }
 
       const tmuxTarget = targetFor(projectName, window.index);

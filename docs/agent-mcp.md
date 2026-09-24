@@ -168,25 +168,39 @@ authority, and reusing it as authority would be the bug. The record gains:
   `app/api-tokens.js`: a credential that lives on somebody's laptop must not reach
   the dashboard's 29 admin routes.
 
-## The marker rule: an agent types into its OWN lane
+## What may be prompted (revised 2026-09-24)
 
-`pw_send_prompt` refuses a window this service did not create, unless the token
-carries `sessions:prompt:any`.
+The first version of this refused any window the token had not created, borrowing
+`app/orchestrator/session.js`'s marker rule. In use that read as *"Bi-Tools is
+Kevin's, my token acts as Kevin, why can I not type into it?"* — a fair
+complaint, because **ownership was never the hazard.** Two things are:
 
-This is `app/orchestrator/session.js`'s rule, and it is worth restating because it
-is the difference between a feature and an incident: **a window belongs to a token
-only if it carries the role marker this code set** — not because the name matches.
-A tmux window whose pane is running `bash` turns an injected "prompt" into a shell
-command executed as the pane account. So:
+- a pane running a **shell**, where injected text is executed as a command;
+- a pane spending **somebody else's** Claude/Copilot seat, which would bill their
+  credentials for this token's turn and put the wrong name on it.
 
-- windows this surface creates are marked (`@pw_agent_token`, `@pw_agent_user`) and
-  are started on a CLI (`claude`, `copilot`), never a bare shell;
-- an unmarked window — a human's tab — is refused by default, with an error that
-  names the alternative ("create your own session, or ask an operator for
-  `sessions:prompt:any`");
-- `sessions:prompt:any` exists because there IS a legitimate case (an operator
-  wiring an assistant into their own working tab) and it should be a visible,
-  separately-granted decision rather than the default.
+So the decision is made on what the pane is running and whose credentials it
+carries. Project access — already required, and already the intersection of the
+token and the account it acts as — covers the rest:
+
+| Pane | Prompt allowed? |
+|---|---|
+| `claude` / `copilot` | yes, created by this token or not |
+| `node` **and** PW created it as an agent tab (credential stamp or Claude marker) | yes |
+| `node` with no such marker (a dev server, say) | no — ambiguous, and guessing means executing a prompt in a shell |
+| `bash`, `vim`, anything else | no — the text would be executed |
+| hibernated | no — it must be resumed first, and the error says so |
+| runs on another account's CLI credentials | no — that spends their seat |
+
+`sessions:prompt:any` overrides all of it, which is its entire purpose: an
+operator wiring an assistant into a tab it does not own, decided deliberately and
+granted separately.
+
+Windows this surface creates are still marked (`@pw_agent_token`,
+`@pw_agent_user`) and still started on a CLI rather than a shell — the marker is
+now a fast path and an audit aid rather than the gate. And `pw_list_sessions`
+answers `promptable` per session with `not_promptable_because`, so a caller reads
+the answer instead of inferring it and getting it wrong in both directions.
 
 ## Completion: how PW already knows a turn ended
 
