@@ -3941,3 +3941,42 @@ prompt body, because a prompt carries whatever the sending agent had in context
 and the audit log has more readers than the pane.
 
 Six decisions are open for the operator at the end; nothing is implemented.
+
+## GOA — 2026-09-24 — the prompt gate was wrong, and a readiness probe was flaky
+
+**Ownership was never the hazard.** The agent surface refused a prompt into any
+window the token had not created, borrowed from `app/orchestrator/session.js`'s
+marker rule. In use that produced: *"Bi-Tools is owned by Kevin, my token acts as
+Kevin, and Kevin has access to every project — why can it not send prompts into
+those sessions?"* The complaint is right. What is dangerous is a pane running a
+SHELL (injected text is executed as a command as the pane account) and a pane
+spending SOMEBODY ELSE's Claude/Copilot seat (their credentials, this token's
+turn, the wrong name on it). Neither has anything to do with who opened the
+window.
+
+So the gate reads the pane now: `claude`/`copilot` panes are promptable whether
+this token created them or not, because the account the token acts as can already
+open that project and type into it by hand. `node` is ambiguous — Claude reports
+it and so does a dev server — and counts only where PW created the window as an
+agent tab. Shells, hibernated sessions and other accounts' credentials are
+refused, each naming the specific thing in the way, because "not authorised" sent
+the operator to the wrong fix, which is exactly what the report was.
+`pw_list_sessions` now answers `promptable` / `not_promptable_because` per
+session, so a caller reads the answer instead of inferring it from ownership flags.
+`parseTmuxWindows` carries `paneCommand` for this; it was parsed and then dropped
+before any caller could see it.
+
+**A readiness probe, not a race condition.** `af7646c` went red in the container
+job on `test/same-user-delete-login-race.test.mjs`, which is unrelated to that
+change — and the failure text contained `dashboard listening on 127.0.0.1:5060`,
+i.e. the probe gave up on a server that had already announced itself. `waitUp`
+budgeted an ITERATION COUNT (100 × 50ms = 5s) rather than a duration, while the
+round starts two dashboards that each scrypt-hash 24 concurrent logins, six times
+over. It is a deadline now (30s) with backoff, and its error says how long it
+waited and whether the child was still running, so the next failure is
+diagnosable rather than a log dump. Same shape as PR #76's cleanup retry: bounded,
+and it makes a real failure louder rather than quieter.
+
+Worth noting for whoever sees the next red run: I could not re-run the failed job
+(`gh run rerun` needs admin on the repository, which this EMU account does not
+have), so a flake has to be diagnosed from its log and fixed rather than retried.

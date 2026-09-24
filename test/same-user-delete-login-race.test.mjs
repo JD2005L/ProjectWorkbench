@@ -45,13 +45,29 @@ async function hashPassword(p) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function sid(resp) { return /pw_session=([^;]+)/.exec(resp.headers.get('set-cookie') || '')?.[1] || null; }
+// Two dashboards per round, six rounds, each doing scrypt work for 24 concurrent
+// logins — and the budget here used to be an iteration count (100 x 50ms = 5s)
+// rather than a duration. On a loaded CI runner that expired while the server was
+// still starting: the failure captured "dashboard listening on 127.0.0.1:5060" in
+// its own error text, which is a probe giving up on a server that had already
+// announced itself. Fixed as a DEADLINE, because "how long to wait" and "how
+// often to look" are different questions and conflating them is what made this
+// flaky rather than slow.
+const STARTUP_BUDGET_MS = 30_000;
+
 async function waitUp(base, child, logs) {
-  for (let i = 0; i < 100; i++) {
-    if (child.exitCode !== null) throw new Error(logs.join(''));
+  const deadline = Date.now() + STARTUP_BUDGET_MS;
+  let waited = 0;
+  while (Date.now() < deadline) {
+    // A child that died is a real failure and must not wait out the budget.
+    if (child.exitCode !== null) throw new Error(`server exited (${child.exitCode}) ` + logs.join(''));
     try { if ((await fetch(base + '/healthz')).status === 200) return; } catch { /* not up yet */ }
-    await sleep(50);
+    // Back off a little so a slow start is not hammered hundreds of times while
+    // it is competing for the same CPU.
+    waited = Math.min(250, waited + 25);
+    await sleep(waited);
   }
-  throw new Error('startup timeout ' + logs.join(''));
+  throw new Error(`startup timeout after ${STARTUP_BUDGET_MS}ms (child ${child.exitCode === null ? 'still running' : `exited ${child.exitCode}`}) ` + logs.join(''));
 }
 
 async function runRound() {
