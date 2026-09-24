@@ -144,6 +144,8 @@ export function safeTokenShape(t) {
     projects: t.projects === '*' ? '*' : (t.projects || []),
     createdAt: t.createdAt || null,
     createdBy: t.createdBy || '',
+    updatedAt: t.updatedAt || null,
+    updatedBy: t.updatedBy || '',
     lastUsedAt: t.lastUsedAt || null,
     disabled: !!t.disabled,
   };

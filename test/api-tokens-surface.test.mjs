@@ -191,3 +191,83 @@ test('the users table can always reach its last column', { timeout: 60000 }, asy
       'a two-word status must not stack into three lines and widen the column that caused this');
   });
 });
+
+test('the mint form picks an account and its OWN projects, rather than free text', { timeout: 60000 }, async () => {
+  // A typed username is a token that fails on first use with nothing to point at,
+  // and a typed project list is a tick that silently never matches. Both are
+  // pickers now, and the project picker is the intersection rule made visible:
+  // you can only scope a token to projects the account it acts as can reach.
+  await withDashboard(async ({ base }) => {
+    const html = await (await fetch(`${base}/settings`)).text();
+    assert.match(html, /<select id="tokActsAs">/, 'the acting account is chosen, not typed');
+    assert.match(html, /nobody \(not a session token\)/, 'and "no account" is an explicit option');
+    assert.match(html, /<fieldset id="tokProjects"[^>]*>/, 'projects are a checkbox list');
+    assert.match(html, /id="tokAllProjects"/, 'with an explicit "all" rather than a magic asterisk');
+    assert.doesNotMatch(html, /id="tokProjects"[^>]*>\s*<input/, 'the old free-text project field is gone');
+
+    const listed = await fetch(`${base}/api/tokens`).then((r) => r.json());
+    // Each user carries their own reachable projects, so the picker never offers a
+    // project the selected account cannot open.
+    assert.ok(Array.isArray(listed.users), 'the payload carries the accounts');
+    for (const user of listed.users) {
+      assert.equal(typeof user.username, 'string');
+      assert.ok(Array.isArray(user.projects), `${user.username} must carry their own project list`);
+    }
+    assert.equal(JSON.stringify(listed).includes('passwordHash'), false, 'a user list is not a user record');
+    assert.equal(JSON.stringify(listed).includes('digest'), false);
+  });
+});
+
+test('a token can be re-scoped in place, and the secret still works afterwards', { timeout: 60000 }, async () => {
+  // The point of editing: widening or narrowing a bot's authority must not mean
+  // redeploying the bot. So the digest is untouched and the same plaintext keeps
+  // authenticating — with the NEW scopes.
+  await withDashboard(async ({ base }) => {
+    const minted = await mintViaApi(base, { label: 'editable', scopes: [SCOPE] });
+    assert.equal(minted.ok, true, minted.error);
+    const id = minted.record.id;
+
+    const patch = async (body) => {
+      const r = await fetch(`${base}/api/tokens/${id}`, {
+        method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+      });
+      return { status: r.status, body: await r.json() };
+    };
+
+    // Session scopes cannot be added without naming the account they act as.
+    const nameless = await patch({ scopes: [SCOPE, 'sessions:read'] });
+    assert.equal(nameless.status, 400);
+    assert.match(nameless.body.error, /must name the user it acts as/);
+
+    // Nor can a token be left able to do nothing — that is what revoking is for.
+    const empty = await patch({ scopes: [] });
+    assert.equal(empty.status, 400);
+    assert.match(empty.body.error, /revoke it instead/);
+
+    const unknown = await patch({ scopes: ['admin'] });
+    assert.equal(unknown.status, 400);
+    assert.match(unknown.body.error, /Unknown scope/);
+
+    // A narrowing edit needs nothing extra.
+    const narrowed = await patch({ scopes: [SCOPE], label: 'editable (narrowed)' });
+    assert.equal(narrowed.status, 200);
+    assert.deepEqual(narrowed.body.record.scopes, [SCOPE]);
+    assert.equal(narrowed.body.record.label, 'editable (narrowed)');
+    assert.ok(narrowed.body.record.updatedAt, 'an edit is stamped, because a scope change is an authority change');
+    assert.equal(narrowed.body.record.createdAt, minted.record.createdAt, 'provenance is not editable history');
+
+    // And the credential minted before the edit still authenticates.
+    const stillWorks = await fetch(`${base}/api/projects`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${minted.token}`, Origin: base },
+      body: JSON.stringify({}),
+    });
+    assert.notEqual(stillWorks.status, 401, 'the secret was not rolled by re-scoping');
+    assert.notEqual(stillWorks.status, 403, 'and it still carries the scope it was left with');
+
+    assert.equal((await patch({ scopes: [SCOPE] })).status, 200);
+    const missing = await fetch(`${base}/api/tokens/does-not-exist`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ scopes: [SCOPE] }),
+    });
+    assert.equal(missing.status, 404);
+  });
+});
