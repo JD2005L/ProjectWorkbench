@@ -271,3 +271,28 @@ test('a token can be re-scoped in place, and the secret still works afterwards',
     assert.equal(missing.status, 404);
   });
 });
+
+test('minting a session token shows how to connect an AI to it, with the real URL and secret', { timeout: 60000 }, async () => {
+  // The instructions live at the moment of minting because that is the one moment
+  // they are needed AND the one moment the token exists. Assembling the snippet
+  // from prose is where people paste the wrong host or lose the secret.
+  await withDashboard(async ({ base }) => {
+    const html = await (await fetch(`${base}/settings`)).text();
+    assert.match(html, /id="tokConnect"/, 'the mint panel carries connection instructions');
+    assert.match(html, /id="tokMcp"/, 'an MCP config block');
+    assert.match(html, /id="tokCurl"/, 'and a plain-HTTPS alternative');
+    assert.match(html, /Treat the config file as a secret/, 'with the warning that the snippet contains the token');
+    assert.match(html, /mcp add|mcpServers/, 'and where to put it');
+
+    // The generator is client-side, so what this test can prove from here is that
+    // it compiles and that it is wired to the mint response — the inline-script
+    // compile check above is the other half, and it is what caught this block
+    // twice while it was being written.
+    const script = html.split('<script>').find((chunk) => chunk.includes('showConnectInstructions'));
+    assert.ok(script, 'the generator is on the page');
+    assert.match(script, /showConnectInstructions\(j\.token,j\.record\)/, 'fed by the one response that has the plaintext');
+    assert.match(script, /sc\.indexOf\('sessions:'\)===0/,
+      'a token with no session scopes gets no MCP block: showing a config that would be refused is worse than none');
+    assert.match(script, /location\.origin/, 'the URL comes from the instance, not from a guess');
+  });
+});

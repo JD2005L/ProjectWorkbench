@@ -212,6 +212,43 @@ Every live PW instance also serves the same file unauthenticated at
 `http://<workbench-host>/agents.md` so a remote agent can `curl` it
 without first negotiating credentials.
 
+### Connecting an AI to this workbench (MCP)
+
+An external assistant can drive a project session over HTTPS with a bearer
+token — no SSH, no dashboard login. **Settings ▸ API tokens** is the whole
+setup, and it hands you the configuration to paste:
+
+1. **Mint a token.** Choose **Acts as** (the account whose Claude/Copilot
+   credentials its sessions will spend, and whose name the audit line
+   carries), tick the projects it may reach, and grant `sessions:read`,
+   `sessions:prompt` and `sessions:create`.
+2. **Copy the MCP config it shows you.** The panel builds it with this
+   instance's URL and the token already in place — the token is displayed
+   once and never again, so copy it then. Paste it into the assistant's
+   `mcpServers` configuration (for Claude Code, `~/.claude.json` or
+   `claude mcp add`). A plain `curl` version of the same operations is
+   shown underneath for anything that does not speak MCP.
+3. The assistant then has six tools: list projects, list sessions, send a
+   prompt to a named session (created on demand), wait for that turn to
+   finish, and read what it produced.
+
+Scopes can be changed later from the same page **without rolling the
+token** — the assistant keeps working with its existing credential.
+
+Three things worth knowing before wiring one up:
+
+- An assistant types into **its own** named session. A human's tab is
+  refused, because a pane running a shell would execute a "prompt" as a
+  command. `sessions:prompt:any` exists for the exception and is granted
+  separately.
+- A completed turn means the agent **stopped**, not that it succeeded — a
+  refusal, a crash and a question asked back all end a turn the same way.
+- A token can never exceed the account it acts as: disable that account
+  and every token acting as it stops in the same instant.
+
+The design, the authority model and the full tool contract are in
+[`docs/agent-mcp.md`](docs/agent-mcp.md).
+
 ---
 
 ## Troubleshooting
