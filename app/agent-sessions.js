@@ -36,6 +36,8 @@ export const MAX_PROMPT_BYTES = 256 * 1024;
 export const MAX_READ_LINES = 2000;
 export const DEFAULT_READ_LINES = 200;
 export const SUPPORTED_CLIS = Object.freeze(['claude', 'copilot']);
+/** An _inbox file is a document, not a disk image. */
+export const MAX_INBOX_BYTES = 8 * 1024 * 1024;
 
 export class AgentSessionError extends Error {
   constructor(message, status = 400, code = 'invalid_request') {
@@ -64,6 +66,10 @@ export function createAgentSessions({
   capturePane,           // (target, { lines, scrollback }) -> string
   targetFor,             // (projectName, index) -> tmux target string
   paneMetrics,           // (target) -> { activity, bell, history, rows } | { missing:true }
+  readTranscript,        // ({ project, projectPath, actsAs, sessionIdHint, messages }) -> { …, messages:[] }
+  readWorkspaceFile,     // ({ project, relative, maxBytes }) -> { path, text, size, binary, truncated }
+  readWorkspaceTree,     // ({ project, relative, maxEntries }) -> { path, entries, truncated }
+  writeInboxFile,        // ({ project, filename, buffer }) -> { name, bytes, path }
   turns,                 // app/agent-turns.js store (optional; without it a prompt returns no turn)
   sampleMs = 1500,
   maxWaitMs = 600000,
@@ -231,6 +237,81 @@ export function createAgentSessions({
         await new Promise((resolve) => setTimeout(resolve, sampleMs));
       }
       return { turn: state, waited_ms: Date.now() - started };
+    },
+
+    /**
+     * The session's CONVERSATION rather than its screen.
+     *
+     * pw_read_session returns whatever the TUI painted — spinners, box drawing,
+     * frames it has since redrawn over. A transcript is what was actually said,
+     * which is both better signal and the single richest thing this product
+     * holds, hence its own scope.
+     */
+    async transcript(token, { project: projectName, session, messages = 20 }) {
+      const verdict = await reach(token, projectName);
+      if (!readTranscript) refuse('Transcripts are not available on this instance', 501, 'transcript_unavailable');
+      const { window } = await resolveWindow(projectName, session);
+      if (!window) refuse(`No session "${session}" in ${projectName}`, 404, 'no_such_session');
+      const wanted = Math.max(1, Math.min(200, Number(messages) || 20));
+      // The window's own marker when there is one; otherwise the newest
+      // transcript for this project, and the answer SAYS which — a caller acting
+      // on somebody else's conversation because two lanes were open in one
+      // project is exactly the confusion worth naming rather than hiding.
+      const out = await readTranscript({
+        project: projectName, projectPath: verdict.project.path,
+        actsAs: verdict.user.username, sessionIdHint: window.claudeSid || '', messages: wanted,
+      });
+      if (!out) refuse(`No transcript for "${session}" — it may not be a Claude session, or it has not spoken yet`, 404, 'no_transcript');
+      await audit('agent_transcript', { tokenId: token.id, label: token.label, actsAs: verdict.user.username,
+        project: projectName, session, messages: out.messages?.length || 0, resolvedBy: out.resolved_by });
+      return { project: projectName, session, ...out };
+    },
+
+    /** List a directory inside the project. */
+    async tree(token, { project: projectName, path: relative = '', max_entries }) {
+      await reach(token, projectName);
+      if (!readWorkspaceTree) refuse('Workspace reads are not available on this instance', 501, 'workspace_unavailable');
+      const out = await readWorkspaceTree({ project: projectName, relative, maxEntries: max_entries });
+      await audit('agent_workspace_tree', { tokenId: token.id, label: token.label, project: projectName, path: out.path });
+      return { project: projectName, ...out };
+    },
+
+    /** Read one file inside the project. */
+    async file(token, { project: projectName, path: relative, max_bytes }) {
+      await reach(token, projectName);
+      if (!readWorkspaceFile) refuse('Workspace reads are not available on this instance', 501, 'workspace_unavailable');
+      if (!relative) refuse('A path is required', 400, 'path_required');
+      const out = await readWorkspaceFile({ project: projectName, relative, maxBytes: max_bytes });
+      // Path and size, never the contents: the audit answers what was read, and
+      // the file itself is not the audit log's business.
+      await audit('agent_workspace_read', { tokenId: token.id, label: token.label, project: projectName,
+        path: out.path, bytes: out.size, binary: !!out.binary });
+      return { project: projectName, ...out };
+    },
+
+    /**
+     * Put a file in the project's _inbox — the supported way to hand a session
+     * something too big for a prompt. Deliberately the ONLY write: a change that
+     * goes through the agent inherits the project's tests, conventions and
+     * review, and _inbox is where a human hands over a document too.
+     */
+    async putInbox(token, { project: projectName, filename, content = '', base64 = false }) {
+      await reach(token, projectName);
+      if (!writeInboxFile) refuse('Inbox writes are not available on this instance', 501, 'inbox_unavailable');
+      const name = String(filename || '').trim();
+      if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(name)) {
+        refuse('A filename must be a plain name: letters, digits, dot, dash, underscore', 400, 'invalid_filename');
+      }
+      const buffer = base64 ? Buffer.from(String(content), 'base64') : Buffer.from(String(content), 'utf8');
+      if (!buffer.length) refuse('Refusing to write an empty file', 400, 'empty_file');
+      if (buffer.length > MAX_INBOX_BYTES) {
+        refuse(`File is ${buffer.length} bytes; the limit is ${MAX_INBOX_BYTES}`, 413, 'file_too_large');
+      }
+      const out = await writeInboxFile({ project: projectName, filename: name, buffer });
+      await audit('agent_inbox_write', { tokenId: token.id, label: token.label, project: projectName,
+        filename: out.name, bytes: buffer.length });
+      return { project: projectName, ...out,
+        hint: `Tell the session to read ${out.path} — a prompt naming the path is how a file becomes work.` };
     },
 
     async read(token, { project: projectName, session, lines = DEFAULT_READ_LINES, include_scrollback = false, since_turn = '' }) {

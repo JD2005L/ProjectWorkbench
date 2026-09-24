@@ -255,3 +255,87 @@ test('a turn belonging to another project does not resolve', async () => {
   turns.start({ project: 'Other', session: 'bot-lane', window: 2, tokenId: 'tok-1', actsAs: 'kev', sample: {} });
   await fails(engine.turn(BOT, { project: 'Demo', session: 'bot-lane', turn_id: 'turn-1' }), 'no_such_turn');
 });
+
+// ─── workspace reads, transcript and the one write (2026-09-24) ─────────────
+
+function extendedHarness({ transcript = null, tree = null, file = null, inbox = null } = {}) {
+  const calls = [];
+  const engine = createAgentSessions({
+    authorize: async (project, token) => ({ ok: true, project: { name: project, path: `/w/${project}` }, user: { username: token.actsAs } }),
+    listProjects: async () => [{ name: 'Demo' }],
+    listWindows: async () => [{ index: 2, name: 'bot-lane' }],
+    targetFor: (project, index) => `pw_${project}:${index}`,
+    windowOption: async () => 'tok-1',
+    setWindowOption: async () => {},
+    createWindow: async () => 2,
+    pasteToWindow: async () => {},
+    capturePane: async () => '',
+    paneMetrics: async () => ({ activity: 1 }),
+    readTranscript: async (args) => { calls.push(['transcript', args]); return transcript; },
+    readWorkspaceTree: async (args) => { calls.push(['tree', args]); return tree || { path: args.relative || '', entries: [], truncated: false }; },
+    readWorkspaceFile: async (args) => { calls.push(['file', args]); return file || { path: args.relative, text: 'x', size: 1, binary: false, truncated: false }; },
+    writeInboxFile: async (args) => { calls.push(['inbox', args]); return inbox || { name: args.filename, bytes: args.buffer.length, path: `/w/Demo/_inbox/${args.filename}` }; },
+    audit: async (event, detail) => calls.push(['audit', event, detail]),
+  });
+  return { engine, calls };
+}
+
+test('a transcript is read from the ACTING account and says how it found the session', async () => {
+  const { engine, calls } = extendedHarness({
+    transcript: { session_id: 'abc-123', resolved_by: 'most-recent',
+      messages: [{ role: 'user', text: 'fix the test' }, { role: 'assistant', text: 'done' }] },
+  });
+  const out = await engine.transcript(BOT, { project: 'Demo', session: 'bot-lane', messages: 5 });
+
+  assert.deepEqual(calls[0][1], { project: 'Demo', projectPath: '/w/Demo', actsAs: 'kev', sessionIdHint: '', messages: 5 },
+    "one launcher's transcripts are not another's to read");
+  assert.equal(out.resolved_by, 'most-recent',
+    'with two lanes in one project this may be the other one: said, not hidden');
+  assert.equal(out.messages.length, 2);
+  const [, event, detail] = calls.find(([kind]) => kind === 'audit');
+  assert.equal(event, 'agent_transcript');
+  assert.equal(detail.messages, 2);
+  assert.equal(JSON.stringify(detail).includes('fix the test'), false, 'the audit counts messages, it does not keep them');
+
+  const none = extendedHarness({ transcript: null });
+  await fails(none.engine.transcript(BOT, { project: 'Demo', session: 'bot-lane' }), 'no_transcript');
+  const bounded = extendedHarness({ transcript: { messages: [] } });
+  await bounded.engine.transcript(BOT, { project: 'Demo', session: 'bot-lane', messages: 9999 });
+  assert.equal(bounded.calls[0][1].messages, 200, 'a transcript request is capped');
+});
+
+test('workspace reads pass the caller path through to the confined worker, and audit it without contents', async () => {
+  const { engine, calls } = extendedHarness({ file: { path: 'app/server.js', text: 'secret-looking source', size: 21, binary: false, truncated: false } });
+  await engine.tree(BOT, { project: 'Demo', path: 'app' });
+  assert.deepEqual(calls[0], ['tree', { project: 'Demo', relative: 'app', maxEntries: undefined }]);
+
+  const read = await engine.file(BOT, { project: 'Demo', path: 'app/server.js', max_bytes: 100 });
+  assert.equal(read.text, 'secret-looking source');
+  const audit = calls.filter(([kind]) => kind === 'audit').map(([, event, detail]) => [event, detail]);
+  const [, readDetail] = audit.find(([event]) => event === 'agent_workspace_read');
+  assert.deepEqual([readDetail.path, readDetail.bytes], ['app/server.js', 21]);
+  assert.equal(JSON.stringify(readDetail).includes('secret-looking source'), false,
+    'the audit answers what was read, not what it said');
+
+  await fails(engine.file(BOT, { project: 'Demo', path: '' }), 'path_required');
+});
+
+test('the inbox write is the only write, is bounded, and says what to do next', async () => {
+  const { engine, calls } = extendedHarness();
+  const out = await engine.putInbox(BOT, { project: 'Demo', filename: 'spec.md', content: '# plan\n' });
+  assert.equal(out.name, 'spec.md');
+  assert.match(out.path, /_inbox\/spec\.md$/);
+  assert.match(out.hint, /Tell the session to read/,
+    'a file is not work until something is told to look at it');
+  assert.equal(calls[0][1].buffer.toString('utf8'), '# plan\n');
+
+  const b64 = extendedHarness();
+  await b64.engine.putInbox(BOT, { project: 'Demo', filename: 'blob.bin', content: Buffer.from([1, 2, 3]).toString('base64'), base64: true });
+  assert.deepEqual([...b64.calls[0][1].buffer], [1, 2, 3]);
+
+  for (const bad of ['../escape', '/etc/passwd', 'has space', '.hidden', '']) {
+    await fails(engine.putInbox(BOT, { project: 'Demo', filename: bad, content: 'x' }), 'invalid_filename');
+  }
+  await fails(engine.putInbox(BOT, { project: 'Demo', filename: 'empty.txt', content: '' }), 'empty_file');
+  await fails(engine.putInbox(BOT, { project: 'Demo', filename: 'huge.bin', content: 'x'.repeat(9 * 1024 * 1024) }), 'file_too_large');
+});

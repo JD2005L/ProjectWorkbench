@@ -583,6 +583,14 @@ async function workspaceArgv(){
  const plan = credentialExecutionPlan({ owner, currentUid: process.getuid?.() ?? null });
  return workspaceJobArgv({ plan, execPath: process.execPath, helperPath: WORKSPACE_HELPER });
 }
+// The agent API's workspace reads, through the same privilege-dropped worker the
+// boxes use. The dashboard never reads a workspace as root — see
+// app/workspace-file.js for what a planted symlink did to the superseded path.
+async function workspaceReadJob(project, action, extra){
+ return runWorkspaceJob({ spawn, argv: await workspaceArgv(),
+  job: { action, projectPath: project.path, ...extra } });
+}
+
 async function boxWrite(project, box, name, source, { allowEmpty = false } = {}){
  return runWorkspaceWrite({
   spawn, argv: await workspaceArgv(), source,
@@ -1429,6 +1437,68 @@ const agentSessions = createAgentSessions({
   const { stdout } = await tmux(args);
   const all = String(stdout || '').split('\n');
   return all.slice(Math.max(0, all.length - lines)).join('\n');
+ },
+ // A session's conversation, from the ACTING user's own Claude config tree: the
+ // transcripts of one launcher are not another's to read. Claude writes
+ // <config>/projects/<cwd with / as ->/<session-id>.jsonl.
+ readTranscript: async ({ project, projectPath, actsAs, sessionIdHint, messages }) => {
+  const dir = path.join(userClaudeDir(actsAs), 'projects', String(projectPath || '').replace(/\//g, '-'));
+  let files = [];
+  try {
+   files = (await fs.readdir(dir)).filter(name => name.endsWith('.jsonl'));
+  } catch { return null; }
+  if(!files.length) return null;
+  let chosen = '', resolvedBy = '';
+  if(sessionIdHint && files.includes(`${sessionIdHint}.jsonl`)){ chosen = `${sessionIdHint}.jsonl`; resolvedBy = 'window-marker'; }
+  else {
+   // No marker: the newest transcript for this project. Reported, not hidden —
+   // with two lanes open in one project this can be the other one's.
+   const stamped = await Promise.all(files.map(async name => {
+    try { return { name, at: (await fs.stat(path.join(dir, name))).mtimeMs }; } catch { return { name, at: 0 }; }
+   }));
+   chosen = stamped.sort((a,b) => b.at - a.at)[0]?.name || '';
+   resolvedBy = 'most-recent';
+  }
+  if(!chosen) return null;
+  let raw = '';
+  try { raw = await fs.readFile(path.join(dir, chosen), 'utf8'); } catch { return null; }
+  const lines = raw.split('\n').filter(Boolean);
+  const out = [];
+  // Read from the end: the tail is what a caller waiting on a turn wants, and a
+  // long conversation is megabytes.
+  for(let i = lines.length - 1; i >= 0 && out.length < messages; i--){
+   let entry = null;
+   try { entry = JSON.parse(lines[i]); } catch { continue; }
+   const role = entry?.message?.role || entry?.type || '';
+   if(!['user','assistant'].includes(role)) continue;
+   const content = entry?.message?.content;
+   const text = typeof content === 'string' ? content
+    : Array.isArray(content)
+     ? content.map(part => part?.type === 'text' ? part.text
+        : part?.type === 'tool_use' ? `[tool: ${part.name}]`
+        : part?.type === 'tool_result' ? '[tool result]' : '').filter(Boolean).join('\n')
+     : '';
+   if(!text) continue;
+   out.unshift({ role, at: entry?.timestamp || null, text: text.slice(0, 8000) });
+  }
+  return { session_id: chosen.replace(/\.jsonl$/, ''), resolved_by: resolvedBy, messages: out };
+ },
+ readWorkspaceFile: async ({ project, relative, maxBytes }) => {
+  const p = await projectByName(project);
+  return workspaceReadJob(p, 'ws-read', { relative, maxBytes });
+ },
+ readWorkspaceTree: async ({ project, relative, maxEntries }) => {
+  const p = await projectByName(project);
+  return workspaceReadJob(p, 'ws-tree', { relative, maxEntries });
+ },
+ writeInboxFile: async ({ project, filename, buffer }) => {
+  const p = await projectByName(project);
+  // The same box-write the Files tray uses, so an agent's file arrives exactly
+  // as a human's does — including the inbox drawer noticing it.
+  const source = Readable.from([buffer]);
+  const out = await boxWrite(p, INBOX_DIR, filename, source);
+  return { name: out?.name || filename, bytes: buffer.length,
+   path: path.join(p.path, INBOX_DIR, out?.name || filename) };
  },
  audit: (event, detail) => audit(event, detail, null),
 });
@@ -4121,6 +4191,22 @@ app.get(BASE + '/api/agent/:project/sessions/:session/turns/:id', ...agentRoute(
   ? agentSessions.waitForTurn(token, { project: req.params.project, session: req.params.session,
      turn_id: req.params.id, timeout_ms: req.query.wait_ms })
   : agentSessions.turn(token, { project: req.params.project, session: req.params.session, turn_id: req.params.id }))));
+
+app.get(BASE + '/api/agent/:project/sessions/:session/transcript', ...agentRoute(SCOPES.SESSIONS_TRANSCRIPT,
+ (token, req) => agentSessions.transcript(token, { project: req.params.project, session: req.params.session,
+  messages: req.query.messages })));
+
+app.get(BASE + '/api/agent/:project/tree', ...agentRoute(SCOPES.WORKSPACE_READ,
+ (token, req) => agentSessions.tree(token, { project: req.params.project,
+  path: String(req.query.path || ''), max_entries: req.query.max_entries })));
+
+app.get(BASE + '/api/agent/:project/file', ...agentRoute(SCOPES.WORKSPACE_READ,
+ (token, req) => agentSessions.file(token, { project: req.params.project,
+  path: String(req.query.path || ''), max_bytes: req.query.max_bytes })));
+
+app.post(BASE + '/api/agent/:project/inbox', ...agentRoute(SCOPES.WORKSPACE_INBOX,
+ (token, req) => agentSessions.putInbox(token, { project: req.params.project,
+  filename: req.body?.filename, content: req.body?.content, base64: !!req.body?.base64 })));
 
 app.post(BASE + '/api/agent/:project/sessions/:session/prompt', ...agentRoute(SCOPES.SESSIONS_PROMPT,
  (token, req) => agentSessions.prompt(token, {

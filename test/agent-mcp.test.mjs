@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createAgentMcp, ALLOWED_TOOLS, TOOL_DEFINITIONS, TOOL_SCOPES,
-  FORBIDDEN_TOOL_FRAGMENTS, MCP_PROTOCOL_VERSION, JsonRpc,
+  FORBIDDEN_TOOL_FRAGMENTS, MCP_PROTOCOL_VERSION, JsonRpc, violatesToolNaming,
 } from '../app/agent-mcp.js';
 import { AgentSessionError } from '../app/agent-sessions.js';
 
@@ -37,17 +37,24 @@ test('the advertised tool set is exactly the allow-list, and every name is safe'
   assert.deepEqual(TOOL_DEFINITIONS.map((t) => t.name), [...ALLOWED_TOOLS]);
   assert.deepEqual(Object.keys(TOOL_SCOPES).sort(), [...ALLOWED_TOOLS].sort());
   for (const tool of TOOL_DEFINITIONS) {
-    for (const fragment of FORBIDDEN_TOOL_FRAGMENTS) {
-      assert.equal(tool.name.includes(fragment), false, `${tool.name} contains the forbidden fragment "${fragment}"`);
-    }
+    assert.deepEqual(violatesToolNaming(tool.name), [], `${tool.name} advertises a refused capability`);
     // Closed and bounded: an open schema lets a client send fields nobody vetted.
     assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} has an open input schema`);
     assert.ok(tool.description.length > 40, `${tool.name} needs a description the calling model can act on`);
   }
   // No tool takes a filesystem path or a command; the only nameable things are a
   // project, a session and a turn this instance issued.
+  // The check is matched on segments so an honest name is not flagged for a
+  // coincidental substring — but it still has to catch the things it is for.
+  for (const banned of ['pw_run_shell', 'pw_exec', 'pw_read_file', 'pw_write_file', 'pw_list_dir',
+    'pw_eval', 'pw_run_script', 'pw_get_secret', 'pw_credential', 'pw_env', 'pw_file_path']) {
+    assert.notDeepEqual(violatesToolNaming(banned), [], `${banned} must still be refused`);
+  }
+  assert.deepEqual(violatesToolNaming('pw_session_transcript'), [], 'and "transcript" is a word, not a script tool');
   const fields = new Set(TOOL_DEFINITIONS.flatMap((t) => Object.keys(t.inputSchema.properties)));
-  assert.deepEqual([...fields].sort(), ['cli', 'create_if_missing', 'include_scrollback', 'lines', 'project', 'prompt', 'session', 'since_turn', 'timeout_ms', 'turn_id']);
+  assert.deepEqual([...fields].sort(), ['base64', 'cli', 'content', 'create_if_missing', 'filename',
+    'include_scrollback', 'lines', 'max_bytes', 'max_entries', 'messages', 'path', 'project', 'prompt',
+    'session', 'since_turn', 'timeout_ms', 'turn_id']);
 });
 
 test('initialize advertises tools and NOTHING else — sampling above all', async () => {

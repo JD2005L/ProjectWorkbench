@@ -221,9 +221,21 @@ The same six operations are an **MCP server**, if your client speaks it:
 ```
 
 Tools: `pw_list_projects`, `pw_list_sessions`, `pw_send_prompt`, `pw_get_turn`,
-`pw_wait_for_turn`, `pw_read_session`. No tool takes a filesystem path, runs a
-command or reads a file, and the server does not advertise `sampling` — it will
-never ask your client to run inference on its behalf.
+`pw_wait_for_turn`, `pw_read_session`, `pw_session_transcript`,
+`pw_workspace_tree`, `pw_workspace_file`, `pw_put_inbox_file`. No tool runs a
+command, no tool writes project source, and the server does not advertise
+`sampling` — it will never ask your client to run inference on its behalf.
+
+Reading is worth using well: `pw_session_transcript` gives you what was actually
+said in a session, where `pw_read_session` gives you what its interface happened
+to be painting. `pw_workspace_file` reads project source directly (relative paths
+only; traversals, links leaving the project and credential files are refused).
+
+To change something, don't look for a write tool — there isn't one, by design.
+Either prompt the session and let the coding agent do the work, so it inherits the
+project's tests and conventions, or `pw_put_inbox_file` the content and then send
+a prompt naming the returned path, which is how a human hands over a document
+too.
 
 Three things to know before you use it:
 
@@ -334,6 +346,9 @@ sudo tail -F /var/log/project-workbench/audit.log
 | Prompt a session over HTTPS (no shell)     | `POST /api/agent/<Name>/sessions/<session>/prompt`            |
 | Wait for that turn, then read it           | `GET  …/turns/<id>?wait_ms=…` then `…/output?since_turn=<id>` |
 | Add the workbench as an MCP server         | `POST /api/mcp` with `Authorization: Bearer pwat_…`           |
+| Read a session's real conversation         | `GET  /api/agent/<Name>/sessions/<session>/transcript`        |
+| Read project source (read-only)            | `GET  /api/agent/<Name>/file?path=app/server.js`              |
+| Hand a session a file                      | `POST /api/agent/<Name>/inbox` then prompt with its path      |
 | Discover live Claude sessions              | `claude agents --json`                                        |
 | One-shot reply, don't touch user's window  | `claude --resume <id> --fork-session --print 'prompt'`        |
 | Spawn a new side window via HTTP           | `POST /api/term/<Name>/windows {name, cmd}`                   |

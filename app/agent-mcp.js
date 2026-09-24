@@ -22,11 +22,26 @@
 //     give ProjectWorkbench a way to trigger hidden AI calls back through the
 //     caller — inverting the control direction the whole product depends on.
 //
-// There is no tool that takes a filesystem path, no tool that runs a command, and
-// no tool that reads a file. The only way to name anything is a project name, a
-// session name, and a turn id this instance issued.
+// WHAT CHANGED, AND WHY THE CLAIM IS NOW NARROWER. This header used to say no
+// tool takes a filesystem path and none reads a file. Reading project source was
+// added deliberately (operator decision, 2026-09-24), so the honest claim is the
+// one that is still true: no tool RUNS anything, no tool writes project source,
+// and the read paths are confined by app/workspace-file.js — realpath'd inside
+// the project, traversals refused before any filesystem call, credential-shaped
+// paths denied, sizes capped, every read audited with its path.
+//
+// Writing stays out on purpose, with one exception: a file placed in the
+// project's _inbox, which is how a human hands a session a document too. A change
+// that goes through the agent inherits the project's tests, conventions and
+// review, and an audit line reading "the agent did this work" beats one reading
+// "a token wrote 40 files".
+//
+// `path` remains on FORBIDDEN_TOOL_FRAGMENTS below: the ban is on tool NAMES that
+// advertise raw filesystem access, and renaming around a guard rather than
+// amending it deliberately is exactly the move that list exists to prevent.
 
-import { MAX_PROMPT_BYTES, MAX_READ_LINES, DEFAULT_READ_LINES, SUPPORTED_CLIS, AgentSessionError } from './agent-sessions.js';
+import { MAX_PROMPT_BYTES, MAX_READ_LINES, DEFAULT_READ_LINES, SUPPORTED_CLIS, MAX_INBOX_BYTES, AgentSessionError } from './agent-sessions.js';
+import { WORKSPACE_READ_MAX_BYTES, WORKSPACE_TREE_MAX_ENTRIES } from './workspace-file.js';
 
 export const MCP_PROTOCOL_VERSION = '2024-11-05';
 export const SERVER_NAME = 'project-workbench';
@@ -38,6 +53,10 @@ export const ALLOWED_TOOLS = Object.freeze([
   'pw_get_turn',
   'pw_wait_for_turn',
   'pw_read_session',
+  'pw_session_transcript',
+  'pw_workspace_tree',
+  'pw_workspace_file',
+  'pw_put_inbox_file',
 ]);
 
 /** Mirrors the orchestrator adapter's list, checked against the real exported names. */
@@ -45,6 +64,23 @@ export const FORBIDDEN_TOOL_FRAGMENTS = Object.freeze([
   'shell', 'exec', 'command', 'run_', 'read_file', 'write_file', 'list_dir', 'path',
   'clone', 'checkout', 'eval', 'script', 'secret', 'credential', 'env', 'token',
 ]);
+
+/**
+ * Does this tool name advertise a capability the surface refuses to have?
+ *
+ * Matched on snake_case SEGMENTS for single words, and as a substring for the
+ * multi-word fragments that span them. A raw substring test flagged
+ * `pw_session_transcript` for containing "script", and the choice then is to
+ * weaken the guard, rename an honest tool to slip past it, or make the check say
+ * what it means. The third is the only one that leaves the guard working: a tool
+ * called `pw_run_script` is still caught, and "transcript" is still a word.
+ */
+export function violatesToolNaming(name) {
+  const segments = new Set(String(name).split('_'));
+  return FORBIDDEN_TOOL_FRAGMENTS.filter((fragment) => (fragment.includes('_')
+    ? String(name).includes(fragment)
+    : segments.has(fragment) || segments.has(fragment.replace(/_$/, ''))));
+}
 
 /** Which scope each tool needs. The engine enforces the rest (create, prompt:any). */
 export const TOOL_SCOPES = Object.freeze({
@@ -54,6 +90,13 @@ export const TOOL_SCOPES = Object.freeze({
   pw_get_turn: 'sessions:read',
   pw_wait_for_turn: 'sessions:read',
   pw_send_prompt: 'sessions:prompt',
+  // Its own scope, not sessions:read: a transcript is everything said and
+  // everything the agent read, which is a different thing to hand over than a
+  // screen's worth of output.
+  pw_session_transcript: 'sessions:transcript',
+  pw_workspace_tree: 'workspace:read',
+  pw_workspace_file: 'workspace:read',
+  pw_put_inbox_file: 'workspace:inbox',
 });
 
 const closed = (properties, required = []) => ({
@@ -116,6 +159,56 @@ export const TOOL_DEFINITIONS = Object.freeze([
       include_scrollback: { type: 'boolean' },
     }, ['project', 'session']),
   },
+  {
+    name: 'pw_session_transcript',
+    description: [
+      "A session's actual conversation, newest last — what was asked, what the agent replied, which tools it used.",
+      'Prefer this to pw_read_session when you want to know what happened: the screen contains spinners, box drawing and frames the agent has since redrawn over, while this is the record.',
+      'The reply names the session_id it read and how it found it: "window-marker" is exact, "most-recent" means it took the newest conversation in this project — so with two sessions open in one project, it may not be the one you prompted. One agent session per project avoids the question entirely.',
+    ].join(' '),
+    inputSchema: closed({
+      project: NAME, session: NAME,
+      messages: { type: 'integer', minimum: 1, maximum: 200 },
+    }, ['project', 'session']),
+  },
+  {
+    name: 'pw_workspace_tree',
+    description: `List a directory in the project's git workspace, up to ${WORKSPACE_TREE_MAX_ENTRIES} entries. Paths are relative to the project root; an entry marked denied holds credentials rather than source and cannot be read.`,
+    inputSchema: closed({
+      project: NAME,
+      path: { type: 'string', maxLength: 512 },
+      max_entries: { type: 'integer', minimum: 1, maximum: WORKSPACE_TREE_MAX_ENTRIES },
+    }, ['project']),
+  },
+  {
+    name: 'pw_workspace_file',
+    description: [
+      `Read one file from the project's git workspace, up to ${WORKSPACE_READ_MAX_BYTES} bytes (truncated is reported, not silent).`,
+      'Relative paths only; traversals, links that leave the project, and credential files are refused.',
+      'A binary file reports its size rather than returning bytes.',
+      'This is read-only: to change something, prompt the session and let the coding agent do it, so the work inherits the project\'s tests and conventions.',
+    ].join(' '),
+    inputSchema: closed({
+      project: NAME,
+      path: { type: 'string', minLength: 1, maxLength: 512 },
+      max_bytes: { type: 'integer', minimum: 1, maximum: WORKSPACE_READ_MAX_BYTES },
+    }, ['project', 'path']),
+  },
+  {
+    name: 'pw_put_inbox_file',
+    description: [
+      `Place a file in the project's _inbox (up to ${MAX_INBOX_BYTES} bytes) — the way to hand a session something too large for a prompt.`,
+      'It appears in the operator\'s Files tray exactly as a human upload does.',
+      'This does NOT do anything by itself: follow it with pw_send_prompt naming the returned path, which is what turns a file into work.',
+      'Set base64 true for binary content.',
+    ].join(' '),
+    inputSchema: closed({
+      project: NAME,
+      filename: { type: 'string', minLength: 1, maxLength: 128, pattern: '^[A-Za-z0-9][A-Za-z0-9._-]*$' },
+      content: { type: 'string', minLength: 1 },
+      base64: { type: 'boolean' },
+    }, ['project', 'filename', 'content']),
+  },
 ]);
 
 export const JsonRpc = Object.freeze({
@@ -143,6 +236,10 @@ export function createAgentMcp({ sessions, tokenHasScope, serverVersion = '0' } 
       case 'pw_get_turn': return sessions.turn(token, args);
       case 'pw_wait_for_turn': return sessions.waitForTurn(token, args);
       case 'pw_read_session': return sessions.read(token, args);
+      case 'pw_session_transcript': return sessions.transcript(token, args);
+      case 'pw_workspace_tree': return sessions.tree(token, args);
+      case 'pw_workspace_file': return sessions.file(token, args);
+      case 'pw_put_inbox_file': return sessions.putInbox(token, args);
       default: throw new AgentSessionError(`Unknown tool: ${name}`, 404, 'unknown_tool');
     }
   }

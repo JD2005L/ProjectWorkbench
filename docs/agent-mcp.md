@@ -1,10 +1,9 @@
 # An MCP surface for driving a project session from an external AI
 
-Status: **built** (2026-09-23). All four phases are in: the token model, the REST
-engine, the turn latch, and the MCP façade at `POST {BASE}/api/mcp`. An external
-AI can add the workbench as an HTTP MCP server and drive a project session
-end-to-end. `AGENTS.md` — the file served unauthenticated to external agents —
-documents the surface for them.
+Status: **built.** Phases 1–4 (token model, REST engine, turn latch, MCP façade)
+landed 2026-09-23; workspace reads, session transcripts and the `_inbox` write
+landed 2026-09-24. Ten tools. `AGENTS.md` — served unauthenticated to external
+agents — documents the surface for them.
 
 ## What already exists, so this builds rather than duplicates
 
@@ -79,6 +78,62 @@ bounded (≤ 2000) because an agent asking for "everything" on a long-running pa
 would otherwise pull megabytes through a tool result. With `since_turn`, the text
 is trimmed to what appeared after that turn's prompt was injected — which is the
 "what was the result" half of the loop the caller is trying to close.
+
+### `pw_session_transcript`
+`{ project, session, messages = 20 }` → the conversation, newest last, with
+`session_id` and `resolved_by`.
+
+The screen is not the record. `pw_read_session` returns whatever the TUI painted —
+spinners, box drawing, frames since redrawn over — while this is what was actually
+said and which tools ran. It reads from the **acting account's own** Claude config
+tree (`<config>/projects/<cwd>/<session-id>.jsonl`), so one launcher's
+conversations are not another's to read.
+
+`resolved_by` is `window-marker` when the window carries `@pw_claude_sid` (exact)
+or `most-recent` when it took the newest conversation for that project — which,
+with two sessions open in one project, may not be the one you prompted. Said
+rather than hidden; one agent lane per project avoids the question.
+
+Its own scope, `sessions:transcript`, never implied by `sessions:read`: a
+transcript is everything the operator said and everything the agent read, which is
+a different thing to hand over than a screenful of output.
+
+### `pw_workspace_tree` / `pw_workspace_file`
+`{ project, path?, max_entries? }` and `{ project, path, max_bytes? }`, scope
+`workspace:read`.
+
+Read-only, and confined by `app/workspace-file.js` through the same
+privilege-dropped worker the Files tray uses — the dashboard performs no
+filesystem operation in a pane-owned tree as root, because the superseded upload
+path proved what a planted symlink does to one that does. Three controls, in the
+order they matter:
+
+1. **The request cannot describe an escape.** Absolute paths and `..` are refused
+   before any filesystem call.
+2. **Realpath confinement.** Both ends are resolved and the target must sit inside
+   the project root, so a link pointing out of the workspace is a refusal rather
+   than a read.
+3. **A credential deny-list** (`.git/.pw-credentials`, `.env*`, keys, `.ssh`,
+   `.claude`), which is the *weakest* of the three and is not relied on: the real
+   protection is that a token only reaches projects its acting user reaches, and
+   that every read is audited with its path and size — never its contents.
+
+Reads are capped (256 KB, truncation reported), a binary reports its size instead
+of returning bytes, and a listing marks denied entries rather than hiding them —
+hiding one only invites a caller to keep guessing at it.
+
+### `pw_put_inbox_file`
+`{ project, filename, content, base64? }`, scope `workspace:inbox`.
+
+The one write, and it writes to the project's `_inbox` — where a human hands a
+session a document too. It appears in the operator's Files tray exactly as an
+upload does, and it does nothing by itself: the reply carries the path and says to
+follow with `pw_send_prompt` naming it, because a file is not work until something
+is told to look at it.
+
+**Project source stays read-only on purpose.** A change made through the agent
+inherits the project's tests, conventions and review; an audit line reading "the
+agent did this work" beats one reading "a token wrote 40 files".
 
 ## Authority: a token acts as a person, and can never exceed them
 

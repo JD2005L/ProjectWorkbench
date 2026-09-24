@@ -169,6 +169,7 @@ test('the advertised scope list contains no admin-equivalent scope', { timeout: 
     const listed = await fetch(`${base}/api/tokens`).then((r) => r.json());
     assert.deepEqual(listed.scopes, [
       SCOPE, 'sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any',
+      'sessions:transcript', 'workspace:read', 'workspace:inbox',
     ]);
     for (const scope of listed.scopes) {
       assert.doesNotMatch(scope, /(^|:)(admin|all|write|\*)$/, `${scope} is too broad for a machine token`);

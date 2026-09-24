@@ -32,11 +32,26 @@ export const SCOPES = Object.freeze({
   // granted, never implied by sessions:prompt, because a pane running a shell
   // turns an injected "prompt" into a command run as the pane account.
   SESSIONS_PROMPT_ANY: 'sessions:prompt:any',
+  // A session's structured conversation, not its screen. Its own scope and NOT
+  // implied by sessions:read, because a transcript is the richest thing this
+  // product holds: everything the operator said and everything the agent read.
+  SESSIONS_TRANSCRIPT: 'sessions:transcript',
+  // Reading project source through the privilege-dropped worker. Separate from
+  // the session scopes because "watch what the agent is doing" and "read the
+  // repository yourself" are different powers with different blast radii.
+  WORKSPACE_READ: 'workspace:read',
+  // Placing a file in the project's _inbox — the supported way to hand a session
+  // something large. Deliberately NOT general file writing: a change that goes
+  // through the agent inherits the project's tests, conventions and review, and
+  // an audit line saying "the agent did this work" beats one saying "a token
+  // wrote 40 files".
+  WORKSPACE_INBOX: 'workspace:inbox',
 });
 
 /** Scopes that act on somebody's behalf, and therefore require `actsAs`. */
 export const ACTING_SCOPES = Object.freeze([
   SCOPES.SESSIONS_READ, SCOPES.SESSIONS_PROMPT, SCOPES.SESSIONS_CREATE, SCOPES.SESSIONS_PROMPT_ANY,
+  SCOPES.SESSIONS_TRANSCRIPT, SCOPES.WORKSPACE_READ, SCOPES.WORKSPACE_INBOX,
 ]);
 
 export function needsActingUser(scopes) {

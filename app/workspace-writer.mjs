@@ -36,11 +36,13 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { unlinkSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 
 import {
   applyBoxClear, applyBoxDelete, applyBoxList, applyBoxRead, applyBoxWrite, readJobHeader,
+  applyWorkspaceRead, applyWorkspaceTree,
 } from './workspace-file.js';
 
 // The controller stands this process down with SIGTERM when its payload stream
@@ -109,6 +111,22 @@ async function main() {
         try { await pipeline(out.stream, process.stdout); } catch { process.exitCode = 1; }
         return;
       }
+
+      // The agent API's read paths (docs/agent-mcp.md). Same worker, same
+      // authority as the pane account, and the confinement lives in
+      // app/workspace-file.js so it is one implementation rather than one per
+      // caller.
+      case 'ws-read':
+        reply({ ok: true, result: await applyWorkspaceRead({
+          fsp, path, projectPath: job.projectPath, relative: job.relative, maxBytes: job.maxBytes,
+        }) });
+        return;
+
+      case 'ws-tree':
+        reply({ ok: true, result: await applyWorkspaceTree({
+          fsp, path, projectPath: job.projectPath, relative: job.relative, maxEntries: job.maxEntries,
+        }) });
+        return;
 
       default:
         fail(`workspace worker: unknown action ${JSON.stringify(String(job.action))}`);

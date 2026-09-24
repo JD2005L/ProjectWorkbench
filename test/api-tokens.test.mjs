@@ -43,6 +43,7 @@ test('there is deliberately no admin scope, and every scope is narrow', () => {
   assert.deepEqual(Object.values(SCOPES), [
     'projects:register',
     'sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any',
+    'sessions:transcript', 'workspace:read', 'workspace:inbox',
   ]);
   assert.equal(isKnownScope('admin'), false);
   assert.equal(isKnownScope('*'), false);
@@ -56,7 +57,8 @@ test('there is deliberately no admin scope, and every scope is narrow', () => {
 test('a session scope cannot be minted without the account it acts as', () => {
   // The window's launcher, the CLI credentials it spends and the audit line all come from
   // actsAs. There is no sensible default, and guessing one would fabricate an identity.
-  for (const scope of ['sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any']) {
+  for (const scope of ['sessions:read', 'sessions:prompt', 'sessions:create', 'sessions:prompt:any',
+    'sessions:transcript', 'workspace:read', 'workspace:inbox']) {
     assert.throws(() => mintToken({ label: 'bot', scopes: [scope] }), /must name the user it acts as/);
   }
   // projects:register acts on nobody's behalf, so it still needs nothing.

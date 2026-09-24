@@ -488,3 +488,142 @@ export async function applyBoxClear({ fsp, projectPath, box }) {
   await Promise.all(names.map((n) => fsp.rm(path.join(dir, n), { force: true, recursive: true })));
   return { removed: names };
 }
+
+// ─── Reading project source, for the agent API (docs/agent-mcp.md) ──────────
+//
+// The same rule as the boxes above, for the same reason: the root dashboard
+// performs no filesystem operation inside a pane-owned tree, so these run in the
+// privilege-dropped worker with exactly the authority the pane account has. What
+// is new is that the path comes from a CALLER rather than from a fixed box name,
+// which makes confinement the whole job.
+//
+// Three controls, in the order they matter:
+//
+//   1. REALPATH CONFINEMENT. The resolved target must sit inside the resolved
+//      project root. Resolving both ends is what makes a symlink pointing out of
+//      the workspace a refusal rather than a read — and a planted symlink is
+//      exactly how the superseded upload path became an arbitrary root read.
+//   2. NO ESCAPE IN THE REQUEST. Absolute paths and `..` are refused before any
+//      filesystem call, so a traversal never even gets to be resolved.
+//   3. A CREDENTIAL DENY-LIST, which is the WEAKEST of the three and is not
+//      relied upon: it stops the obvious (.git/.pw-credentials, .env, keys) while
+//      the real protection is that a token only reaches projects its acting user
+//      reaches, and that every read is audited with its path.
+
+export const WORKSPACE_READ_MAX_BYTES = 256 * 1024;
+export const WORKSPACE_TREE_MAX_ENTRIES = 500;
+
+/** Paths whose contents are credentials rather than source. Matched on the request path. */
+export const WORKSPACE_DENIED = Object.freeze([
+  /(^|\/)\.git\/\.pw-credentials$/,
+  /(^|\/)\.git-credentials$/,
+  /(^|\/)\.env(\..*)?$/,
+  /(^|\/)\.netrc$/,
+  /(^|\/)\.npmrc$/,
+  /(^|\/)\.(claude|copilot|config|ssh|aws|azure)(\/|$)/,
+  /(^|\/)id_(rsa|dsa|ecdsa|ed25519)(\.pub)?$/,
+  /\.(pem|key|pfx|p12|keystore)$/i,
+  /(^|\/)\.pw-credentials$/,
+]);
+
+export class WorkspacePathError extends Error {
+  constructor(message, code = 'workspace_path_refused') {
+    super(message);
+    this.name = 'WorkspacePathError';
+    this.code = code;
+  }
+}
+
+/** Normalise a caller's relative path, refusing anything that could leave the tree. */
+export function normalizeWorkspacePath(raw) {
+  const value = String(raw ?? '').trim().replace(/^\.\/+/, '');
+  if (!value || value === '.') return '';
+  if (value.startsWith('/') || /^[A-Za-z]:/.test(value)) throw new WorkspacePathError('Path must be relative to the project');
+  if (value.includes('\0')) throw new WorkspacePathError('Path contains a null byte');
+  const parts = [];
+  for (const part of value.split('/')) {
+    if (!part || part === '.') continue;
+    // Refused rather than resolved: a traversal must not reach a filesystem call.
+    if (part === '..') throw new WorkspacePathError('Path may not traverse above the project');
+    parts.push(part);
+  }
+  const joined = parts.join('/');
+  if (joined.length > 512) throw new WorkspacePathError('Path is too long');
+  return joined;
+}
+
+export function isDeniedWorkspacePath(relative) {
+  return WORKSPACE_DENIED.some((pattern) => pattern.test(relative));
+}
+
+/** Resolve inside the project, with both ends realpath'd. */
+export async function resolveInsideWorkspace({ fsp, path, projectPath, relative }) {
+  const clean = normalizeWorkspacePath(relative);
+  if (clean && isDeniedWorkspacePath(clean)) {
+    throw new WorkspacePathError(`Refused: ${clean} holds credentials rather than source`, 'workspace_path_denied');
+  }
+  const root = await fsp.realpath(projectPath);
+  const target = clean ? path.join(root, clean) : root;
+  let resolved;
+  try { resolved = await fsp.realpath(target); }
+  catch (error) {
+    if (error?.code === 'ENOENT') throw new WorkspacePathError(`No such path: ${clean || '.'}`, 'workspace_path_missing');
+    throw error;
+  }
+  // A link inside the tree that points outside it resolves outside it, and this
+  // is the comparison that catches that.
+  if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+    throw new WorkspacePathError(`Refused: ${clean} resolves outside the project`, 'workspace_path_escape');
+  }
+  return { root, relative: clean, absolute: resolved };
+}
+
+export async function applyWorkspaceRead({ fsp, path, projectPath, relative, maxBytes = WORKSPACE_READ_MAX_BYTES }) {
+  const { relative: clean, absolute } = await resolveInsideWorkspace({ fsp, path, projectPath, relative });
+  const stat = await fsp.stat(absolute);
+  if (stat.isDirectory()) throw new WorkspacePathError(`${clean} is a directory; list it instead`, 'workspace_path_is_dir');
+  if (!stat.isFile()) throw new WorkspacePathError(`${clean} is not a regular file`, 'workspace_path_not_file');
+  const cap = Math.max(1, Math.min(WORKSPACE_READ_MAX_BYTES, Number(maxBytes) || WORKSPACE_READ_MAX_BYTES));
+  const handle = await fsp.open(absolute, 'r');
+  try {
+    const buffer = Buffer.alloc(Math.min(cap, stat.size));
+    const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
+    const slice = buffer.subarray(0, bytesRead);
+    // A NUL means this is not source, and shipping half a binary through a tool
+    // result helps nobody — say what it is and how big instead.
+    if (slice.includes(0)) {
+      return { path: clean, size: stat.size, binary: true, truncated: stat.size > bytesRead, text: '' };
+    }
+    return {
+      path: clean, size: stat.size, binary: false,
+      truncated: stat.size > bytesRead, text: slice.toString('utf8'),
+    };
+  } finally { await handle.close(); }
+}
+
+export async function applyWorkspaceTree({ fsp, path, projectPath, relative, maxEntries = WORKSPACE_TREE_MAX_ENTRIES }) {
+  const { relative: clean, absolute } = await resolveInsideWorkspace({ fsp, path, projectPath, relative });
+  const stat = await fsp.stat(absolute);
+  if (!stat.isDirectory()) throw new WorkspacePathError(`${clean} is not a directory`, 'workspace_path_not_dir');
+  const raw = await fsp.readdir(absolute, { withFileTypes: true });
+  const cap = Math.max(1, Math.min(WORKSPACE_TREE_MAX_ENTRIES, Number(maxEntries) || WORKSPACE_TREE_MAX_ENTRIES));
+  const sorted = raw.slice().sort((a, b) => a.name.localeCompare(b.name));
+  const entries = [];
+  for (const entry of sorted.slice(0, cap)) {
+    const child = clean ? `${clean}/${entry.name}` : entry.name;
+    const denied = isDeniedWorkspacePath(child);
+    let size = null;
+    if (!denied && entry.isFile()) {
+      try { size = (await fsp.stat(path.join(absolute, entry.name))).size; } catch { size = null; }
+    }
+    entries.push({
+      name: entry.name,
+      // A symlink is reported as what it is; following one is the read path's
+      // decision, and it refuses the ones that leave the tree.
+      type: entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'link' : entry.isFile() ? 'file' : 'other',
+      ...(size === null ? {} : { size }),
+      ...(denied ? { denied: true } : {}),
+    });
+  }
+  return { path: clean, entries, truncated: sorted.length > cap };
+}
