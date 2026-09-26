@@ -599,6 +599,107 @@ export async function userCopilotSignedIn({ fsp, base, username }) {
   return typeof parsed.lastLoggedInUser?.login === 'string' && !!parsed.lastLoggedInUser.login.trim();
 }
 
+const CLAUDE_TRANSCRIPT_MAX_BYTES = 16 * 1024 * 1024;
+
+async function openClaudeProjectTranscriptDir({ fsp, base, username, projectPath }) {
+  const procfs = process.env.PW_PROCFS_PATH || '/proc';
+  const parts = [encodeUserName(username), 'claude', 'projects', String(projectPath || '').replace(/\//g, '-')];
+  let handle = null;
+  try {
+    handle = await fsp.open(base, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    for (const part of parts) {
+      const next = await fsp.open(path.join(procfs, 'self', 'fd', String(handle.fd), part),
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      await handle.close();
+      handle = next;
+    }
+    return handle;
+  } catch (error) {
+    if (handle) await handle.close().catch(() => {});
+    throw error;
+  }
+}
+
+export async function applyUserClaudeTranscript({ fsp, base, username, projectPath, sessionIdHint = '', messages = 20 }) {
+  const procfs = process.env.PW_PROCFS_PATH || '/proc';
+  let dirHandle;
+  let entries;
+  try {
+    dirHandle = await openClaudeProjectTranscriptDir({ fsp, base, username, projectPath });
+    entries = await fsp.readdir(path.join(procfs, 'self', 'fd', String(dirHandle.fd)), { withFileTypes: true });
+  }
+  catch { return null; }
+  const dir = path.join(procfs, 'self', 'fd', String(dirHandle.fd));
+  try {
+    const files = entries.filter((entry) => entry.isFile() && entry.name.endsWith('.jsonl')).map((entry) => entry.name);
+    if (!files.length) return null;
+
+  let chosen = '';
+  let resolvedBy = '';
+  if (sessionIdHint && files.includes(`${sessionIdHint}.jsonl`)) {
+    chosen = `${sessionIdHint}.jsonl`;
+    resolvedBy = 'window-marker';
+  } else {
+    const stamped = await Promise.all(files.map(async (name) => {
+      let handle;
+      try {
+        handle = await fsp.open(path.join(dir, name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+        const stat = await handle.stat();
+        return stat.isFile() ? { name, at: stat.mtimeMs } : { name, at: 0 };
+      } catch { return { name, at: 0 }; }
+      finally { if (handle) await handle.close().catch(() => {}); }
+    }));
+    chosen = stamped.sort((a, b) => b.at - a.at)[0]?.name || '';
+    resolvedBy = 'most-recent';
+  }
+  if (!chosen) return null;
+
+  let handle;
+  let raw;
+  try {
+    handle = await fsp.open(path.join(dir, chosen), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    const bytes = Math.min(stat.size, CLAUDE_TRANSCRIPT_MAX_BYTES);
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, Math.max(0, stat.size - bytes));
+    raw = buffer.subarray(0, bytesRead).toString('utf8');
+  } catch { return null; }
+  finally { if (handle) await handle.close().catch(() => {}); }
+
+  const lines = raw.split('\n').filter(Boolean);
+  const out = [];
+  const limit = Math.max(1, Math.min(200, Number(messages) || 20));
+  for (let i = lines.length - 1; i >= 0 && out.length < limit; i--) {
+    let entry;
+    try { entry = JSON.parse(lines[i]); } catch { continue; }
+    const role = entry?.message?.role || entry?.type || '';
+    if (!['user', 'assistant'].includes(role)) continue;
+    const content = entry?.message?.content;
+    const text = typeof content === 'string' ? content
+      : Array.isArray(content)
+        ? content.map((part) => part?.type === 'text' ? part.text
+          : part?.type === 'tool_use' ? `[tool: ${part.name}]`
+          : part?.type === 'tool_result' ? '[tool result]' : '').filter(Boolean).join('\n')
+        : '';
+    if (!text) continue;
+    out.unshift({ role, at: entry?.timestamp || null, text: text.slice(0, 8000) });
+  }
+    return { session_id: chosen.replace(/\.jsonl$/, ''), resolved_by: resolvedBy, messages: out };
+  } finally {
+    await dirHandle.close().catch(() => {});
+  }
+}
+
+export async function readUserClaudeTranscript({
+  fsp, base, username, projectPath, sessionIdHint = '', messages = 20,
+  owner = null, currentUid = null, runJob = null,
+}) {
+  const job = { action: 'transcript', base, username, projectPath, sessionIdHint, messages };
+  const plan = credentialExecutionPlan({ owner, currentUid });
+  return plan.drop ? runJob(job, plan) : applyUserClaudeTranscript({ fsp, ...job });
+}
+
 // What has this person's gh stored? Runs through the SAME privilege-dropped helper as
 // every other access to the credential tree: the config dir belongs to the pane account,
 // and the dashboard (often root) must not read inside it directly — nor run gh as root

@@ -19,12 +19,13 @@ import { createDeployRuns } from './deploy-runs.js';
 import { createAgentSessions, AgentSessionError, MARKER_TOKEN, MARKER_USER } from './agent-sessions.js';
 import { createAgentTurns } from './agent-turns.js';
 import { createAgentMcp } from './agent-mcp.js';
+import { prepareAgentPasteFile, pasteFileOwnership } from './agent-paste-file.js';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { deployFollowClientSrc } from './deploy-follow.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken, readUserClaudeTranscript } from './user-credentials.js';
 import { ghLoginCommand, GH_DEFAULT_SCOPES } from './gh-cli.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
@@ -1406,17 +1407,21 @@ const agentSessions = createAgentSessions({
   // payloads, and the temp file is 0600 and removed whatever happens — a prompt is
   // somebody's content and does not belong in /tmp a moment longer than it must.
   const buffer = `pw-agent-${crypto.randomBytes(6).toString('hex')}`;
-  const file = path.join(os.tmpdir(), `${buffer}.txt`);
+  let prepared = null;
   try {
-   await fs.writeFile(file, text, { mode: 0o600 });
-   await tmux(['load-buffer','-b',buffer,file]);
+   const owner = DEPLOY_MODE === 'host' ? await terminalOwner() : null;
+   prepared = await prepareAgentPasteFile({
+    fsp: fs, tmpRoot: os.tmpdir(), text,
+    ownership: pasteFileOwnership({ deployMode: DEPLOY_MODE, owner, currentUid: process.getuid?.() ?? null }),
+   });
+   await tmux(['load-buffer','-b',buffer,prepared.file]);
    await tmux(['paste-buffer','-d','-p','-b',buffer,'-t',target]);
    // A beat before Enter: a TUI that is still ingesting a bracketed paste can
    // otherwise swallow the submit and leave the prompt sitting in the composer.
    await new Promise(r => setTimeout(r, 120));
    await tmux(['send-keys','-t',target,'Enter']);
   } finally {
-   await fs.rm(file, { force: true }).catch(()=>{});
+   if(prepared) await prepared.cleanup().catch(()=>{});
    await tmux(['delete-buffer','-b',buffer]).catch(()=>{});
   }
  },
@@ -1442,46 +1447,10 @@ const agentSessions = createAgentSessions({
  // transcripts of one launcher are not another's to read. Claude writes
  // <config>/projects/<cwd with / as ->/<session-id>.jsonl.
  readTranscript: async ({ project, projectPath, actsAs, sessionIdHint, messages }) => {
-  const dir = path.join(userClaudeDir(actsAs), 'projects', String(projectPath || '').replace(/\//g, '-'));
-  let files = [];
-  try {
-   files = (await fs.readdir(dir)).filter(name => name.endsWith('.jsonl'));
-  } catch { return null; }
-  if(!files.length) return null;
-  let chosen = '', resolvedBy = '';
-  if(sessionIdHint && files.includes(`${sessionIdHint}.jsonl`)){ chosen = `${sessionIdHint}.jsonl`; resolvedBy = 'window-marker'; }
-  else {
-   // No marker: the newest transcript for this project. Reported, not hidden —
-   // with two lanes open in one project this can be the other one's.
-   const stamped = await Promise.all(files.map(async name => {
-    try { return { name, at: (await fs.stat(path.join(dir, name))).mtimeMs }; } catch { return { name, at: 0 }; }
-   }));
-   chosen = stamped.sort((a,b) => b.at - a.at)[0]?.name || '';
-   resolvedBy = 'most-recent';
-  }
-  if(!chosen) return null;
-  let raw = '';
-  try { raw = await fs.readFile(path.join(dir, chosen), 'utf8'); } catch { return null; }
-  const lines = raw.split('\n').filter(Boolean);
-  const out = [];
-  // Read from the end: the tail is what a caller waiting on a turn wants, and a
-  // long conversation is megabytes.
-  for(let i = lines.length - 1; i >= 0 && out.length < messages; i--){
-   let entry = null;
-   try { entry = JSON.parse(lines[i]); } catch { continue; }
-   const role = entry?.message?.role || entry?.type || '';
-   if(!['user','assistant'].includes(role)) continue;
-   const content = entry?.message?.content;
-   const text = typeof content === 'string' ? content
-    : Array.isArray(content)
-     ? content.map(part => part?.type === 'text' ? part.text
-        : part?.type === 'tool_use' ? `[tool: ${part.name}]`
-        : part?.type === 'tool_result' ? '[tool result]' : '').filter(Boolean).join('\n')
-     : '';
-   if(!text) continue;
-   out.unshift({ role, at: entry?.timestamp || null, text: text.slice(0, 8000) });
-  }
-  return { session_id: chosen.replace(/\.jsonl$/, ''), resolved_by: resolvedBy, messages: out };
+  return readUserClaudeTranscript({
+   fsp: fs, base: USER_CRED_BASE, username: actsAs, projectPath, sessionIdHint, messages,
+   owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
+  });
  },
  readWorkspaceFile: async ({ project, relative, maxBytes }) => {
   const p = await projectByName(project);
@@ -3686,6 +3655,19 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railFilterAll{margin-top:2px;border:0;border-top:1px solid var(--line);background:transparent;color:var(--dim);font:600 12px var(--font);padding:8px 9px 6px;cursor:pointer;text-align:left;border-radius:0}
 .railFilterAll:hover{color:var(--cyan)}
 .pkeyRow.catHidden{display:none}
+.railCategoryMenu{position:fixed;z-index:120;width:min(310px,calc(100vw - 24px));background:var(--elev2);border:1px solid var(--line2);border-radius:12px;box-shadow:0 24px 54px -12px rgba(0,0,0,.95);padding:10px;display:flex;flex-direction:column;gap:8px}
+.railCategoryMenu[hidden]{display:none}
+.railCategoryHead{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
+.railCategoryTitle{font:700 13px var(--font);color:#fff;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.railCategoryHelp{font:11px/1.4 var(--font);color:var(--faint)}
+.railCategoryInput{width:100%;box-sizing:border-box;background:#070d19;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 9px;font:12px var(--font)}
+.railCategoryInput:focus{outline:none;border-color:var(--cyan)}
+.railCategoryActions{display:flex;justify-content:flex-end;gap:7px}
+.railCategoryActions button{border:1px solid var(--line2);border-radius:8px;background:var(--panel);color:var(--text);padding:7px 10px;font:600 11.5px var(--font);cursor:pointer}
+.railCategoryActions button:hover{border-color:var(--cyan);color:#fff}
+.railCategoryActions .save{background:linear-gradient(135deg,var(--cyan),var(--blue));border-color:transparent;color:#04101f}
+.railCategoryStatus{min-height:1.2em;font:11px var(--font);color:var(--ok)}
+.railCategoryStatus.err{color:var(--err)}
 @container (min-width:180px){.railBrandName{opacity:1;transform:none}#railToggle .chev{opacity:1}.pk-meta{opacity:1;transform:none}.railActLabel{opacity:1;transform:none}.railWhoName{opacity:1}.pk-pin{display:grid}.railFilterLabel{opacity:1;transform:none}.railFilterBtn .chev{opacity:1}.railPinToggle{display:grid}}
 #railScrim{display:none}
 @media(max-width:640px){
@@ -3743,7 +3725,8 @@ function railHtml(projects, currentName, user, deployConfigured=false){
   + allCats.map(c=>`<label class="railFilterOpt"><input type="checkbox" data-cat="${esc(c.name)}"><span class="n">${esc(c.name)}</span><span class="cnt">${c.n}</span></label>`).join('')
   + (allCats.length && uncatN ? `<label class="railFilterOpt"><input type="checkbox" data-cat="|none"><span class="n">Uncategorized</span><span class="cnt">${uncatN}</span></label>` : '');
  const railFilter = `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter the project rail"><span class="railFilterIco" aria-hidden="true">🗂</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><button id="railPinToggle" class="railPinToggle" type="button" aria-pressed="false" title="Pinned only — quick toggle">📌</button><div id="railFilterMenu" class="railFilterMenu" hidden>${filterOpts}<button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div>`;
- return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div>${railFilter}<nav id="railKeys" class="railKeys" aria-label="Projects"><ul class="railKeysList">${keys}</ul></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>`;
+ const categoryMenu = isAdmin ? `<div id="railCategoryMenu" class="railCategoryMenu" role="dialog" aria-label="Manage project category tags" hidden><div class="railCategoryHead"><div><div id="railCategoryTitle" class="railCategoryTitle"></div><div class="railCategoryHelp">Manage category tags. Separate multiple tags with commas.</div></div></div><input id="railCategoryInput" class="railCategoryInput" type="text" maxlength="500" placeholder="Client Sites, Internal" autocomplete="off"><div id="railCategoryStatus" class="railCategoryStatus"></div><div class="railCategoryActions"><button id="railCategoryClear" type="button">Clear tags</button><button id="railCategorySave" class="save" type="button">Save tags</button></div></div>` : '';
+ return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div>${railFilter}<nav id="railKeys" class="railKeys" aria-label="Projects"><ul class="railKeysList">${keys}</ul></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>${categoryMenu}`;
 }
 
 const railScript = `<script>(function(){
@@ -3772,6 +3755,25 @@ const autoBtn=document.getElementById('autoPinBtn');
 function renderAuto(){if(!autoBtn)return;autoBtn.setAttribute('aria-pressed',autoPin?'true':'false');autoBtn.classList.toggle('off',!autoPin);const st=document.getElementById('autoPinState');if(st)st.textContent=autoPin?'on':'off'}
 if(autoBtn)autoBtn.onclick=()=>{autoPin=!autoPin;try{localStorage.setItem('pwAutoPin',autoPin?'1':'0')}catch{}renderAuto()};
 KEYS.addEventListener('click',e=>{const pb=e.target.closest('.pk-pin');if(!pb)return;e.preventDefault();e.stopPropagation();const n=pb.dataset.project;if(!n)return;if(pinned.has(n))pinned.delete(n);else pinned.add(n);savePins();applyPins()});
+// Admin shortcut: right-click any project tile to edit only its category tags.
+// This has its own narrow endpoint so a label change never restarts that project's
+// terminal or interrupts the session the operator is looking at.
+const catMenu=document.getElementById('railCategoryMenu');
+if(catMenu){
+ const catTitle=document.getElementById('railCategoryTitle'),catInput=document.getElementById('railCategoryInput'),catStatus=document.getElementById('railCategoryStatus'),catSave=document.getElementById('railCategorySave'),catClear=document.getElementById('railCategoryClear');
+ let catProject='',catTrigger=null;
+ function closeCatMenu(refocus=false){catMenu.hidden=true;catProject='';catStatus.textContent='';catStatus.classList.remove('err');if(refocus&&catTrigger)catTrigger.focus();catTrigger=null}
+ function openCatMenu(row,x,y){catTrigger=row.querySelector('.pkey');catProject=catTrigger?.dataset.project||'';if(!catProject)return;catTitle.textContent=catProject;catInput.value=(row.dataset.cats||'').split('|').filter(Boolean).join(', ');catMenu.hidden=false;const pad=10;const w=catMenu.offsetWidth,h=catMenu.offsetHeight;catMenu.style.left=Math.max(pad,Math.min(x,window.innerWidth-w-pad))+'px';catMenu.style.top=Math.max(pad,Math.min(y,window.innerHeight-h-pad))+'px';catInput.focus();catInput.select()}
+ async function saveCategories(value){if(!catProject)return;const categories=Array.isArray(value)?value:String(value||'').split(',');catSave.disabled=true;catClear.disabled=true;catStatus.textContent='Saving…';catStatus.classList.remove('err');try{const r=await fetch('${BASE}/api/projects/'+encodeURIComponent(catProject)+'/categories',{method:'PUT',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify({categories})});const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||('Request failed ('+r.status+')'));catStatus.textContent='Saved';setTimeout(()=>location.reload(),120)}catch(err){catStatus.textContent=err.message||String(err);catStatus.classList.add('err');catSave.disabled=false;catClear.disabled=false}}
+ KEYS.addEventListener('contextmenu',e=>{const row=e.target.closest('.pkeyRow');if(!row)return;e.preventDefault();setFilterOpen(false);openCatMenu(row,e.clientX,e.clientY)});
+ KEYS.addEventListener('keydown',e=>{if(e.key!=='ContextMenu'&&!(e.shiftKey&&e.key==='F10'))return;const link=e.target.closest('.pkey');if(!link)return;e.preventDefault();const row=link.closest('.pkeyRow'),r=link.getBoundingClientRect();setFilterOpen(false);openCatMenu(row,r.left+Math.min(36,r.width),r.top+Math.min(36,r.height))});
+ catSave.onclick=()=>saveCategories(catInput.value);
+ catClear.onclick=()=>saveCategories([]);
+ catInput.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();saveCategories(catInput.value)}else if(e.key==='Escape')closeCatMenu(true)});
+ document.addEventListener('pointerdown',e=>{if(!catMenu.hidden&&!catMenu.contains(e.target)&&!e.target.closest('.pkeyRow'))closeCatMenu()});
+ document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!catMenu.hidden)closeCatMenu(true)});
+ window.addEventListener('blur',closeCatMenu);
+}
 // Rail filter: "Pinned only" plus multi-select category checkboxes, rendered server-side;
 // selection persists per browser. An empty selection means "show all". Pinned-only intersects
 // with the category selection (a category union). The current project stays visible whatever the
@@ -4361,6 +4363,27 @@ app.post(BASE + '/api/internal/pvikpbot/handoff', async (req,res)=>{ try {
  await audit('pvikpbot_handoff', { project:p.name, promptBytes:Buffer.byteLength(prompt), injected }, req);
  res.json({ok:true,project:p.name,...injected});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
+
+app.put(BASE + '/api/projects/:name/categories', requireAdmin, async (req,res) => { try {
+ const name = String(req.params.name || '');
+ if(!Array.isArray(req.body?.categories) || req.body.categories.some(value => typeof value !== 'string')) {
+  return res.status(400).json({ ok:false, error:'categories must be an array of strings' });
+ }
+ const categories = parseCategories(req.body.categories.join(','));
+ let found = false;
+ await withProjectsLock(async () => {
+  const projects = await loadProjects();
+  const project = projects.find(p => p.name === name);
+  if(!project) return;
+  found = true;
+  if(categories.length) project.categories = categories; else delete project.categories;
+  await saveProjects(projects);
+ });
+ if(!found) return res.status(404).json({ ok:false, error:`Project "${name}" not found` });
+ await audit('project_categories_update', { project:name, categories }, req);
+ return res.json({ ok:true, project:name, categories });
+ } catch(e){ return res.status(500).json({ ok:false, error:e?.message || String(e) }); }
+});
 
 app.get(BASE + '/api/projects/config', requireAdmin, async (_req,res)=>{ try {
  const [projects, users, settings] = await Promise.all([loadProjects(), loadUsers(), loadWorkbenchSettings()]);
