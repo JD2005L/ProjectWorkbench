@@ -96,6 +96,67 @@ test('reading a file is capped, and a binary says what it is instead of shipping
   await refuses(applyWorkspaceRead({ fsp, path, projectPath: root, relative: 'nope.txt' }), 'workspace_path_missing');
 });
 
+test('a registered workspace root cannot be redirected through a symlink', async (t) => {
+  const { root, outside } = workspace(t);
+  fs.writeFileSync(path.join(outside, 'outside.txt'), 'OUTSIDE');
+  const redirected = `${root}.redirected`;
+  fs.symlinkSync(outside, redirected, 'dir');
+  t.after(() => fs.rmSync(redirected, { force: true }));
+
+  await refuses(applyWorkspaceRead({ fsp, path, projectPath: redirected, relative: 'outside.txt' }), 'workspace_path_escape');
+  await refuses(applyWorkspaceTree({ fsp, path, projectPath: redirected, relative: '' }), 'workspace_path_escape');
+});
+
+test('a workspace-root substitution cannot redirect a pinned file read', async (t) => {
+  const { root, outside } = workspace(t);
+  fs.writeFileSync(path.join(root, 'victim.txt'), 'INSIDE');
+  fs.writeFileSync(path.join(outside, 'victim.txt'), 'OUTSIDE');
+  const moved = `${root}.moved`;
+  t.after(() => { fs.rmSync(moved, { recursive: true, force: true }); });
+  let swapped = false;
+  const racing = {
+    ...fsp,
+    open: async (file, flags, ...rest) => {
+      if (!swapped && String(file).endsWith('/victim.txt')) {
+        fs.renameSync(root, moved);
+        fs.symlinkSync(outside, root);
+        swapped = true;
+      }
+      return fsp.open(file, flags, ...rest);
+    },
+  };
+
+  const out = await applyWorkspaceRead({ fsp: racing, path, projectPath: root, relative: 'victim.txt' });
+  assert.equal(swapped, true, 'the adversarial substitution happened');
+  assert.equal(out.text, 'INSIDE', 'the read stays on the directory descriptor that passed confinement');
+});
+
+test('a workspace-root substitution cannot redirect a pinned tree listing', async (t) => {
+  const { root, outside } = workspace(t);
+  fs.writeFileSync(path.join(root, 'inside-only.txt'), 'inside');
+  fs.writeFileSync(path.join(outside, 'outside-only.txt'), 'outside');
+  const moved = `${root}.moved`;
+  t.after(() => { fs.rmSync(moved, { recursive: true, force: true }); });
+  let swapped = false;
+  const racing = {
+    ...fsp,
+    readdir: async (file, ...rest) => {
+      if (!swapped) {
+        fs.renameSync(root, moved);
+        fs.symlinkSync(outside, root);
+        swapped = true;
+      }
+      return fsp.readdir(file, ...rest);
+    },
+  };
+
+  const out = await applyWorkspaceTree({ fsp: racing, path, projectPath: root, relative: '' });
+  assert.equal(swapped, true, 'the adversarial substitution happened');
+  assert.equal(out.entries.some((e) => e.name === 'inside-only.txt'), true);
+  assert.equal(out.entries.some((e) => e.name === 'outside-only.txt'), false,
+    'the listing stays on the directory descriptor that passed confinement');
+});
+
 test('listing shows what is there, marks what it will not read, and is bounded', async (t) => {
   const { root } = workspace(t);
   const listed = await applyWorkspaceTree({ fsp, path, projectPath: root, relative: '' });

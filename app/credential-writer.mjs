@@ -23,7 +23,7 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
-import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir } from './user-credentials.js';
+import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir, applyUserClaudeTranscript } from './user-credentials.js';
 import { readStoredGhToken } from './gh-cli.js';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
@@ -34,7 +34,7 @@ import { runGitCredentialJob, remediateGitCredentials, nodeJobDeps, nodeRunGit }
 // Jobs that operate on the per-user credential TREE are addressed by `base`.
 // The git-credential job addresses a project REPOSITORY instead, so it carries
 // a workspace root and a project path and has no `base` at all.
-const TREE_ACTIONS = new Set(['ensure', 'prune', 'status', 'gh-token']);
+const TREE_ACTIONS = new Set(['ensure', 'prune', 'status', 'gh-token', 'transcript']);
 
 async function readStdin() {
   const chunks = [];
@@ -99,6 +99,15 @@ async function main() {
         ghConfigDir: userGhConfigDir(job.base, job.username),
         env: process.env,
       }) }
+      : job.action === 'transcript'
+      ? await applyUserClaudeTranscript({
+        fsp,
+        base: job.base,
+        username: job.username,
+        projectPath: job.projectPath,
+        sessionIdHint: job.sessionIdHint || '',
+        messages: job.messages,
+      })
       : job.action === 'status'
       // Both CLIs in one job: the Users table asks per user per request, and each job
       // is a privilege-dropped process spawn.

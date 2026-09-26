@@ -12,7 +12,7 @@
 // test/project-categories-browser.test.mjs.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { withCockpit } from './cockpit-instance-fixture.mjs';
+import { withCockpit, tmux } from './cockpit-instance-fixture.mjs';
 
 const form = (base, path, fields) => fetch(`${base}${path}`, {
   method: 'POST',
@@ -88,6 +88,43 @@ test('categories round-trip: manage form → sanitized registry → config → r
     assert.doesNotMatch(cleared, /data-cat="Client Sites"/, 'category options leave with the last tag');
     assert.doesNotMatch(cleared, /data-cat="\|none"/, 'Uncategorized leaves with them');
     assert.match(cleared, /data-cat="\|pinned"/, 'Pinned only stays');
+  });
+});
+
+test('right-click category management updates only tags and preserves the live project session', { timeout: 120000 }, async () => {
+  await withCockpit(async ({ base, name, sock }) => {
+    const html = await cockpitHtml(base, name);
+    assert.match(html, /id="railCategoryMenu"/, 'admins receive the project context menu');
+    assert.match(html, /addEventListener\('contextmenu'/, 'the rail opens it on right click');
+    assert.match(html, /e\.key!=='ContextMenu'/, 'the keyboard ContextMenu key opens the menu');
+    assert.match(html, /e\.shiftKey&&e\.key==='F10'/, 'Shift+F10 opens the same menu');
+    assert.match(html, /Manage category tags/, 'the menu explains its focused action');
+
+    const before = await configOf(base, name);
+    const sessionBefore = (await tmux(sock, ['display-message', '-p', '-t', `pw_${name}`, '#{session_id}'])).trim();
+    const response = await fetch(`${base}/api/projects/${encodeURIComponent(name)}/categories`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ categories: [' Client Sites ', 'client sites', ' Internal   Tools ', 'we|ird'] }),
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.deepEqual(body.categories, ['Client Sites', 'Internal Tools', 'weird']);
+    const after = await configOf(base, name);
+    assert.deepEqual(after.categories, body.categories, 'the registry is updated');
+    assert.deepEqual([after.port, after.path, after.repo], [before.port, before.path, before.repo],
+      'tag-only changes preserve unrelated project fields');
+    const sessionAfter = (await tmux(sock, ['display-message', '-p', '-t', `pw_${name}`, '#{session_id}'])).trim();
+    assert.equal(sessionAfter, sessionBefore, 'tag-only changes do not restart or replace the project session');
+
+    const malformed = await fetch(`${base}/api/projects/${encodeURIComponent(name)}/categories`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ categories: 'not-an-array' }),
+    });
+    assert.equal(malformed.status, 400, 'the narrow API requires an explicit string array');
+    const missing = await fetch(`${base}/api/projects/does-not-exist/categories`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ categories: [] }),
+    });
+    assert.equal(missing.status, 404, 'unknown projects are not created by a tag edit');
   });
 });
 

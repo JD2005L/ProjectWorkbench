@@ -578,14 +578,60 @@ export async function resolveInsideWorkspace({ fsp, path, projectPath, relative 
   return { root, relative: clean, absolute: resolved };
 }
 
-export async function applyWorkspaceRead({ fsp, path, projectPath, relative, maxBytes = WORKSPACE_READ_MAX_BYTES }) {
-  const { relative: clean, absolute } = await resolveInsideWorkspace({ fsp, path, projectPath, relative });
-  const stat = await fsp.stat(absolute);
-  if (stat.isDirectory()) throw new WorkspacePathError(`${clean} is a directory; list it instead`, 'workspace_path_is_dir');
-  if (!stat.isFile()) throw new WorkspacePathError(`${clean} is not a regular file`, 'workspace_path_not_file');
-  const cap = Math.max(1, Math.min(WORKSPACE_READ_MAX_BYTES, Number(maxBytes) || WORKSPACE_READ_MAX_BYTES));
-  const handle = await fsp.open(absolute, 'r');
+async function openPinnedWorkspaceTarget({ fsp, path, projectPath, relative, directory = false }) {
+  const clean = normalizeWorkspacePath(relative);
+  if (clean && isDeniedWorkspacePath(clean)) {
+    throw new WorkspacePathError(`Refused: ${clean} holds credentials rather than source`, 'workspace_path_denied');
+  }
+  let rootHandle;
+  let targetHandle;
   try {
+    const procfs = process.env.PW_PROCFS_PATH || '/proc';
+    try {
+      rootHandle = await fsp.open(projectPath,
+        fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+    } catch (error) {
+      if (error?.code === 'ELOOP' || error?.code === 'ENOTDIR') {
+        throw new WorkspacePathError('Refused: the registered project root is not a real directory', 'workspace_path_escape');
+      }
+      throw error;
+    }
+    const rootFdPath = path.join(procfs, 'self', 'fd', String(rootHandle.fd));
+    const targetPath = clean ? path.join(rootFdPath, clean) : rootFdPath;
+    try {
+      targetHandle = await fsp.open(targetPath,
+        fsConstants.O_RDONLY | (directory ? fsConstants.O_DIRECTORY : 0));
+    } catch (error) {
+      if (error?.code === 'ENOENT') throw new WorkspacePathError(`No such path: ${clean || '.'}`, 'workspace_path_missing');
+      if (directory && error?.code === 'ENOTDIR') throw new WorkspacePathError(`${clean} is not a directory`, 'workspace_path_not_dir');
+      throw error;
+    }
+    // Authorize the OPEN descriptors, not pathnames checked earlier. The project
+    // root can be renamed/replaced by the pane account between any two syscalls;
+    // /proc/self/fd keeps both operations pinned to the inodes actually opened.
+    const [root, resolved] = await Promise.all([
+      fsp.realpath(rootFdPath),
+      fsp.realpath(path.join(procfs, 'self', 'fd', String(targetHandle.fd))),
+    ]);
+    if (resolved !== root && !resolved.startsWith(root + path.sep)) {
+      throw new WorkspacePathError(`Refused: ${clean} resolves outside the project`, 'workspace_path_escape');
+    }
+    return { rootHandle, targetHandle, root, relative: clean, absolute: resolved };
+  } catch (error) {
+    if (targetHandle) await targetHandle.close().catch(() => {});
+    if (rootHandle) await rootHandle.close().catch(() => {});
+    throw error;
+  }
+}
+
+export async function applyWorkspaceRead({ fsp, path, projectPath, relative, maxBytes = WORKSPACE_READ_MAX_BYTES }) {
+  const opened = await openPinnedWorkspaceTarget({ fsp, path, projectPath, relative });
+  const { rootHandle, targetHandle: handle, relative: clean } = opened;
+  try {
+    const stat = await handle.stat();
+    if (stat.isDirectory()) throw new WorkspacePathError(`${clean} is a directory; list it instead`, 'workspace_path_is_dir');
+    if (!stat.isFile()) throw new WorkspacePathError(`${clean} is not a regular file`, 'workspace_path_not_file');
+    const cap = Math.max(1, Math.min(WORKSPACE_READ_MAX_BYTES, Number(maxBytes) || WORKSPACE_READ_MAX_BYTES));
     const buffer = Buffer.alloc(Math.min(cap, stat.size));
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, 0);
     const slice = buffer.subarray(0, bytesRead);
@@ -598,32 +644,47 @@ export async function applyWorkspaceRead({ fsp, path, projectPath, relative, max
       path: clean, size: stat.size, binary: false,
       truncated: stat.size > bytesRead, text: slice.toString('utf8'),
     };
-  } finally { await handle.close(); }
+  } finally {
+    await handle.close().catch(() => {});
+    await rootHandle.close().catch(() => {});
+  }
 }
 
 export async function applyWorkspaceTree({ fsp, path, projectPath, relative, maxEntries = WORKSPACE_TREE_MAX_ENTRIES }) {
-  const { relative: clean, absolute } = await resolveInsideWorkspace({ fsp, path, projectPath, relative });
-  const stat = await fsp.stat(absolute);
-  if (!stat.isDirectory()) throw new WorkspacePathError(`${clean} is not a directory`, 'workspace_path_not_dir');
-  const raw = await fsp.readdir(absolute, { withFileTypes: true });
-  const cap = Math.max(1, Math.min(WORKSPACE_TREE_MAX_ENTRIES, Number(maxEntries) || WORKSPACE_TREE_MAX_ENTRIES));
-  const sorted = raw.slice().sort((a, b) => a.name.localeCompare(b.name));
-  const entries = [];
-  for (const entry of sorted.slice(0, cap)) {
-    const child = clean ? `${clean}/${entry.name}` : entry.name;
-    const denied = isDeniedWorkspacePath(child);
-    let size = null;
-    if (!denied && entry.isFile()) {
-      try { size = (await fsp.stat(path.join(absolute, entry.name))).size; } catch { size = null; }
+  const opened = await openPinnedWorkspaceTarget({ fsp, path, projectPath, relative, directory: true });
+  const { rootHandle, targetHandle: handle, relative: clean } = opened;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isDirectory()) throw new WorkspacePathError(`${clean} is not a directory`, 'workspace_path_not_dir');
+    const procfs = process.env.PW_PROCFS_PATH || '/proc';
+    const pinned = path.join(procfs, 'self', 'fd', String(handle.fd));
+    const raw = await fsp.readdir(pinned, { withFileTypes: true });
+    const cap = Math.max(1, Math.min(WORKSPACE_TREE_MAX_ENTRIES, Number(maxEntries) || WORKSPACE_TREE_MAX_ENTRIES));
+    const sorted = raw.slice().sort((a, b) => a.name.localeCompare(b.name));
+    const entries = [];
+    for (const entry of sorted.slice(0, cap)) {
+      const child = clean ? `${clean}/${entry.name}` : entry.name;
+      const denied = isDeniedWorkspacePath(child);
+      let size = null;
+      if (!denied && entry.isFile()) {
+        let childHandle;
+        try {
+          childHandle = await fsp.open(path.join(pinned, entry.name), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+          const childStat = await childHandle.stat();
+          if (childStat.isFile()) size = childStat.size;
+        } catch { size = null; }
+        finally { if (childHandle) await childHandle.close().catch(() => {}); }
+      }
+      entries.push({
+        name: entry.name,
+        type: entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'link' : entry.isFile() ? 'file' : 'other',
+        ...(size === null ? {} : { size }),
+        ...(denied ? { denied: true } : {}),
+      });
     }
-    entries.push({
-      name: entry.name,
-      // A symlink is reported as what it is; following one is the read path's
-      // decision, and it refuses the ones that leave the tree.
-      type: entry.isDirectory() ? 'dir' : entry.isSymbolicLink() ? 'link' : entry.isFile() ? 'file' : 'other',
-      ...(size === null ? {} : { size }),
-      ...(denied ? { denied: true } : {}),
-    });
+    return { path: clean, entries, truncated: sorted.length > cap };
+  } finally {
+    await handle.close().catch(() => {});
+    await rootHandle.close().catch(() => {});
   }
-  return { path: clean, entries, truncated: sorted.length > cap };
 }
