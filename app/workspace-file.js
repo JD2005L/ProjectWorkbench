@@ -599,8 +599,11 @@ async function openPinnedWorkspaceTarget({ fsp, path, projectPath, relative, dir
     const rootFdPath = path.join(procfs, 'self', 'fd', String(rootHandle.fd));
     const targetPath = clean ? path.join(rootFdPath, clean) : rootFdPath;
     try {
+      // O_NONBLOCK because the type check now happens AFTER the open: a FIFO the
+      // pane account planted would otherwise block this open until the worker's
+      // timeout. It changes nothing for the regular files and directories we read.
       targetHandle = await fsp.open(targetPath,
-        fsConstants.O_RDONLY | (directory ? fsConstants.O_DIRECTORY : 0));
+        fsConstants.O_RDONLY | fsConstants.O_NONBLOCK | (directory ? fsConstants.O_DIRECTORY : 0));
     } catch (error) {
       if (error?.code === 'ENOENT') throw new WorkspacePathError(`No such path: ${clean || '.'}`, 'workspace_path_missing');
       if (directory && error?.code === 'ENOTDIR') throw new WorkspacePathError(`${clean} is not a directory`, 'workspace_path_not_dir');

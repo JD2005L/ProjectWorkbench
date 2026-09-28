@@ -96,6 +96,20 @@ test('reading a file is capped, and a binary says what it is instead of shipping
   await refuses(applyWorkspaceRead({ fsp, path, projectPath: root, relative: 'nope.txt' }), 'workspace_path_missing');
 });
 
+test('a planted FIFO is refused as not-a-file instead of blocking the open', async (t) => {
+  const { root } = workspace(t);
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('mkfifo', [path.join(root, 'pipe')]);
+  const read = applyWorkspaceRead({ fsp, path, projectPath: root, relative: 'pipe' });
+  let timer;
+  const hung = new Promise((resolve) => { timer = setTimeout(() => resolve('hung'), 2000); });
+  const outcome = await Promise.race([read.then(() => 'read', (e) => e), hung]);
+  clearTimeout(timer);
+  assert.notEqual(outcome, 'hung', 'opening a FIFO with no writer must not block');
+  assert.ok(outcome instanceof WorkspacePathError, `expected a WorkspacePathError, got ${outcome}`);
+  assert.equal(outcome.code, 'workspace_path_not_file');
+});
+
 test('a registered workspace root cannot be redirected through a symlink', async (t) => {
   const { root, outside } = workspace(t);
   fs.writeFileSync(path.join(outside, 'outside.txt'), 'OUTSIDE');
