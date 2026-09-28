@@ -328,20 +328,42 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
   await mkdirChecked(fsp, ghConfigDir, { enforceMode: true });
 
   // Seed the managed MCP servers from the shared config so a per-user Claude
-  // still gets team MCP (teamkb / pulse / skillhub). Only on first creation:
-  // never clobber a config the user has since edited.
+  // still gets team MCP (teamkb / pulse / skillhub). Fill-only MERGE, not
+  // "only on first creation": Claude Code creates .claude.json itself on first
+  // launch, and when it won that race the absent-file guard left every per-user
+  // config on GOA with an empty mcpServers since 2026-09-14 — the same failure
+  // the settings.json merge below describes. Only server NAMES the user lacks
+  // are added; an entry they have is never touched.
   const cfgFile = path.join(configDir, '.claude.json');
   let seeded = false;
+  let sharedMcp = {};
+  if (sharedClaudeJson) {
+    try {
+      const shared = JSON.parse(await fsp.readFile(sharedClaudeJson, 'utf8'));
+      if (shared && typeof shared.mcpServers === 'object' && shared.mcpServers) sharedMcp = shared.mcpServers;
+    } catch { /* no shared config, or unparseable: nothing to seed */ }
+  }
   if (!(await regularFileExists(fsp, cfgFile))) {
-    let mcpServers = {};
-    if (sharedClaudeJson) {
-      try {
-        const shared = JSON.parse(await fsp.readFile(sharedClaudeJson, 'utf8'));
-        if (shared && typeof shared.mcpServers === 'object' && shared.mcpServers) mcpServers = shared.mcpServers;
-      } catch { /* no shared config, or unparseable: seed an empty one */ }
-    }
-    await writeChecked(fsp, cfgFile, `${JSON.stringify({ mcpServers }, null, 2)}\n`);
+    await writeChecked(fsp, cfgFile, `${JSON.stringify({ mcpServers: sharedMcp }, null, 2)}\n`);
     seeded = true;
+  } else if (Object.keys(sharedMcp).length) {
+    let current = null;
+    try { current = JSON.parse(await fsp.readFile(cfgFile, 'utf8')); } catch { current = null; }
+    // Unparseable (or mid-write by Claude): leave it alone; the next ensure retries.
+    if (current && typeof current === 'object' && !Array.isArray(current)) {
+      const mine = (current.mcpServers && typeof current.mcpServers === 'object') ? current.mcpServers : {};
+      const missing = Object.keys(sharedMcp).filter((name) => !(name in mine));
+      if (missing.length) {
+        current.mcpServers = { ...mine };
+        for (const name of missing) current.mcpServers[name] = sharedMcp[name];
+        // Claude Code rewrites this file constantly, so replace it atomically
+        // rather than truncating it under a reader.
+        const tmp = `${cfgFile}.pw-seed`;
+        await fsp.rm(tmp, { force: true });
+        await writeChecked(fsp, tmp, `${JSON.stringify(current, null, 2)}\n`);
+        await fsp.rename(tmp, cfgFile);
+      }
+    }
   }
 
   // settings.json needs MERGE semantics, not the "only on first creation" guard .claude.json

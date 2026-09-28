@@ -238,6 +238,31 @@ test('MCP servers are seeded from the shared config', async () => {
   await fsp.rm(base, { recursive: true, force: true });
 });
 
+test('REGRESSION: a .claude.json Claude created first still gets the team MCP servers, without losing its own state', async () => {
+  const base = await tmpBase();
+  const shared = path.join(base, 'shared.json');
+  await fsp.writeFile(shared, JSON.stringify({ mcpServers: { teamkb: { url: 'shared' }, pulse: { url: 'p' } } }));
+  // What GOA had since 2026-09-14: Claude won the race and wrote an empty mcpServers.
+  const first = await applyCredentialJob({ fsp, base, username: 'u' });
+  const cfgFile = path.join(first.configDir, '.claude.json');
+  await fsp.writeFile(cfgFile, JSON.stringify({ numStartups: 17, mcpServers: { teamkb: { url: 'mine' }, own: { url: 'o' } } }));
+
+  const r = await applyCredentialJob({ fsp, base, username: 'u', sharedClaudeJson: shared });
+  assert.equal(r.seeded, false);
+  const cfg = JSON.parse(await fsp.readFile(cfgFile, 'utf8'));
+  assert.equal(cfg.numStartups, 17, 'Claude state is preserved');
+  assert.deepEqual(cfg.mcpServers, { teamkb: { url: 'mine' }, own: { url: 'o' }, pulse: { url: 'p' } },
+    'missing team servers are added; entries the user has are never overwritten');
+  assert.equal((await fsp.stat(cfgFile)).mode & 0o777, 0o600);
+  await assert.rejects(fsp.stat(`${cfgFile}.pw-seed`), /ENOENT/, 'no temp file is left behind');
+
+  // An unparseable config is left alone rather than clobbered.
+  await fsp.writeFile(cfgFile, '{"half');
+  await applyCredentialJob({ fsp, base, username: 'u', sharedClaudeJson: shared });
+  assert.equal(await fsp.readFile(cfgFile, 'utf8'), '{"half');
+  await fsp.rm(base, { recursive: true, force: true });
+});
+
 // ---------------------------------------------------------------------------
 // Privilege drop
 // ---------------------------------------------------------------------------
