@@ -334,6 +334,49 @@ async function seedFileIfAbsent(fsp, target, sourcePath) {
   return true;
 }
 
+// The mcpServers object of a shared config, or null when there is none to seed from
+// (missing, unreadable, unparseable, or no mcpServers object).
+async function readSharedMcpServers(fsp, sourcePath) {
+  if (!sourcePath) return null;
+  try {
+    const shared = JSON.parse(await fsp.readFile(sourcePath, 'utf8'));
+    return shared && typeof shared.mcpServers === 'object' && shared.mcpServers && !Array.isArray(shared.mcpServers)
+      ? shared.mcpServers : null;
+  } catch { return null; }
+}
+
+// Fill-only merge of shared MCP servers into a per-user config (Claude's .claude.json,
+// Copilot's mcp-config.json). NOT "only on first creation": Claude Code creates
+// .claude.json itself on first launch, and when it won that race the absent-file guard
+// left every per-user config on GOA with an empty mcpServers from 2026-09-14 -- the same
+// failure the settings.json merge describes. Only server NAMES the user lacks are added;
+// an entry they have is never touched, and an unparseable file (or one mid-write by the
+// CLI) is left alone for the next ensure. Returns 'created' | 'merged' | false.
+async function mergeMcpServers(fsp, file, sharedMcp, { createEmpty = false } = {}) {
+  const servers = sharedMcp || {};
+  if (!(await regularFileExists(fsp, file))) {
+    if (!sharedMcp && !createEmpty) return false;
+    await writeChecked(fsp, file, `${JSON.stringify({ mcpServers: servers }, null, 2)}\n`);
+    return 'created';
+  }
+  if (!Object.keys(servers).length) return false;
+  let current = null;
+  try { current = JSON.parse(await fsp.readFile(file, 'utf8')); } catch { current = null; }
+  if (!current || typeof current !== 'object' || Array.isArray(current)) return false;
+  const mine = (current.mcpServers && typeof current.mcpServers === 'object') ? current.mcpServers : {};
+  const missing = Object.keys(servers).filter((name) => !(name in mine));
+  if (!missing.length) return false;
+  current.mcpServers = { ...mine };
+  for (const name of missing) current.mcpServers[name] = servers[name];
+  // The CLIs rewrite these files constantly, so replace atomically rather than
+  // truncating under a reader.
+  const tmp = `${file}.pw-seed`;
+  await fsp.rm(tmp, { force: true });
+  await writeChecked(fsp, tmp, `${JSON.stringify(current, null, 2)}\n`);
+  await fsp.rename(tmp, file);
+  return 'merged';
+}
+
 // ---------------------------------------------------------------------------
 // The filesystem job
 // ---------------------------------------------------------------------------
@@ -356,43 +399,10 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
   await mkdirChecked(fsp, ghConfigDir, { enforceMode: true });
 
   // Seed the managed MCP servers from the shared config so a per-user Claude
-  // still gets team MCP (teamkb / pulse / skillhub). Fill-only MERGE, not
-  // "only on first creation": Claude Code creates .claude.json itself on first
-  // launch, and when it won that race the absent-file guard left every per-user
-  // config on GOA with an empty mcpServers since 2026-09-14 — the same failure
-  // the settings.json merge below describes. Only server NAMES the user lacks
-  // are added; an entry they have is never touched.
+  // still gets team MCP (teamkb / pulse / skillhub) -- see mergeMcpServers().
   const cfgFile = path.join(configDir, '.claude.json');
-  let seeded = false;
-  let sharedMcp = {};
-  if (sharedClaudeJson) {
-    try {
-      const shared = JSON.parse(await fsp.readFile(sharedClaudeJson, 'utf8'));
-      if (shared && typeof shared.mcpServers === 'object' && shared.mcpServers) sharedMcp = shared.mcpServers;
-    } catch { /* no shared config, or unparseable: nothing to seed */ }
-  }
-  if (!(await regularFileExists(fsp, cfgFile))) {
-    await writeChecked(fsp, cfgFile, `${JSON.stringify({ mcpServers: sharedMcp }, null, 2)}\n`);
-    seeded = true;
-  } else if (Object.keys(sharedMcp).length) {
-    let current = null;
-    try { current = JSON.parse(await fsp.readFile(cfgFile, 'utf8')); } catch { current = null; }
-    // Unparseable (or mid-write by Claude): leave it alone; the next ensure retries.
-    if (current && typeof current === 'object' && !Array.isArray(current)) {
-      const mine = (current.mcpServers && typeof current.mcpServers === 'object') ? current.mcpServers : {};
-      const missing = Object.keys(sharedMcp).filter((name) => !(name in mine));
-      if (missing.length) {
-        current.mcpServers = { ...mine };
-        for (const name of missing) current.mcpServers[name] = sharedMcp[name];
-        // Claude Code rewrites this file constantly, so replace it atomically
-        // rather than truncating it under a reader.
-        const tmp = `${cfgFile}.pw-seed`;
-        await fsp.rm(tmp, { force: true });
-        await writeChecked(fsp, tmp, `${JSON.stringify(current, null, 2)}\n`);
-        await fsp.rename(tmp, cfgFile);
-      }
-    }
-  }
+  const seeded = (await mergeMcpServers(fsp, cfgFile,
+    await readSharedMcpServers(fsp, sharedClaudeJson), { createEmpty: true })) === 'created';
 
   // settings.json needs MERGE semantics, not the "only on first creation" guard .claude.json
   // uses above. Claude Code writes this file ITSELF the moment a user changes theme or model, so
@@ -440,7 +450,17 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
   // copy of that guardrail) and its MCP servers. Fill-only, like .claude.json.
   if (sharedCopilotHome) {
     for (const name of SEEDED_COPILOT_FILES) {
-      await seedFileIfAbsent(fsp, path.join(copilotHome, name), path.join(sharedCopilotHome, name));
+      const target = path.join(copilotHome, name);
+      const source = path.join(sharedCopilotHome, name);
+      // mcp-config.json gets the same fill-only MERGE as .claude.json: copied only
+      // when absent, a server added to the shared config later never reached anyone
+      // who already had a per-user file (i.e. everyone, once seeding worked).
+      if (name === 'mcp-config.json') {
+        const shared = await readSharedMcpServers(fsp, source);
+        if (shared) await mergeMcpServers(fsp, target, shared, { createEmpty: false });
+      } else {
+        await seedFileIfAbsent(fsp, target, source);
+      }
     }
   }
 

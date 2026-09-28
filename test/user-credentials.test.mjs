@@ -576,3 +576,27 @@ test('REGRESSION: the seed source is the PANE account home, never the root dashb
     sharedCopilotHome: '/home/admin/.copilot',
   });
 });
+
+test('REGRESSION: a server added to the shared Copilot mcp-config.json reaches an EXISTING per-user one', async () => {
+  const base = await tmpBase();
+  const sharedCopilotHome = path.join(base, 'shared-copilot');
+  await fsp.mkdir(sharedCopilotHome);
+  const sharedFile = path.join(sharedCopilotHome, 'mcp-config.json');
+  await fsp.writeFile(sharedFile, JSON.stringify({ mcpServers: { teamkb: { url: 't' } } }));
+  const first = await applyCredentialJob({ fsp, base, username: 'u', sharedCopilotHome });
+  const mine = path.join(first.copilotHome, 'mcp-config.json');
+  assert.deepEqual(Object.keys(JSON.parse(await fsp.readFile(mine, 'utf8')).mcpServers), ['teamkb'], 'seeded when absent');
+
+  // The user customises their copy; the team then adds a server to the shared one.
+  await fsp.writeFile(mine, JSON.stringify({ mcpServers: { teamkb: { url: 'mine' }, own: { url: 'o' } } }));
+  await fsp.writeFile(sharedFile, JSON.stringify({ mcpServers: { teamkb: { url: 't' }, gateway: { url: 'g' } } }));
+  await applyCredentialJob({ fsp, base, username: 'u', sharedCopilotHome });
+  assert.deepEqual(JSON.parse(await fsp.readFile(mine, 'utf8')).mcpServers,
+    { teamkb: { url: 'mine' }, own: { url: 'o' }, gateway: { url: 'g' } });
+  assert.equal((await fsp.stat(mine)).mode & 0o777, 0o600);
+
+  // No shared Copilot config at all: nothing is created.
+  const other = await applyCredentialJob({ fsp, base, username: 'v', sharedCopilotHome: path.join(base, 'nope') });
+  await assert.rejects(fsp.stat(path.join(other.copilotHome, 'mcp-config.json')), /ENOENT/);
+  await fsp.rm(base, { recursive: true, force: true });
+});
