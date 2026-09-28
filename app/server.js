@@ -25,7 +25,7 @@ import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, rend
 import { deployFollowClientSrc } from './deploy-follow.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken, readUserClaudeTranscript } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken, readUserClaudeTranscript, sharedCliSeedPaths } from './user-credentials.js';
 import { ghLoginCommand, GH_DEFAULT_SCOPES } from './gh-cli.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
@@ -118,19 +118,10 @@ const PER_USER_CLAUDE = String(process.env.PW_PER_USER_CLAUDE || '').toLowerCase
 const PER_LAUNCHER_CLAUDE = PER_USER_CLAUDE
   && String(process.env.PW_PER_LAUNCHER_CLAUDE ?? 'true').toLowerCase() !== 'false';
 const USER_CRED_BASE = process.env.PW_USER_CRED_BASE || '/home/admin/pw-users';
-// The shared/default Claude config (source for seeding managed MCP servers into
-// each per-user config dir so team MCP — teamkb/pulse/skillhub — still loads).
-const sharedClaudeJson = path.join(process.env.HOME || '/home/admin', '.claude.json');
-// The shared settings.json is the source for the per-user infrastructure keys (hooks +
-// notification channel) -- see SEEDED_SETTINGS_KEYS in app/user-credentials.js.
-const sharedSettings = path.join(process.env.HOME || '/home/admin', '.claude', 'settings.json');
-// The shared CLAUDE.md is INSTRUCTIONS (it carries this workbench's standing agent
-// guardrails), so a per-user config dir that lacks it is a behaviour change, not a
-// missing preference — see SEEDED_SETTINGS_KEYS' reasoning in app/user-credentials.js.
-const sharedClaudeMd = path.join(process.env.HOME || '/home/admin', '.claude', 'CLAUDE.md');
-// Copilot's shared config dir: the seed source for a per-user COPILOT_HOME's
-// instructions + MCP servers (SEEDED_COPILOT_FILES).
-const sharedCopilotHome = path.join(process.env.HOME || '/home/admin', '.copilot');
+// The shared CLI config every per-user dir is seeded from (MCP servers, settings
+// hooks, CLAUDE.md guardrails, Copilot instructions + MCP) lives in the PANE
+// account's home — see sharedCliSeedPaths() in app/user-credentials.js for why
+// the dashboard's own $HOME is the wrong place to look.
 const setupTtydPort = 7680;
 const setupTmuxSession = 'pw_setup';
 const internalHandoffToken = process.env.PW_INTERNAL_HANDOFF_TOKEN || '';
@@ -902,10 +893,11 @@ async function credentialContext(project, launcher = ''){
  }
  if(!owner) return off;
  try {
+  const paneOwner = await terminalOwner();
   const cred = await ensureUserCredentials({
    fsp: fs, base: USER_CRED_BASE, username: owner.username,
-   ghToken: owner.ghToken, sharedClaudeJson, sharedSettings, sharedClaudeMd, sharedCopilotHome,
-   owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
+   ghToken: owner.ghToken, ...sharedCliSeedPaths({ env: process.env, owner: paneOwner }),
+   owner: paneOwner, currentUid: process.getuid?.() ?? null, runJob: runCredentialJob,
   });
   return {
    // COPILOT_HOME rides alongside CLAUDE_CONFIG_DIR because Copilot CLI keeps its

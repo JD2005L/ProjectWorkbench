@@ -51,6 +51,7 @@
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { constants as fsConstants } from 'node:fs';
+import { resolveTerminalPriv } from './terminal-priv.js';
 
 // ---------------------------------------------------------------------------
 // Username -> path segment
@@ -152,6 +153,33 @@ export const SEEDED_SETTINGS_KEYS = Object.freeze([
  * stored login, which is the whole point of splitting the directory.
  */
 export const SEEDED_COPILOT_FILES = Object.freeze(['copilot-instructions.md', 'mcp-config.json']);
+
+// Where the shared CLI config every per-user dir is seeded FROM lives: the pane
+// account's home, never the dashboard's own $HOME. The dashboard is root (HOME
+// /root) in both deploy modes, and the seed job runs dropped to the pane
+// account, so a $HOME-derived source is unreadable and every seed silently
+// no-ops. On GOA that left every per-user Claude and Copilot dir without team
+// MCP servers, hooks and guardrail instructions from 2026-09-14 until
+// 2026-09-28, patched by hand where anyone noticed. Container mode knows the
+// pane's HOME (PW_TERMINAL_HOME, the value panes are launched with); host mode
+// has it from the owner's passwd entry. $HOME is only the shared-account case.
+export function sharedCliHome({ env = {}, owner = null } = {}) {
+  if (env.PW_SHARED_CLI_HOME) return env.PW_SHARED_CLI_HOME;
+  const priv = resolveTerminalPriv(env);
+  if (priv.enabled && priv.home) return priv.home;
+  if (owner && typeof owner.home === 'string' && owner.home.startsWith('/')) return owner.home;
+  return env.HOME || '/home/admin';
+}
+
+export function sharedCliSeedPaths({ env = {}, owner = null } = {}) {
+  const home = sharedCliHome({ env, owner });
+  return {
+    sharedClaudeJson: path.join(home, '.claude.json'),
+    sharedSettings: path.join(home, '.claude', 'settings.json'),
+    sharedClaudeMd: path.join(home, '.claude', 'CLAUDE.md'),
+    sharedCopilotHome: path.join(home, '.copilot'),
+  };
+}
 
 export function userClaudeConfigDir(base, username) {
   return path.join(userCredRoot(base, username), 'claude');

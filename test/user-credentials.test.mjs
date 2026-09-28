@@ -39,6 +39,8 @@ import {
   CREDENTIALS_OFF,
   userSignedIn,
   checkUserSignedIn,
+  sharedCliHome,
+  sharedCliSeedPaths,
 } from '../app/user-credentials.js';
 
 const APP_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'app');
@@ -554,4 +556,23 @@ test('SECURITY: the dashboard hands credential work to the dropped helper', asyn
   assert.match(src, /runJob:\s*runCredentialJob/, 'ensureUserCredentials must be given the privilege-dropping runner');
   assert.match(src, /credentialDropArgv/);
   assert.match(src, /currentUid:\s*process\.getuid/, 'the drop decision needs the real uid');
+});
+
+test('REGRESSION: the seed source is the PANE account home, never the root dashboard $HOME', () => {
+  // GOA: container mode, dashboard HOME=/root, panes launched with HOME=/home/admin.
+  const goa = { HOME: '/root', PW_DEPLOY_MODE: 'container', PW_TERMINAL_UID: '1001' };
+  assert.equal(sharedCliHome({ env: goa }), '/home/admin');
+  assert.equal(sharedCliHome({ env: { ...goa, PW_TERMINAL_HOME: '/srv/pane' } }), '/srv/pane');
+  // Host mode: the owner's passwd home.
+  assert.equal(sharedCliHome({ env: { HOME: '/root' }, owner: { uid: 1001, home: '/home/pw' } }), '/home/pw');
+  // Shared account (no drop): the dashboard's own home IS the pane home.
+  assert.equal(sharedCliHome({ env: { HOME: '/home/admin' }, owner: null }), '/home/admin');
+  // Explicit override wins.
+  assert.equal(sharedCliHome({ env: { ...goa, PW_SHARED_CLI_HOME: '/opt/shared' } }), '/opt/shared');
+  assert.deepEqual(sharedCliSeedPaths({ env: goa }), {
+    sharedClaudeJson: '/home/admin/.claude.json',
+    sharedSettings: '/home/admin/.claude/settings.json',
+    sharedClaudeMd: '/home/admin/.claude/CLAUDE.md',
+    sharedCopilotHome: '/home/admin/.copilot',
+  });
 });
