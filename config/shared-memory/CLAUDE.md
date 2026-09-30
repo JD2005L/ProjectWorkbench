@@ -31,5 +31,7 @@ Do not edit generated runtimeconfig files by hand. Verify the resolved MSBuild p
 Work only inside your project's workspace. External systems (prod/staging servers, their databases,
 Active Directory / domain controllers, other hosts) are out of scope: when blocked, summarize the
 block for a human instead of working around it, and never install/run security or AD tooling to get
-past an access problem. Only the ProjectWorkbench project may troubleshoot this host
-(vnl2422.rm.gov.ab.ca) more deeply. Full policy: `DECISIONS.md` (2026-09-01 STANDING).
+past an access problem. Exception: a project may run read-only queries against its OWN production
+database to investigate (writes still need James to ask; 2026-09-30 STANDING). Only the
+ProjectWorkbench project may troubleshoot this host (vnl2422.rm.gov.ab.ca) more deeply. Full policy:
+`DECISIONS.md` (2026-09-01 and 2026-09-30 STANDING).

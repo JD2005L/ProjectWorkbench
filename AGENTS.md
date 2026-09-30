@@ -25,6 +25,15 @@ other host on the network. Agents lack the surrounding context, ownership, and
 authorization to act on them, and doing so looks like an attack to endpoint
 security monitoring and triggers real incidents.
 
+**Exception — the project's own production database, read-only:** a project
+may connect to the production (or staging) database its own application uses
+to investigate a problem — read-only queries, schema, data checks — with no
+per-query approval. Its own database only, never another project's or the
+server's host; sanctioned credentials only (the project's config or the PVI
+credential store); query results with customer or personal data never go into
+the repo, commits, or off the box. Changing data or schema still needs James to
+ask for that specific change. A refused connection is still a block (below).
+
 When a task needs an external system and hits a **block** — permission denied,
 auth failure, missing grant, a firewall/connectivity problem, a failed prod
 migration or deploy — **stop.** Do not work around it. Never install, download,

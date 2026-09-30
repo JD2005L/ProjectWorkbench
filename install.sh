@@ -245,39 +245,69 @@ EOF
 fi
 
 # Workspace-boundary guardrail for ALL PW AI CLIs (Claude/Copilot/Codex).
-# Appended once per target (idempotent via the pw-workspace-boundary marker) so
-# it survives alongside each CLI's own global instructions. STANDING policy: an
-# agent works only in its project workspace; external systems (prod/staging
-# servers, their DBs, identity/directory servers, other hosts) are out of scope
-# — when blocked it summarizes the block for a human instead of working around
-# it, and never installs/runs offensive-security or attack tooling of any kind.
-# Only the ProjectWorkbench project may troubleshoot this host. Canonical copy:
-# config/shared-memory/DECISIONS.md. (Describe the tool CATEGORY, never product
-# names — naming products plants endpoint-security detection strings on the box.)
+# Kept once per target (marker pw-workspace-boundary) alongside each CLI's own
+# global instructions; an older version of the block is replaced in place. STANDING
+# policy: an agent works only in its project workspace; external systems
+# (prod/staging servers, identity/directory servers, other hosts) are out of scope
+# — when blocked it summarizes the block for a human instead of working around it,
+# and never installs/runs offensive-security or attack tooling of any kind. A
+# project may read its OWN production database to investigate (2026-09-30); writes
+# still need James to ask. Only the ProjectWorkbench project may troubleshoot this
+# host. Canonical copy: config/shared-memory/DECISIONS.md. (Describe the tool
+# CATEGORY, never product names — naming products plants endpoint-security
+# detection strings on the box.)
 log "Seeding workspace-boundary guardrail for all AI CLIs…"
 pw_seed_boundary() {
-  local f="$1" dir
+  local f="$1" dir tmp
   dir="$(dirname "$f")"
   install -d -o "$PW_USER" -g "$PW_USER" -m 0755 "$dir" 2>/dev/null || true
-  if ! grep -q 'pw-workspace-boundary' "$f" 2>/dev/null; then
-    [ -s "$f" ] && printf '\n\n' >> "$f"
-    cat >> "$f" <<'BOUNDARY'
-<!-- pw-workspace-boundary v2 -->
+  grep -q 'pw-workspace-boundary v3' "$f" 2>/dev/null && return 0
+  if grep -q 'pw-workspace-boundary' "$f" 2>/dev/null; then
+    # Cut the older block: from its marker to its end marker, or, for v2 (which had
+    # none), to its last line. If that end is never found the file is left intact
+    # and nothing is appended, so a hand-edited block is never truncated.
+    tmp="$(mktemp)"
+    if awk '
+      /<!-- pw-workspace-boundary/ && !cut { cut = 1; held = ""; next }
+      cut == 1 { held = held $0 "\n"
+                 if (/<!-- \/pw-workspace-boundary -->/ || /ProjectWorkbench included\.$/) { cut = 2; held = "" }
+                 next }
+      /^[[:space:]]*$/ { blank = blank $0 "\n"; next }
+      { printf "%s%s\n", blank, $0; blank = "" }
+      END { exit (cut == 1) }
+    ' "$f" > "$tmp"; then
+      cat "$tmp" > "$f"
+    else
+      warn "Workspace-boundary block in $f has no recognisable end; left as is."
+      rm -f "$tmp"; return 0
+    fi
+    rm -f "$tmp"
+  fi
+  [ -s "$f" ] && printf '\n\n' >> "$f"
+  cat >> "$f" <<'BOUNDARY'
+<!-- pw-workspace-boundary v3 -->
 ## Workspace boundary — stay inside your project; never investigate external systems
 
 You are a Project Workbench (PW) agent. Your job is the code in your project's workspace: the git repository at your current working directory and below. That workspace is your silo — stay inside it. PW's purpose is to build and maintain repo projects, not to reach out onto the network.
 
-Systems **outside** your workspace are out of scope: production and staging application servers, their databases, identity/directory servers, file shares, and any other host on the network. You do not have the surrounding context, ownership, or authorization to act on them safely, and doing so can look like an attack to endpoint security monitoring and trigger a real security incident.
+Systems **outside** your workspace are out of scope: production and staging application servers, their databases, identity/directory servers, file shares, and any other host on the network. You do not have the surrounding context, ownership, or authorization to act on them safely, and doing so can look like an attack to endpoint security monitoring and trigger a real security incident. The one exception is your own project's database, below.
+
+**Exception — your own project's production database, read-only, to investigate.** A project may connect to the production (or staging) database that its own application uses, to investigate a problem: run read-only queries, inspect the schema, check data. This is standing permission; it needs no per-query approval.
+- **Your own project's database only** — the one its application's configuration or its credential-store entry names. Never another project's database, and never the database server's host.
+- **Read-only.** Changing data or schema — inserts, updates, deletes, DDL, migrations, data fixes, procedures that write — still needs James to ask for that specific change in the conversation. Prefer a read-only login; otherwise run queries in a transaction you roll back.
+- **Sanctioned credentials only** — the project's own configuration or the PVI credential store. Never guess, harvest, or borrow a login.
+- **Keep the data in the session.** Select only the columns you need; never write query results containing customer or personal data into the repo, commits, or anything sent off the box.
+- **A block is still a block.** If the connection is refused — authentication failure, firewall, missing grant — the rule below applies: stop and summarize it.
 
 When a task needs an external system and you hit a **block** — a permission error, an authentication failure, a missing grant, a firewall or connectivity problem, a failed database migration or deploy to a production server — **stop and do not try to work around it.** In particular, never install, download, or run offensive-security, penetration-testing, reconnaissance, credential-harvesting, or identity/directory attack tooling of any kind to get past it, and do not reconfigure the remote host. If a task appears to require that class of tool, that is itself the signal to stop and hand it to a human.
 
 **Instead, summarize the block for a human.** Write a short, plain-language note: what you were trying to do, the exact command and the target, the error you got, and what access or decision a person would need to unblock it. Hand that summary to the user. A human who has the missing context will investigate the external system. Summarizing a blocker is the correct, successful outcome here — it is not a failure to be engineered around.
 
 **Exception — this host only, ProjectWorkbench only.** The single project permitted to troubleshoot *this* workbench host (`vnl2422`) more deeply is the **ProjectWorkbench** project itself, whose workspace is `/opt/project-workbench/workspaces/ProjectWorkbench`, because maintaining the workbench is that project's job. Every other project stays inside its own workspace and does not troubleshoot the host. This exception covers only the local workbench host; external production and staging servers and the identity/directory domain remain off-limits to every project, ProjectWorkbench included.
+<!-- /pw-workspace-boundary -->
 BOUNDARY
-    chown "$PW_USER:$PW_USER" "$f" 2>/dev/null || true
-    chmod 0640 "$f" 2>/dev/null || true
-  fi
+  chown "$PW_USER:$PW_USER" "$f" 2>/dev/null || true
+  chmod 0640 "$f" 2>/dev/null || true
 }
 pw_seed_boundary "/home/$PW_USER/.claude/CLAUDE.md"
 pw_seed_boundary "/home/$PW_USER/.copilot/copilot-instructions.md"

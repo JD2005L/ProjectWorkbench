@@ -57,6 +57,28 @@ decision exists to prevent.
 A different setting requires measured evidence from a dedicated or high-throughput workload plus the
 reason documented here.
 
+## 2026-09-30 — STANDING: a project may read its OWN production database to investigate (amends 2026-09-01)
+
+James: "Projects should be allowed to access their production databases for investigative purposes."
+Every project may connect to the production (or staging) database its own application uses, to
+investigate a problem — read-only queries, schema inspection, data checks — as standing permission
+with no per-query approval. Limits:
+- Its own database only (named by the app's configuration or its credential-store entry); never
+  another project's database, and never the database server's host.
+- Read-only. Changing data or schema (inserts/updates/deletes, DDL, migrations, data fixes, writing
+  procedures) still needs James to ask for that specific change. Prefer a read-only login; otherwise
+  run queries in a transaction that is rolled back.
+- Sanctioned credentials only (the project's config or the PVI credential store).
+- Query results with customer or personal data never go into the repo, commits, or off the box.
+- A refused connection (auth failure, firewall, missing grant) is still a block: stop and summarize,
+  per 2026-09-01. Everything else in 2026-09-01 is unchanged.
+
+Why: the 2026-09-01 boundary listed production databases as out of scope, so a ProVisionIPortal
+session was blocked from a read-only investigation James wanted. Delivered as `pw-workspace-boundary v3`
+in `~/.claude/CLAUDE.md`, `~/.copilot/copilot-instructions.md`, `~/.codex/AGENTS.md` (install.sh
+replaces an older block in place), and in the repo-root `AGENTS.md`. Running sessions read the new
+text only after a restart.
+
 ## 2026-09-01 — STANDING: Stay inside your workspace; never investigate external systems (all projects)
 
 PW agents work on the code in their project's workspace (the git repo at their cwd and below) and
