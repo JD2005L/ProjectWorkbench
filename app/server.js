@@ -2,7 +2,7 @@ import express from 'express';
 import fs from 'fs/promises';
 import fsSync from 'fs';
 import { resolveShippedHelper } from './shipped-helpers.js';
-import { createTurnTriage, evaluateTurn, createHermesRelay, hermesEvent } from './turn-outcome.js';
+import { createTurnTriage, evaluateTurn, createHermesRelay, hermesEvent, turnOutcomeOptedIn } from './turn-outcome.js';
 import path from 'path';
 import os from 'os';
 import crypto from 'crypto';
@@ -703,17 +703,20 @@ function runGitCredentialHelperJob(job, plan){
  return spawnCredentialJob({ spawn, argv: gitCredentialArgv(plan), job });
 }
 // Turn outcomes (turn-outcome.js): what each finished Claude turn is asking of the
-// person — an answer, someone to unblock it, nothing at all. On only while the AI
-// Gateway key file exists (root-only, outside every workspace); PW_TURN_OUTCOME=off
-// turns it off regardless. Hermes is told about turns that need someone only when
-// PW_TURN_OUTCOME_HERMES=on. Off, or undecided, the strip shows the amber it always did.
+// person — an answer, someone to unblock it, nothing at all. STRICTLY OPT-IN: on only
+// when PW_TURN_OUTCOME=on is set explicitly AND the AI Gateway key file exists
+// (root-only, outside every workspace). Unset — which is what every upgrade gets —
+// is off: no helper job, no call to the gateway, the amber the strip always showed.
+// Some instances must never run it (GOA: DECISIONS.md 2026-10-05), so a key file
+// alone must never be enough to switch it on. Hermes is told about turns that need
+// someone only when PW_TURN_OUTCOME_HERMES=on as well.
 const TURN_OUTCOME_KEY_PATH = process.env.PW_TURN_OUTCOME_KEY_PATH || '/etc/project-workbench/ai-gateway.key';
-const TURN_OUTCOME_DISABLED = String(process.env.PW_TURN_OUTCOME || '').toLowerCase() === 'off';
+const TURN_OUTCOME_ENABLED = turnOutcomeOptedIn(process.env);
 const TURN_OUTCOME_HERMES = String(process.env.PW_TURN_OUTCOME_HERMES || '').toLowerCase() === 'on';
 const TURN_OUTCOME_RELAY_CONFIG = process.env.PW_TURN_OUTCOME_RELAY_CONFIG || '/etc/project-workbench/pvimcp-mcp.json';
 let gatewayKey = { at: 0, value: '' };
 async function readGatewayKey(){
- if(TURN_OUTCOME_DISABLED) return '';
+ if(!TURN_OUTCOME_ENABLED) return '';
  if(Date.now() - gatewayKey.at < 60000) return gatewayKey.value;
  let value = '';
  try { value = (await fs.readFile(TURN_OUTCOME_KEY_PATH, 'utf8')).trim(); } catch {}
@@ -722,6 +725,7 @@ async function readGatewayKey(){
 }
 // Synchronous gate for the 2s window poll: the key is re-read at most once a minute.
 function turnOutcomeOn(){
+ if(!TURN_OUTCOME_ENABLED) return false;
  if(Date.now() - gatewayKey.at >= 60000) readGatewayKey().catch(()=>{});
  return !!gatewayKey.value;
 }
@@ -3896,6 +3900,13 @@ document.title=(anyLit?'● ':'')+baseTitle;
 first=false;
 }catch{}}
 window.__pwRailRefresh=refreshRail;
+// Opening another project is a full page load, which would land the list back at the top every
+// time. Where it was is kept per browser tab (sessionStorage) and restored once pins and filters
+// have laid the list out.
+const saveRailScroll=()=>{try{sessionStorage.setItem('pwRailScroll',String(KEYS.scrollTop))}catch{}};
+try{const y=Number(sessionStorage.getItem('pwRailScroll'));if(y>0){KEYS.scrollTop=y;requestAnimationFrame(()=>{KEYS.scrollTop=y})}}catch{}
+KEYS.addEventListener('scroll',saveRailScroll,{passive:true});
+window.addEventListener('pagehide',saveRailScroll);
 refreshRail();setInterval(()=>{if(!document.hidden)refreshRail()},4000);
 document.addEventListener('visibilitychange',()=>{if(!document.hidden)refreshRail()});
 })();</script>`;

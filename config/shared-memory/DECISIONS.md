@@ -57,6 +57,21 @@ decision exists to prevent.
 A different setting requires measured evidence from a dedicated or high-throughput workload plus the
 reason documented here.
 
+## 2026-10-05 — STANDING: turn outcomes (Jev) are opt-in per instance; GOA stays on the old method
+
+James: "it's imperative that the GOA side not run JEV, and continue to utilize the old method, as
+the GOA does not approve of JEV internally." Turn outcomes (`app/turn-outcome.js`: each finished
+Claude turn's final message classified by TypeSafe AI's Jev through Vercel AI Gateway) are
+therefore STRICTLY OPT-IN:
+- On only when the dashboard's environment sets `PW_TURN_OUTCOME=on` (also `true`/`1`/`yes`)
+  AND the root-only key file `/etc/project-workbench/ai-gateway.key` exists. Unset, a typo, or
+  `off` is off: no helper job runs, nothing is sent to the gateway, and the tab strip and rail
+  show the plain amber "finished" signal exactly as before.
+- install.sh never sets it and never creates the key, so an upgrade — GOA's included — keeps the
+  old method with no action needed. Do not add it to any GOA profile, drop-in or installer default.
+- PVI2 opts in with the drop-in `/etc/systemd/system/project-workbench.service.d/turn-outcome.conf`
+  (`PW_TURN_OUTCOME=on`, `PW_TURN_OUTCOME_HERMES=on`).
+
 ## 2026-09-30 — STANDING: a project may read its OWN production database to investigate (amends 2026-09-01)
 
 James: "Projects should be allowed to access their production databases for investigative purposes."

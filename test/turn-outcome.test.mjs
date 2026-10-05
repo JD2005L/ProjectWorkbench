@@ -14,7 +14,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
   lastAssistantTurn, transcriptDirName, readTurnTails, evaluateTurn, createTurnTriage,
-  redactForRelay, hermesEvent, createHermesRelay, CRITERIA, MIN_CONFIDENCE, STATE_CHARS,
+  redactForRelay, hermesEvent, createHermesRelay, CRITERIA, MIN_CONFIDENCE, STATE_CHARS, turnOutcomeOptedIn,
 } from '../app/turn-outcome.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -23,6 +23,30 @@ const assistantText = (uuid, text) => line({ type: 'assistant', uuid, timestamp:
 const assistantTool = (uuid) => line({ type: 'assistant', uuid, message: { role: 'assistant', content: [{ type: 'tool_use', id: 't1', name: 'Bash', input: {} }] } });
 const toolResult = () => line({ type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' }] } });
 const human = (text) => line({ type: 'user', message: { role: 'user', content: text } });
+
+// ---------------------------------------------------------------- opt-in
+
+test('turn outcomes are off unless an instance explicitly says yes (GOA must never get them by upgrading)', () => {
+  for (const off of [undefined, '', 'off', 'OFF', 'no', 'false', '0', 'onn', ' maybe ']) {
+    assert.equal(turnOutcomeOptedIn({ PW_TURN_OUTCOME: off }), false, String(off));
+  }
+  assert.equal(turnOutcomeOptedIn({}), false);
+  for (const on of ['on', 'ON', ' on ', 'true', '1', 'yes']) assert.equal(turnOutcomeOptedIn({ PW_TURN_OUTCOME: on }), true, on);
+});
+
+test('the dashboard gates every turn-outcome path on the explicit opt-in, not on the key file', () => {
+  const src = fs.readFileSync(path.join(here, '..', 'app', 'server.js'), 'utf8');
+  assert.match(src, /const TURN_OUTCOME_ENABLED = turnOutcomeOptedIn\(process\.env\);/);
+  assert.match(src, /async function readGatewayKey\(\)\{\n if\(!TURN_OUTCOME_ENABLED\) return '';/);
+  assert.match(src, /function turnOutcomeOn\(\)\{\n if\(!TURN_OUTCOME_ENABLED\) return false;/);
+  // every caller goes through turnOutcomeOn(); nothing observes or annotates without it
+  const observes = src.match(/turnTriage\.(observe|annotate|projectOutcome)\(/g) || [];
+  assert.equal(observes.length, 3);
+  for (const call of ['turnTriage.observe(project, windows)', 'turnTriage.projectOutcome(p.name, ws)']) {
+    const at = src.indexOf(call);
+    assert.ok(at > 0 && src.lastIndexOf('turnOutcomeOn()', at) > at - 200, `${call} must sit behind turnOutcomeOn()`);
+  }
+});
 
 // ---------------------------------------------------------------- transcript reading
 

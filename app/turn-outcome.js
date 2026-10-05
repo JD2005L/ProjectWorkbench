@@ -22,6 +22,13 @@
 import { constants as fsConstants } from 'node:fs';
 import path from 'node:path';
 
+// The feature is opt-in per instance, and only an explicit yes switches it on: an
+// unset variable, a typo or 'off' all mean off. GOA does not approve of Jev, and an
+// upgrade must never turn it on there by default (DECISIONS.md 2026-10-05).
+export function turnOutcomeOptedIn(env = process.env) {
+  return ['on', 'true', '1', 'yes'].includes(String(env?.PW_TURN_OUTCOME ?? '').trim().toLowerCase());
+}
+
 export const OUTCOMES = Object.freeze(['needs_input', 'blocked', 'failed', 'working', 'done']);
 export const MIN_CONFIDENCE = 0.8;
 export const EVALUATE_URL = 'https://ai-gateway.vercel.sh/v1/evaluate';
