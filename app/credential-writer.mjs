@@ -14,6 +14,8 @@
 //         {"action":"prune","base":…,"keep":[…]}
 //         {"action":"status","base":…,"username":…}   -> {signedIn, copilotSignedIn}
 //         {"action":"gh-token","base":…,"username":…}  -> {token} ('' when none stored)
+//         {"action":"turn-tail","panes":[{key,panePid,credUser}],"base":…}
+//                                                  -> {<key>: {sessionId,uuid,text,at}|null}
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
 //
 // The job travels on stdin specifically so the GitHub token never appears in
@@ -23,8 +25,11 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
-import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir, applyUserClaudeTranscript } from './user-credentials.js';
+import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir, userClaudeConfigDir, applyUserClaudeTranscript } from './user-credentials.js';
 import { readStoredGhToken } from './gh-cli.js';
+import { readTurnTails } from './turn-outcome.js';
+import os from 'node:os';
+import path from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
 import { promisify } from 'node:util';
 
@@ -99,6 +104,18 @@ async function main() {
         ghConfigDir: userGhConfigDir(job.base, job.username),
         env: process.env,
       }) }
+      : job.action === 'turn-tail'
+      // The final message of the Claude running under each pane (turn-outcome.js).
+      // Registry and transcripts are this account's files, read with its authority:
+      // the per-user tree first when the pane carries a credential identity, then
+      // this account's own ~/.claude (the shared box login).
+      ? await readTurnTails({
+        fsp,
+        procfs: process.env.PW_PROCFS_PATH || '/proc',
+        panes: Array.isArray(job.panes) ? job.panes.slice(0, 64) : [],
+        claudeDirs: [path.join(os.userInfo().homedir, '.claude')],
+        perUserDir: job.base ? (user) => userClaudeConfigDir(job.base, user) : null,
+      })
       : job.action === 'transcript'
       ? await applyUserClaudeTranscript({
         fsp,
