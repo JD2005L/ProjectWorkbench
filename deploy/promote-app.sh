@@ -127,6 +127,25 @@ for v in PW_ORCHESTRATOR_ENABLED PW_PER_USER_CLAUDE; do
   fi
 done
 
+# Turn outcomes (app/turn-outcome.js) send each finished Claude turn's final message
+# to TypeSafe AI's Jev via Vercel AI Gateway. GOA does not approve of Jev, so this is
+# a hard stop rather than a warning (DECISIONS.md 2026-10-05). The container's own
+# Config.Env is read as well as the podman cmdline, because an --env-file never
+# shows on the cmdline.
+hr "preflight: turn outcomes (Jev) must stay off on GOA"
+CENV=$(podman inspect --format '{{range .Config.Env}}{{println .}}{{end}}' "$CONTAINER" 2>/dev/null || true)
+for v in PW_TURN_OUTCOME PW_TURN_OUTCOME_HERMES; do
+  # Every occurrence is judged, so a stray opt-in is never masked by a later "off".
+  vals=$(printf '%s\n%s\n' "$CENV" "$ENVDUMP" | sed -nE "s/^(--env=|-e)?$v=//p" | tr -d '[:blank:]' | tr '[:upper:]' '[:lower:]')
+  if printf '%s\n' "$vals" | grep -qxE 'on|true|1|yes'; then
+    die "$v is opted in in the $CONTAINER container env. GOA must not run turn
+      outcomes (Jev). Remove it from the container's env and re-run. Nothing changed."
+  fi
+  printf '  ok      %s %s (turn outcomes off)\n' "$v" "${vals:+not opted in: $(printf '%s' "$vals" | tr '\n' ' ')}${vals:-unset}"
+done
+[ -e /etc/project-workbench/ai-gateway.key ] \
+  && printf '  WARNING /etc/project-workbench/ai-gateway.key exists — inert without PW_TURN_OUTCOME, but GOA should not hold one\n'
+
 # --------------------------------------------------- preflight: what moves ---
 hr "preflight: change summary"
 NEW=0; CHANGED=0; SAME=0

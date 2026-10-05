@@ -71,6 +71,8 @@ therefore STRICTLY OPT-IN:
   old method with no action needed. Do not add it to any GOA profile, drop-in or installer default.
 - PVI2 opts in with the drop-in `/etc/systemd/system/project-workbench.service.d/turn-outcome.conf`
   (`PW_TURN_OUTCOME=on`, `PW_TURN_OUTCOME_HERMES=on`).
+- GOA enforces it at deploy time: `deploy/promote-app.sh` (GOA-only) aborts before changing
+  anything if either variable is opted in in the dashboard container's env.
 
 ## 2026-09-30 — STANDING: a project may read its OWN production database to investigate (amends 2026-09-01)
 
