@@ -32,6 +32,7 @@ export const STATE_CHARS = 2500;
 const TAIL_BYTES = 1024 * 1024;
 const CACHE_LIMIT = 500;
 const RETRY_AFTER_MS = 5000;
+export const RECHECK_MS = 15000;
 const MAX_ATTEMPTS = 3;
 
 // The definitions and priority order the pilot was scored with. Changing them
@@ -150,45 +151,51 @@ export async function readTurnTails({ fsp, procfs = '/proc', claudeDirs, panes, 
     const key = String(pane?.key || '');
     if (!key) continue;
     out[key] = null;
-    const root = String(pane?.panePid || '');
-    if (!/^\d+$/.test(root)) continue;
-    const user = String(pane?.credUser || '');
-    const dirs = user && perUserDir ? [perUserDir(user), ...claudeDirs] : claudeDirs;
-    let entry = null;
-    let configDir = '';
-    let frontier = [root];
-    const seen = new Set();
-    for (let depth = 0; depth < 6 && frontier.length && !entry; depth++) {
-      const next = [];
-      for (const pid of frontier) {
-        if (seen.has(pid)) continue;
-        seen.add(pid);
-        for (const dir of dirs) {
-          const reg = await readJson(fsp, path.join(dir, 'sessions', `${pid}.json`));
-          if (reg && typeof reg.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(reg.sessionId)) { entry = reg; configDir = dir; break; }
-        }
-        if (entry) break;
-        next.push(...await procChildren(fsp, procfs, pid));
-      }
-      frontier = next;
-    }
-    if (!entry) continue;
-    const name = `${entry.sessionId}.jsonl`;
-    const projects = path.join(configDir, 'projects');
-    let raw = await readTail(fsp, path.join(projects, transcriptDirName(entry.cwd), name));
-    if (raw === null) {
-      // The cwd-to-directory rule is Claude's, not ours; look rather than guess.
-      let dirs = [];
-      try { dirs = await fsp.readdir(projects); } catch {}
-      for (const dir of dirs) {
-        raw = await readTail(fsp, path.join(projects, dir, name));
-        if (raw !== null) break;
-      }
-    }
-    const turn = raw === null ? null : lastAssistantTurn(raw);
-    if (turn) out[key] = { sessionId: entry.sessionId, ...turn };
+    // One pane that cannot be read (an odd credential name, a vanished process)
+    // must not cost the others their answer.
+    try { out[key] = await readOneTail({ fsp, procfs, claudeDirs, perUserDir, pane }); } catch { out[key] = null; }
   }
   return out;
+}
+
+async function readOneTail({ fsp, procfs, claudeDirs, perUserDir, pane }) {
+  const root = String(pane?.panePid || '');
+  if (!/^\d+$/.test(root)) return null;
+  const user = String(pane?.credUser || '');
+  const dirs = user && perUserDir ? [perUserDir(user), ...claudeDirs] : claudeDirs;
+  let entry = null;
+  let configDir = '';
+  let frontier = [root];
+  const seen = new Set();
+  for (let depth = 0; depth < 6 && frontier.length && !entry; depth++) {
+    const next = [];
+    for (const pid of frontier) {
+      if (seen.has(pid)) continue;
+      seen.add(pid);
+      for (const dir of dirs) {
+        const reg = await readJson(fsp, path.join(dir, 'sessions', `${pid}.json`));
+        if (reg && typeof reg.sessionId === 'string' && /^[0-9a-f-]{36}$/i.test(reg.sessionId)) { entry = reg; configDir = dir; break; }
+      }
+      if (entry) break;
+      next.push(...await procChildren(fsp, procfs, pid));
+    }
+    frontier = next;
+  }
+  if (!entry) return null;
+  const name = `${entry.sessionId}.jsonl`;
+  const projects = path.join(configDir, 'projects');
+  let raw = await readTail(fsp, path.join(projects, transcriptDirName(entry.cwd), name));
+  if (raw === null) {
+    // The cwd-to-directory rule is Claude's, not ours; look rather than guess.
+    let dirs = [];
+    try { dirs = await fsp.readdir(projects); } catch {}
+    for (const dir of dirs) {
+      raw = await readTail(fsp, path.join(projects, dir, name));
+      if (raw !== null) break;
+    }
+  }
+  const turn = raw === null ? null : lastAssistantTurn(raw);
+  return turn ? { sessionId: entry.sessionId, ...turn } : null;
 }
 
 /**
@@ -288,15 +295,21 @@ export function createHermesRelay({ fetchImpl, url, authorization, timeoutMs = 1
  * The per-window state machine. observe() is called with every window listing
  * (the cockpit polls every 2s) and must stay cheap: it only notices bells and
  * queues work. annotate() and projectOutcome() read the decided state.
+ *
+ * A window's outcome always belongs to the turn that is current NOW:
+ * - every bell edge (rise or clear) starts a new generation, and a decision that
+ *   finishes for an older generation is dropped, not attached to the new bell;
+ * - while the bell stays up the transcript is re-read every RECHECK_MS, because
+ *   a turn that paused ("I'll report back when CI finishes") can resume and end
+ *   again without anyone viewing the tab, so tmux never sees the bell fall.
  */
 export function createTurnTriage({
   readTails, evaluate, relay = null, log = () => {}, now = () => Date.now(),
-  minConfidence = MIN_CONFIDENCE,
+  minConfidence = MIN_CONFIDENCE, recheckMs = RECHECK_MS,
 }) {
   const windows = new Map(); // `${project}\u0000${windowId}` -> state
   const decided = new Map(); // message uuid -> { outcome, confidence }
   const relayed = new Map(); // message uuid -> true once sent to Hermes
-  const latest = new Map(); // project -> most recent confident outcome
   let running = false;
   let pending = [];
 
@@ -315,15 +328,14 @@ export function createTurnTriage({
         let tails = {};
         try { tails = await readTails(batch.map(({ key, w }) => ({ key, panePid: w.panePid, credUser: w.credUser || '' }))) || {}; }
         catch (error) { log(`turn-tail failed: ${error?.message || error}`); }
-        for (const { key, project, w } of batch) {
-          const state = windows.get(key);
-          if (!state) continue;
+        for (const item of batch) {
+          const state = windows.get(item.key);
+          if (!state || state.gen !== item.gen) { if (state) state.inflight = false; continue; } // a newer bell: re-queued by observe
           state.inflight = false;
-          state.attempts += 1;
           state.triedAt = now();
           // One window's failure must not strand the rest of the batch mid-flight.
-          try { await decide(key, project, w, state, tails[key]); }
-          catch (error) { log(`turn triage failed for ${project}: ${error?.message || error}`); }
+          try { await decide(item, state, tails[item.key]); }
+          catch (error) { log(`turn triage failed for ${item.project}: ${error?.message || error}`); }
         }
       }
     } finally {
@@ -331,18 +343,18 @@ export function createTurnTriage({
     }
   }
 
-  async function decide(key, project, w, state, tail) {
-    if (!tail) return; // still mid-turn or not a Claude pane: retried while the bell stands
+  async function decide({ project, w, gen }, state, tail) {
+    if (!tail) { if (!state.result) state.attempts += 1; return; } // mid-turn or not a Claude pane
+    if (state.result && state.result.uuid === tail.uuid) return; // same turn, already decided
     let verdict = decided.get(tail.uuid);
     if (!verdict) {
       const answer = await evaluate(tail.text);
-      if (!answer || answer.error) { log(`evaluate failed for ${project}: ${answer?.error || 'no answer'}`); return; }
+      if (!answer || answer.error) { state.attempts += 1; log(`evaluate failed for ${project}: ${answer?.error || 'no answer'}`); return; }
       verdict = { outcome: answer.outcome, confidence: answer.confidence };
       if (tail.uuid) remember(decided, tail.uuid, verdict);
     }
-    state.result = { ...verdict, uuid: tail.uuid, at: now() };
-    state.attempts = MAX_ATTEMPTS; // decided: nothing to retry for this bell
-    if (verdict.confidence >= minConfidence) latest.set(project, { outcome: verdict.outcome, at: now() });
+    if (state.gen !== gen) return; // the bell moved while the model answered
+    state.result = { ...verdict, uuid: tail.uuid };
     const ask = verdict.outcome === 'needs_input' || verdict.outcome === 'blocked';
     const watching = w.active && w.attached > 0;
     if (relay && ask && verdict.confidence >= minConfidence && !watching && tail.uuid && !relayed.has(tail.uuid)) {
@@ -360,16 +372,22 @@ export function createTurnTriage({
         const key = keyOf(project, w);
         let state = windows.get(key);
         if (!w.bell || w.hibernated) {
-          // The bell is gone (viewed, or a new turn started): the next bell is a new turn.
-          if (state) { state.bell = false; state.attempts = 0; }
+          // The bell is gone (viewed, or a new turn started): forget this window
+          // unless a read is in flight, whose result the generation bump discards.
+          if (state) { if (state.inflight) { state.bell = false; state.gen += 1; state.result = null; } else windows.delete(key); }
           continue;
         }
-        if (!state) { state = { bell: false, inflight: false, attempts: 0, triedAt: 0, result: null }; windows.set(key, state); }
-        if (!state.bell) { state.bell = true; state.attempts = 0; state.result = null; }
-        if (state.inflight || state.attempts >= MAX_ATTEMPTS) continue;
-        if (state.attempts > 0 && now() - state.triedAt < RETRY_AFTER_MS) continue;
+        if (!state) { state = { bell: false, gen: 0, inflight: false, attempts: 0, triedAt: 0, result: null }; windows.set(key, state); }
+        if (!state.bell) { state.bell = true; state.gen += 1; state.attempts = 0; state.result = null; state.triedAt = 0; }
+        if (state.inflight) continue;
+        if (state.result) {
+          if (now() - state.triedAt < recheckMs) continue; // decided: re-read now and then for a newer turn
+        } else {
+          if (state.attempts >= MAX_ATTEMPTS) continue;
+          if (state.attempts > 0 && now() - state.triedAt < RETRY_AFTER_MS) continue;
+        }
         state.inflight = true;
-        pending.push({ key, project, w });
+        pending.push({ key, project, w, gen: state.gen });
       }
       if (pending.length) drain().catch((error) => log(`turn triage stopped: ${error?.message || error}`));
     },
@@ -383,16 +401,17 @@ export function createTurnTriage({
       });
     },
     // One outcome for a project's rail key: the most urgent among its rung tabs.
-    // Any rung tab without a confident outcome makes the answer null (plain amber),
-    // so a project is never shown calmer than one of its tabs warrants.
+    // Any rung tab without a confident outcome — or no rung tab at all, as when a
+    // stray attach cleared the bells but the pending marker stands — answers null
+    // (plain amber), so a project is never shown calmer than it may warrant.
     projectOutcome(project, list) {
       const rung = (Array.isArray(list) ? list : []).filter((w) => w.bell && (!w.active || w.attached === 0));
-      if (!rung.length) return latest.get(project)?.outcome || null;
+      if (!rung.length) return null;
       const outcomes = this.annotate(project, rung).map((w) => w.outcome);
       if (outcomes.some((o) => !o)) return null;
       return URGENCY.find((o) => outcomes.includes(o)) || null;
     },
-    clearProject(project) { latest.delete(project); },
+    clearProject() {}, // nothing project-wide is remembered beyond the rung tabs themselves
   };
 }
 

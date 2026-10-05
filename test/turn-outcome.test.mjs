@@ -243,6 +243,9 @@ test('a project shows its most urgent tab, and nothing calmer than an undecided 
   assert.equal(triage.projectOutcome('P', [ws[0], ws[2]]), 'done');
   assert.equal(triage.projectOutcome('P', [ws[2]]), 'working');
   assert.equal(triage.projectOutcome('P', [...ws, win({ windowId: '@4', panePid: '4' })]), null, 'an undecided rung tab makes it plain amber');
+  // REVIEW P1-2: with no rung tab (a stray attach cleared the bells, the pending marker stands)
+  // nothing remembered may make the project look calmer than plain amber.
+  assert.equal(triage.projectOutcome('P', ws.map((w) => ({ ...w, bell: false }))), null);
 });
 
 test('Hermes hears once per turn that needs someone, never while it is being watched, never for the rest', async () => {
@@ -280,6 +283,54 @@ test('one window that throws does not strand the others in its batch', async () 
   triage.observe('P', ws); await flush();
   assert.equal(triage.annotate('P', ws)[1].outcome, 'done', 'the second window was still decided');
   assert.ok(logs.some((m) => m.includes('boom')));
+});
+
+test('REVIEW P1-1: a paused turn that resumes and ends again is re-read while its bell stays up', async () => {
+  let tail = { uuid: 'u1', text: 'CI is running; I will report back.' };
+  const { triage, calls, tick } = triageHarness({
+    tails: () => tail,
+    answers: { 'CI is running; I will report back.': { outcome: 'working', confidence: 0.97 }, 'CI failed. Should I revert?': { outcome: 'needs_input', confidence: 0.98 } },
+    relay: async () => true,
+  });
+  triage.observe('P', [win({})]); await flush();
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, 'working');
+  tail = { uuid: 'u2', text: 'CI failed. Should I revert?' }; // resumed and ended again; nobody viewed the tab
+  tick(5000); triage.observe('P', [win({})]); await flush();
+  assert.equal(calls.tails, 1, 'not re-read before the recheck interval');
+  tick(11000); triage.observe('P', [win({})]); await flush();
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, 'needs_input');
+  assert.deepEqual(calls.relay.map((r) => r.uuid), ['u2']);
+  tick(16000); triage.observe('P', [win({})]); await flush();
+  assert.equal(calls.evaluate.length, 2, 'an unchanged turn is not re-evaluated');
+});
+
+test('REVIEW P2-3: a decision that lands after its bell moved is dropped, not attached to the new bell', async () => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  let tail = { uuid: 'old', text: 'old' };
+  const triage = createTurnTriage({
+    readTails: async (panes) => Object.fromEntries(panes.map((p) => [p.key, tail])),
+    evaluate: async (text) => { if (text === 'old') await gate; return { outcome: text === 'old' ? 'done' : 'blocked', confidence: 0.99 }; },
+  });
+  triage.observe('P', [win({})]); await flush();          // reading turn 1; the model is slow
+  triage.observe('P', [win({ bell: false })]);              // viewed and replied
+  tail = { uuid: 'new', text: 'new' };
+  triage.observe('P', [win({})]);                           // turn 2 rings while turn 1 is still with the model
+  release(); await flush();
+  // Turn 2 is read on its own (queued as soon as turn 1's read left flight); turn 1's
+  // late "done" must never be what turn 2 shows.
+  triage.observe('P', [win({})]); await flush();
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, 'blocked');
+});
+
+test('one pane that cannot be read does not cost the others their answer', async () => {
+  const fx = fixture();
+  const out = await readTurnTails({
+    fsp, procfs: fx.procfs, claudeDirs: [fx.claude], perUserDir: (u) => { if (u === 'bad') throw new Error('odd name'); return fx.claude; },
+    panes: [{ key: 'bad', panePid: '100', credUser: 'bad' }, { key: 'ok', panePid: '100' }],
+  });
+  assert.equal(out.bad, null);
+  assert.equal(out.ok?.uuid, 'u9');
 });
 
 // ---------------------------------------------------------------- what reaches Hermes
