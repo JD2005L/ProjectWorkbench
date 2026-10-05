@@ -346,6 +346,10 @@ export function createTurnTriage({
   async function decide({ project, w, gen }, state, tail) {
     if (!tail) { if (!state.result) state.attempts += 1; return; } // mid-turn or not a Claude pane
     if (state.result && state.result.uuid === tail.uuid) return; // same turn, already decided
+    // A newer turn ended: the old outcome stops describing this window NOW, before
+    // the model is asked. If the ask fails the window is plain amber and retries
+    // under the normal cap — never left showing what the previous turn wanted.
+    if (state.result) { state.result = null; state.attempts = 0; }
     let verdict = decided.get(tail.uuid);
     if (!verdict) {
       const answer = await evaluate(tail.text);
@@ -367,6 +371,12 @@ export function createTurnTriage({
 
   return {
     observe(project, list) {
+      const listed = new Set();
+      for (const w of Array.isArray(list) ? list : []) if (w?.windowId) listed.add(keyOf(project, w));
+      // Windows closed while their bell was up are forgotten too.
+      for (const [key, state] of windows) {
+        if (key.startsWith(`${project}\u0000`) && !listed.has(key) && !state.inflight) windows.delete(key);
+      }
       for (const w of Array.isArray(list) ? list : []) {
         if (!w?.windowId) continue;
         const key = keyOf(project, w);

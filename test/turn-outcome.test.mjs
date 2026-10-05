@@ -304,6 +304,33 @@ test('REVIEW P1-1: a paused turn that resumes and ends again is re-read while it
   assert.equal(calls.evaluate.length, 2, 'an unchanged turn is not re-evaluated');
 });
 
+test('REVIEW (f448be0): a newer turn that cannot be decided falls back to amber, not the old outcome', async () => {
+  let tail = { uuid: 'u1', text: 'paused' };
+  let up = true;
+  let clock = 0;
+  const asked = [];
+  const triage = createTurnTriage({
+    readTails: async (panes) => Object.fromEntries(panes.map((p) => [p.key, tail])),
+    evaluate: async (text) => { asked.push(text); return up ? { outcome: 'working', confidence: 0.97 } : { error: 'gateway down' }; },
+    now: () => clock,
+  });
+  triage.observe('P', [win({})]); await flush();
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, 'working');
+  up = false; tail = { uuid: 'u2', text: 'Should I revert?' }; // resumed, ended on a question; the gateway is down
+  clock += 16000; triage.observe('P', [win({})]); await flush();
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, null, 'the old "working" is gone');
+  for (let i = 0; i < 6; i++) { clock += 6000; triage.observe('P', [win({})]); await flush(); }
+  assert.equal(asked.filter((x) => x === 'Should I revert?').length, 3, 'retries stop at the cap');
+});
+
+test('a window closed while its bell was up is forgotten', async () => {
+  const { triage, calls } = triageHarness({ tails: () => ({ uuid: 'u', text: 'T' }), answers: { T: { outcome: 'done', confidence: 0.9 } } });
+  triage.observe('P', [win({})]); await flush();
+  triage.observe('P', []); // the tab was closed
+  triage.observe('P', [win({})]); await flush(); // a new window reusing the id is a new turn
+  assert.equal(calls.tails, 2);
+});
+
 test('REVIEW P2-3: a decision that lands after its bell moved is dropped, not attached to the new bell', async () => {
   let release;
   const gate = new Promise((r) => { release = r; });
