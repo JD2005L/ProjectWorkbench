@@ -15,7 +15,8 @@
 //         {"action":"status","base":…,"username":…}   -> {signedIn, copilotSignedIn}
 //         {"action":"gh-token","base":…,"username":…}  -> {token} ('' when none stored)
 //         {"action":"turn-tail","panes":[{key,panePid,credUser}],"base":…}
-//                                                  -> {<key>: {sessionId,uuid,text,at}|null}
+//                                                  -> {<key>: {sessionId,uuid,at,digest,assistant,user}|null}
+//            (assistant/user are redacted, bounded excerpts — never the raw transcript; see turn-context.js)
 //   out: {"ok":true,"result":{…}} | {"ok":false,"error":"…"}
 //
 // The job travels on stdin specifically so the GitHub token never appears in
