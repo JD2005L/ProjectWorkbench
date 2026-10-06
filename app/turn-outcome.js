@@ -12,10 +12,11 @@
 //
 // Failing closed is the whole design: anything not decided with confidence —
 // no key, the gateway down, a turn still mid-tool-call, an answer that is not
-// valid, not from Jev, or not confident — yields NO outcome, and the UI then shows
-// exactly the amber signal it showed before this existed. An outcome only ever
-// refines the bell; it never invents attention where tmux saw none, and it never
-// authorizes anything: it changes a colour and who is told, nothing else.
+// valid, not from Jev, without TypeSafe's own confidence, or not confident —
+// yields NO outcome, and the UI then shows exactly the amber signal it showed
+// before this existed. An outcome only ever refines the bell; it never invents
+// attention where tmux saw none, and it never authorizes anything: it changes a
+// colour and who is told, nothing else.
 //
 // Pilot (2026-10-05, 197 real turn endings from 22 projects, outcome question on the
 // final message alone): 89% agreement with two independent reference labellers
@@ -39,8 +40,10 @@ export const INTERVENTIONS = Object.freeze(['answer', 'approval', 'credential_ho
 // The selected option's probability — the measure the pilot calibrated.
 export const MIN_CONFIDENCE = 0.8;
 export const HIGH_CONFIDENCE = 0.95;
-// TypeSafe's own confidence statistic, when it reports one (providerMetadata.typesafe.confidence).
-// It is not the selected option's probability; Vercel's routing guide uses 0.6 as its floor.
+// TypeSafe's own per-question confidence statistic: how concentrated the answer's distribution is, not
+// the selected option's probability. Required: the gateway's own decision fallbacks treat an answer
+// without a finite one as unassessable (confidence_unavailable), and so does this. Vercel's routing
+// guide uses 0.6 as its floor.
 export const MIN_TYPESAFE_CONFIDENCE = 0.6;
 // The documented HTTP API for decisions (vercel.com/docs/ai-gateway/modalities/decision, verified
 // 2026-10-06). The AI SDK's experimental_decide sends the same state and questions to an SDK-only
@@ -294,17 +297,35 @@ function isRecord(value) {
   return proto === Object.prototype || proto === null;
 }
 const isProbability = (v) => typeof v === 'number' && Number.isFinite(v) && v >= 0 && v <= 1;
+// The AI SDK's documented default absolute tolerance: for a distribution's sum, and for two copies of
+// one confidence.
 const TOLERANCE = 1e-6;
 class Invalid extends Error {}
 const invalid = (code) => { throw new Invalid(code); };
 
-// A confidence statistic is optional; when given it must be a probability.
+// TypeSafe's confidence for question `id`. /v1/evaluate reports it twice: on the answer itself
+// ("native decision results preserve Choice and Score confidence", Vercel's decision-fallbacks docs)
+// and keyed by question ID under providerMetadata.typesafe.confidence (the AI SDK's documented
+// location); live responses carry both, identical. At least one copy is required, every copy must be a
+// probability, and two copies are one statistic: if they disagree the answer contradicts itself.
 function confidenceOf(body, answer, id) {
-  const meta = body.providerMetadata?.typesafe?.confidence;
-  if (meta !== undefined && !isRecord(meta)) invalid('bad_confidence');
-  const fromMeta = meta?.[id];
-  for (const value of [fromMeta, answer.confidence]) if (value !== undefined && !isProbability(value)) invalid('bad_confidence');
-  return fromMeta ?? answer.confidence ?? null;
+  const copies = [answer.confidence, metadataConfidence(body, id)].filter((value) => value !== undefined);
+  if (!copies.every(isProbability)) invalid('bad_confidence');
+  if (!copies.length) invalid('no_confidence');
+  if (Math.max(...copies) - Math.min(...copies) > TOLERANCE) invalid('confidence_mismatch');
+  return Math.min(...copies);
+}
+
+// providerMetadata.typesafe.confidence[id]; undefined where the response leaves a level out, and
+// invalid where a level it gives is not an object.
+function metadataConfidence(body, id) {
+  let node = body;
+  for (const key of ['providerMetadata', 'typesafe', 'confidence']) {
+    node = node[key];
+    if (node === undefined) return undefined;
+    if (!isRecord(node)) invalid('bad_confidence');
+  }
+  return node[id];
 }
 
 // The AI SDK's own answer rules (ai@7.0.128 validateDecisionAnswers) for a choice question, made
@@ -326,14 +347,16 @@ function checkChoice(body, id, criteria, roundingError) {
 }
 
 function bandOf(probability, confidence) {
-  if (confidence !== null && confidence < MIN_TYPESAFE_CONFIDENCE) return 'uncertain';
+  if (!isProbability(confidence) || confidence < MIN_TYPESAFE_CONFIDENCE) return 'uncertain';
   return probability >= HIGH_CONFIDENCE ? 'high' : probability >= MIN_CONFIDENCE ? 'medium' : 'uncertain';
 }
 
 /**
  * A gateway response turned into a decision, or { ok:false, error } when it is not a valid answer
- * from Jev. An uncertain decision is still a decision (outcome null, band 'uncertain'): it is
- * plain amber, and asking again would not make it surer.
+ * from Jev — including one that lacks TypeSafe's confidence for a question (no_confidence), gives one
+ * that is not a probability (bad_confidence), or gives two that disagree (confidence_mismatch). An
+ * uncertain decision is still a decision (outcome null, band 'uncertain'): it is plain amber, and
+ * asking again would not make it surer.
  */
 export function validateDecision(body) {
   try {
@@ -507,6 +530,17 @@ function errText(error) {
   return String(error?.message || error || 'error').replace(/[^\x20-\x7E]/g, '').slice(0, 120);
 }
 
+// The outbox holds a turn durably only when it says so: written to its ledger now, or already there in
+// one of the ledger's states (turn-outbox.js). null for that; otherwise a short code for why the turn
+// was not handed over — the outbox's own refusal reason (outbox_full), or that its answer was no answer.
+const LEDGER_STATES = new Set(['pending', 'sending', 'delivered', 'suppressed', 'failed']);
+function handOverFailure(out) {
+  if (!isRecord(out)) return 'not_durable';
+  if (out.status === 'enqueued' || (out.status === 'deduplicated' && LEDGER_STATES.has(out.state))) return null;
+  if (out.status === 'refused') return typeof out.reason === 'string' && /^[a-z_]{1,32}$/.test(out.reason) ? out.reason : 'refused';
+  return 'not_durable';
+}
+
 /**
  * The per-window state machine. observe() is called with every window listing
  * (the cockpit polls every 2s) and must stay cheap: it only notices bells and
@@ -520,9 +554,11 @@ function errText(error) {
  *   again without anyone viewing the tab, so tmux never sees the bell fall.
  *
  * A turn that needs someone is handed to `relay` (the durable outbox) — after one more, fresh
- * look at the window, immediately before. The in-memory maps here are only caches of work already
- * done: losing one costs a re-read or a re-evaluation, never a second relay, because the outbox
- * remembers every correlation ID it has accepted.
+ * look at the window, immediately before. It counts as handed over only when the outbox answers that
+ * it holds the turn durably; a refusal (the outbox is full), any other answer or a throw leaves it
+ * owed, retried on the next re-read of the same turn without asking the model again. The in-memory
+ * maps here are only caches of work already done: losing one costs a re-read or a re-evaluation,
+ * never a second relay, because the outbox remembers every correlation ID it has accepted.
  */
 export function createTurnTriage({
   readTails, evaluate, relay = null, lookupWindow = null, instance = 'pw', log = () => {},
@@ -530,7 +566,7 @@ export function createTurnTriage({
 }) {
   const windows = new Map(); // `${project}\u0000${windowId}` -> state
   const decided = new Map(); // turn cache key -> decision
-  const handed = new Map(); // correlation id -> true once the outbox has it
+  const handed = new Map(); // correlation id -> true once the outbox has said it holds it durably
   let running = false;
   let pending = [];
 
@@ -541,9 +577,11 @@ export function createTurnTriage({
     if (map.size > CACHE_LIMIT) map.delete(map.keys().next().value);
   };
   const emit = (event, fields = {}) => { try { log(event, fields); } catch {} };
-  // What the UI may show: the decided outcome, held to the floor here too, whatever produced it.
+  // What the UI may show — and so what may be relayed: the decided outcome, held to both floors here
+  // too, whatever produced it.
   const shown = (d) => (d && OUTCOMES.includes(d.outcome) && d.band !== 'uncertain'
-    && typeof d.probability === 'number' && d.probability >= minConfidence ? d.outcome : null);
+    && typeof d.probability === 'number' && d.probability >= minConfidence
+    && isProbability(d.confidence) && d.confidence >= MIN_TYPESAFE_CONFIDENCE ? d.outcome : null);
   const validWindow = (w) => WINDOW_ID.test(String(w?.windowId ?? '')) && Number.isInteger(w?.index) && w.index >= 0 && w.index <= 99999;
   const watchedReason = (w) => (!w ? 'window_gone' : w.hibernated ? 'hibernated' : !w.bell ? 'viewed' : (w.active && w.attached > 0) ? 'watched' : '');
 
@@ -617,8 +655,8 @@ export function createTurnTriage({
     if (relay && (outcome === 'needs_input' || outcome === 'blocked')) startHandOver({ project, w, gen, state, tail, decision, ask, identity, fields });
   }
 
-  // A hand-over that failed (a full disk, a lock that timed out) is tried again on the next re-read
-  // of the same turn, for as long as its bell stays up.
+  // A hand-over that failed (a full outbox, a full disk, a lock that timed out) is tried again on the
+  // next re-read of the same turn, for as long as its bell stays up.
   function startHandOver(job) {
     const result = job.state.result;
     handOver(job).catch((error) => {
@@ -643,11 +681,12 @@ export function createTurnTriage({
     if (reason) return emit('suppressed', { ...f, reason });
     if (state.gen !== gen) return emit('suppressed', { ...f, reason: 'superseded' });
     const args = hermesEvent({ project, window: { index: w.index, name: w.name }, decision, ask, at: tail.at, correlationId: identity.correlationId });
-    await relay({
+    const failure = handOverFailure(await relay({
       id: identity.correlationId, project, windowId: w.windowId, windowIndex: w.index,
       outcome: decision.outcome, intervention: decision.intervention, band: decision.band,
       decidedBy: decision.model, decisionSchema: decision.schema, probability: decision.probability, args,
-    });
+    }));
+    if (failure) throw new Error(failure); // startHandOver logs the code and marks the turn for a retry
     remember(handed, identity.correlationId, true);
   }
 

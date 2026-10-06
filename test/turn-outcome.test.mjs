@@ -19,7 +19,7 @@ import {
   DECISION_SCHEMA, MODEL, turnOutcomeOptedIn,
 } from '../app/turn-outcome.js';
 import { normalizedDigest, turnContext, requestedAction, TRUNCATION_MARKER } from '../app/turn-context.js';
-import { createTurnOutbox } from '../app/turn-outbox.js';
+import { createTurnOutbox, createTurnLog } from '../app/turn-outbox.js';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const serverSrc = () => fs.readFileSync(path.join(here, '..', 'app', 'server.js'), 'utf8');
@@ -335,6 +335,97 @@ test('a decision is only what Jev validly and confidently said; everything else 
   }
 });
 
+// REVIEW (aa01550) P1: TypeSafe's per-question confidence was optional, and when the answer and the
+// provider metadata disagreed the metadata won unchecked — so a response with no confidence at all, or
+// one whose answer said 0.01 under metadata claiming 0.99, came out as a confident outcome.
+// /v1/evaluate reports the one statistic twice: on each answer (Vercel's decision-fallbacks docs:
+// "native decision results preserve Choice and Score confidence") and keyed by question ID under
+// providerMetadata.typesafe.confidence (the AI SDK's documented location). Every question needs at
+// least one copy, every copy must be a probability, and two copies must agree.
+const unconfident = (b, ids = ['outcome', 'intervention']) => {
+  for (const id of ids) { delete b.answers[id].confidence; delete b.providerMetadata.typesafe.confidence[id]; }
+  return b;
+};
+const calmBody = () => jevBody({ outcome: 'done', p: 0.99, intervention: 'none', ip: 0.95 });
+const CONFIDENCE = [
+  // what the review's probes did: a calm "done", band high, from no confidence / a contradicted one
+  ['REVIEW probe: done with no confidence at all', () => { const b = unconfident(calmBody()); delete b.providerMetadata.typesafe; return b; }, { error: 'no_confidence' }],
+  ['REVIEW probe: done, the answer says 0.01 where the metadata claims 0.99', () => { const b = calmBody(); b.answers.outcome.confidence = 0.01; b.providerMetadata.typesafe.confidence.outcome = 0.99; return b; }, { error: 'confidence_mismatch' }],
+  // missing: no decision, however probable the choice
+  ['an empty TypeSafe confidence record', (b) => unconfident(b), { error: 'no_confidence' }],
+  ['no confidence for the outcome', (b) => unconfident(b, ['outcome']), { error: 'no_confidence' }],
+  ['no confidence for the intervention', (b) => unconfident(b, ['intervention']), { error: 'no_confidence' }],
+  ['no provider metadata and none on the answers', (b) => { unconfident(b); delete b.providerMetadata; return b; }, { error: 'no_confidence' }],
+  // not a probability, in either copy or in the record that holds one
+  ['a numeric string on the answer', (b) => { b.answers.outcome.confidence = '0.95'; return b; }, { error: 'bad_confidence' }],
+  ['a numeric string in the metadata', (b) => { b.providerMetadata.typesafe.confidence.outcome = '0.95'; return b; }, { error: 'bad_confidence' }],
+  ['a boolean', (b) => { b.answers.intervention.confidence = true; return b; }, { error: 'bad_confidence' }],
+  ['null on the answer', (b) => { b.answers.outcome.confidence = null; return b; }, { error: 'bad_confidence' }],
+  ['null in the metadata', (b) => { b.providerMetadata.typesafe.confidence.intervention = null; return b; }, { error: 'bad_confidence' }],
+  ['NaN', (b) => { b.answers.outcome.confidence = NaN; return b; }, { error: 'bad_confidence' }],
+  ['Infinity', (b) => { b.providerMetadata.typesafe.confidence.outcome = Infinity; return b; }, { error: 'bad_confidence' }],
+  ['just above one, on the answer only', (b) => { b.answers.outcome.confidence = 1.000001; return b; }, { error: 'bad_confidence' }],
+  ['just below zero, the only copy', (b) => { unconfident(b, ['intervention']); b.providerMetadata.typesafe.confidence.intervention = -0.000001; return b; }, { error: 'bad_confidence' }],
+  ['a confidence record that is a number', (b) => { unconfident(b); b.providerMetadata.typesafe.confidence = 0.95; return b; }, { error: 'bad_confidence' }],
+  ['a confidence record that is an array', (b) => { b.providerMetadata.typesafe.confidence = [0.95, 0.9]; return b; }, { error: 'bad_confidence' }],
+  ['a typesafe namespace that is not an object', (b) => { b.providerMetadata.typesafe = 'confident'; return b; }, { error: 'bad_confidence' }],
+  ['provider metadata that is not an object', (b) => { b.providerMetadata = 'confident'; return b; }, { error: 'bad_confidence' }],
+  // contradictory
+  ['the answer says 0.99 where the metadata says 0.01', (b) => { b.answers.outcome.confidence = 0.99; b.providerMetadata.typesafe.confidence.outcome = 0.01; return b; }, { error: 'confidence_mismatch' }],
+  ['the intervention copies disagree', (b) => { b.providerMetadata.typesafe.confidence.intervention = 0.3; return b; }, { error: 'confidence_mismatch' }],
+  ['copies a thousandth apart', (b) => { b.providerMetadata.typesafe.confidence.outcome = 0.951; return b; }, { error: 'confidence_mismatch' }],
+  // the documented shapes, kept
+  ['copies equal up to float noise', (b) => { b.providerMetadata.typesafe.confidence.outcome = 0.95 + 5e-7; return b; }, { outcome: 'needs_input', band: 'high', intervention: 'approval' }],
+  ['the metadata copy only (the AI SDK\'s documented location)', (b) => { delete b.answers.outcome.confidence; delete b.answers.intervention.confidence; return b; }, { outcome: 'needs_input', band: 'high', intervention: 'approval', confidence: 0.95, interventionConfidence: 0.9 }],
+  ['the answer copy only (/v1/evaluate without a typesafe namespace)', (b) => { delete b.providerMetadata.typesafe; return b; }, { outcome: 'needs_input', band: 'high', intervention: 'approval', confidence: 0.95, interventionConfidence: 0.9 }],
+  ['a low confidence in both copies is a decision, and it is uncertain', () => jevBody({ conf: 0.4 }), { outcome: null, band: 'uncertain', confidence: 0.4 }],
+];
+
+test('REVIEW (aa01550) P1: TypeSafe confidence is required for every question, a probability in every copy, and one value', () => {
+  for (const [label, tweak, want] of CONFIDENCE) {
+    const out = validateDecision(tweak(jevBody()));
+    if (want.error) {
+      assert.deepEqual(out, { ok: false, error: want.error }, label);
+    } else {
+      assert.equal(out.ok, true, `${label}: ${JSON.stringify(out)}`);
+      for (const [k, v] of Object.entries(want)) assert.equal(out.decision[k], v, `${label}: ${k}`);
+    }
+  }
+});
+
+// The three live /v1/evaluate answers recorded by the 2026-10-06 contract smoke (synthetic turns, no
+// conversation). Every live response so far has carried both copies of the confidence, identical.
+// The first is the response body byte for byte; the other two keep the recorded answers and TypeSafe
+// metadata, with the gateway metadata cut to its routing verdict.
+const LIVE_RESPONSES = [
+  ['blocked, a credential holder needed', JSON.parse('{"answers":{"outcome":{"type":"choice","choice":"blocked","probabilities":{"working":0,"needs_input":0,"blocked":1,"done":0,"failed":0},"confidence":1},"intervention":{"type":"choice","choice":"credential_holder","probabilities":{"deployment":0,"none":0,"investigation":0,"answer":0,"credential_holder":0.99,"manual_action":0.01,"approval":0},"confidence":0.99}},"model":"typesafe-ai/jev","providerMetadata":{"typesafe":{"confidence":{"outcome":1,"intervention":0.99}},"gateway":{"routing":{"originalModelId":"typesafe-ai/jev","resolvedProvider":"typesafe-ai","fallbacksAvailable":[],"planningReasoning":"Provider set restricted to: typesafe-ai. System credentials planned for: typesafe-ai. ZDR requested: all 1 attempts support ZDR. Execution order: typesafe-ai(system)","canonicalSlug":"typesafe-ai/jev","finalProvider":"typesafe-ai","modelAttemptCount":1,"modelAttempts":[{"canonicalSlug":"typesafe-ai/jev","success":true,"providerAttemptCount":1,"providerAttempts":[{"provider":"typesafe-ai","credentialType":"system","success":true,"startTime":1791311267515,"endTime":1791311267646,"statusCode":200}]}],"totalProviderAttemptCount":1},"cost":"0.000025158","marketCost":"0.000025158","surchargeCost":"0","gatewayCost":"0.000025158","inferenceCost":"0.000025158","inputInferenceCost":"0.000025158","outputInferenceCost":"0","generationId":"gen_01M497HHE1HR50EZ0YQKGP7N9E"}},"usage":{"inputTokens":599,"outputTokens":125}}'),
+    { outcome: 'blocked', band: 'high', intervention: 'credential_holder', confidence: 1, interventionConfidence: 0.99, generationId: 'gen_01M497HHE1HR50EZ0YQKGP7N9E' }],
+  ['an inconclusive answer', {
+    answers: {
+      outcome: { type: 'choice', choice: 'done', probabilities: { working: 0, needs_input: 0.21, blocked: 0, failed: 0.01, done: 0.78 }, confidence: 0.72 },
+      intervention: { type: 'choice', choice: 'answer', probabilities: { answer: 0.52, deployment: 0, investigation: 0.09, credential_holder: 0, approval: 0.17, none: 0.02, manual_action: 0.2 }, confidence: 0.44 },
+    },
+    model: 'typesafe-ai/jev',
+    providerMetadata: { typesafe: { confidence: { outcome: 0.72, intervention: 0.44 } }, gateway: { routing: { finalProvider: 'typesafe-ai' } } },
+  }, { outcome: null, band: 'uncertain', intervention: 'unknown', confidence: 0.72, interventionConfidence: 0.44 }],
+  ['a finished rename', {
+    answers: {
+      outcome: { type: 'choice', choice: 'done', probabilities: { done: 1, blocked: 0, needs_input: 0, failed: 0, working: 0 }, confidence: 1 },
+      intervention: { type: 'choice', choice: 'none', probabilities: { none: 0.78, answer: 0.17, approval: 0.05, credential_holder: 0, manual_action: 0, investigation: 0, deployment: 0 }, confidence: 0.73 },
+    },
+    model: 'typesafe-ai/jev',
+    providerMetadata: { typesafe: { confidence: { outcome: 1, intervention: 0.73 } }, gateway: { routing: { finalProvider: 'typesafe-ai' } } },
+  }, { outcome: 'done', band: 'high', intervention: 'unknown', confidence: 1, interventionConfidence: 0.73 }],
+];
+
+test('the recorded live response shapes still decide exactly as they did', () => {
+  for (const [label, body, want] of LIVE_RESPONSES) {
+    const out = validateDecision(body);
+    assert.equal(out.ok, true, `${label}: ${JSON.stringify(out)}`);
+    for (const [k, v] of Object.entries(want)) assert.equal(out.decision[k], v, `${label}: ${k}`);
+  }
+});
+
 // ---------------------------------------------------------------- the per-window state
 
 const settle = () => new Promise((r) => setImmediate(r));
@@ -345,9 +436,10 @@ async function waitFor(cond, ms = 20000) {
 }
 
 const tailOf = (n, assistant, extra = {}) => ({ sessionId: SID, uuid: U(n), at: '2026-10-05T00:00:00Z', digest: normalizedDigest(assistant), assistant, user: null, ...extra });
+// What validateDecision hands the triage: a validated decision always carries TypeSafe's confidence.
 function verdict(outcome, { p = 0.97, intervention = outcome === 'done' || outcome === 'working' ? 'none' : 'answer', band } = {}) {
   const b = band || (p >= 0.95 ? 'high' : p >= MIN_CONFIDENCE ? 'medium' : 'uncertain');
-  return { ok: true, decision: { outcome: b === 'uncertain' ? null : outcome, band: b, probability: p, confidence: null, intervention, interventionProbability: 0.9, interventionConfidence: null, model: MODEL, schema: DECISION_SCHEMA, generationId: null, latencyMs: 1 } };
+  return { ok: true, decision: { outcome: b === 'uncertain' ? null : outcome, band: b, probability: p, confidence: 0.95, intervention, interventionProbability: 0.9, interventionConfidence: 0.9, model: MODEL, schema: DECISION_SCHEMA, generationId: null, latencyMs: 1 } };
 }
 
 function triageHarness({ tails = {}, answers = {}, relay = null, lookup = null, minConfidence, instance = 'pvi2' } = {}) {
@@ -384,6 +476,60 @@ test('a decision the triage did not get from validation is still held to the con
   const { triage } = triageHarness({ tails: { 100: tailOf(1, 'x') }, answers: { x: forged } });
   triage.observe('P', [win({})]); await flush();
   assert.equal(triage.annotate('P', [win({})])[0].outcome, null);
+});
+
+test('REVIEW (aa01550) P1: the triage holds TypeSafe\'s confidence floor too — no shown outcome and no relay without it', async () => {
+  for (const [label, confidence] of [['null', null], ['absent', undefined], ['a string', '0.95'], ['NaN', NaN], ['above one', 1.5], ['below the floor', 0.59]]) {
+    const forged = { ok: true, decision: { ...verdict('blocked', { intervention: 'credential_holder' }).decision, confidence } };
+    const { triage, calls } = triageHarness({ tails: () => tailOf(1, 'x'), answers: { x: forged }, relay: async () => ({ status: 'enqueued' }) });
+    triage.observe('P', [win({})]); await flush();
+    assert.equal(triage.annotate('P', [win({})])[0].outcome, null, label);
+    assert.equal(triage.projectOutcome('P', [win({})]), null, label);
+    assert.equal(calls.relay.length, 0, `${label}: never handed to the outbox`);
+  }
+  // The same decision with its confidence is shown and handed over: the confidence is what stopped it.
+  const { triage, calls } = triageHarness({ tails: () => tailOf(1, 'x'), answers: { x: verdict('blocked', { intervention: 'credential_holder' }) }, relay: async () => ({ status: 'enqueued' }) });
+  triage.observe('P', [win({})]); await flush();
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, 'blocked');
+  assert.equal(calls.relay.length, 1);
+});
+
+test('REVIEW (aa01550) P1: a gateway answer whose confidence is missing, invalid or contradictory is plain amber and never relayed', async () => {
+  const blockedBody = () => jevBody({ outcome: 'blocked', p: 0.99, intervention: 'credential_holder', ip: 0.95, conf: 0.97, iconf: 0.95 });
+  const cases = [
+    ['missing', (b) => { unconfident(b); delete b.providerMetadata.typesafe; return b; }, 'no_confidence'],
+    ['the answer says 0.01 where the metadata claims 0.99', (b) => { b.answers.outcome.confidence = 0.01; b.providerMetadata.typesafe.confidence.outcome = 0.99; return b; }, 'confidence_mismatch'],
+    ['the answer says 0.99 where the metadata says 0.01', (b) => { b.answers.outcome.confidence = 0.99; b.providerMetadata.typesafe.confidence.outcome = 0.01; return b; }, 'confidence_mismatch'],
+    ['not a number', (b) => { b.providerMetadata.typesafe.confidence.outcome = 'high'; return b; }, 'bad_confidence'],
+    ['out of range', (b) => { b.answers.outcome.confidence = 1.2; b.providerMetadata.typesafe.confidence.outcome = 1.2; return b; }, 'bad_confidence'],
+    ['a typesafe namespace that is not an object', (b) => { b.providerMetadata.typesafe = 'confident'; return b; }, 'bad_confidence'],
+  ];
+  const run = async (body) => {
+    const relayed = [];
+    const logs = [];
+    let clock = 1000;
+    const triage = createTurnTriage({
+      readTails: async (panes) => Object.fromEntries(panes.map((p) => [p.key, tailOf(1, 'I need the deploy key rotated.')])),
+      // the real path: HTTP body -> evaluateTurn -> validateDecision -> triage
+      evaluate: (ctx) => evaluateTurn({ fetchImpl: async () => jsonResponse(200, body), apiKey: 'k', context: ctx }),
+      relay: async (item) => { relayed.push(item); return { status: 'enqueued' }; },
+      instance: 'pvi2', log: (event, fields) => logs.push({ event, ...fields }), now: () => clock,
+    });
+    for (let i = 0; i < 4; i++) { triage.observe('P', [win({})]); await flush(); clock += 16000; }
+    return { triage, relayed, logs };
+  };
+  for (const [label, tweak, code] of cases) {
+    const { triage, relayed, logs } = await run(tweak(blockedBody()));
+    assert.equal(triage.annotate('P', [win({})])[0].outcome, null, label);
+    assert.equal(triage.projectOutcome('P', [win({})]), null, label);
+    assert.equal(relayed.length, 0, `${label}: never handed to the outbox`);
+    const failed = logs.filter((l) => l.event === 'evaluation_failed');
+    assert.ok(failed.length >= 1 && failed.every((l) => l.error === code), `${label}: ${JSON.stringify(failed)}`);
+  }
+  // Control: the same body with its confidence intact is shown and relayed once.
+  const { triage, relayed } = await run(blockedBody());
+  assert.equal(triage.annotate('P', [win({})])[0].outcome, 'blocked');
+  assert.equal(relayed.length, 1);
 });
 
 test('a window is read once per bell, and the next bell is a new turn', async () => {
@@ -597,6 +743,129 @@ test('a failing enqueue is logged, never thrown into the window poll, and tried 
   tick(16000); triage.observe('P', [win({})]); await flush();
   assert.equal(calls.relay.length, 2, 'and not again once it is in');
   assert.equal(calls.evaluate.length, 1, 'without asking the model again');
+});
+
+test('REVIEW (aa01550) P1: a turn the outbox refuses because it is full stays owed, and is handed over once there is room', async () => {
+  const dir = tmpDir('turn-outcome-full-');
+  const file = path.join(dir, 'turn-outcome-outbox.json');
+  const ledger = () => JSON.parse(fs.readFileSync(file, 'utf8')).entries;
+  const sent = [];
+  const outbox = createTurnOutbox({
+    file, maxPending: 1, setTimer: () => null, clearTimer: () => {},
+    send: async (args) => { sent.push(args.correlation_id); return { ok: true, eventId: `wbr-${sent.length}` }; },
+  });
+  // Another turn already holds the outbox's only place.
+  const otherId = `pwt1-${'f'.repeat(32)}`;
+  const other = {
+    id: otherId, project: 'P', windowId: '@9', windowIndex: 9, outcome: 'needs_input', intervention: 'answer', band: 'high',
+    args: { project: 'P', session: 'w9-claude', event_type: 'question', summary: 'P › claude: waiting', evidence: '{}', correlation_id: otherId, urgency: 'normal' },
+  };
+  assert.equal((await outbox.enqueue(other)).status, 'enqueued');
+
+  const text = 'SECRET-ASK: Should I deploy to staging?';
+  const id = turnIdentity({ instance: 'pvi2', project: 'P', sessionId: SID, uuid: U(1), digest: normalizedDigest(text) }).correlationId;
+  const handed = [];
+  const statuses = [];
+  const lines = [];
+  const turnLog = createTurnLog({ write: (l) => lines.push(l) }); // the dashboard's own logger
+  let evaluations = 0;
+  let clock = 1000;
+  const triage = createTurnTriage({
+    readTails: async (panes) => Object.fromEntries(panes.map((p) => [p.key, tailOf(1, text)])),
+    evaluate: async () => { evaluations++; return verdict('needs_input'); },
+    relay: async (item) => { handed.push(item.id); const out = await outbox.enqueue(item); statuses.push(out.status); return out; },
+    instance: 'pvi2', log: turnLog.log, now: () => clock,
+  });
+
+  triage.observe('P', [win({})]);
+  await waitFor(() => statuses.length === 1);
+  await flush();
+  assert.deepEqual(statuses, ['refused']);
+  assert.equal(ledger()[id], undefined, 'the refused turn is not in the ledger');
+  const failed = lines.filter((l) => l.includes('"event":"enqueue_failed"')).map((l) => JSON.parse(l.slice(l.indexOf('{'))));
+  assert.equal(failed.length, 1, lines.join('\n'));
+  assert.deepEqual([failed[0].error, failed[0].correlation_id], ['outbox_full', id], 'a secret-free reason, logged');
+
+  await outbox.drain(); // the other turn is delivered, which makes room
+  assert.deepEqual(sent, [otherId]);
+
+  clock += 5000; triage.observe('P', [win({})]); await flush();
+  assert.equal(handed.length, 1, 'not retried before the re-read interval');
+  clock += 11000; triage.observe('P', [win({})]);
+  await waitFor(() => statuses.length === 2);
+  assert.deepEqual(statuses, ['refused', 'enqueued']);
+  assert.deepEqual(handed, [id, id], 'the same turn, the same correlation ID');
+  assert.equal(ledger()[id]?.state, 'pending', 'now durably owed');
+  await outbox.drain();
+  assert.deepEqual(sent, [otherId, id]);
+  assert.equal(ledger()[id]?.state, 'delivered');
+
+  clock += 16000; triage.observe('P', [win({})]); await flush();
+  assert.equal(handed.length, 2, 'not handed over again once the outbox has it');
+  assert.equal(evaluations, 1, 'and the model was asked once');
+  assert.ok(!lines.join('\n').includes('SECRET-ASK'), 'nothing of the message is logged');
+});
+
+test('REVIEW (aa01550) P1: only a durable answer from the outbox counts as handed over; anything else is retried on the next re-read', async () => {
+  const text = 'SECRET-TEXT Should I deploy?';
+  const notDurable = [
+    ['refused: the outbox is full', () => ({ status: 'refused', reason: 'outbox_full' }), 'outbox_full'],
+    ['refused, no reason given', () => ({ status: 'refused' }), 'refused'],
+    ['refused, a reason that is not a code', () => ({ status: 'refused', reason: 'SECRET-TEXT in a reason' }), 'refused'],
+    ['no answer', () => undefined, 'not_durable'],
+    ['null', () => null, 'not_durable'],
+    ['an empty object', () => ({}), 'not_durable'],
+    ['a bare string', () => 'enqueued', 'not_durable'],
+    ['deduplicated, with no ledger state', () => ({ status: 'deduplicated' }), 'not_durable'],
+    ['deduplicated, in a state the ledger never has', () => ({ status: 'deduplicated', state: 'bogus' }), 'not_durable'],
+    ['a thrown error', () => { throw new Error('ledger lock timed out'); }, 'ledger lock timed out'],
+    ['a rejected promise', () => Promise.reject(new Error('ENOSPC')), 'ENOSPC'],
+  ];
+  for (const [label, first, code] of notDurable) {
+    let answer = first;
+    const { triage, calls, tick } = triageHarness({ tails: () => tailOf(1, text), answers: { [text]: verdict('needs_input') }, relay: async () => answer() });
+    triage.observe('P', [win({})]); await flush();
+    assert.equal(calls.relay.length, 1, label);
+    const failed = calls.logs.filter((l) => l.event === 'enqueue_failed');
+    assert.deepEqual(failed.map((l) => [l.error, l.correlation_id]), [[code, calls.relay[0].id]], label);
+    assert.equal(triage.annotate('P', [win({})])[0].outcome, 'needs_input', `${label}: the tab still shows what the turn needs`);
+    answer = () => ({ status: 'enqueued' });
+    tick(5000); triage.observe('P', [win({})]); await flush();
+    assert.equal(calls.relay.length, 1, `${label}: not before the re-read interval`);
+    tick(11000); triage.observe('P', [win({})]); await flush();
+    assert.equal(calls.relay.length, 2, `${label}: retried`);
+    assert.equal(calls.relay[1].id, calls.relay[0].id, `${label}: the same turn`);
+    tick(16000); triage.observe('P', [win({})]); await flush();
+    assert.equal(calls.relay.length, 2, `${label}: and not again once the outbox has it`);
+    assert.equal(calls.evaluate.length, 1, `${label}: without asking the model again`);
+    assert.ok(!JSON.stringify(calls.logs).includes('SECRET-TEXT'), `${label}: nothing of the message or the answer is logged`);
+  }
+  // A relay that throws synchronously takes the same path.
+  let clock = 1000;
+  const logs = [];
+  const tried = [];
+  const sync = createTurnTriage({
+    readTails: async (panes) => Object.fromEntries(panes.map((p) => [p.key, tailOf(1, text)])),
+    evaluate: async () => verdict('needs_input'),
+    relay: (item) => { tried.push(item.id); if (tried.length === 1) throw new Error('sync throw'); return Promise.resolve({ status: 'enqueued' }); },
+    log: (event, fields) => logs.push({ event, ...fields }), now: () => clock,
+  });
+  sync.observe('P', [win({})]); await flush();
+  assert.ok(logs.some((l) => l.event === 'enqueue_failed' && l.error === 'sync throw'));
+  clock += 16000; sync.observe('P', [win({})]); await flush();
+  clock += 16000; sync.observe('P', [win({})]); await flush();
+  assert.equal(tried.length, 2);
+  // Durable answers: handed over once, never retried, nothing logged as failed.
+  for (const answer of [{ status: 'enqueued' }, { status: 'deduplicated', state: 'pending' }, { status: 'deduplicated', state: 'sending' },
+    { status: 'deduplicated', state: 'delivered' }, { status: 'deduplicated', state: 'suppressed' }, { status: 'deduplicated', state: 'failed' }]) {
+    const label = JSON.stringify(answer);
+    const { triage, calls, tick } = triageHarness({ tails: () => tailOf(1, text), answers: { [text]: verdict('needs_input') }, relay: async () => answer });
+    triage.observe('P', [win({})]); await flush();
+    tick(16000); triage.observe('P', [win({})]); await flush();
+    tick(16000); triage.observe('P', [win({})]); await flush();
+    assert.equal(calls.relay.length, 1, label);
+    assert.equal(calls.logs.filter((l) => l.event === 'enqueue_failed').length, 0, label);
+  }
 });
 
 test('one window that throws does not strand the others in its batch', async () => {

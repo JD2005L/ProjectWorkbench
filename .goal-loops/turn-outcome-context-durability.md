@@ -58,7 +58,7 @@
 | # | Criterion | Measured by |
 |---|---|---|
 | AC1 | Request is `/v1/evaluate`, `typesafe-ai/jev`, ZDR + only typesafe-ai, `redirect: 'error'`, state = `{latest_user_request, final_assistant_message}`, questions `outcome` + `intervention` with exactly the listed options | `test/turn-outcome.test.mjs` request-shape test |
-| AC2 | Response validation: wrong/missing `model`, non-typesafe `finalProvider`, missing/extra answers, unknown option, missing/incomplete/non-finite/out-of-range distribution, bad sum, non-argmax choice, bad rounding, out-of-range TypeSafe confidence ⇒ no outcome; p<0.8 or TypeSafe confidence<0.6 ⇒ `uncertain`; calm outcome contradicted by a confident non-`none` intervention ⇒ uncertain; resolved model + schema + band recorded | decision-validation table test |
+| AC2 | Response validation: wrong/missing `model`, non-typesafe `finalProvider`, missing/extra answers, unknown option, missing/incomplete/non-finite/out-of-range distribution, bad sum, non-argmax choice, bad rounding, missing, non-probability or self-contradictory TypeSafe confidence (review repair) ⇒ no outcome; p<0.8 or TypeSafe confidence<0.6 ⇒ `uncertain`; calm outcome contradicted by a confident non-`none` intervention ⇒ uncertain; resolved model + schema + band recorded | decision-validation table test |
 | AC3 | Context: latest genuine user request found past tool calls/meta/command echoes; redaction precedes truncation; secrets (≥12 formats) placed across BOTH truncation boundaries never appear even partially; marker present; Unicode (surrogates, ZWJ emoji, combining marks, CJK) never split; unrelated paragraphs absent from the Hermes excerpt | context tests in `test/turn-context.test.mjs` |
 | AC4 | Hermes contract is deterministic JSON with project/window, outcome, intervention, requested_action, source_time, confidence_band, schema, correlation_id; no transcript tail; receiver-valid `session`/`correlation_id` | contract test |
 | AC5 | Outbox: enqueue is idempotent per correlation ID; survives a restart between detection and delivery; two producer instances on one ledger deliver exactly once; >500 turns never re-relay an old turn; backoff is bounded exponential; terminal after max attempts; lease recovery after a crash | `test/turn-outbox.test.mjs` |
@@ -84,7 +84,8 @@ git diff --check
   per-window triage). The privilege-dropped helper (`credential-writer.mjs` → `readTurnTails`) now
   returns only redacted, bounded excerpts plus a digest, never the raw message.
 - **Gating.** Outcome shown iff the selected-option probability ≥ 0.8 (the pilot's calibrated measure)
-  and TypeSafe's own confidence, when reported, ≥ 0.6 (Vercel's routing guide floor). A calm outcome
+  and TypeSafe's own per-question confidence — REQUIRED since the review repair below — ≥ 0.6
+  (Vercel's routing guide floor). A calm outcome
   (done/working) additionally needs the independent intervention question to give P(`none`) ≥ 0.5,
   because a calm tab stops pulsing. Intervention kind reported only at ≥ 0.8 and consistent with the
   outcome, else `unknown`. Band: high ≥ 0.95, medium ≥ 0.8, else uncertain.
@@ -136,6 +137,40 @@ existing red `out-blocked` styling; no secret anywhere.
 - **Accuracy re-baseline.** The pilot's figures were measured on the old single-question,
   message-only state. The new state and second question are validated for shape and gating, not
   re-scored against the 197-turn reference set.
+
+## Review repair — immutable review BLOCK on `aa01550` (2026-10-06)
+
+Same branch and worktree, strict TDD, commit only (no push / PR / merge / deploy).
+
+- **P1-1 — missing or contradictory TypeSafe confidence was accepted as confident.** `confidenceOf`
+  treated the statistic as optional and preferred `providerMetadata` without checking the answer's
+  copy. Now: `/v1/evaluate` reports it twice — `answers[id].confidence` (Vercel decision-fallbacks
+  docs: "native decision results preserve Choice and Score confidence") and
+  `providerMetadata.typesafe.confidence[id]` (the AI SDK's documented location); live responses carry
+  both, identical. Every question needs at least one copy; every copy, and every metadata level that
+  holds one, must be valid (a finite probability / an object); two copies must agree within 1e-6 (the
+  AI SDK's documented default absolute tolerance). Otherwise the answer is not a decision —
+  `no_confidence`, `bad_confidence` or `confidence_mismatch` — so the tab stays plain amber, nothing is
+  enqueued, and the evaluation is retried under the existing cap (3 per bell). The triage's `shown()`
+  now holds the confidence floor too, as it already did the probability floor, whatever produced the
+  decision. The three recorded live response shapes decide exactly as before.
+- **P1-2 — an outbox-capacity refusal was mistaken for a durable hand-over.** `handOver` remembered
+  the correlation ID in `handed` whatever `enqueue()` answered, so `{status:'refused',
+  reason:'outbox_full'}` was never stored and never retried. Now `handed` is set only on `enqueued`
+  or `deduplicated` with a real ledger state; a refusal, any other answer, or a throw goes down the
+  existing failure path: `enqueue_failed` logged with a code (`outbox_full`, `refused`, `not_durable`,
+  or the thrown message), the turn marked for retry, and retried on the existing 15 s re-read of the
+  same turn — same correlation ID, no second model evaluation.
+- **RED on the unchanged code:** 5 new tests failed (confidence table, triage confidence floor,
+  gateway-path confidence, outbox-full with the real ledger, non-durable answers). Per-row probe on
+  `aa01550`: 6 missing-confidence rows (both review probes reproduced: `done`/`high`), 2 malformed
+  metadata containers and 4 contradictions were accepted; the 11 non-numeric/out-of-range rows were
+  already rejected and stay as guards; every non-durable hand-over answer was silently treated as
+  handed (thrown errors were already retried).
+- **GREEN:** focused `turn-outcome` + `turn-outbox` + `turn-context` 95/95; release check + adjacent
+  suites (credential helper, cockpit script, env contract, completion latch, agent sessions) 168/168;
+  `app/VERSION` 1.26.1006.1957. The canonical full gate (`umask 0022; cd app && npm test`) runs on this
+  exact tree before the commit; its result is in the commit message.
 
 ## Progress log
 
