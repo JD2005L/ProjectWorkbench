@@ -464,15 +464,17 @@ export async function applyBoxDelete({ fsp, projectPath, box, name }) {
  * owner-dropped `box-delete` the dashboard UI uses. Entries box-delete would refuse
  * (dotfiles — see isSafeBoxName; this also spares an in-progress `.pw-inbox-*.part`
  * upload temp) and entries with an unparseable mtime are left alone. maxAgeDays <= 0
- * disables expiry (returns []). Input is the `files` array from applyBoxList.
+ * disables expiry (returns []). Input is the `files` array from applyBoxList. `keep` is
+ * a Set of names never to expire — the pinned files (inbox-pins.js).
  */
-export function selectExpiredBoxFiles(files, { now = Date.now(), maxAgeDays } = {}) {
+export function selectExpiredBoxFiles(files, { now = Date.now(), maxAgeDays, keep = null } = {}) {
   const days = Number(maxAgeDays);
   if (!(days > 0)) return [];
   const cutoff = now - days * 24 * 60 * 60 * 1000;
   const expired = [];
   for (const f of Array.isArray(files) ? files : []) {
     if (!f || !isSafeBoxName(f.name)) continue;
+    if (keep && keep.has(f.name)) continue; // pinned: kept for as long as it stays pinned
     const t = Date.parse(f.mtime);
     if (!Number.isFinite(t)) continue;
     if (t < cutoff) expired.push(f.name);
