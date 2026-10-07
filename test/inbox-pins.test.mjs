@@ -131,7 +131,6 @@ test('API: listing shows pin state and expiry; pin, unpin, refusals; clear-all k
     assert.ok(up, `server did not come up\n${logs.join('')}`);
 
     let list = (await json('/api/inbox/demo')).body;
-    assert.equal(list.expiryDays, 30);
     const byName = (l) => Object.fromEntries(l.files.map((f) => [f.name, f]));
     assert.equal(byName(list)['keep.pdf'].pinned, false);
     assert.ok(byName(list)['keep.pdf'].expiresAt, 'an unpinned file reports when it will expire');

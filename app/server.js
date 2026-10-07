@@ -4667,7 +4667,7 @@ app.get(BASE + '/api/inbox/:project', requireAuth, requireProjectAccess, async (
   return { ...f, ...boxFileFacts(p, INBOX_DIR, f.name), pinned: isPinned, expiresAt: inboxExpiresAt({ mtime: f.mtime, pinned: isPinned, maxAgeDays: INBOX_EXPIRY_DAYS }) };
  });
  files.sort((a,b)=>b.mtime.localeCompare(a.mtime));
- res.json({ok:true,files,expiryDays: INBOX_EXPIRY_DAYS > 0 ? INBOX_EXPIRY_DAYS : null});
+ res.json({ok:true,files});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.delete(BASE + '/api/inbox/:project/:file', requireInboxWrite, async (req,res)=>{ try {
