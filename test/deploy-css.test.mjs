@@ -86,3 +86,25 @@ test('deploy styling itself is preserved (classes still targeted, media query ke
   }
   assert.ok(css.includes('@media'), 'responsive @media block lost');
 });
+
+// REGRESSION (2026-10-08): a running deploy streamed long unbroken lines into one
+// target card and that column grew mid-deploy, squeezing the other. A bare `1fr`
+// track is minmax(auto,1fr) — it never shrinks below its content — so the tracks
+// must be minmax(0,1fr), the card must allow shrinking, and logs must wrap anywhere.
+test('deploy target columns stay fixed whatever the logs contain', async () => {
+  const css = (await getDeployCss()).replace(/\/\*[\s\S]*?\*\//g, '');
+  const rule = (sel) => {
+    const re = new RegExp(`:is\\(\\.deploy-page,#deployBackdrop\\) ${sel.replace(/[.]/g, '\\.')}\\{([^}]*)\\}`, 'g');
+    return [...css.matchAll(re)].map((m) => m[1]);
+  };
+  const tracks = rule('.targets').map((body) => body.match(/grid-template-columns:([^;]+)/)?.[1]).filter(Boolean);
+  assert.ok(tracks.length >= 2, 'both the wide and the narrow layout declare their tracks');
+  for (const t of tracks) {
+    assert.doesNotMatch(t.replace(/minmax\(0,\s*1fr\)/g, ''), /1fr/, `a bare 1fr track grows with its content: ${t}`);
+    assert.match(t, /minmax\(0,\s*1fr\)/, `tracks must be allowed to shrink: ${t}`);
+  }
+  assert.ok(rule('.target-card').some((b) => /min-width:0/.test(b)), 'the card itself must be allowed to shrink');
+  for (const sel of ['.deploy-output', '.deploy-status']) {
+    assert.ok(rule(sel).some((b) => /overflow-wrap:anywhere/.test(b)), `${sel} must wrap a long unbroken token`);
+  }
+});
