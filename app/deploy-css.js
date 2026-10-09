@@ -16,8 +16,11 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .button:disabled{opacity:.5;cursor:not-allowed}
 :is(.deploy-page,#deployBackdrop) .project-card{background:#111827;border:1px solid #374151;border-radius:12px;padding:1.2rem 1.5rem;margin-bottom:1.2rem}
 :is(.deploy-page,#deployBackdrop) .project-card h2{margin:0 0 .8rem;font-size:1.2rem;color:#f8fafc}
-:is(.deploy-page,#deployBackdrop) .targets{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
-:is(.deploy-page,#deployBackdrop) .target-card{border:1px solid #334155;border-radius:8px;padding:1rem;background:#0b1220}
+/* Equal columns that may shrink below their content. A bare 1fr is minmax(auto,1fr), so a
+   long unbreakable log line or path in one card widened that column and squeezed the
+   other mid-deploy; minmax(0,1fr) + min-width:0 keeps both halves fixed whatever streams in. */
+:is(.deploy-page,#deployBackdrop) .targets{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:1rem}
+:is(.deploy-page,#deployBackdrop) .target-card{border:1px solid #334155;border-radius:8px;padding:1rem;background:#0b1220;min-width:0}
 :is(.deploy-page,#deployBackdrop) .target-card h3{margin:0 0 .5rem;font-size:.95rem;text-transform:uppercase;letter-spacing:.05em}
 :is(.deploy-page,#deployBackdrop) .target-card.dev h3{color:#6ee7b7}
 :is(.deploy-page,#deployBackdrop) .target-card.prod h3{color:#fca5a5}
@@ -39,7 +42,7 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .config-section label{display:block;font-size:.8rem;font-weight:600;color:#cbd5e1;margin-bottom:.3rem}
 :is(.deploy-page,#deployBackdrop) .config-section textarea,:is(.deploy-page,#deployBackdrop) .config-section input{width:100%;box-sizing:border-box;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.8rem;padding:.4rem .5rem;border:1px solid #334155;border-radius:4px;resize:vertical;background:#020617;color:#e5e7eb}
 :is(.deploy-page,#deployBackdrop) .config-section textarea{min-height:60px}
-:is(.deploy-page,#deployBackdrop) .deploy-output{margin-top:.5rem;background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none}
+:is(.deploy-page,#deployBackdrop) .deploy-output{margin-top:.5rem;background:#020617;border:1px solid #1f2937;color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.75rem;padding:.6rem;border-radius:4px;max-height:200px;overflow:auto;white-space:pre-wrap;display:none;overflow-wrap:anywhere}
 :is(.deploy-page,#deployBackdrop) .deploy-output.show{display:block}
 /* A slot has two shapes and never both at once: the FORM (script, version
    command, backend, Save, Deploy) or the LOG. Deploying switches to the log and
@@ -56,7 +59,7 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
    scroll the answer out of view — which is exactly what it did when this line
    was the pane's first row. Empty when idle, so it takes no space. */
 :is(.deploy-page,#deployBackdrop) .deploy-status:empty{display:none}
-:is(.deploy-page,#deployBackdrop) .deploy-status{margin-top:.5rem;padding:.4rem .6rem;border-radius:4px;font-size:.78rem;font-weight:600;border-left:3px solid #475569;background:#0b1220;color:#e2e8f0;white-space:pre-wrap}
+:is(.deploy-page,#deployBackdrop) .deploy-status{margin-top:.5rem;padding:.4rem .6rem;border-radius:4px;font-size:.78rem;font-weight:600;border-left:3px solid #475569;background:#0b1220;color:#e2e8f0;white-space:pre-wrap;overflow-wrap:anywhere}
 :is(.deploy-page,#deployBackdrop) .deploy-status.running{border-left-color:#38bdf8}
 :is(.deploy-page,#deployBackdrop) .deploy-status.interrupted{border-left-color:#f59e0b;color:#fde68a}
 :is(.deploy-page,#deployBackdrop) .deploy-status.success{border-left-color:#22c55e;color:#bbf7d0}
@@ -93,5 +96,5 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .deploy-tab{background:transparent;border:none;color:#94a3b8;padding:.5rem 1.2rem;font:inherit;font-size:.9rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s}
 :is(.deploy-page,#deployBackdrop) .deploy-tab:hover{color:#e5e7eb}
 :is(.deploy-page,#deployBackdrop) .deploy-tab.active{color:#93c5fd;border-bottom-color:#3b82f6;font-weight:600}
-@media(max-width:760px){:is(.deploy-page,#deployBackdrop) .targets{grid-template-columns:1fr}:is(.deploy-page,#deployBackdrop) .top{align-items:flex-start;flex-direction:column}}
+@media(max-width:760px){:is(.deploy-page,#deployBackdrop) .targets{grid-template-columns:minmax(0,1fr)}:is(.deploy-page,#deployBackdrop) .top{align-items:flex-start;flex-direction:column}}
 `;

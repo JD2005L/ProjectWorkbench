@@ -82,6 +82,7 @@ export async function withCockpit(fn, { prefix = 'pw-cockpit-', env: extraEnv = 
     PW_WORKBENCH_SETTINGS: path.join(dir, 'workbench.json'),
     PW_USER_CRED_BASE: path.join(dir, 'pw-users'),
     PW_API_TOKENS_PATH: path.join(dir, 'api-tokens.json'),
+    PW_INBOX_PINS_PATH: path.join(dir, 'inbox-pins.json'),
     PW_AUDIT_LOG: path.join(dir, 'audit.log'),
     ...extraEnv,
   };
