@@ -32,6 +32,7 @@ const REAL_TMUX = execFileSync('bash', ['-c', 'command -v tmux'], { encoding: 'u
 const TUNABLES = [
   'PW_TMUX_ALLOW_SHRINK', 'PW_TMUX_CAPTURE_TIMEOUT', 'PW_TMUX_CAPTURE_BUDGET',
   'PW_TMUX_QUERY_TIMEOUT', 'PW_TMUX_SHRINK_PERCENT', 'PW_TMUX_SCROLLBACK_LINES',
+  'PW_TMUX_SHRINK_CONFIRM_RUNS', 'PW_TMUX_SHRINK_CONFIRM_SECONDS', 'PW_TMUX_SHRINK_AUTO_MAX_PERCENT',
 ];
 
 const sockName = () => 'pwsavetest-' + crypto.randomBytes(4).toString('hex');
@@ -368,4 +369,84 @@ test('REGRESSION: save reads only the socket it is told to use, never an inherit
     await teardown(ctx);
   }
   assert.equal(await snapshotDefault(), before, 'the real default tmux server must be untouched');
+});
+
+// The shrink guard compares every candidate against a manifest it refuses to update, so before
+// these tests a shrink the operator meant refused identically forever and persistence stopped
+// until someone ran the script by hand. It did: this host refused every two minutes for three days
+// in October 2026. What tells a real shrink from the incident's anomaly is that it reproduces.
+const shrinkCtx = async () => {
+  const ctx = await setup();
+  // 15 recorded windows in 3 sessions against 10 live in 2: material (and so refused today),
+  // but nowhere near the collapse the hardening exists to stop.
+  await addSession(ctx, 'pw_Project0', Array.from({ length: 5 }, (_, w) => ({ name: `tab${w}` })));
+  await addSession(ctx, 'pw_Project1', Array.from({ length: 5 }, (_, w) => ({ name: `tab${w}` })));
+  writeManifest(ctx.manifest, richRows({ sessions: 3, windows: 5 }));
+  return ctx;
+};
+const watchFile = (ctx) => path.join(ctx.stateDir, 'shrink-watch');
+
+test('a shrink that reproduces unchanged confirms itself, and the save that lands clears the watch', { timeout: 30000 }, async () => {
+  const ctx = await shrinkCtx();
+  const confirm = { PW_TMUX_SHRINK_CONFIRM_RUNS: '2', PW_TMUX_SHRINK_CONFIRM_SECONDS: '0' };
+  try {
+    const before = fs.readFileSync(ctx.manifest);
+
+    const first = await runSave(ctx, confirm);
+    assert.equal(first.code, REFUSED, first.stderr);
+    assert.deepEqual(fs.readFileSync(ctx.manifest), before, 'the first sighting still protects the manifest');
+    assert.match(readLog(ctx), /windows would drop from 15 to 10, seen 1\/2 times/);
+    assert.ok(fs.existsSync(watchFile(ctx)), 'the shape under watch is recorded for the next run');
+
+    const second = await runSave(ctx, confirm);
+    assert.equal(second.code, 0, second.stderr);
+    assert.equal(readRows(ctx.manifest).length, 10, 'the confirmed shape replaces the stale manifest');
+    assert.deepEqual(fs.readFileSync(path.join(ctx.stateDir, 'manifest.tsv.prev')), before);
+    assert.match(readLog(ctx), /accepting a sustained shrink: windows would drop from 15 to 10, unchanged across 2 runs/);
+    assert.equal(fs.existsSync(watchFile(ctx)), false, 'a landed save leaves no watch behind');
+    assert.equal(fs.existsSync(path.join(ctx.stateDir, 'last-refusal')), false);
+    assert.deepEqual(tempLeftovers(ctx), []);
+  } finally { await teardown(ctx); }
+});
+
+test('a shrink whose shape keeps changing never accumulates a confirmation', { timeout: 30000 }, async () => {
+  const ctx = await shrinkCtx();
+  const confirm = { PW_TMUX_SHRINK_CONFIRM_RUNS: '2', PW_TMUX_SHRINK_CONFIRM_SECONDS: '0' };
+  try {
+    const before = fs.readFileSync(ctx.manifest);
+    const first = await runSave(ctx, confirm);
+    assert.equal(first.code, REFUSED, first.stderr);
+    assert.match(readLog(ctx), /seen 1\/2 times/);
+
+    // Still settling: a different shape next run, so the count starts over rather than
+    // letting two unrelated sightings add up to a confirmation.
+    await tmux(ctx.sock, ['kill-window', '-t', 'pw_Project1:4']);
+    const second = await runSave(ctx, confirm);
+    assert.equal(second.code, REFUSED, second.stderr);
+    assert.match(readLog(ctx), /windows would drop from 15 to 9, seen 1\/2 times/);
+    assert.deepEqual(fs.readFileSync(ctx.manifest), before, 'the manifest survives both sightings');
+  } finally { await teardown(ctx); }
+});
+
+test('REGRESSION (2026-09-14): a collapse too steep to be routine is never auto-confirmed, however often it repeats', { timeout: 30000 }, async () => {
+  const ctx = await setup();
+  // The incident's own shape: 48 recorded windows with resume ids against one blank live session.
+  const alwaysConfirm = { PW_TMUX_SHRINK_CONFIRM_RUNS: '1', PW_TMUX_SHRINK_CONFIRM_SECONDS: '0' };
+  try {
+    await addSession(ctx, 'pw_Recovered', [{ name: 'main' }]);
+    writeManifest(ctx.manifest, richRows({ sessions: 24, windows: 2, sids: true }));
+    const before = fs.readFileSync(ctx.manifest);
+
+    for (const attempt of [1, 2, 3]) {
+      const r = await runSave(ctx, alwaysConfirm);
+      assert.equal(r.code, REFUSED, `attempt ${attempt}: ${r.stderr}`);
+      assert.deepEqual(fs.readFileSync(ctx.manifest), before, `attempt ${attempt} must not touch the manifest`);
+    }
+    assert.match(readLog(ctx), /a drop too large to confirm on its own/);
+    assert.equal(fs.existsSync(watchFile(ctx)), false, 'a collapse never accrues confirmations to resume from');
+
+    const accepted = await runSave(ctx, { PW_TMUX_ALLOW_SHRINK: '1' });
+    assert.equal(accepted.code, 0, 'an operator who means it can still say so');
+    assert.deepEqual(readRows(ctx.manifest).map((x) => x.s), ['pw_Recovered']);
+  } finally { await teardown(ctx); }
 });

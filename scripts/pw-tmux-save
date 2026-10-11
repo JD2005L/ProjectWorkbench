@@ -30,6 +30,25 @@
 #     uses. A server the owner unit never stamped is not the workbench.
 #   * A snapshot materially smaller than the manifest it would replace is
 #     refused. PW_TMUX_ALLOW_SHRINK=1 accepts an intentional shrink.
+#
+# That last rule compares every candidate against a manifest it refuses to
+# update, so a shrink the operator MEANT — closing ten windows and leaving them
+# closed — refuses identically forever, and persistence silently stops until
+# someone runs this by hand. That happened: saves on this host refused every two
+# minutes from 2026-10-08 to 2026-10-11, and a reboot in that window would have
+# restored the world as it stood before the windows were closed.
+#
+# What separates the two cases is TIME, not size. The incident's anomaly was
+# transient — a sick server for a few minutes, gone by the next timer tick —
+# while a real shrink reproduces identically run after run because it is simply
+# what the server now holds. So a shrink that repeats UNCHANGED across
+# PW_TMUX_SHRINK_CONFIRM_RUNS runs spanning PW_TMUX_SHRINK_CONFIRM_SECONDS is
+# accepted on its own, and the watch resets the moment the shape changes.
+#
+# A drop bigger than PW_TMUX_SHRINK_AUTO_MAX_PERCENT is never auto-confirmed, no
+# matter how long it persists: the incident replaced 60 windows with 1 (a 98%
+# drop), and nothing routine looks like that. Those still wait for an operator
+# and PW_TMUX_ALLOW_SHRINK=1.
 #   * The candidate is validated row by row, fsynced and renamed into place;
 #     the previous generation is kept as manifest.tsv.prev.
 #   * A hibernated window keeps its resume id (hasc=2). The pre-hardening code
@@ -53,6 +72,15 @@ CAPTURE_TIMEOUT="${PW_TMUX_CAPTURE_TIMEOUT:-5}"   # seconds, one pane's scrollba
 CAPTURE_BUDGET="${PW_TMUX_CAPTURE_BUDGET:-60}"    # seconds, all captures in a run
 SHRINK_PERCENT="${PW_TMUX_SHRINK_PERCENT:-25}"    # refuse a count that drops by more than this
 ALLOW_SHRINK="${PW_TMUX_ALLOW_SHRINK:-0}"
+# A refused shrink that keeps reproducing is the server's real shape, not an
+# anomaly: accept it once the same counts have survived this many runs AND this
+# long. Both must pass, so neither a burst of quick retries nor one stale run
+# hours later can confirm on its own.
+SHRINK_CONFIRM_RUNS="${PW_TMUX_SHRINK_CONFIRM_RUNS:-3}"
+SHRINK_CONFIRM_SECONDS="${PW_TMUX_SHRINK_CONFIRM_SECONDS:-900}"
+# Never auto-confirm a drop larger than this, however long it persists.
+SHRINK_AUTO_MAX_PERCENT="${PW_TMUX_SHRINK_AUTO_MAX_PERCENT:-60}"
+SHRINK_WATCH="$STATE_DIR/shrink-watch"
 # Sessions we never persist (space padded for substring match).
 EXCLUDE=" pw_setup "
 # Field separator for the manifest: US (0x1f). Must be non-whitespace so `read`
@@ -73,10 +101,14 @@ log() {
 	printf 'pw-tmux-save: %s\n' "$*" >&2
 }
 
-for v in SCROLLBACK_LINES QUERY_TIMEOUT CAPTURE_TIMEOUT CAPTURE_BUDGET SHRINK_PERCENT; do
+for v in SCROLLBACK_LINES QUERY_TIMEOUT CAPTURE_TIMEOUT CAPTURE_BUDGET SHRINK_PERCENT \
+	SHRINK_CONFIRM_RUNS SHRINK_CONFIRM_SECONDS SHRINK_AUTO_MAX_PERCENT; do
 	[[ "${!v}" =~ ^[0-9]+$ ]] || { log "CONFIGURATION ERROR: $v=${!v} is not a whole number; saved nothing"; exit "$CONFIG_ERROR_EXIT"; }
 done
 (( QUERY_TIMEOUT > 0 && CAPTURE_TIMEOUT > 0 )) || { log "CONFIGURATION ERROR: tmux timeouts must be positive; saved nothing"; exit "$CONFIG_ERROR_EXIT"; }
+# A confirmation that needs zero runs would accept the first refused candidate,
+# which is the guard switched off while still looking switched on.
+(( SHRINK_CONFIRM_RUNS > 0 )) || { log "CONFIGURATION ERROR: PW_TMUX_SHRINK_CONFIRM_RUNS must be at least 1; saved nothing"; exit "$CONFIG_ERROR_EXIT"; }
 
 # Every tmux call goes to the socket this script was told to use — PW_TMUX_SOCKET,
 # exactly as pw-tmux-restore, project-terminal-start and app/server.js do — and
@@ -320,12 +352,63 @@ materially_smaller() {
 	(( drop > floor && drop * 100 > old * SHRINK_PERCENT ))
 }
 
+# Too steep to ever be routine attrition — the incident's own shape.
+beyond_auto_confirm() {
+	local old="$1" new="$2" drop=$(( $1 - $2 ))
+	(( drop > 0 && drop * 100 > old * SHRINK_AUTO_MAX_PERCENT ))
+}
+
+# Has this exact shrink reproduced long enough to be the truth? The watch file
+# holds the shape that is being watched, when it was first seen, and how many
+# runs have agreed since. Any change of shape starts the count over, so a server
+# still settling never accumulates confirmations.
+#
+# Sets CONFIRM_RUNS_SEEN / CONFIRM_ELAPSED for the caller's message. An
+# unreadable or malformed watch file is treated as "never seen before": this
+# decides only how long a refusal lasts, so a corrupt one costs another wait
+# rather than a wrong save.
+shrink_confirmed() {
+	local shape="$1" now first runs seen_shape
+	now=$(date +%s)
+	first=0 runs=0 seen_shape=""
+	if [[ -r "$SHRINK_WATCH" ]]; then
+		read -r first runs seen_shape < "$SHRINK_WATCH" 2>/dev/null || true
+		[[ "$first" =~ ^[0-9]+$ && "$runs" =~ ^[0-9]+$ ]] || { first=0; runs=0; seen_shape=""; }
+	fi
+	if [[ "$seen_shape" != "$shape" || "$first" -gt "$now" ]]; then
+		first="$now"; runs=0
+	fi
+	runs=$(( runs + 1 ))
+	CONFIRM_RUNS_SEEN="$runs"
+	CONFIRM_ELAPSED=$(( now - first ))
+	printf '%s %s %s\n' "$first" "$runs" "$shape" >"$SHRINK_WATCH" 2>/dev/null || true
+	(( runs >= SHRINK_CONFIRM_RUNS && CONFIRM_ELAPSED >= SHRINK_CONFIRM_SECONDS ))
+}
+
 if [[ -f "$MANIFEST" && "$ALLOW_SHRINK" != "1" ]]; then
 	[[ -r "$MANIFEST" ]] || refuse "the existing manifest is not readable, so this snapshot cannot be compared with it"
 	read -r old_s old_w old_c < <(count_rows "$MANIFEST")
-	materially_smaller "$old_s" "$new_s" 2 && refuse "sessions would drop from $old_s to $new_s"
-	materially_smaller "$old_w" "$new_w" 3 && refuse "windows would drop from $old_w to $new_w"
-	materially_smaller "$old_c" "$new_c" 2 && refuse "Claude resume ids would drop from $old_c to $new_c"
+	shrink_reason=""
+	materially_smaller "$old_s" "$new_s" 2 && shrink_reason="sessions would drop from $old_s to $new_s"
+	[[ -z "$shrink_reason" ]] && materially_smaller "$old_w" "$new_w" 3 && shrink_reason="windows would drop from $old_w to $new_w"
+	[[ -z "$shrink_reason" ]] && materially_smaller "$old_c" "$new_c" 2 && shrink_reason="Claude resume ids would drop from $old_c to $new_c"
+	if [[ -n "$shrink_reason" ]]; then
+		# Judged across all three counts, not just the one that tripped the rule:
+		# a modest window drop that comes with most of the resume ids vanishing is
+		# the incident's shape wearing a smaller number.
+		if beyond_auto_confirm "$old_s" "$new_s" || beyond_auto_confirm "$old_w" "$new_w" || beyond_auto_confirm "$old_c" "$new_c"; then
+			rm -f -- "$SHRINK_WATCH"
+			refuse "$shrink_reason, a drop too large to confirm on its own"
+		fi
+		if shrink_confirmed "$new_s $new_w $new_c"; then
+			log "accepting a sustained shrink: $shrink_reason, unchanged across $CONFIRM_RUNS_SEEN runs over ${CONFIRM_ELAPSED}s"
+		else
+			refuse "$shrink_reason, seen $CONFIRM_RUNS_SEEN/$SHRINK_CONFIRM_RUNS times over ${CONFIRM_ELAPSED}/${SHRINK_CONFIRM_SECONDS}s"
+		fi
+	else
+		# Nothing material is shrinking any more; a half-finished watch is stale.
+		rm -f -- "$SHRINK_WATCH"
+	fi
 fi
 
 # Install: previous generation first, then the fsynced candidate by rename.
@@ -341,7 +424,7 @@ fi
 trap - EXIT
 sync -- "$STATE_DIR" 2>/dev/null || true
 date -Iseconds >"$STATE_DIR/last-save"
-rm -f -- "$STATE_DIR/last-refusal"
+rm -f -- "$STATE_DIR/last-refusal" "$SHRINK_WATCH"
 msg="wrote manifest: $new_w windows in $new_s sessions, $claude with Claude, $hibernated hibernated"
 msg+="; scrollback: $captured captured, $kept_timeout kept after a stalled capture, $kept_budget kept over budget"
 (( unparseable > 0 )) && msg+="; skipped $unparseable pane(s) whose name or path cannot be recorded"
