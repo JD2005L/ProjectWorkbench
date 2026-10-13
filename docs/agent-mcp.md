@@ -168,6 +168,34 @@ authority, and reusing it as authority would be the bug. The record gains:
   `app/api-tokens.js`: a credential that lives on somebody's laptop must not reach
   the dashboard's 29 admin routes.
 
+## Registering a project (`projects:register`, `POST /api/projects`)
+
+The one non-session scope. It reaches exactly one route, `POST /api/projects`,
+which mounts the same `addProjectHandler` as the admin form `POST /manage/add`, so
+the two cannot accept different fields. Since 2026-10-13 that includes the
+per-project preview, so a caller holding only this scope (the `/newpackage`
+skill) can create a project with a working Preview pane in one call:
+
+| Field | Default | Rule |
+|---|---|---|
+| `previewCmd` | absent = no preview | trimmed; blank means no preview and the other two are ignored |
+| `previewPort` | next free from 7790, skipping the new terminal port | 1024–65535; not the terminal port; not any project's terminal or preview port |
+| `previewEnv` | none | `KEY=VALUE` lines, `#` comments; `PORT`/`BASEPATH` reserved; names `^[A-Za-z_][A-Za-z0-9_]*$` |
+
+Stored as `p.preview = { cmd, port, env? }`. The validation is
+`buildPreviewBlock` in `app/preview-config.js` — the same function the edit route
+(`/manage/update/:oldName`) uses, with the same error messages. It runs before the
+clone (a bad preview is a 400 with nothing on disk), and the preview port is
+re-checked inside the short registry transaction exactly as the terminal port is.
+nginx is regenerated with the new `/preview/<name>/` route; the preview is not
+started.
+
+The JSON reply is `{ ok:true, name, preview: { port } | null }`. The `preview` key
+is always present on a workbench that understands the fields, so a client can tell
+it from an older one (no key). The `project_add` audit record gains
+`hasPreview: true|false`; the command and env are never logged. Full contract and
+error strings: `AGENTS.md`, "Register a project".
+
 ## What may be prompted (revised 2026-09-24)
 
 The first version of this refused any window the token had not created, borrowing

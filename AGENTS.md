@@ -282,6 +282,52 @@ Roles for agents:
 
 ---
 
+## Register a project (machine API)
+
+A token with the `projects:register` scope (and nothing else) can create a project —
+clone, terminal, routing — in one call. It is the same handler as the admin
+**Manage → Add** form.
+
+```bash
+curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \
+  -d '{"name":"MyTool","repo":"https://github.com/org/my-tool.git",
+       "previewCmd":"npm run dev -- --host 127.0.0.1 --port ${PORT}",
+       "previewEnv":"NODE_ENV=development"}' \
+  "$HOST/api/projects"
+# {"ok":true,"name":"MyTool","preview":{"port":7791}}
+```
+
+| Field | Required | Meaning |
+|---|---|---|
+| `name` | yes | letters, digits, dot, dash, underscore |
+| `repo` | no | git URL to clone; omitted = empty `git init`'d workspace |
+| `port` | no | terminal port; default = next free from 7681 |
+| `devUrl`, `prodUrl`, `primaryUser`, `categories`, `pushToken` | no | as on the Manage form |
+| `adminOnly`, `defaultProject` | no | `"yes"` to set |
+| `previewCmd` | no | the Preview pane's command; `${PORT}` and `${BASEPATH}` are substituted. Blank/absent = no preview (and the two fields below are ignored) |
+| `previewPort` | no | number or numeric string, 1024–65535; default = next free port from 7790 (never the project's own terminal port) |
+| `previewEnv` | no | `KEY=VALUE` lines; blank lines and `#` comments skipped; names match `^[A-Za-z_][A-Za-z0-9_]*$`; `PORT` and `BASEPATH` are reserved |
+
+The response is `{"ok":true,"name":…,"preview":{"port":N}}`, or `"preview":null`
+when no `previewCmd` was given. A workbench that predates the preview fields
+answers without a `preview` key at all (and ignores them) — check for the key,
+not its value. The preview is configured and routed at `/preview/<name>/` but
+**not started**; the user presses Start in the Preview pane.
+
+Every refusal is HTTP 400 `{"ok":false,"error":"…"}`, and a bad preview is refused
+before anything is cloned. The preview errors are:
+
+- `Preview port must be between 1024 and 65535`
+- `Preview port cannot match this project's terminal port`
+- `Preview port <N> is already in use by another project` (another project's
+  terminal or preview port — re-checked after the clone, so a port taken while
+  cloning is still refused)
+- `Bad env line (need KEY=VALUE): <line>`
+- `PORT is reserved and cannot be set via preview env` (likewise `BASEPATH`)
+- `Invalid env var name: <name>`
+
+---
+
 ## Hand a file to the user
 
 Push a file into a project's inbox; the user's interactive Claude session

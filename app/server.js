@@ -37,6 +37,7 @@ import { repairWorkspaceBoxes } from './workspace-box-owner.js';
 import { loadUsersFile } from './users-file.js';
 import { writeFileAtomic } from './atomic-file.js';
 import { createInboxPins, inboxExpiresAt } from './inbox-pins.js';
+import { allUsedPorts, nextPort, nextPreviewPort, validPort, buildPreviewBlock, previewPortInUseMessage } from './preview-config.js';
 import { SCOPES, mintToken, loadTokens, saveTokens, safeTokenShape, resolveToken,
          presentedToken, tokenHasScope, isKnownScope, looksLikeApiToken,
          needsActingUser, tokenAuthority } from './api-tokens.js';
@@ -1984,10 +1985,8 @@ function projectLinksMenu(p){
 const projLinksScript = `<script>(function(){const btn=document.getElementById('projChipBtn'),menu=document.getElementById('projLinksMenu');if(!btn||!menu)return;function close(){menu.hidden=true;btn.setAttribute('aria-expanded','false')}function open(){menu.hidden=false;btn.setAttribute('aria-expanded','true')}btn.addEventListener('click',e=>{e.stopPropagation();menu.hidden?open():close()});document.addEventListener('click',e=>{if(!menu.hidden&&!btn.contains(e.target)&&!menu.contains(e.target))close()});document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!menu.hidden){close();btn.focus()}});menu.addEventListener('click',e=>{if(e.target.closest('a'))close()})})();</script>`;
 function workspacePath(name){ return path.join(workspaceRoot, name); }
 async function projectByName(name){ return (await loadProjects()).find(p => p.name === name); }
-function allUsedPorts(projects){ const out = new Set(); for(const p of projects){ const a = Number(p?.port); if(Number.isFinite(a)) out.add(a); const b = Number(p?.preview?.port); if(Number.isFinite(b) && b > 0) out.add(b); } return out; }
-function nextPort(projects){ const used = allUsedPorts(projects); let port = 7681; while(used.has(port)) port++; return port; }
-function nextPreviewPort(projects){ const used = allUsedPorts(projects); let port = 7790; while(used.has(port)) port++; return port; }
-function validPort(n){ return Number.isInteger(n) && n >= 1024 && n <= 65535; }
+// allUsedPorts / nextPort / nextPreviewPort / validPort live in preview-config.js, next to the
+// preview validation that depends on them.
 
 // Category tags are presentation-only grouping for the rail's filter. Comma-separated in the form,
 // stored as an array on the project. '|' is stripped because the rail serializes the list into a
@@ -4207,7 +4206,13 @@ const addProjectHandler = async (req,res,next)=>{ try {
   const port = Number(req.body.port) || nextPort(projects);
   if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
   if(allUsedPorts(projects).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
+  // Same rules as the edit route (preview-config.js), checked before the clone so a bad
+  // preview fails fast. The auto-allocated preview port also skips this project's own
+  // terminal port, which is not in the registry yet.
+  const preview = buildPreviewBlock({ cmd: req.body.previewCmd, port: req.body.previewPort, env: req.body.previewEnv,
+   terminalPort: port, others: projects, defaultPort: nextPreviewPort([...projects, { port }]) });
   const p = repo ? { name, repo, path: workspacePath(name), port } : { name, path: workspacePath(name), port };
+  if(preview) p.preview = preview;
   if(req.body.adminOnly === 'yes') p.adminOnly = true;
   // Validated on the way in, so the registry never stores a URL the link menu
   // would have to refuse to render.
@@ -4236,6 +4241,7 @@ const addProjectHandler = async (req,res,next)=>{ try {
    const fresh = await loadProjects();
    if(fresh.some(x=>x.name===name)) throw new Error('A project named "'+name+'" already exists');
    if(allUsedPorts(fresh).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
+   if(p.preview && allUsedPorts(fresh).has(p.preview.port)) throw new Error(previewPortInUseMessage(p.preview.port));
    fresh.push(p); await saveProjects(fresh);
    return fresh;
   });
@@ -4252,8 +4258,10 @@ const addProjectHandler = async (req,res,next)=>{ try {
  await applyDefaultProjectFlag(null, name, req.body.defaultProject);
  // The value is never audited — only that the project carries one, which is the fact
  // an operator needs when a push authenticates as an unexpected account.
- await audit('project_add', { project: name, port: Number(req.body.port) || null, repo, hasPushToken: !!added?.pushToken }, req);
- if(wantsJson(req)) return res.json({ok:true,name});
+ await audit('project_add', { project: name, port: Number(req.body.port) || null, repo, hasPushToken: !!added?.pushToken, hasPreview: !!added?.preview }, req);
+ // `preview` is always present (null when none was configured), so a client can tell this
+ // version from one that ignored the preview fields.
+ if(wantsJson(req)) return res.json({ok:true,name,preview: added?.preview ? { port: added.preview.port } : null});
  res.redirect(BASE + '/manage');
  } catch(e){ if(wantsJson(req)) return res.status(400).json({ok:false,error:e.message||String(e)}); next(e); }};
 app.post(BASE + '/manage/add', requireAdmin, addProjectHandler);
@@ -4352,9 +4360,6 @@ app.post(BASE + '/api/projects', requireScope(SCOPES.PROJECTS_REGISTER), addProj
 
 app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{ try {
  const oldName = req.params.oldName; const newName = String(req.body.name || '').trim(); const repo = String(req.body.repo || '').trim(); const port = Number(req.body.port);
- const previewCmd = String(req.body.previewCmd || '').trim();
- const previewPortRaw = String(req.body.previewPort || '').trim();
- const previewEnvRaw = String(req.body.previewEnv || '');
  const primaryUser = String(req.body.primaryUser || '').trim();
  if(!validName(newName)) throw new Error('Invalid project name (letters, digits, dot, dash, underscore only)');
  if(!validPort(port)) throw new Error('Port must be between 1024 and 65535');
@@ -4364,27 +4369,10 @@ app.post(BASE + '/manage/update/:oldName', requireAdmin, async (req,res,next)=>{
  if(newName!==oldName && projects.some(x=>x.name===newName)) throw new Error('A project named "'+newName+'" already exists');
  const others = projects.filter(x=>x.name!==oldName);
  if(allUsedPorts(others).has(port)) throw new Error('Port '+port+' is already in use by another project (terminal or preview)');
- let previewBlock = null;
- if(previewCmd){
-  let previewPort = Number(previewPortRaw) || Number(p.preview?.port) || nextPreviewPort(others);
-  if(!validPort(previewPort)) throw new Error('Preview port must be between 1024 and 65535');
-  if(previewPort === port) throw new Error('Preview port cannot match this project\'s terminal port');
-  if(allUsedPorts(others).has(previewPort)) throw new Error('Preview port '+previewPort+' is already in use by another project');
-  const env = {};
-  for(const raw of previewEnvRaw.split(/\r?\n/)){
-   const line = raw.replace(/^\s+|\s+$/g,'');
-   if(!line || line.startsWith('#')) continue;
-   const i = line.indexOf('=');
-   if(i < 1) throw new Error(`Bad env line (need KEY=VALUE): ${line.slice(0,60)}`);
-   const k = line.slice(0,i).replace(/\s+$/,'');
-   const v = line.slice(i+1);
-   if(k === 'PORT' || k === 'BASEPATH') throw new Error(`${k} is reserved and cannot be set via preview env`);
-   if(!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) throw new Error(`Invalid env var name: ${k}`);
-   env[k] = v;
-  }
-  previewBlock = { cmd: previewCmd, port: previewPort };
-  if(Object.keys(env).length) previewBlock.env = env;
- }
+ // Shared with addProjectHandler (preview-config.js). An edit keeps the stored preview port
+ // when the field is blank.
+ const previewBlock = buildPreviewBlock({ cmd: req.body.previewCmd, port: req.body.previewPort, env: req.body.previewEnv,
+  terminalPort: port, others, defaultPort: p.preview?.port });
  // Parse tab templates (JSON, serialized client-side).
  let tabs = [];
  if(req.body.tabs){
