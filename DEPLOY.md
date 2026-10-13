@@ -206,6 +206,14 @@ a fallback to some other identity. Unknown manifest fields and duplicate names,
 environment names, or choices are rejected. The limits are eight inputs, 1,024
 choices per input, and 1 MiB per JSON file.
 
+A slot may set `action` to what its button says instead of **Deploy**, for a slot
+that does something else, such as `"action": "Check"` for a slot that only verifies
+and changes nothing. It is presentation only: up to three words of letters starting
+with a capital (at most 24 characters). The button then reads that word, shows
+"Running…" while the script runs, and the card says "Never run" before the first
+run. It changes neither the confirmation rule (a `prod` slot or a slot with inputs
+still asks to confirm) nor any privilege, and a slot without it is unchanged.
+
 A script-only slot, such as `prod` above, may omit `inputs` or use `inputs: []`
 and omit `version`. It is independently discoverable without a saved host script,
 shows no identity/bump controls, and still requires an explicit Deploy action.

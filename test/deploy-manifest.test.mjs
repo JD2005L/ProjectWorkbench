@@ -153,6 +153,26 @@ test('manifest: static select metacharacters remain data, never shell interpolat
  assert.equal(selected.targetVersion, null);
 });
 
+test('manifest: an optional action names the button and is presentation only', async t => {
+ const { root, document, save } = manifestWorkspace(t);
+ document.slots.prod = { label: 'Check against Hub (publishes nothing)', script: 'bash scripts/check.sh', action: 'Check' };
+ save();
+ const slot = await resolveDeployManifest(root, 'prod');
+ assert.equal(slot.action, 'Check');
+ assert.equal(slot.script, 'bash scripts/check.sh');
+ assert.deepEqual(validateDeployInputs(slot, {}, slot.revision).env, {});
+ const plain = await resolveDeployManifest(root, 'dev');
+ assert.equal(Object.hasOwn(plain, 'action'), false, 'a slot without action resolves exactly as before');
+ for (const bad of ['', 'check', 'Run the full check now', 'Check!', 'Check\nnow', 'Deploy <b>', 42, true, ['Check']]) {
+  document.slots.prod.action = bad; save();
+  await assert.rejects(resolveDeployManifest(root, 'prod'), DeployManifestError, `action ${JSON.stringify(bad)} must be rejected`);
+ }
+ for (const good of ['Check', 'Run check', 'Publish', 'Dry run']) {
+  document.slots.prod.action = good; save();
+  assert.equal((await resolveDeployManifest(root, 'prod')).action, good);
+ }
+});
+
 test('manifest: schema is strict and cannot grant privileges or define defaults', async t => {
  const mutations = [
   ['unknown top-level key', doc => { doc.commands = []; }],

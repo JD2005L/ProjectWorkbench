@@ -3251,9 +3251,9 @@ const deployModalScript = `<script>(function(){
    const out=card.querySelector('.deploy-output');const btn=card.querySelector('.deploy-btn');
    pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,card,
     isHidden:()=>document.hidden,
-    onRunning:()=>{if(btn){btn.disabled=true;btn.textContent='Deploying…'}},
+    onRunning:()=>{if(btn){btn.disabled=true;btn.textContent=btn.dataset.busy||'Deploying…'}},
     onDone:(run)=>{
-     if(btn){btn.disabled=false;btn.textContent='Deploy'}
+     if(btn){btn.disabled=false;btn.textContent=btn.dataset.idle||'Deploy'}
      const vEl=card.querySelector('.current-version');if(vEl&&run.version)vEl.textContent=run.version;
      const ldEl=card.querySelector('.last-deploy-info');
      if(ldEl&&run.startedAt)ldEl.textContent=String(run.startedAt).replace('T',' ').replace(/\..*/,' UTC')+' by '+(run.user||'unknown')+(run.status==='success'?'':' — FAILED');
@@ -3270,7 +3270,7 @@ const deployModalScript = `<script>(function(){
    const selected=deployInputs.collect(card);if(!selected)return;
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft'))&&!confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
-   deployInputs.setBusy(card,true);btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
    pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};if(pw){bd.password=pw;if(save)bd.savePassword=true}
@@ -3290,7 +3290,7 @@ const deployModalScript = `<script>(function(){
      const pw=prompt(j.error||'Enter your domain password for deployment:');
      if(!pw){pwRunFollower.restore(card,output,'Deployment cancelled.');return}
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
-     output.textContent='Running deployment script…';j=await requestAndFollow(pw,save);
+     output.textContent=btn.dataset.running||'Running deployment script…';j=await requestAndFollow(pw,save);
     }
     if(j.running&&j.run){
      output.textContent='Another deployment of this slot is already running — attaching to it instead of starting a second one.';
@@ -3311,7 +3311,7 @@ const deployModalScript = `<script>(function(){
     const nb=card.querySelector('.src-newer-badge');if(nb&&typeof j.sourceNewer==='boolean')nb.hidden=!j.sourceNewer;
     const ldEl=card.querySelector('.last-deploy-info');if(ldEl)ldEl.textContent='Just now by '+who+(j.ok?'':' — FAILED')+(summary?' | '+summary:'');
    }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}
-   finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
+   finally{btn.textContent=btn.dataset.idle||'Deploy';deployInputs.setBusy(card,false)}
   })});
   container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{
    const card=btn.closest('.target-card'),project=card.dataset.project,target=card.dataset.target;
@@ -3347,9 +3347,9 @@ const deployScript = `<script>
   const out=card.querySelector('.deploy-output');const btn=card.querySelector('.deploy-btn');
   pwRunFollower.follow({base:'${BASE}',project:card.dataset.project,target:card.dataset.target,output:out,card,
    isHidden:()=>document.hidden,
-   onRunning:()=>{if(btn){btn.disabled=true;btn.textContent='Deploying…'}},
+   onRunning:()=>{if(btn){btn.disabled=true;btn.textContent=btn.dataset.busy||'Deploying…'}},
    onDone:(run)=>{
-    if(btn){btn.disabled=false;btn.textContent='Deploy'}
+    if(btn){btn.disabled=false;btn.textContent=btn.dataset.idle||'Deploy'}
     const vEl=card.querySelector('.current-version');if(vEl&&run.version)vEl.textContent=run.version;
     const ldEl=card.querySelector('.last-deploy-info');
     if(ldEl&&run.startedAt)ldEl.textContent=String(run.startedAt).replace('T',' ').replace(/\..*/,' UTC')+' by '+(run.user||'unknown')+(run.status==='success'?'':' — FAILED');
@@ -3397,7 +3397,7 @@ const deployScript = `<script>
    const selected=deployInputs.collect(card);if(!selected)return;
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
-   deployInputs.setBusy(card,true);btn.textContent='Deploying…';output.className='deploy-output show';output.textContent='Running deployment script…';
+   deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
    pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};
@@ -3420,7 +3420,7 @@ const deployScript = `<script>
      const pw=prompt(j.error||'Enter your domain password for deployment:');
      if(!pw){pwRunFollower.restore(card,output,'Deployment cancelled.');return}
      const save=confirm('Save this password securely so you are not asked again? It is stored encrypted on the server and reused for future deployments.');
-     output.textContent='Running deployment script…';
+     output.textContent=btn.dataset.running||'Running deployment script…';
      j=await requestAndFollow(pw,save);
     }
     if(j.running&&j.run){
@@ -3450,7 +3450,7 @@ const deployScript = `<script>
     markSrcNewer(card, j.version||'');
     const ldEl=card.querySelector('.last-deploy-info');
     if(ldEl)ldEl.textContent='Just now by '+who+(summary?' | '+summary:'');
-   }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}finally{btn.textContent='Deploy';deployInputs.setBusy(card,false)}
+   }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}finally{btn.textContent=btn.dataset.idle||'Deploy';deployInputs.setBusy(card,false)}
   };
  });
  document.querySelectorAll('.toggle-log').forEach(btn=>{
@@ -6856,8 +6856,8 @@ mountDeploymentRoutes(app, {
 });
 
 if(DEPLOY_CENTRE){
- const fmtDeployLog = (entry) => {
-  if(!entry) return 'Never deployed';
+ const fmtDeployLog = (entry, action) => {
+  if(!entry) return action ? 'Never run' : 'Never deployed';
   const selection = describeDeploySelection(entry);
   return `${entry.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')} by ${entry.user}${selection ? ' | '+selection : ''}`;
  };
@@ -6872,9 +6872,9 @@ if(DEPLOY_CENTRE){
    ${renderExecutionRecipe(manifest.execution, external)}
    ${renderDeployInputs(manifest, 'deploy-'+p.name+'-'+target, esc)}
    <p class="manifest-notice">${esc(deployInputNotice(manifest))}</p>
-   <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(entry))}</span></div>
+   <div class="last-deploy">Last: <span class="last-deploy-info">${esc(fmtDeployLog(entry, manifest.action))}</span></div>
    ${external ? `<p>Latest job version: ${esc(entry?.version || 'none recorded')}${entry?.jobId ? ` | <a href="${BASE}/deploy-service?job=${encodeURIComponent(entry.jobId)}">View job</a>` : ''}</p>` : ''}
-   <button class="button ${target==='prod'?'danger ':''}small deploy-btn" type="button"${manifest.inputs.length?' disabled':''}>Deploy</button>
+   <button class="button ${target==='prod'?'danger ':''}small deploy-btn" type="button"${manifest.inputs.length?' disabled':''}${manifest.action ? ` data-idle="${esc(manifest.action)}" data-busy="Running…" data-running="Running script…"` : ''}>${esc(manifest.action || 'Deploy')}</button>
    <div class="deploy-output" role="status" aria-live="polite"></div>
    ${isAdmin ? `<div class="config-section"><p class="repo-managed-note">Execution backend is an operator setting. The repository recipe remains read-only.</p>${deployBackendSelect(config)}<button class="button secondary small save-backend" type="button" style="margin-top:.5rem">Save backend</button></div>` : ''}
    <div class="config-section"><label>Repository-managed deploy script (bash, read-only)<textarea class="deploy-script" readonly>${esc(manifest.script)}</textarea></label></div>

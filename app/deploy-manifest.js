@@ -202,8 +202,17 @@ async function resolveManifest(workspace, target) {
  fields(manifest.slots, TARGETS, 'slots');
  if (!Object.hasOwn(manifest.slots, target)) return null;
  const slot = manifest.slots[target];
- fields(slot, ['label', 'script', 'inputs', 'version', 'execution'], `slots.${target}`);
+ fields(slot, ['label', 'script', 'inputs', 'version', 'execution', 'action'], `slots.${target}`);
  const label = text(slot.label, `slots.${target}.label`);
+ // What the slot's button says instead of "Deploy" (e.g. "Check" for a slot that only verifies): presentation only,
+ // it grants nothing and changes neither the confirmation rule nor how the script runs.
+ let action;
+ if (slot.action !== undefined) {
+  if (typeof slot.action !== 'string' || !/^[A-Z][A-Za-z]*(?: [A-Za-z]+){0,2}$/.test(slot.action) || slot.action.length > 24) {
+   fail(`slots.${target}.action must be a short button label: up to three words, letters only, starting with a capital, at most 24 characters`);
+  }
+  action = slot.action;
+ }
  const execution = slot.execution === undefined ? undefined : validateRecipe(slot.execution);
  const script = slot.script === undefined && execution?.adapter === 'podman' ? '' : slot.script;
  if (typeof script !== 'string' || (!script.trim() && execution?.adapter !== 'podman') || script.length > 65536 || script.includes('\0')) {
@@ -246,7 +255,7 @@ async function resolveManifest(workspace, target) {
   if (!bump || bump === identity || bump.choices.length !== 3 || !BUMPS.every(value => bump.choices.some(choice => choice.value === value))) fail('version.bumpInput must name the patch/minor/major select');
   version = { input: identity.name, bumpInput: bump.name };
  }
- const resolved = { schemaVersion: 1, target, label, script, inputs, version, ...(execution ? { execution } : {}) };
+ const resolved = { schemaVersion: 1, target, label, script, inputs, version, ...(execution ? { execution } : {}), ...(action ? { action } : {}) };
  const revision = crypto.createHash('sha256').update(JSON.stringify({ resolved, fingerprints })).digest('hex');
  return { ...resolved, revision };
 }

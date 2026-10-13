@@ -196,6 +196,26 @@ test('managed routes: real page, modal, status and version handlers read only da
  assert.equal(h.saves, 0, 'GET must not migrate saved configuration');
 });
 
+test('managed routes: a slot action names its button, its busy text and its empty history', async t => {
+ const { root, document, save } = manifestWorkspace(t);
+ document.slots.prod = { label: 'Check against Hub (publishes nothing)', script: 'bash scripts/check.sh', action: 'Check' };
+ save();
+ const h = deployRouteHarness(root);
+ const page = await h.call('GET', '/deploy');
+ const modal = await h.call('GET', '/api/deploy/:project/card', { params: { project: 'demo' } });
+ for (const html of [page.html, modal.body.html]) {
+  const prod = targetHtml(html, 'prod');
+  assert.match(prod, /<button[^>]*class="[^"]*deploy-btn"[^>]*data-idle="Check" data-busy="Running…" data-running="Running script…"[^>]*>Check<\/button>/);
+  assert.match(prod, /Last: <span class="last-deploy-info">Never run<\/span>/);
+  const dev = targetHtml(html, 'dev');
+  assert.match(dev, />Deploy<\/button>/, 'a slot without action still says Deploy');
+  assert.doesNotMatch(dev, /data-idle=/);
+ }
+ assert.match(page.html, /btn\.textContent=btn\.dataset\.busy\|\|'Deploying…'/);
+ assert.match(page.html, /btn\.textContent=btn\.dataset\.idle\|\|'Deploy'/);
+ assert.equal(h.executions.length, 0);
+});
+
 test('managed routes: new identities appear on reopening with no registry/config edits', async t => {
  const { root } = manifestWorkspace(t);
  const h = deployRouteHarness(root, { config: {} });
