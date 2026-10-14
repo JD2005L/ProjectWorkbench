@@ -333,6 +333,11 @@ before anything is cloned. The preview errors are:
 Push a file into a project's inbox; the user's interactive Claude session
 sees it land in the prompt (drawer auto-opens with the path inserted).
 
+`_inbox/` and `_outbox/` are never source: PW keeps both in every clone's
+`.git/info/exclude`, so a file in either box does not show in `git status`. Do
+not `git add` anything from them, and do not add them to a project's
+`.gitignore` just to quiet `git status` — it is already handled.
+
 ```bash
 # As shell user
 cp /path/to/report.pdf /opt/project-workbench/workspaces/AmrikPublic/_inbox/

@@ -607,6 +607,28 @@ async function boxWrite(project, box, name, source, { allowEmpty = false } = {})
 async function boxJob(project, box, action, name){
  return runWorkspaceJob({ spawn, argv: await workspaceArgv(), job: { action, projectPath: project.path, box, name } });
 }
+// Keep `/_inbox/` and `/_outbox/` in the clone's .git/info/exclude, as the pane
+// account, so a dropped file never makes the repo look dirty to anything that runs
+// `git status` itself (see applyBoxesIgnore in app/workspace-file.js). Never fatal:
+// a workspace this cannot fix is reported, and whatever triggered it carries on.
+async function ensureBoxesIgnored(project){
+ if(!project?.path) return { status:'skipped', reason:'no-path' };
+ try { return await runWorkspaceJob({ spawn, argv: await workspaceArgv(), job: { action:'boxes-ignore', projectPath: project.path } }); }
+ catch(e){ return { status:'failed', error: e?.message || String(e) }; }
+}
+// Once per dashboard start, for every registered workspace — the repair for clones
+// that predate this, which are most of them. Sequential: one short worker each.
+async function sweepBoxIgnores(){
+ const projects = await loadProjects();
+ let updated = 0;
+ for(const p of projects){
+  const r = await ensureBoxesIgnored(p);
+  if(r?.status === 'updated'){ updated++; console.log(`[boxes] ${p.name}: added ${r.added.join(' ')} to .git/info/exclude`); }
+  else if(r?.status === 'failed') console.warn(`[boxes] ${p.name}: could not update .git/info/exclude — ${r.error}`);
+  else if(r?.status === 'skipped' && r.reason === 'gitfile') console.warn(`[boxes] ${p.name}: .git is a file (worktree/submodule); boxes not excluded`);
+ }
+ console.log(`[boxes] git exclude sweep: ${updated} updated, ${projects.length} checked`);
+}
 async function boxRead(project, box, name){
  return runWorkspaceRead({ spawn, argv: await workspaceArgv(), job: { action:'box-read', projectPath: project.path, box, name } });
 }
@@ -2981,6 +3003,11 @@ async function applyRouting(projects){
  if(!nginxReloadCmd) await sh('systemctl',['daemon-reload']);
 }
 async function cloneWorkspace(p, token){
+ await provisionWorkspace(p, token);
+ const r = await ensureBoxesIgnored(p);
+ if(r?.status === 'failed') console.warn(`[boxes] ${p.name}: could not update .git/info/exclude — ${r.error}`);
+}
+async function provisionWorkspace(p, token){
  const own = await workspaceOwner();
  await fs.mkdir(workspaceRoot,{recursive:true});
  try { await fs.access(path.join(p.path,'.git')); await sh('chown',['-R',own.spec,p.path]).catch(()=>{}); return; } catch {}
@@ -7292,6 +7319,9 @@ if(DEPLOY_CENTRE){
    DEPLOY_OPERATOR:operatorName, DEPLOY_IDENTITY_SOURCE:identitySource,
    ...(manifest ? selection.env : { DEPLOY_OPTION:option }) };
   if(manifest) delete executionEnv.DEPLOY_OPTION;
+  // A repo-managed script may run its own `git status --porcelain` gate, which a
+  // file dropped into a box would fail — the case that prompted this.
+  await ensureBoxesIgnored(p);
   const start = Date.now();
   // The run is registered BEFORE the script starts, so the panel can be reopened
   // (or opened by somebody else) mid-deploy and find it. One per slot: two
@@ -7514,6 +7544,7 @@ const srv = app.listen(PORT,'127.0.0.1',()=>{
  // Never in an isolated instance — those point at real projects.
  if(!ISOLATED) startTaskScheduler();
  if(!ISOLATED) startInboxExpiry();
+ if(!ISOLATED) sweepBoxIgnores().catch(e => console.warn(`[boxes] git exclude sweep failed: ${e?.message || e}`));
  if(DEPLOY_MODE === 'host'){ if(!ISOLATED) sweepOrphanTmuxSessions(); return; }
  if(ISOLATED){ console.log('[isolated] skipping tmux/ttyd/nginx auto-start'); return; }
  sweepOrphanTmuxSessions();

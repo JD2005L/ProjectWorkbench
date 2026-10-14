@@ -491,6 +491,110 @@ export async function applyBoxClear({ fsp, projectPath, box }) {
   return { removed: names };
 }
 
+// ─── Keeping the boxes out of git ───────────────────────────────────────────
+//
+// `_inbox` and `_outbox` are runtime drop boxes, never source, but most project
+// repos never listed them in .gitignore. So a screenshot pasted into a terminal
+// left the clone "dirty", and anything that checks `git status --porcelain` itself
+// refused: a repo-managed publish script, an agent's `git add -A`, a human. (PW's
+// own generated deploy gates already exclude the boxes by pathspec — see
+// scripts/pw-deploy-guard-messages.py — but those are not the only readers.)
+//
+// The clone's `.git/info/exclude` is the one place that fixes every workspace
+// without a commit to the project's repo. Git always honours it, it covers a box
+// whoever created it (agents make `_outbox` themselves), and clearing or expiring
+// a box cannot remove it. A `.gitignore` written inside each box would cover none
+// of those reliably.
+//
+// It runs in the privilege-dropped worker like everything else here: `.git` is a
+// pane-owned tree. Idempotent, append-only: the two lines are added when either is
+// missing, with a marker comment, and nothing else in the file is touched. A file
+// already TRACKED under a box stays tracked; exclude only hides untracked files.
+
+export const BOX_EXCLUDE_LINES = Object.freeze([`/${INBOX_DIR}/`, `/${OUTBOX_DIR}/`]);
+export const BOX_EXCLUDE_MARKER = '# Project Workbench: runtime drop boxes, never source (kept by PW)';
+
+async function lstatOrNull(fsp, p) {
+  try { return await fsp.lstat(p); } catch (e) { if (e?.code === 'ENOENT') return null; throw e; }
+}
+
+/**
+ * Make sure `<projectPath>/.git/info/exclude` ignores both boxes.
+ *
+ * Returns `{status}` of `updated` (with `added`), `unchanged`, `not-a-repo` (no
+ * `.git`), or `skipped` (`.git` is a file: a linked worktree or submodule, whose
+ * exclude lives in another repository's directory). Throws on a symlinked or
+ * non-directory `.git`/`info` or a symlinked/non-regular `exclude` — the same
+ * refusals, for the same reason, as the box code above.
+ */
+export async function applyBoxesIgnore({ fsp, projectPath }) {
+  if (!projectPath || typeof projectPath !== 'string') throw new Error('workspace worker: project path required');
+  const gitDir = path.join(projectPath, '.git');
+  const gitStat = await lstatOrNull(fsp, gitDir);
+  if (!gitStat) return { status: 'not-a-repo' };
+  if (gitStat.isSymbolicLink()) throw new Error('workspace worker: .git is a symlink; refusing to work through it');
+  if (gitStat.isFile()) return { status: 'skipped', reason: 'gitfile' };
+  if (!gitStat.isDirectory()) throw new Error('workspace worker: .git is not a directory');
+
+  const infoDir = path.join(gitDir, 'info');
+  const infoStat = await lstatOrNull(fsp, infoDir);
+  if (infoStat) {
+    if (infoStat.isSymbolicLink()) throw new Error('workspace worker: .git/info is a symlink; refusing to work through it');
+    if (!infoStat.isDirectory()) throw new Error('workspace worker: .git/info is not a directory');
+  } else {
+    await fsp.mkdir(infoDir, { mode: 0o755 });
+  }
+
+  const file = path.join(infoDir, 'exclude');
+  let current = '';
+  let mode = 0o644;
+  const fileStat = await lstatOrNull(fsp, file);
+  if (fileStat) {
+    if (fileStat.isSymbolicLink()) throw new Error('workspace worker: .git/info/exclude is a symlink; refusing to work through it');
+    if (!fileStat.isFile()) throw new Error('workspace worker: .git/info/exclude is not a regular file');
+    const handle = await fsp.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    try {
+      const st = await handle.stat();
+      if (!st.isFile()) throw new Error('workspace worker: .git/info/exclude is not a regular file');
+      mode = st.mode & 0o777;
+      current = await handle.readFile('utf8');
+    } finally { await handle.close().catch(() => {}); }
+  }
+
+  const present = new Set(current.split(/\r?\n/).map((line) => line.trim()));
+  const missing = BOX_EXCLUDE_LINES.filter((line) => !present.has(line));
+  if (missing.length === 0) return { status: 'unchanged', path: file };
+
+  let next = current;
+  if (next && !next.endsWith('\n')) next += '\n';
+  if (!present.has(BOX_EXCLUDE_MARKER)) next += `${BOX_EXCLUDE_MARKER}\n`;
+  next += `${missing.join('\n')}\n`;
+
+  // Same publish as a box write: a private name that cannot already exist, opened
+  // O_EXCL|O_NOFOLLOW, then rename(2), which replaces rather than follows anything
+  // planted at `exclude` meanwhile. git never sees a half-written file.
+  const tmp = path.join(infoDir, `.pw-exclude-${process.pid}-${crypto.randomBytes(8).toString('hex')}.tmp`);
+  const handle = await fsp.open(
+    tmp,
+    fsConstants.O_CREAT | fsConstants.O_EXCL | fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW,
+    mode,
+  );
+  let closed = false;
+  let published = false;
+  try {
+    await handle.writeFile(next, 'utf8');
+    await handle.chmod(mode);
+    await handle.close();
+    closed = true;
+    await fsp.rename(tmp, file);
+    published = true;
+  } finally {
+    if (!closed) await handle.close().catch(() => {});
+    if (!published) await fsp.unlink(tmp).catch(() => {});
+  }
+  return { status: 'updated', path: file, added: missing };
+}
+
 // ─── Reading project source, for the agent API (docs/agent-mcp.md) ──────────
 //
 // The same rule as the boxes above, for the same reason: the root dashboard

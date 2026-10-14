@@ -90,6 +90,8 @@ The preview process is owned by `systemd` (one unit instance per project), so cl
 ### File inbox
 Each terminal page has a drop-shade for drag-and-drop, paste, and file picker. Uploaded files land in `<workspace>/_inbox/` and the absolute path is auto-inserted into the active terminal — useful for handing screenshots or PDFs to Claude. Pasted images skip the picker and go straight in.
 
+`_inbox/` and its counterpart `_outbox/` are runtime drop boxes, never source, so PW keeps both out of git in every workspace without a commit to the project: it adds `/_inbox/` and `/_outbox/` to the clone's `.git/info/exclude` (under a `# Project Workbench` marker, appending only) when a workspace is cloned or provisioned, once for every workspace at each dashboard start, before every deploy, and on every write into a box. A dropped file therefore never makes `git status` dirty for a repo-managed script, an agent or a human. Files already *tracked* under a box stay tracked; `.git/info/exclude` only hides untracked ones. A workspace whose `.git` is a file (a linked worktree or submodule) is reported in the dashboard log and left alone.
+
 ### Project CRUD
 A `/manage` page clones repos into workspaces — or stands up empty local workspaces (`git init`'d) when no repo URL is given — allocates ports, regenerates nginx, registers systemd units, and tears down cleanly on delete. Per-project preview command and env vars live in the same form. Port collisions across terminals and previews are caught before they bite.
 

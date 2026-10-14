@@ -25,6 +25,7 @@
 //        -> {"ok":true,"result":{"bytes":N,"mtime":…}}\n<N bytes…>
 //   delete: {"action":"box-delete","projectPath":…,"box":…,"name":…}\n
 //   clear : {"action":"box-clear","projectPath":…,"box":…}\n
+//   ignore: {"action":"boxes-ignore","projectPath":…}\n   (both boxes into .git/info/exclude)
 //        -> {"ok":true,"result":{…}}\n
 //   any   -> {"ok":false,"error":…,"code":…}\n
 //
@@ -41,7 +42,7 @@ import { unlinkSync } from 'node:fs';
 import { pipeline } from 'node:stream/promises';
 
 import {
-  applyBoxClear, applyBoxDelete, applyBoxList, applyBoxRead, applyBoxWrite, readJobHeader,
+  applyBoxClear, applyBoxDelete, applyBoxList, applyBoxRead, applyBoxWrite, applyBoxesIgnore, readJobHeader,
   applyWorkspaceRead, applyWorkspaceTree,
 } from './workspace-file.js';
 
@@ -88,6 +89,10 @@ async function main() {
           }),
         });
         tempPath = null;
+        // A drop into a box is exactly what made clones look dirty, so every write
+        // also keeps the boxes in .git/info/exclude. Best effort and after the reply:
+        // the upload has succeeded whatever this finds.
+        await applyBoxesIgnore({ fsp, projectPath: job.projectPath }).catch(() => {});
         return;
 
       case 'box-list':
@@ -100,6 +105,10 @@ async function main() {
 
       case 'box-clear':
         reply({ ok: true, result: await applyBoxClear(common) });
+        return;
+
+      case 'boxes-ignore':
+        reply({ ok: true, result: await applyBoxesIgnore({ fsp, projectPath: job.projectPath }) });
         return;
 
       case 'box-read': {

@@ -724,3 +724,41 @@ test('REGRESSION: a deploy in flight is watchable, and its output is still there
     assert.equal((await fetch(`${base}/api/deploy/demo/run/deadbeef`, { headers: { Cookie: cookie } })).status, 404);
   });
 });
+
+// REGRESSION (2026-10-14): a repo-managed deploy script that runs its own
+// `git status --porcelain` gate refused because a pasted screenshot sat untracked in
+// `_inbox/`. Every deploy now keeps both boxes in the clone's .git/info/exclude first,
+// through the workspace worker — no commit to the project's repo.
+test('REGRESSION: a deploy keeps _inbox/ and _outbox/ out of git before its script runs', { timeout: 30000 }, async () => {
+  const port = 3942;
+  const inst = makeInstance(port);
+  const proj = path.join(inst.dir, 'workspaces', 'demo');
+  fs.mkdirSync(path.join(proj, '_inbox'), { recursive: true });
+  const { execFileSync } = await import('node:child_process');
+  execFileSync('git', ['init', '-q', '-b', 'main', proj]);
+  execFileSync('git', ['-C', proj, '-c', 'user.email=t@example.invalid', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', 'init']);
+  fs.writeFileSync(path.join(proj, '_inbox', 'clip.png'), 'png');
+  fs.writeFileSync(inst.env.PW_REGISTRY_PATH, JSON.stringify([{ name: 'demo', path: proj, port: 7822 }], null, 2));
+  // The publish-script shape that refused: fail on ANY porcelain output.
+  fs.writeFileSync(inst.env.PW_DEPLOY_CONFIG, JSON.stringify({ demo: { dev: {
+    script: `cd ${JSON.stringify(proj)} && test -z "$(git status --porcelain)" && echo clean-tree`,
+  } } }));
+  const password = 'Sup3rSecret!23';
+  fs.writeFileSync(inst.env.PW_USERS_PATH, JSON.stringify({ users: [
+    { id: 'u-boss', username: 'boss', role: 'admin', projects: '*', passwordHash: await hashPassword(password) },
+  ] }, null, 2));
+  await withServer(inst, port, async (base) => {
+    const login = await fetch(`${base}/api/auth/login`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'boss', password }),
+    });
+    const cookie = login.headers.get('set-cookie').split(';')[0];
+    const dep = await (await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    })).json();
+    assert.equal(dep.ok, true, `the porcelain-gated script must pass: ${JSON.stringify(dep).slice(0, 300)}`);
+    assert.match(dep.output, /clean-tree/);
+    const exclude = fs.readFileSync(path.join(proj, '.git', 'info', 'exclude'), 'utf8');
+    assert.match(exclude, /^\/_inbox\/$/m);
+    assert.match(exclude, /^\/_outbox\/$/m);
+  });
+});
