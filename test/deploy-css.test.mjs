@@ -108,3 +108,12 @@ test('deploy target columns stay fixed whatever the logs contain', async () => {
     assert.ok(rule(sel).some((b) => /overflow-wrap:anywhere/.test(b)), `${sel} must wrap a long unbroken token`);
   }
 });
+
+// REGRESSION (2026-10-14): the modal's "source newer" badge is hidden with the `hidden`
+// attribute, so its display must come from a rule `[hidden]` can beat, never from an
+// inline style (see sourceNewerBadge in server.js).
+test('the source-newer badge is styled here, with a [hidden] rule that actually hides it', async () => {
+  const css = (await getDeployCss()).replace(/\/\*[\s\S]*?\*\//g, '');
+  assert.match(css, /:is\(\.deploy-page,#deployBackdrop\) \.src-newer-badge\{[^}]*display:inline-block/);
+  assert.match(css, /:is\(\.deploy-page,#deployBackdrop\) \.src-newer-badge\[hidden\]\{display:none\}/);
+});

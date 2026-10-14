@@ -1928,9 +1928,13 @@ function sourceNewer(src, dep){
 // to be emitted only when true, so after a successful deploy the version text was
 // rewritten and the badge was left behind — claiming the working copy was newer
 // than a build that had just superseded it.
+//
+// No inline style: an inline `display` beats the browser's `[hidden]{display:none}`,
+// which is why this badge showed on every card whatever the comparison said. Its
+// look lives in deploy-css.js, beside a `[hidden]` rule that actually hides it.
 function sourceNewerBadge(src, dep){
  const on = sourceNewer(src, dep);
- return `<span class="src-newer-badge" style="${'display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap'}"`
+ return `<span class="src-newer-badge"`
   + (on ? '' : ' hidden')
   + ` title="Working copy is newer than the deployed build — deploy to update">⬆ source newer</span>`;
 }
@@ -3238,8 +3242,38 @@ const deployModalScript = `<script>(function(){
    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});
    const j=await r.json();if(generation!==loadGeneration)return;
    if(!j.ok)throw new Error(j.error||'load failed');
-   body.innerHTML=j.html;bindDeployActions(body);(body.querySelector('.deploy-input')||closeBtn).focus();
+   body.dataset.project=name;body.innerHTML=j.html;bindDeployActions(body);(body.querySelector('.deploy-input')||closeBtn).focus();
   }catch(e){if(generation===loadGeneration)body.innerHTML='<p role="alert" style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}
+ }
+ function srcIsNewer(src,dep){var re=/^V1\\.\\d{2}\\.\\d{4}\\.\\d{4}$/;return !!src&&!!dep&&re.test(src)&&re.test(dep)&&src>dep}
+ /* Redraw what a finished deploy changes — the History table, the Source stamp and
+    each card's "source newer" badge — in place, so nothing needs a close/reopen. One
+    request at a time per open panel; a reply for a panel since closed or reloaded
+    (loadGeneration moved on) is dropped. A run's output being read is never yanked
+    away: the table is marked stale and redrawn when Back is pressed. */
+ function refreshDeployState(container){
+  const name=container.dataset.project;if(!name)return Promise.resolve();
+  if(container.__pwRefreshing)return container.__pwRefreshing;
+  const generation=loadGeneration;
+  const pending=(async()=>{
+   try{
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/history',{cache:'no-store'});
+    const j=await r.json();if(generation!==loadGeneration||!j.ok)return;
+    const panel=container.querySelector('#history-panel');
+    if(panel){
+     const detail=panel.querySelector('.history-detail');
+     if(detail&&!detail.hidden)container.__pwHistoryStale=true;
+     else{panel.innerHTML=j.html;container.__pwHistoryStale=false}
+    }
+    const srcEl=container.querySelector('.version.source');if(srcEl&&j.sourceVersion)srcEl.textContent=j.sourceVersion;
+    const src=j.sourceVersion||(srcEl?srcEl.textContent.trim():'');
+    container.querySelectorAll('.target-card').forEach(card=>{
+     const nb=card.querySelector('.src-newer-badge'),vEl=card.querySelector('.current-version');
+     if(nb&&vEl)nb.hidden=!srcIsNewer(src,vEl.textContent.trim());
+    });
+   }catch{}finally{if(container.__pwRefreshing===pending)container.__pwRefreshing=null}
+  })();
+  container.__pwRefreshing=pending;return pending;
  }
  function bindDeployActions(container){
   deployInputs.bind(container);
@@ -3257,13 +3291,21 @@ const deployModalScript = `<script>(function(){
      const vEl=card.querySelector('.current-version');if(vEl&&run.version)vEl.textContent=run.version;
      const ldEl=card.querySelector('.last-deploy-info');
      if(ldEl&&run.startedAt)ldEl.textContent=String(run.startedAt).replace('T',' ').replace(/\..*/,' UTC')+' by '+(run.user||'unknown')+(run.status==='success'?'':' — FAILED');
+     refreshDeployState(container);
     }}).catch(()=>{});
   });
-  pwRunFollower.bindHistory({base:'${BASE}',root:container});
+  /* The body element outlives every open, so delegated listeners go on it once —
+     binding per open stacked a handler per visit and ran each click that many times. */
+  if(!container.__pwHistoryBound){
+   container.__pwHistoryBound=true;
+   pwRunFollower.bindHistory({base:'${BASE}',root:container});
+   container.addEventListener('click',e=>{if(e.target.closest?.('.history-back')&&container.__pwHistoryStale)refreshDeployState(container)});
+  }
   container.querySelectorAll('.deploy-tab').forEach(t=>{t.addEventListener('click',()=>{
    container.querySelectorAll('.deploy-tab').forEach(b=>b.classList.remove('active'));t.classList.add('active');
    container.querySelectorAll('.deploy-tab-panel').forEach(p=>p.style.display='none');
    const panel=container.querySelector('#'+t.dataset.tab);if(panel)panel.style.display='block';
+   if(t.dataset.tab==='history-panel')refreshDeployState(container);
   })});
   container.querySelectorAll('.deploy-btn').forEach(btn=>{btn.addEventListener('click',async()=>{
    const card=btn.closest('.target-card'),project=card.dataset.project,target=card.dataset.target,output=card.querySelector('.deploy-output');
@@ -3311,23 +3353,39 @@ const deployModalScript = `<script>(function(){
     const nb=card.querySelector('.src-newer-badge');if(nb&&typeof j.sourceNewer==='boolean')nb.hidden=!j.sourceNewer;
     const ldEl=card.querySelector('.last-deploy-info');if(ldEl)ldEl.textContent='Just now by '+who+(j.ok?'':' — FAILED')+(summary?' | '+summary:'');
    }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}
-   finally{btn.textContent=btn.dataset.idle||'Deploy';deployInputs.setBusy(card,false)}
+   finally{btn.textContent=btn.dataset.idle||'Deploy';deployInputs.setBusy(card,false);refreshDeployState(container)}
   })});
   container.querySelectorAll('.save-config').forEach(btn=>{btn.addEventListener('click',async()=>{
    const card=btn.closest('.target-card'),project=card.dataset.project,target=card.dataset.target;
    const script=card.querySelector('.deploy-script').value,versionCmd=card.querySelector('.version-cmd').value,backend=card.querySelector('.deploy-backend').value;
    try{
     const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,script,versionCmd,backend})});
-    const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save'},2000);
+    const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';
+    /* What the card shows was rendered from the old settings: a slot that just became
+       (or stopped being) deployable, a new version check or backend all change it, so
+       redraw rather than leave a stale card until the modal is reopened. A script edit
+       on a slot that stays configured changes nothing visible and keeps its place. */
+    const wasUnconfigured=!!card.querySelector('.no-config');
+    const changed=wasUnconfigured||!script.trim()||versionCmd!==(card.dataset.pwVersionCmd??versionCmd)||backend!==(card.dataset.pwBackend??backend);
+    if(changed)setTimeout(()=>backdrop.__pwRefresh?.(),600);
+    else{card.dataset.pwVersionCmd=versionCmd;card.dataset.pwBackend=backend;setTimeout(()=>{btn.textContent='Save'},2000)}
    }catch(e){alert(e.message||String(e))}
   })});
   container.querySelectorAll('.save-backend').forEach(btn=>{btn.addEventListener('click',async()=>{
    const card=btn.closest('.target-card'),project=card.dataset.project,target=card.dataset.target,backend=card.querySelector('.deploy-backend').value;
    try{
     const r=await fetch('${BASE}/api/deploy/config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({project,target,backend})});
-    const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';setTimeout(()=>{btn.textContent='Save backend'},2000);
+    const j=await r.json();if(!j.ok)throw new Error(j.error);btn.textContent='Saved ✓';
+    if(backend!==(card.dataset.pwBackend??backend))setTimeout(()=>backdrop.__pwRefresh?.(),600);
+    else setTimeout(()=>{btn.textContent='Save backend'},2000);
    }catch(e){alert(e.message||String(e))}
   })});
+  /* What each card was rendered with, so a save can tell whether it changed anything visible. */
+  container.querySelectorAll('.target-card').forEach(card=>{
+   const vc=card.querySelector('.version-cmd'),be=card.querySelector('.deploy-backend');
+   if(vc)card.dataset.pwVersionCmd=vc.value;
+   if(be)card.dataset.pwBackend=be.value;
+  });
  }
  window.pwDeploy={open:show,close:hide};
  document.addEventListener('click',e=>{const btn=e.target.closest('[data-deploy]');if(!btn)return;e.preventDefault();show(btn.dataset.deploy)});
@@ -3450,24 +3508,31 @@ const deployScript = `<script>
     markSrcNewer(card, j.version||'');
     const ldEl=card.querySelector('.last-deploy-info');
     if(ldEl)ldEl.textContent='Just now by '+who+(summary?' | '+summary:'');
-   }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}finally{btn.textContent=btn.dataset.idle||'Deploy';deployInputs.setBusy(card,false)}
+   }catch(e){pwRunFollower.restore(card,output,'❌ FAILED\\n'+(e.message||String(e)))}finally{btn.textContent=btn.dataset.idle||'Deploy';deployInputs.setBusy(card,false);refreshOpenLog(card.closest('.project-card'))}
   };
  });
  document.querySelectorAll('.toggle-log').forEach(btn=>{
-  btn.onclick=async()=>{
+  btn.onclick=()=>{
    const card=btn.closest('.project-card');
    const logDiv=card.querySelector('.deploy-log');
    if(logDiv.style.display==='block'){logDiv.style.display='none';btn.textContent='Show history';return}
+   return loadLog(card);
+  };
+ });
+ /* An open history table is redrawn when a deploy in its project finishes, so the run
+    just made is listed without hiding and re-showing it. Closed tables load on open. */
+ function refreshOpenLog(card){const d=card&&card.querySelector('.deploy-log');if(d&&d.style.display==='block')loadLog(card)}
+ async function loadLog(card){
+   const btn=card.querySelector('.toggle-log'),logDiv=card.querySelector('.deploy-log');
    const project=card.dataset.project;
    try{
-    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log');
+    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(project)+'/log',{cache:'no-store'});
     const j=await r.json();if(!j.ok)throw new Error(j.error);
     if(!j.log.length){logDiv.innerHTML='<p class="muted">No deployments yet.</p>'}
     else{logDiv.innerHTML='<div class="history-panel"><div class="history-list"><table class="log-table"><thead><tr><th>When</th><th>Target</th><th>Inputs / anticipated</th><th>Version</th><th>User</th><th>Status</th><th>Duration</th><th>Output</th></tr></thead><tbody>'+j.log.slice(-20).reverse().map(e=>'<tr><td>'+esc(e.ts?.replace('T',' ').replace(/\\.\\d+Z/,' UTC'))+'</td><td>'+esc(e.target)+'</td><td>'+esc(deployInputs.history(e)||'—')+'</td><td><span class="version">'+esc(e.version||'—')+'</span></td><td>'+esc(e.user)+'</td><td><span class="badge '+(e.status==='success'?'ok':e.active?'':'fail')+'">'+esc(e.status)+'</span></td><td>'+(e.duration||'—')+'s</td><td>'+(e.runId?'<button type="button" class="button secondary small run-detail" data-run="'+esc(e.runId)+'" data-run-project="'+esc(project)+'">Output</button>':'<span class="muted">—</span>')+'</td></tr>').join('')+'</tbody></table></div><div class="history-detail" hidden><button type="button" class="button secondary small history-back">&larr; Back to history</button><pre class="run-detail-output" aria-label="Retained deployment output"></pre></div></div>'}
     logDiv.style.display='block';btn.textContent='Hide history';
    }catch(e){logDiv.innerHTML='<p class="muted">Error: '+esc(e.message)+'</p>';logDiv.style.display='block'}
-  };
- });
+ }
  function srcCmp(src,dep){var re=/^V1\\.\\d{2}\\.\\d{4}\\.\\d{4}$/;return !!src&&!!dep&&re.test(src)&&re.test(dep)&&src>dep;}
  function markSrcNewer(card,dep){
   if(card.dataset.managed==='1')return;
@@ -6940,6 +7005,21 @@ if(DEPLOY_CENTRE){
   </div>`;
  }
 
+ // The History tab's content. One function for the first render and for the
+ // modal's refresh (GET /api/deploy/:project/history), so a deploy that finishes
+ // while the modal is open shows up without closing and reopening it, and the two
+ // can never render a row differently.
+ function deployHistoryPanelHtml(p, allLog, external){
+  // A retained run gets a drill-in: the table used to show a result with no way
+  // to reach the output that produced it.
+  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(e.backend||'local')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td><td>${e.runId?`<button type="button" class="button secondary small run-detail" data-run="${esc(e.runId)}" data-run-project="${esc(p.name)}">Output</button>`:'<span class="muted">—</span>'}</td></tr>`).join('');
+  return `${external ? `<p><a href="${BASE}/deploy-service?project=${encodeURIComponent(p.name)}">Open durable service history, job details, and live logs</a></p>` : ''}
+    ${allLog.length ? `<div class="history-panel">
+     <div class="history-list"><table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Backend</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th><th>Output</th></tr></thead><tbody>${historyRows}</tbody></table></div>
+     <div class="history-detail" hidden><button type="button" class="button secondary small history-back">&larr; Back to history</button><pre class="run-detail-output" aria-label="Retained deployment output"></pre></div>
+    </div>` : `<p class="muted">No deployment history yet.</p>`}`;
+ }
+
  // `envFor(target)` resolves the probe identity for ONE slot (see
  // deployIdentity.resolve): dev and prod can authenticate as different accounts, so
  // a single env for the whole card would be wrong.
@@ -6968,9 +7048,6 @@ if(DEPLOY_CENTRE){
    ? ' title="No version reported. If this check signs in to the app server, it needs a deployment credential: one for this target in Settings &gt; Deployment, or your own in Settings &gt; Users."' : '';
   const devLog = allLog.filter(e=>e.target==='dev').slice(-1)[0];
   const prodLog = allLog.filter(e=>e.target==='prod').slice(-1)[0];
-  // A retained run gets a drill-in: the table used to show a result with no way
-  // to reach the output that produced it.
-  const historyRows = allLog.slice().reverse().slice(0,50).map(e => `<tr><td>${esc(e.ts?.replace('T',' ').replace(/\.\d+Z/,' UTC')||'')}</td><td>${esc(e.target||'')}</td><td>${esc(e.backend||'local')}</td><td>${esc(describeDeploySelection(e)||'—')}</td><td class="${e.status==='success'||e.ok?'ok':e.active?'muted':'fail'}">${e.status==='success'||e.ok?'✅ OK':e.jobId?esc(e.status||'unknown'):'❌ Failed'}</td><td>${esc(e.version||'—')}</td><td>${esc(e.user||'')}</td><td>${e.duration?e.duration+'s':'—'}</td><td>${e.runId?`<button type="button" class="button secondary small run-detail" data-run="${esc(e.runId)}" data-run-project="${esc(p.name)}">Output</button>`:'<span class="muted">—</span>'}</td></tr>`).join('');
   return `${renderDeploymentNotice(BASE, p.name, !!external)}<div class="deploy-tabs"><button class="deploy-tab active" data-tab="deploy-panel">Deploy</button><button class="deploy-tab" data-tab="history-panel">History</button></div>
    <div id="deploy-panel" class="deploy-tab-panel">
    ${deploySourceSummary(localVersion, independent)}
@@ -7008,11 +7085,7 @@ if(DEPLOY_CENTRE){
    </div>
    </div>
    <div id="history-panel" class="deploy-tab-panel" style="display:none">
-    ${external ? `<p><a href="${BASE}/deploy-service?project=${encodeURIComponent(p.name)}">Open durable service history, job details, and live logs</a></p>` : ''}
-    ${allLog.length ? `<div class="history-panel">
-     <div class="history-list"><table class="log-table"><thead><tr><th>Time</th><th>Target</th><th>Backend</th><th>Inputs / anticipated</th><th>Result</th><th>Version</th><th>User</th><th>Duration</th><th>Output</th></tr></thead><tbody>${historyRows}</tbody></table></div>
-     <div class="history-detail" hidden><button type="button" class="button secondary small history-back">&larr; Back to history</button><pre class="run-detail-output" aria-label="Retained deployment output"></pre></div>
-    </div>` : `<p class="muted">No deployment history yet.</p>`}
+    ${deployHistoryPanelHtml(p, allLog, external)}
    </div>`;
  }
 
@@ -7382,6 +7455,26 @@ if(DEPLOY_CENTRE){
     envFor = target => deployIdentity.probeEnv(cfg?.[projectName]?.[target], target, operatorRecord, req.user?.username);
    }
    res.json({ok:true, html: await deployModalCard(p, cfg, isAdmin, envFor, states)});
+  } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ // The modal's History tab and its "source newer" badges, refreshed in place: after
+ // a deploy finishes, when History is opened, and when a run's output is closed.
+ // Deliberately not the /card route — that one runs every slot's version check
+ // (often an SSH round-trip to the app server) just to redraw a table.
+ app.get(BASE + '/api/deploy/:project/history', requireAuth, requireProjectAccess, async (req,res)=>{
+  try {
+   const p = await projectByName(req.params.project);
+   if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+   const cfg = await loadDeployConfig();
+   const states = await getProjectDeployStates(p, cfg);
+   const backends = await Promise.all(states.map(effectiveDeployBackend));
+   const external = backends.includes('external');
+   const [allLog, localVersion] = await Promise.all([
+    deploymentHistory(p.name, states, backends),
+    usesIndependentVersions(states) || external ? null : getLocalVersion(p.path || workspacePath(p.name)),
+   ]);
+   res.json({ok:true, html: deployHistoryPanelHtml(p, allLog, external), sourceVersion: localVersion?.version || null});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
  });
 }

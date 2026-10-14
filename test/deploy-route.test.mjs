@@ -246,6 +246,53 @@ test('REGRESSION: the source-newer badge is always rendered so a deploy can clea
   });
 });
 
+// REGRESSION (2026-10-14): the badge carried an inline `display:inline-block`, which
+// beats the browser's `[hidden]{display:none}` — so `hidden` was set correctly and the
+// badge showed on every card anyway. The attribute test above could not see that.
+test('REGRESSION: the hidden source-newer badge has no inline display to defeat [hidden]', { timeout: 30000 }, async () => {
+  await withDeployCard(3940, 'echo V1.99.0101.0000', async ({ card }) => {
+    const badge = targetSection(card.html, 'dev').match(/<span class="src-newer-badge"[^>]*>/)?.[0];
+    assert.ok(badge, 'badge rendered');
+    assert.match(badge, /\shidden/, 'hidden when the build is newer');
+    assert.doesNotMatch(badge, /\sstyle=/, 'no inline style: it would override [hidden] and show the badge regardless');
+  });
+});
+
+// REGRESSION (2026-10-14): a deploy that finished while the modal was open never
+// appeared under History until the modal was closed and reopened — the panel was
+// rendered once, when the modal opened. The modal now redraws it from this route.
+test('REGRESSION: the History route lists a deploy the moment it finishes, rendered as the modal renders it', { timeout: 30000 }, async () => {
+  await withDeployCard(3941, 'echo V1.99.0101.0000', async ({ base, cookie, card }) => {
+    const history = async () => {
+      const r = await fetch(`${base}/api/deploy/demo/history`, { headers: { Cookie: cookie } });
+      const j = await r.json();
+      assert.equal(j.ok, true, `history must load: ${JSON.stringify(j).slice(0, 200)}`);
+      return j;
+    };
+    const before = await history();
+    assert.match(before.html, /No deployment history yet/);
+    assert.match(card.html, /No deployment history yet/, 'the first render agrees with the refresh');
+    assert.match(String(before.sourceVersion), /^V1\.\d{2}\.\d{4}\.\d{4}$/, 'carries the Source stamp the badges are recomputed from');
+
+    const dep = await (await fetch(`${base}/api/deploy/demo/dev`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json', Cookie: cookie }, body: JSON.stringify({}),
+    })).json();
+    assert.equal(dep.ok, true, `deploy must succeed: ${JSON.stringify(dep).slice(0, 200)}`);
+
+    const after = await history();
+    assert.doesNotMatch(after.html, /No deployment history yet/, 'the run just made is listed without reopening');
+    assert.match(after.html, /<td>dev<\/td>/);
+    assert.match(after.html, /✅ OK/);
+    assert.match(after.html, new RegExp(`class="button secondary small run-detail" data-run="${dep.runId}"`), 'with its Output drill-in');
+    assert.match(after.html, /class="history-detail" hidden/, 'and the drill-in view the Output button opens');
+
+    // One renderer for both paths: a reopened modal shows exactly the refreshed panel.
+    const reopened = await (await fetch(`${base}/api/deploy/demo/card`, { headers: { Cookie: cookie } })).json();
+    const panel = reopened.html.split('<div id="history-panel" class="deploy-tab-panel" style="display:none">')[1];
+    assert.ok(panel?.trim().startsWith(after.html.trim().slice(0, 200)), 'the card embeds the same History markup the route returns');
+  });
+});
+
 test('managed deployment HTTP: data-only panels and fresh validated choices never use stale saved scripts', { timeout: 30000 }, async () => {
   // No login/session mutation is needed for the existing trusted-local test
   // operator. In particular, this scenario can run without Linux flock(1).

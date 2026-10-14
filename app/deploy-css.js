@@ -24,6 +24,10 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .target-card h3{margin:0 0 .5rem;font-size:.95rem;text-transform:uppercase;letter-spacing:.05em}
 :is(.deploy-page,#deployBackdrop) .target-card.dev h3{color:#6ee7b7}
 :is(.deploy-page,#deployBackdrop) .target-card.prod h3{color:#fca5a5}
+/* The deploy modal's "source newer" badge. Kept out of an inline style, which would beat the
+   [hidden] rule below and leave the badge showing on every card whatever the comparison said. */
+:is(.deploy-page,#deployBackdrop) .src-newer-badge{display:inline-block;margin-left:.5rem;font-size:.72rem;font-weight:600;color:#fde68a;background:rgba(245,158,11,.15);border:1px solid #b45309;border-radius:999px;padding:.05rem .5rem;white-space:nowrap}
+:is(.deploy-page,#deployBackdrop) .src-newer-badge[hidden]{display:none}
 :is(.deploy-page,#deployBackdrop) .version{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:.85rem;background:#020617;border:1px solid #334155;padding:.2rem .5rem;border-radius:4px;display:inline-block;margin:.3rem 0;color:#bbf7d0}
 :is(.deploy-page,#deployBackdrop) .version-line{display:flex;align-items:center;gap:.4rem;flex-wrap:wrap}
 :is(.deploy-page,#deployBackdrop) .probe-btn{padding:.15rem .45rem;line-height:1;font-size:.85rem}
