@@ -1,0 +1,13 @@
+# Drains the promote queue, one job at a time, then exits; pw-promote.path starts it again
+# when the next job arrives. A promote restarts the dashboard's node process, which is why
+# this is a HOST service: it outlives that restart and records the result itself.
+[Unit]
+Description=Project Workbench promote runner
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pw-promote-runner
+UMask=0077
+# A promote's own health wait and rollback can take a few minutes; a dry run, seconds.
+TimeoutStartSec=3600

@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+# pw-promote — ask for a Project Workbench promote, and follow it. For the ProjectWorkbench
+# agent: it can REQUEST a promote and read its progress; only an administrator signed in to the
+# dashboard can APPROVE one (Settings > System & Updates), with their password.
+#
+#   pw-promote request ["note for the approver"]   snapshot + dry run, then wait for approval
+#   pw-promote status [ID]                          the request's state (default: the newest)
+#   pw-promote log [ID]                             its dry-run and promote output
+#   pw-promote wait [ID]                            poll until it is promoted/failed/rejected/...
+#
+# It talks to the dashboard on loopback (127.0.0.1:3000), which the server accepts for asking
+# and reading and refuses for approving. During a promote the dashboard restarts; `wait` keeps
+# polling through that, and the host runner records the result either way.
+set -euo pipefail
+
+PORT="${PW_DASHBOARD_PORT:-3000}"
+if [ -n "${PW_DASHBOARD_URL:-}" ]; then URL="${PW_DASHBOARD_URL%/}"
+else
+  URL=""
+  if [ -n "${PW_BASE_PATH+x}" ]; then candidates=("${PW_BASE_PATH%/}"); else candidates=(/workbench ""); fi
+  for base in "${candidates[@]}"; do
+    if curl -fsS -m 5 -o /dev/null "http://127.0.0.1:$PORT$base/healthz" 2>/dev/null; then URL="http://127.0.0.1:$PORT$base"; break; fi
+  done
+  [ -n "$URL" ] || { echo "pw-promote: the dashboard is not answering on 127.0.0.1:$PORT" >&2; exit 1; }
+fi
+API="$URL/api/promote/requests"
+
+json(){ node -e '
+let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let j;try{j=JSON.parse(s)}catch{console.error("pw-promote: unexpected reply: "+s.slice(0,300));process.exit(1)}
+const mode=process.argv[1];
+if(!j.ok){console.error("pw-promote: "+(j.error||"request failed"));process.exit(2)}
+const show=r=>{const h=r.head||{};console.log([
+ "request   "+r.id,"state     "+r.state,"asked by  "+(r.requestedBy||"-")+" at "+r.createdAt,
+ "commit    "+(h.commit?((h.ref||"(detached)")+" @ "+h.commit):"unknown"),
+ "snapshot  "+(r.digest?(r.files+" files, digest "+r.digest):"-"),
+ ...(r.note?["note      "+r.note]:[]),
+ ...(r.approval?["approved  by "+r.approval.by+" at "+r.approval.at+" (expires "+r.approval.expiresAt+")"]:[]),
+ ...(r.rejection?["rejected  by "+r.rejection.by+(r.rejection.reason?": "+r.rejection.reason:"")]:[]),
+ ...(r.error?["error     "+r.error]:[])].join("\n"))};
+if(mode==="id"){console.log(j.request?j.request.id:((j.requests||[])[0]||{}).id||"");return}
+if(mode==="state"){console.log(j.request.state);return}
+if(mode==="list"){if(!j.installed){console.error("pw-promote: promote approvals are not installed on this host");process.exit(3)}if(!j.requests.length){console.log("no promote requests yet");return}show(j.requests[0]);return}
+if(mode==="show"){show(j.request);return}
+if(mode==="log"){show(j.request);console.log("\n----- dry run -----\n"+(j.request.dryRunLog||"(none yet)"));if(j.request.promoteLog)console.log("\n----- promote -----\n"+j.request.promoteLog);return}
+});' "$1"; }
+
+latest(){ curl -fsS -m 10 "$API" | json id; }
+get(){ curl -sS -m 10 "$API/$1"; }
+
+cmd="${1:-status}"; shift || true
+case "$cmd" in
+  request)
+    note="${1:-}"
+    body=$(NOTE="$note" node -e 'console.log(JSON.stringify({note:process.env.NOTE||""}))')
+    reply=$(curl -sS -m 30 -X POST -H 'Content-Type: application/json' --data-binary "$body" "$API")
+    printf '%s' "$reply" | json show
+    cat <<EOF
+
+Next: the host runner snapshots the workspace and runs a dry run (seconds). Then ask James to
+review and approve it in the dashboard: Settings > System & Updates > Promote Project Workbench.
+Follow it with:  scripts/pw-promote wait
+EOF
+    ;;
+  status) id="${1:-$(latest)}"; [ -n "$id" ] || { echo "no promote requests yet"; exit 0; }; get "$id" | json show ;;
+  log)    id="${1:-$(latest)}"; [ -n "$id" ] || { echo "no promote requests yet"; exit 0; }; get "$id" | json log ;;
+  wait)
+    id="${1:-$(latest)}"; [ -n "$id" ] || { echo "no promote requests yet"; exit 1; }
+    last=""
+    while :; do
+      if state=$(get "$id" 2>/dev/null | json state 2>/dev/null); then
+        [ "$state" != "$last" ] && { echo "$(date +%H:%M:%S) $state"; last="$state"; }
+        case "$state" in
+          promoted|failed|refused|dry-run-failed|rejected|superseded|expired|stale) get "$id" | json log; exit 0 ;;
+        esac
+      else
+        [ "$last" != "(dashboard restarting)" ] && { echo "$(date +%H:%M:%S) (dashboard not answering — restarting?)"; last="(dashboard restarting)"; }
+      fi
+      sleep 5
+    done ;;
+  -h|--help|help) sed -n '2,15p' "$0" ;;
+  *) echo "usage: pw-promote request [note] | status [ID] | log [ID] | wait [ID]" >&2; exit 2 ;;
+esac

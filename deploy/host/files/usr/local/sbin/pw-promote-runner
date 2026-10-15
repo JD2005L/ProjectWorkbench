@@ -1,0 +1,419 @@
+#!/usr/bin/env node
+// pw-promote-runner — the host half of "the agent asks, an admin approves" PW promotes.
+//
+// Runs as ROOT on the host, started by pw-promote.service whenever pw-promote.path sees the
+// spool queue non-empty. Installed root-owned by a human (deploy/host/install.sh) and never
+// refreshed automatically — the code that decides what root runs is not the agent's to change.
+//
+// THE GATE. Promoting means agent-written code becomes the live dashboard, which runs in a
+// --privileged --pid=host container: host root. The approval an administrator gives in the
+// dashboard is therefore the only gate, so this runner:
+//
+//   * DRY RUN (automatic, no approval): snapshots the workspace's app/ (minus node_modules) and
+//     scripts/ and runs `pw-promote-app --dry-run` against the snapshot. It must hand the agent
+//     no root power, so:
+//       - the workspace is READ as its unprivileged owner (setpriv --reuid/--regid
+//         --clear-groups --no-new-privs tar ...), refused outright if that owner is root;
+//       - the archive streams into a root-owned file under a size cap;
+//       - root never runs tar over it. This file parses the ustar headers itself and accepts
+//         only regular files and directories under app/ and scripts/ with plain names —
+//         symlinks, hard links, devices, FIFOs, pax/GNU extension headers, absolute paths, '..',
+//         dash-leading names and duplicates are all refused — and writes each file O_EXCL into
+//         a fresh root-owned directory it created;
+//       - HEAD is read by parsing .git/HEAD and refs as plain files, as the owner. git is never
+//         run as root in the agent's repo (.git/config could make it run code).
+//   * PROMOTE (only after approval): re-verifies that the approval names the request, has not
+//     expired, and carries the digest recorded at dry-run time, recomputes the digest of the
+//     snapshot on disk, and only then runs `pw-promote-app` against THAT snapshot. What was
+//     reviewed is exactly what ships, whatever happens in the workspace afterwards.
+//
+// The spool (/etc/project-workbench/promote, 0700 root) is writable only by root: the
+// dashboard (root in its container) writes requests, approvals and queue entries; this runner
+// writes status and logs. The agent account cannot read or write any of it.
+//
+// Every path is overridable through the environment so the test suite can drive this file
+// against disposable trees. The systemd unit sets none of them.
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+const { spawn, spawnSync } = require('child_process');
+
+const env = process.env;
+const SPOOL = env.PW_PROMOTE_SPOOL || '/etc/project-workbench/promote';
+const WORKSPACE = env.PW_PROMOTE_WORKSPACE || '/opt/project-workbench/workspaces/ProjectWorkbench';
+const PROMOTE_BIN = env.PW_PROMOTE_BIN || '/usr/local/sbin/pw-promote-app';
+const SETPRIV = env.PW_PROMOTE_SETPRIV || '/usr/bin/setpriv';
+const TAR = env.PW_PROMOTE_TAR || '/usr/bin/tar';
+const CAT = env.PW_PROMOTE_CAT || '/usr/bin/cat';
+const MAX_BYTES = Number(env.PW_PROMOTE_MAX_BYTES) > 0 ? Number(env.PW_PROMOTE_MAX_BYTES) : 64 * 1024 * 1024;
+const MAX_ENTRIES = 20000;
+const KEEP = Number(env.PW_PROMOTE_KEEP) > 0 ? Number(env.PW_PROMOTE_KEEP) : 10;
+const AUDIT_LOG = env.PW_PROMOTE_AUDIT_LOG || '/var/log/project-workbench/audit.log';
+const DRY_RUN_TIMEOUT_S = Number(env.PW_PROMOTE_DRY_RUN_TIMEOUT_S) > 0 ? Number(env.PW_PROMOTE_DRY_RUN_TIMEOUT_S) : 600;
+const PROMOTE_TIMEOUT_S = Number(env.PW_PROMOTE_TIMEOUT_S) > 0 ? Number(env.PW_PROMOTE_TIMEOUT_S) : 1800;
+
+const ID_RE = /^\d{8}T\d{6}Z-[a-f0-9]{8}$/;
+const QUEUE_RE = /^(\d{8}T\d{6}Z-[a-f0-9]{8})\.(dryrun|promote)$/;
+const ACTIVE = new Set(['snapshotting', 'dry-running', 'promoting']);
+
+const queueDir = () => path.join(SPOOL, 'queue');
+const requestDir = (id) => path.join(SPOOL, 'requests', id);
+
+function log(msg) { process.stdout.write(`[pw-promote-runner] ${msg}\n`); }
+
+function readJson(file) {
+  try {
+    const st = fs.lstatSync(file);
+    if (!st.isFile()) return null;
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch { return null; }
+}
+
+function writeJsonAtomic(file, value) {
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
+  fs.writeFileSync(tmp, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+  fs.renameSync(tmp, file);
+}
+
+function audit(event, detail) {
+  try {
+    if (!fs.existsSync(AUDIT_LOG)) return;
+    fs.appendFileSync(AUDIT_LOG, `${JSON.stringify({ ts: new Date().toISOString(), event, user: 'pw-promote-runner', role: 'host-service', ip: '', ...detail })}\n`);
+  } catch { /* the audit log is best effort; the request's own status is the record */ }
+}
+
+function setStatus(id, patch) {
+  const file = path.join(requestDir(id), 'status.json');
+  const next = { ...(readJson(file) || {}), id, ...patch, updatedAt: new Date().toISOString() };
+  writeJsonAtomic(file, next);
+  return next;
+}
+
+// ---------------------------------------------------------------------------
+// Reading the workspace as its owner
+// ---------------------------------------------------------------------------
+
+function workspaceOwner() {
+  let st;
+  try { st = fs.lstatSync(WORKSPACE); } catch { throw new Error(`workspace not found: ${WORKSPACE}`); }
+  if (st.isSymbolicLink()) throw new Error('refused: the workspace path is a symlink');
+  if (!st.isDirectory()) throw new Error('refused: the workspace path is not a directory');
+  if (st.uid === 0) throw new Error('refused: the workspace is owned by root, so reading it would be a root read of an agent-chosen tree');
+  return { uid: st.uid, gid: st.gid };
+}
+
+// argv run with exactly the owner's authority. When this process already IS the owner (the test
+// suite), there is nothing to drop; otherwise setpriv drops uid, gid and every supplementary
+// group, and no_new_privs means nothing it starts can regain them.
+function asOwner(owner, argv) {
+  if (process.getuid() === owner.uid && process.getgid() === owner.gid) return argv;
+  return [SETPRIV, `--reuid=${owner.uid}`, `--regid=${owner.gid}`, '--clear-groups', '--no-new-privs', '--', ...argv];
+}
+
+function ownerRead(owner, file, maxBytes) {
+  const argv = asOwner(owner, [CAT, '--', file]);
+  const r = spawnSync(argv[0], argv.slice(1), { cwd: '/', maxBuffer: maxBytes, stdio: ['ignore', 'pipe', 'ignore'] });
+  if (r.status !== 0 || r.error) return null;
+  return r.stdout.toString('utf8');
+}
+
+// The commit, from plain files only — never `git`, which reads .git/config.
+function readHead(owner) {
+  const git = path.join(WORKSPACE, '.git');
+  const head = (ownerRead(owner, path.join(git, 'HEAD'), 4096) || '').trim();
+  if (/^[0-9a-f]{40}$/.test(head)) return { ref: null, commit: head };
+  const m = /^ref: (refs\/heads\/[A-Za-z0-9._\/-]{1,200})$/.exec(head);
+  if (!m || m[1].split('/').some((s) => !s || s === '.' || s === '..')) return { ref: null, commit: null };
+  const ref = m[1];
+  const loose = (ownerRead(owner, path.join(git, ref), 4096) || '').trim();
+  if (/^[0-9a-f]{40}$/.test(loose)) return { ref, commit: loose };
+  const packed = ownerRead(owner, path.join(git, 'packed-refs'), 4 * 1024 * 1024) || '';
+  for (const line of packed.split('\n')) {
+    const p = /^([0-9a-f]{40}) (\S+)$/.exec(line.trim());
+    if (p && p[2] === ref) return { ref, commit: p[1] };
+  }
+  return { ref, commit: null };
+}
+
+// The archive, created by the owner, streamed into a root-owned file and capped.
+function captureArchive(owner, out) {
+  return new Promise((resolve, reject) => {
+    const argv = asOwner(owner, [TAR, '--format=ustar', '--one-file-system', '-C', WORKSPACE,
+      '--exclude=app/node_modules', '-cf', '-', '--', 'app', 'scripts']);
+    const fd = fs.openSync(out, 'wx', 0o600);
+    let bytes = 0, over = false, stderr = '';
+    const child = spawn(argv[0], argv.slice(1), { cwd: '/', stdio: ['ignore', 'pipe', 'pipe'] });
+    child.stdout.on('data', (chunk) => {
+      if (over) return;
+      bytes += chunk.length;
+      if (bytes > MAX_BYTES) { over = true; child.kill('SIGKILL'); return; }
+      fs.writeSync(fd, chunk);
+    });
+    child.stderr.on('data', (d) => { stderr = (stderr + d).slice(-4000); });
+    child.on('error', (e) => { fs.closeSync(fd); reject(e); });
+    child.on('close', (code) => {
+      fs.closeSync(fd);
+      if (over) return reject(new Error(`refused: the snapshot is larger than ${MAX_BYTES} bytes`));
+      if (code !== 0) return reject(new Error(`reading the workspace failed (tar exit ${code}): ${stderr.trim()}`));
+      resolve(bytes);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Validating and extracting — no tar runs as root
+// ---------------------------------------------------------------------------
+
+const TYPE_NAMES = { '1': 'a hard link', '2': 'a symbolic link', '3': 'a character device', '4': 'a block device',
+  '6': 'a FIFO', '7': 'a contiguous file', x: 'a pax header', g: 'a pax global header', L: 'a GNU long-name header',
+  K: 'a GNU long-link header', S: 'a sparse file', V: 'a volume header', M: 'a multi-volume entry', D: 'a directory dump' };
+const SEGMENT_RE = /^[A-Za-z0-9._@+=,~][A-Za-z0-9._@+=,~-]*$/;
+
+function cstr(buf, start, len) {
+  const slice = buf.subarray(start, start + len);
+  const nul = slice.indexOf(0);
+  return slice.subarray(0, nul < 0 ? len : nul).toString('utf8');
+}
+function octal(buf, start, len, what) {
+  if (buf[start] & 0x80) throw new Error(`refused: ${what} uses a binary size field`);
+  const s = cstr(buf, start, len).trim();
+  if (!/^[0-7]*$/.test(s)) throw new Error(`refused: ${what} has a malformed numeric field`);
+  return s ? parseInt(s, 8) : 0;
+}
+function safeName(raw, isDir) {
+  const name = isDir ? raw.replace(/\/+$/, '') : raw;
+  const show = JSON.stringify(raw);
+  if (!name || name.length > 255) throw new Error(`refused: entry name ${show} is empty or too long`);
+  if (name.startsWith('/')) throw new Error(`refused: entry ${show} is an absolute path`);
+  const parts = name.split('/');
+  if (parts.some((p) => p === '..')) throw new Error(`refused: entry ${show} contains '..'`);
+  if (!['app', 'scripts'].includes(parts[0])) throw new Error(`refused: entry ${show} is outside app/ and scripts/`);
+  if (parts[0] === 'app' && parts[1] === 'node_modules') throw new Error(`refused: entry ${show} is under app/node_modules`);
+  for (const p of parts) if (!SEGMENT_RE.test(p) || p === '.') throw new Error(`refused: entry ${show} has an unsupported name`);
+  return name;
+}
+
+function parseUstar(buf) {
+  const entries = [];
+  const seen = new Set();
+  let o = 0;
+  for (;;) {
+    if (o + 512 > buf.length) throw new Error('refused: the archive is truncated');
+    const h = buf.subarray(o, o + 512);
+    if (h.every((b) => b === 0)) {
+      const next = buf.subarray(o + 512, o + 1024);
+      if (next.length !== 512 || !next.every((b) => b === 0)) throw new Error('refused: the archive end marker is malformed');
+      break;
+    }
+    let sum = 0;
+    for (let i = 0; i < 512; i++) sum += (i >= 148 && i < 156) ? 0x20 : h[i];
+    if (sum !== octal(h, 148, 8, 'a header checksum')) throw new Error('refused: an archive header checksum does not match');
+    if (cstr(h, 257, 6) !== 'ustar' || cstr(h, 263, 2) !== '00') throw new Error('refused: the archive is not POSIX ustar');
+    const type = String.fromCharCode(h[156] || 0x30);
+    const prefix = cstr(h, 345, 155);
+    const raw = prefix ? `${prefix}/${cstr(h, 0, 100)}` : cstr(h, 0, 100);
+    if (type !== '0' && type !== '5') throw new Error(`refused: ${JSON.stringify(raw)} is ${TYPE_NAMES[type] || `an entry of type ${JSON.stringify(type)}`}; only regular files and directories are accepted`);
+    const isDir = type === '5';
+    const name = safeName(raw, isDir);
+    if (seen.has(name)) throw new Error(`refused: ${JSON.stringify(name)} appears twice`);
+    seen.add(name);
+    const size = octal(h, 124, 12, JSON.stringify(name));
+    if (isDir && size !== 0) throw new Error(`refused: directory ${JSON.stringify(name)} carries data`);
+    const mode = octal(h, 100, 8, JSON.stringify(name)) & 0o777;
+    const start = o + 512;
+    if (start + size > buf.length) throw new Error('refused: the archive is truncated');
+    entries.push({ type: isDir ? 'dir' : 'file', name, exec: (mode & 0o111) !== 0, data: isDir ? null : buf.subarray(start, start + size) });
+    if (entries.length > MAX_ENTRIES) throw new Error(`refused: more than ${MAX_ENTRIES} entries`);
+    o = start + Math.ceil(size / 512) * 512;
+  }
+  if (!entries.some((e) => e.type === 'file' && e.name.startsWith('app/'))) throw new Error('refused: the snapshot has no files under app/');
+  return entries;
+}
+
+function extract(entries, root) {
+  fs.mkdirSync(root, { mode: 0o755 });                  // fails if it exists: always a fresh tree
+  const inside = (name) => {
+    const full = path.join(root, name);
+    if (!full.startsWith(root + path.sep)) throw new Error(`refused: ${name} resolves outside the snapshot`);
+    return full;
+  };
+  for (const e of entries) {
+    const full = inside(e.name);
+    if (e.type === 'dir') { fs.mkdirSync(full, { recursive: true, mode: 0o755 }); continue; }
+    fs.mkdirSync(path.dirname(full), { recursive: true, mode: 0o755 });
+    const mode = e.exec ? 0o755 : 0o644;
+    const fd = fs.openSync(full, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW, mode);
+    try { fs.writeSync(fd, e.data); fs.fchmodSync(fd, mode); } finally { fs.closeSync(fd); }
+  }
+}
+
+// Every path, its kind, its mode and its content hash, in a fixed order. Computed from the tree
+// on disk both after extraction and again right before a promote, so a digest names exactly
+// what ships. Anything that is not a regular file or directory is a tampered snapshot.
+function treeDigest(root) {
+  const lines = [];
+  let files = 0, bytes = 0;
+  (function walk(dir, rel) {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const full = path.join(dir, name), r = rel ? `${rel}/${name}` : name;
+      const st = fs.lstatSync(full);
+      if (st.isDirectory()) { lines.push(`d ${r}`); walk(full, r); }
+      else if (st.isFile()) {
+        const data = fs.readFileSync(full);
+        files++; bytes += data.length;
+        lines.push(`f ${(st.mode & 0o111) ? 'x' : '-'} ${r} ${crypto.createHash('sha256').update(data).digest('hex')}`);
+      } else throw new Error(`refused: ${r} in the snapshot is not a regular file or directory`);
+    }
+  })(root, '');
+  return { digest: crypto.createHash('sha256').update(lines.join('\n')).digest('hex'), files, bytes };
+}
+
+// ---------------------------------------------------------------------------
+// Running pw-promote-app
+// ---------------------------------------------------------------------------
+
+function runLogged(argv, { logFile, timeoutS, extraEnv }) {
+  return new Promise((resolve) => {
+    const fd = fs.openSync(logFile, 'w', 0o600);
+    const child = spawn(argv[0], argv.slice(1), { cwd: '/', env: { ...env, ...extraEnv }, stdio: ['ignore', fd, fd] });
+    let timedOut = false;
+    const t = setTimeout(() => { timedOut = true; child.kill('SIGTERM'); setTimeout(() => child.kill('SIGKILL'), 10000).unref(); }, timeoutS * 1000);
+    child.on('error', (e) => { clearTimeout(t); fs.writeSync(fd, `\n[pw-promote-runner] could not start ${argv[0]}: ${e.message}\n`); fs.closeSync(fd); resolve({ code: 127, timedOut }); });
+    child.on('close', (code) => { clearTimeout(t); if (timedOut) fs.writeSync(fd, `\n[pw-promote-runner] timed out after ${timeoutS}s\n`); fs.closeSync(fd); resolve({ code: code ?? 1, timedOut }); });
+  });
+}
+
+const snapshotEnv = (id) => {
+  const snap = path.join(requestDir(id), 'snapshot');
+  return { PW_PROMOTE_SRC: path.join(snap, 'app'), PW_PROMOTE_SCRIPTS_SRC: path.join(snap, 'scripts'), PW_PROMOTE_REQUEST_ID: id };
+};
+
+function withdrawn(id) {
+  const dir = requestDir(id);
+  if (fs.existsSync(path.join(dir, 'rejected.json'))) return 'rejected';
+  if (fs.existsSync(path.join(dir, 'superseded.json'))) return 'superseded';
+  return '';
+}
+
+async function dryRun(id) {
+  const dir = requestDir(id);
+  if (!readJson(path.join(dir, 'request.json'))) return log(`${id}: no request record; ignored`);
+  if (withdrawn(id)) return log(`${id}: ${withdrawn(id)} before its dry run; skipped`);
+  const prior = readJson(path.join(dir, 'status.json'));
+  if (prior && prior.state && prior.state !== 'queued') return log(`${id}: already ${prior.state}; dry run not repeated`);
+  setStatus(id, { state: 'snapshotting', startedAt: new Date().toISOString() });
+  const snap = path.join(dir, 'snapshot'), archive = path.join(dir, 'snapshot.tar');
+  try {
+    fs.rmSync(snap, { recursive: true, force: true });
+    fs.rmSync(archive, { force: true });
+    const owner = workspaceOwner();
+    const head = readHead(owner);
+    await captureArchive(owner, archive);
+    const entries = parseUstar(fs.readFileSync(archive));
+    extract(entries, snap);
+    fs.rmSync(archive, { force: true });
+    const { digest, files, bytes } = treeDigest(snap);
+    setStatus(id, { state: 'dry-running', head, digest, files, bytes, snapshotAt: new Date().toISOString() });
+    const r = await runLogged([PROMOTE_BIN, '--dry-run'], { logFile: path.join(dir, 'dry-run.log'), timeoutS: DRY_RUN_TIMEOUT_S, extraEnv: snapshotEnv(id) });
+    const ok = r.code === 0;
+    setStatus(id, { state: ok ? 'dry-run-ok' : 'dry-run-failed', exitCode: r.code, finishedAt: new Date().toISOString(),
+      ...(ok ? {} : { error: r.timedOut ? 'the dry run timed out' : `the dry run exited ${r.code}` }) });
+    audit('promote_dry_run', { requestId: id, ok, digest, commit: head.commit });
+  } catch (e) {
+    fs.rmSync(snap, { recursive: true, force: true });
+    fs.rmSync(archive, { force: true });
+    setStatus(id, { state: 'dry-run-failed', error: e.message, finishedAt: new Date().toISOString() });
+    audit('promote_dry_run', { requestId: id, ok: false, error: e.message });
+  }
+}
+
+async function promote(id) {
+  const dir = requestDir(id);
+  const status = readJson(path.join(dir, 'status.json'));
+  if (!status || status.state !== 'dry-run-ok') return log(`${id}: not awaiting a promote (${status?.state || 'no status'}); ignored`);
+  const refuse = (why) => { setStatus(id, { state: 'refused', error: why, finishedAt: new Date().toISOString() }); audit('promote_result', { requestId: id, ok: false, refused: why }); log(`${id}: refused — ${why}`); };
+  const gone = withdrawn(id);
+  if (gone) return refuse(`the request was ${gone}`);
+  const approval = readJson(path.join(dir, 'approval.json'));
+  if (!approval) return refuse('no approval is on record');
+  if (approval.id !== id) return refuse('the approval names a different request');
+  if (!approval.approvedBy || typeof approval.approvedBy !== 'string') return refuse('the approval does not name its approver');
+  if (!(Date.parse(approval.expiresAt) > Date.now())) return refuse('the approval has expired');
+  if (!approval.digest || approval.digest !== status.digest) return refuse('the approval is for different content than the dry run');
+  if (!(Date.parse(approval.approvedAt) - Date.parse(status.finishedAt) <= 24 * 3600 * 1000)) return refuse('the dry run was more than 24 hours old when it was approved; request a fresh one');
+  let current;
+  try { current = treeDigest(path.join(dir, 'snapshot')).digest; } catch (e) { return refuse(e.message); }
+  if (current !== approval.digest) return refuse('the snapshot on disk no longer matches what was approved');
+
+  setStatus(id, { state: 'promoting', promoteStartedAt: new Date().toISOString(), approvedBy: approval.approvedBy });
+  audit('promote_start', { requestId: id, approvedBy: approval.approvedBy, digest: current, commit: status.head?.commit || null });
+  const r = await runLogged([PROMOTE_BIN], { logFile: path.join(dir, 'promote.log'), timeoutS: PROMOTE_TIMEOUT_S, extraEnv: snapshotEnv(id) });
+  const ok = r.code === 0;
+  setStatus(id, { state: ok ? 'promoted' : 'failed', exitCode: r.code, finishedAt: new Date().toISOString(),
+    ...(ok ? {} : { error: r.timedOut ? 'the promote timed out' : `pw-promote-app exited ${r.code} (it restores the previous build itself on a failed health check)` }) });
+  audit('promote_result', { requestId: id, ok, exitCode: r.code, approvedBy: approval.approvedBy });
+}
+
+// ---------------------------------------------------------------------------
+// The queue
+// ---------------------------------------------------------------------------
+
+function takeLock() {
+  const lock = path.join(SPOOL, 'runner.lock');
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try { fs.writeFileSync(lock, String(process.pid), { flag: 'wx', mode: 0o600 }); return () => fs.rmSync(lock, { force: true }); }
+    catch (e) {
+      if (e.code !== 'EEXIST') throw e;
+      const pid = Number(fs.readFileSync(lock, 'utf8'));
+      let alive = false;
+      try { if (pid > 0) { process.kill(pid, 0); alive = true; } } catch { alive = false; }
+      if (alive) return null;
+      fs.rmSync(lock, { force: true });               // a runner that died holding it
+    }
+  }
+  return null;
+}
+
+function prune() {
+  const root = path.join(SPOOL, 'requests');
+  const ids = fs.readdirSync(root).filter((n) => ID_RE.test(n)).sort().reverse();
+  for (const id of ids.slice(KEEP)) {
+    const st = readJson(path.join(root, id, 'status.json'));
+    if (st && ACTIVE.has(st.state)) continue;
+    if (fs.existsSync(path.join(root, id, 'approval.json')) && st?.state === 'dry-run-ok') continue;
+    fs.rmSync(path.join(root, id), { recursive: true, force: true });
+  }
+}
+
+async function main() {
+  for (const d of [SPOOL, path.join(SPOOL, 'requests'), queueDir()]) {
+    const st = fs.lstatSync(d);
+    if (!st.isDirectory() || st.isSymbolicLink()) throw new Error(`${d} is not a directory`);
+  }
+  if (process.getuid() === 0) {
+    const st = fs.statSync(SPOOL);
+    if (st.uid !== 0 || (st.mode & 0o077)) throw new Error(`${SPOOL} must be owned by root and closed to group and others (0700)`);
+  }
+  const release = takeLock();
+  if (!release) return log('another runner holds the lock; it will drain the queue');
+  try {
+    for (;;) {
+      const jobs = fs.readdirSync(queueDir())
+        .map((n) => ({ n, m: QUEUE_RE.exec(n) }))
+        .map(({ n, m }) => { if (!m) { fs.rmSync(path.join(queueDir(), n), { force: true, recursive: true }); return null; } return { n, id: m[1], kind: m[2], at: fs.lstatSync(path.join(queueDir(), n)).mtimeMs }; })
+        .filter(Boolean)
+        .sort((a, b) => a.at - b.at || a.n.localeCompare(b.n));
+      if (!jobs.length) break;
+      const job = jobs[0];
+      fs.rmSync(path.join(queueDir(), job.n), { force: true });   // consumed first: a crash cannot loop on it
+      if (!fs.existsSync(requestDir(job.id))) { log(`${job.id}: unknown request; ignored`); continue; }
+      log(`${job.id}: ${job.kind}`);
+      if (job.kind === 'dryrun') await dryRun(job.id); else await promote(job.id);
+    }
+    prune();
+  } finally { release(); }
+}
+
+main().catch((e) => { process.stderr.write(`[pw-promote-runner] ${e.message}\n`); process.exitCode = 1; });

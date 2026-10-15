@@ -1,0 +1,11 @@
+# Starts pw-promote.service whenever the dashboard queues a promote job (a dry run when the
+# agent requests one, a promote once an administrator approves). The queue lives in a
+# root-only spool; see /usr/local/sbin/pw-promote-runner.
+[Unit]
+Description=Project Workbench promote queue (agent asks, admin approves)
+
+[Path]
+DirectoryNotEmpty=/etc/project-workbench/promote/queue
+
+[Install]
+WantedBy=multi-user.target

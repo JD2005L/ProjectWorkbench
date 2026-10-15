@@ -51,5 +51,29 @@ else
   echo "     /etc/systemd/system/pw-tmux.service.d/host-alias.conf   # then edit the hostname"
 fi
 
+# Promote approvals: "the agent asks, an administrator approves" (see README.md). The agent can
+# request a promote and read its progress; only a signed-in administrator can approve it in
+# Settings > System & Updates. The pieces that decide what root runs are installed HERE, by a
+# human, root-owned, and are never refreshed automatically:
+#   /usr/local/sbin/pw-promote-app     the pinned promote script (deploy/promote-app.sh)
+#   /usr/local/sbin/pw-promote-runner  snapshots, dry-runs and — once approved — promotes
+#   /etc/project-workbench/promote/    the spool, 0700 root: the dashboard and the runner only
+# Refuse rather than install a gate that would not hold.
+pw_conf=/etc/project-workbench
+if [ "$(stat -c %u "$pw_conf")" != 0 ] || [ $(( 0$(stat -c %a "$pw_conf") & 022 )) -ne 0 ]; then
+  echo "REFUSING to install promote approvals: $pw_conf must be owned by root and not group/other-writable" >&2
+  echo "(it is $(stat -c '%U:%G %a' "$pw_conf")). Anyone who can write there could forge an approval." >&2
+  exit 1
+fi
+command -v node >/dev/null || { echo "REFUSING: node is not on the host PATH (pw-promote-runner and pw-promote-app need it)" >&2; exit 1; }
+[ -x /usr/bin/setpriv ] || { echo "REFUSING: /usr/bin/setpriv is missing (the runner reads the workspace through it, as its owner)" >&2; exit 1; }
+install -m 0755 -o root -g root "$repo/deploy/promote-app.sh"                    /usr/local/sbin/pw-promote-app
+install -m 0755 -o root -g root "$here/files/usr/local/sbin/pw-promote-runner"   /usr/local/sbin/pw-promote-runner
+install -d -m 0700 -o root -g root "$pw_conf/promote" "$pw_conf/promote/requests" "$pw_conf/promote/queue"
+install -m 0644 "$here/files/etc/systemd/system/pw-promote.path"    /etc/systemd/system/pw-promote.path
+install -m 0644 "$here/files/etc/systemd/system/pw-promote.service" /etc/systemd/system/pw-promote.service
+
 systemctl daemon-reload
+systemctl enable --now pw-promote.path
 echo "Installed host hooks + reloaded systemd. They apply on next container (re)start; run the scripts manually to apply now."
+echo "Promote approvals: pw-promote.path is $(systemctl is-active pw-promote.path). Requests appear in Settings > System & Updates."

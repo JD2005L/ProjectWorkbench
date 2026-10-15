@@ -352,6 +352,32 @@ curl -fsS -b jar.txt -X POST "$HOST/api/upload/AmrikPublic" \
 
 ---
 
+## Promoting Project Workbench (the ProjectWorkbench agent)
+
+The agent working on this repo can ask for its own work to be promoted into the live dashboard.
+It cannot approve the promote; an administrator approves it.
+
+```bash
+scripts/pw-promote request "what this promote ships, for the approver"
+scripts/pw-promote status      # or: log, to see the dry run
+scripts/pw-promote wait        # follows it to the end, through the dashboard's restart
+```
+
+1. **Request.** A host service snapshots `app/` (minus `node_modules`) and `scripts/` and runs
+   a dry run against the snapshot. The request is refused while another promote is approved or
+   running. A newer request replaces one that has not been approved yet.
+2. **Ask James to approve it.** He does that in **Settings → System & Updates → Promote Project
+   Workbench**, signed in, with his password. Tell him the request id and what it ships.
+   Nothing on the agent's side can approve, and nothing should try: no on-box call to the app,
+   no forged header, no script left for a browser to run. Looking for a way around the
+   approval is out of bounds, exactly like the workspace boundary above.
+3. **Follow it with `wait`.** What ships is the snapshot that was dry-run and approved. Commits
+   made after the request are not included; ask again for those. The promote restarts the
+   dashboard and the result appears once it is back.
+
+The host side is installed once by a human (`deploy/host/README.md`, "Promote approvals").
+Until it is, `request` answers that it is not installed, and promotes stay manual.
+
 ## Shared instance memory
 
 Before doing durable work in any project, read

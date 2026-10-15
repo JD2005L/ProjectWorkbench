@@ -2,9 +2,15 @@
 # Promote the whole checkout app/ tree into the live app, reconciling the drift
 # that blocks any normal server.js change, then restart node.
 #
-# Run from a HOST shell on vnl2422 as james.levac.z:
-#   sudo bash /opt/project-workbench/persistent/admin-home/promote-app.sh --dry-run
-#   sudo bash /opt/project-workbench/persistent/admin-home/promote-app.sh
+# Installed root-owned as /usr/local/sbin/pw-promote-app by deploy/host/install.sh, and only
+# ever refreshed by a human `sudo install` — never automatically. The usual way it runs is
+# through pw-promote-runner, after an administrator approves the request in Settings > System
+# & Updates; the runner points it at a reviewed, root-owned SNAPSHOT of the workspace with
+# PW_PROMOTE_SRC / PW_PROMOTE_SCRIPTS_SRC. It can still be run by hand from a host shell:
+#   sudo pw-promote-app --dry-run
+#   sudo pw-promote-app
+# (Do not run a copy from persistent/admin-home: that is /home/admin, which the agent account
+# can write, so a script there is not pinned at all.)
 #
 # Why a whole-tree promote and not just server.js: the live build is far behind
 # the checkout and lacks modules the current server.js imports (user-credentials,
@@ -24,15 +30,17 @@
 
 set -uo pipefail
 
-SRC=/opt/project-workbench/workspaces/ProjectWorkbench/app
+# The sources default to the live workspace (the manual path). The promote runner passes a
+# reviewed snapshot instead, so what was approved is exactly what ships.
+SRC=${PW_PROMOTE_SRC:-/opt/project-workbench/workspaces/ProjectWorkbench/app}
 DST=/opt/project-workbench/workspaces/canonical/app
 STAMP=$(date +%Y%m%d-%H%M%S)
 BAK="/opt/project-workbench/workspaces/canonical/app-backup-$STAMP.tar"
 CFGBAK="/opt/project-workbench/workspaces/canonical/config-backup-$STAMP.tar"
-SSRC=/opt/project-workbench/workspaces/ProjectWorkbench/scripts
+SSRC=${PW_PROMOTE_SCRIPTS_SRC:-/opt/project-workbench/workspaces/ProjectWorkbench/scripts}
 SDST=/opt/project-workbench/workspaces/canonical/scripts
 SBAK="/opt/project-workbench/workspaces/canonical/scripts-backup-$STAMP.tar"
-SELF=/opt/project-workbench/persistent/admin-home/promote-app.sh
+SELF=/usr/local/sbin/pw-promote-app
 CONTAINER=project-workbench
 HEALTH_URL='https://127.0.0.1/workbench/'
 DRY=0
@@ -52,9 +60,9 @@ hr(){  printf '\n[promote] ---- %s ----\n' "$*"; }
 # ---------------------------------------------------------------- guards -----
 if [ -f /run/.containerenv ]; then
   die "running inside a container. Use a HOST shell on vnl2422:
-      sudo bash $SELF"
+      sudo $SELF"
 fi
-[ "$(id -u)" -eq 0 ] || die "must run as root (sudo bash $SELF [--dry-run])"
+[ "$(id -u)" -eq 0 ] || die "must run as root (sudo $SELF [--dry-run])"
 [ -d "$SRC" ] || die "source tree not found: $SRC"
 [ -d "$DST" ] || die "live tree not found: $DST"
 command -v node >/dev/null 2>&1 || die "node not on the host PATH; cannot syntax-check before promoting"

@@ -71,3 +71,74 @@ A related pre-existing host hook installed the same way (not tracked here) is
 Copies the files to their host paths and runs `systemctl daemon-reload`. This does **not**
 restart the services; the hooks apply on the next container (re)start. To apply immediately,
 run the scripts against the live containers, e.g. `sudo /usr/local/sbin/pw-ensure-dotnet.sh project-workbench`.
+
+## Promote approvals — "the agent asks, an administrator approves"
+
+Promoting Project Workbench means agent-written code becomes the live dashboard, which runs in
+a `--privileged --pid=host` container: effectively host root. So the agent can **ask** for a
+promote and follow it, and only an **administrator signed in to the dashboard** can approve it.
+
+**The flow.** The agent runs `scripts/pw-promote request "note"`. The host service snapshots
+the workspace and dry-runs the promote against that snapshot. An administrator opens
+**Settings → System & Updates → Promote Project Workbench**, reads the dry run, enters their
+password and approves. The host service then promotes **exactly that snapshot**, and records
+the result. The promote restarts the dashboard's node process; the runner is a host service,
+so it finishes on its own and the dashboard shows the result after its restart.
+
+**Why the agent cannot approve.** Each layer closes a specific route:
+
+- **The approve route admits only a person.** It needs a real dashboard session: the opaque
+  server-side id the login issued, for a non-implicit admin, arriving through nginx.
+  - **Refused:** on-box callers to `127.0.0.1:3000` (the agent can reach it and set any
+    header), the soft-mode implicit admin, `PW_AUTH_HEADER` / `PW_DEV_USER` identities (no
+    session), API tokens and non-admins.
+  - **Password:** it also re-checks the administrator's password, so script running in a page
+    on this origin with their cookie still cannot approve. That could be an agent's preview,
+    or a file it left in a box (those are now served sandboxed as well).
+  - **Lockout:** five wrong passwords lock that session out for 15 minutes.
+- **The approval is pinned to what was reviewed.** It records the approver and the snapshot's
+  digest, and expires after 24 hours. A dry run more than a day old cannot be approved.
+- **The runner re-verifies before promoting.** It checks the approval, the digest and the
+  expiry, recomputes the digest of the snapshot on disk, and only then promotes it.
+- **The spool `/etc/project-workbench/promote` is 0700 root.** The dashboard (root in its
+  container) writes requests, approvals and queue entries there, and the runner writes status
+  and logs. The agent account can neither read nor write it.
+- **The dry run hands the agent no root power.**
+  - The workspace is read **as its owner** (`setpriv --reuid --regid --clear-groups
+    --no-new-privs tar`); a root-owned workspace is refused.
+  - The archive goes into a root-owned file under a size cap, and root never runs `tar` over
+    it. The runner parses the ustar headers itself and accepts only regular files and
+    directories under `app/` and `scripts/`, with plain names. It refuses symlinks, hard
+    links, devices, FIFOs, extension headers, absolute or `..` paths, dash-leading names and
+    duplicates.
+  - HEAD comes from parsing `.git/HEAD` and refs as plain files, also as the owner; `git` is
+    never run as root in the agent's repo.
+- **The code that decides what root runs is installed by a human.** `pw-promote-app` (the
+  pinned `deploy/promote-app.sh`) and `pw-promote-runner` live root-owned in `/usr/local/sbin`,
+  and nothing refreshes them automatically: updating either is a human `sudo install`. Don't
+  promote from a copy under `persistent/admin-home`: that is `/home/admin`, which the agent
+  can write.
+
+**What an approval does not check: it trusts the content.** A promote can ship any code,
+including a change to the approval route itself. The dry run lists every new and changed file;
+review the commit before approving.
+
+**Install, once** (from a host shell on vnl2422; `install.sh` refuses if the gate could not
+hold — `/etc/project-workbench` must be root-owned and not group/other-writable, and host `node`
+and `/usr/bin/setpriv` must exist):
+
+    sudo bash /opt/project-workbench/workspaces/ProjectWorkbench/deploy/host/install.sh
+    systemctl status pw-promote.path
+
+Or just the promote pieces:
+
+    R=/opt/project-workbench/workspaces/ProjectWorkbench
+    sudo install -m 0755 -o root -g root $R/deploy/promote-app.sh /usr/local/sbin/pw-promote-app
+    sudo install -m 0755 -o root -g root $R/deploy/host/files/usr/local/sbin/pw-promote-runner /usr/local/sbin/pw-promote-runner
+    sudo install -d -m 0700 -o root -g root /etc/project-workbench/promote /etc/project-workbench/promote/requests /etc/project-workbench/promote/queue
+    sudo install -m 0644 $R/deploy/host/files/etc/systemd/system/pw-promote.path $R/deploy/host/files/etc/systemd/system/pw-promote.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now pw-promote.path
+
+The runner's own output is in `journalctl -u pw-promote.service`; each request's dry-run and
+promote logs are in its spool directory and in the Settings card.
