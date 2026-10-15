@@ -4066,7 +4066,14 @@ function groupKey(row){const id=row.dataset.category||'';return REAL.some(g=>g.i
 const searchHit=(row,q)=>!q||rowName(row).toLowerCase().includes(q)||rowTags(row).some(t=>t.toLowerCase().includes(q));
 let collapsed=new Set();try{collapsed=new Set(JSON.parse(localStorage.getItem('pwRailCollapsed')||'[]'))}catch{}
 function saveCollapsed(){try{localStorage.setItem('pwRailCollapsed',JSON.stringify([...collapsed]))}catch{}}
+// Regrouping moves every row, which can drop the list back to the top — after a drag, a
+// keyboard move or a category change that would lose the place you were working at. The
+// scroll position is put back, so the rail stays exactly where it was.
 function layoutGroups(){
+ const y=KEYS.scrollTop;
+ try{relayout()}finally{KEYS.scrollTop=y}
+}
+function relayout(){
  LIST.querySelectorAll('.railGroupHead').forEach(h=>h.remove());
  const rows=rowsOf();
  if(!REAL.length){rows.forEach(r=>LIST.appendChild(r));return}
