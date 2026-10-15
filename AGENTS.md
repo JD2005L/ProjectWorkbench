@@ -303,6 +303,7 @@ curl -fsS -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' 
 | `repo` | no | git URL to clone; omitted = empty `git init`'d workspace |
 | `port` | no | terminal port; default = next free from 7681 |
 | `devUrl`, `prodUrl`, `primaryUser`, `categories`, `pushToken` | no | as on the Manage form |
+| `categoryId` | no | the project's rail category: an `id` from `GET /api/project-categories` (any signed-in user). An unknown id is refused. `categories` above are the project's *tags*, comma-separated |
 | `adminOnly`, `defaultProject` | no | `"yes"` to set |
 | `previewCmd` | no | the Preview pane's command; `${PORT}` and `${BASEPATH}` are substituted. Blank/absent = no preview (and the two fields below are ignored) |
 | `previewPort` | no | number or numeric string, 1024–65535; default = next free port from 7790 (never the project's own terminal port) |

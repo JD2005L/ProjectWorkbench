@@ -70,6 +70,15 @@ Every project gets its own `ttyd` + persistent `tmux` session backed by Claude C
 
 ![Terminal](docs/screenshots/terminal.png)
 
+### Project rail: categories, tags and search
+The project rail down the left of every terminal is organized three ways, so a long list stays navigable:
+
+- **Categories** group it into sections you can collapse and expand (remembered per browser). Each project sits in at most one, chosen from an ordered list an admin manages in **Settings → Project categories**; the list's order is the rail's order, and projects with none sit under *Uncategorized* at the end. Renaming a category keeps its projects; deleting one moves them to Uncategorized.
+- **Tags** — any number per project — filter the rail *across* categories from the 🏷 menu at its top (a project matching any selected tag is shown; *No tags* and *📌 Pinned only* are there too).
+- **Search** narrows the list by project name as you type, looking inside collapsed sections too. Enter opens the first match, ↓ moves into the list, Esc clears.
+
+Admins set a project's category and tags by right-clicking it in the rail (or the keyboard context-menu key / Shift+F10): tags appear as badges, each with its own ×, and every change is saved and shown at once without reloading the page — the terminal is never restarted by it. The same two fields are in **Manage projects**. The project you are in always stays visible, whatever is filtered or collapsed.
+
 ### Settings
 A dedicated `/settings` page (admin-only) with sidebar tabs covers the day-to-day controls: **Users & Roles** (full CRUD), **CLIs & Sign-in**, **Environment** (permission mode, MCP mode), **System & Updates** (heal endpoints + readiness checklist), and **First Run** (launches the focused Setup Wizard modal).
 

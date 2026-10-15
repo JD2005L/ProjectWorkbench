@@ -42,10 +42,12 @@ test('categories round-trip: manage form → sanitized registry → config → r
     assert.deepEqual(before.categories, [], 'a project starts with no categories');
     const htmlBefore = await cockpitHtml(base, name);
     assert.match(htmlBefore, /id="railFilter"/, 'the dropdown renders even with no tags');
-    assert.match(htmlBefore, /data-cat="\|pinned"/, 'Pinned only is offered');
     assert.match(htmlBefore, /id="railPinToggle"/, 'the quick toggle sits next to the dropdown');
-    assert.equal([...htmlBefore.matchAll(/data-cat="/g)].length, 1,
-      'no category or Uncategorized options without tags');
+    // The options themselves (Pinned only, one per tag, No tags) are built in the browser from the
+    // rows' data-cats, so an in-place tag edit is offered at once; the server renders the frame.
+    assert.match(htmlBefore, /id="railFilterOpts"/, 'the option list the client fills is rendered');
+    assert.match(htmlBefore, /opt\('\|pinned','📌 Pinned only'/, 'Pinned only is always offered by the client builder');
+    assert.match(htmlBefore, /id="railSearch"[^>]*type="search"/, 'the name search box renders');
     assert.match(htmlBefore, /class="pkeyRow"[^>]*data-cats=""/, 'rows carry an empty data attribute');
 
     // Tagging through the same form the Manage modal posts. The raw value exercises every
@@ -65,17 +67,16 @@ test('categories round-trip: manage form → sanitized registry → config → r
     const html = await cockpitHtml(base, name);
     assert.match(html, /data-cats="Client Sites\|Internal Tools\|weird\|X{40}"/,
       'the rail row serializes the tags pipe-joined for the client filter');
-    assert.match(html, /<input type="checkbox" data-cat="Client Sites">/, 'each category is a checkbox option');
-    assert.doesNotMatch(html, /data-cat="\|none"/,
-      'no Uncategorized option while every visible project is tagged');
+    assert.match(html, /if\(tags\.length&&untagged\)opt\('\|none','No tags'/,
+      'No tags is offered only when some projects are tagged and some are not');
 
     // A second, untagged project makes the set mixed: Uncategorized appears with its count.
     const twin = `${name}b`;
     const added = await form(base, '/manage/add', { name: twin, port: String(before.port + 1) });
     assert.equal(added.ok, true, `second project must be created: ${JSON.stringify(added)}`);
     const mixed = await cockpitHtml(base, name);
-    assert.match(mixed, /data-cat="\|none"><span class="n">Uncategorized<\/span><span class="cnt">1<\/span>/,
-      'a mixed set offers Uncategorized, counting the untagged projects');
+    assert.equal([...mixed.matchAll(/class="pkeyRow"[^>]*data-cats=""/g)].length, 1,
+      'the mixed set is visible to the client builder: exactly one untagged row');
 
     // Clearing the field removes the stored key entirely (config returns [] again); the category
     // options leave with the last tag, but the dropdown itself stays for Pinned only.
@@ -85,9 +86,8 @@ test('categories round-trip: manage form → sanitized registry → config → r
     assert.equal(clear.ok, true, `clearing must succeed: ${JSON.stringify(clear)}`);
     assert.deepEqual((await configOf(base, name)).categories, [], 'clearing the field clears the tags');
     const cleared = await cockpitHtml(base, name);
-    assert.doesNotMatch(cleared, /data-cat="Client Sites"/, 'category options leave with the last tag');
-    assert.doesNotMatch(cleared, /data-cat="\|none"/, 'Uncategorized leaves with them');
-    assert.match(cleared, /data-cat="\|pinned"/, 'Pinned only stays');
+    assert.doesNotMatch(cleared, /data-cats="[^"]*Client Sites/, 'the tag leaves the row, so the client no longer offers it');
+    assert.match(cleared, /id="railFilter"/, 'the filter stays for Pinned only');
   });
 });
 
@@ -98,7 +98,13 @@ test('right-click category management updates only tags and preserves the live p
     assert.match(html, /addEventListener\('contextmenu'/, 'the rail opens it on right click');
     assert.match(html, /e\.key!=='ContextMenu'/, 'the keyboard ContextMenu key opens the menu');
     assert.match(html, /e\.shiftKey&&e\.key==='F10'/, 'Shift+F10 opens the same menu');
-    assert.match(html, /Manage category tags/, 'the menu explains its focused action');
+    assert.match(html, /aria-label="Organize project"/, 'the menu is labelled for what it does');
+    assert.match(html, /id="railCatSelect"/, 'it offers the category');
+    assert.match(html, /id="railTagChips"/, 'and the tags as badges');
+    assert.match(html, /aria-label','Remove tag '\+t/, 'each badge has its own labelled remove button');
+    const organize = html.slice(html.indexOf('Organizing the rail'), html.indexOf('layoutGroups();rebuildTagMenu();'));
+    assert.ok(organize.length > 1000, 'sanity: the rail organize code is on the page');
+    assert.doesNotMatch(organize, /location\.reload\(\)/, 'no edit reloads the page (the terminal view would restart)');
 
     const before = await configOf(base, name);
     const sessionBefore = (await tmux(sock, ['display-message', '-p', '-t', `pw_${name}`, '#{session_id}'])).trim();
