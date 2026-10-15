@@ -3950,6 +3950,17 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .railGroupBtn .gName{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .railGroupBtn .gCnt{font:10.5px var(--mono);letter-spacing:0}
 .railNoMatch{margin:8px 10px;font:12px var(--font);color:var(--faint)}
+/* Drag-to-reorder (admins). The line shows where the project will land; a section header
+   lights up when the drop would put it at the top of that category. */
+.railKeys[data-reorder] .pkeyRow{cursor:grab}
+.pkeyRow.dragging{opacity:.4}
+.pkeyRow.drop-before::before,.pkeyRow.drop-after::after{content:'';position:absolute;left:6px;right:10px;height:3px;border-radius:2px;background:var(--cyan);box-shadow:0 0 8px rgba(56,189,248,.7);pointer-events:none;z-index:3}
+.pkeyRow.drop-before::before{top:-5px}
+.pkeyRow.drop-after::after{bottom:-5px}
+.railGroupHead.drop-into .railGroupBtn{color:var(--cyan);border-top-color:var(--cyan)}
+.railToast{position:fixed;left:12px;bottom:44px;z-index:130;max-width:min(360px,calc(100vw - 24px));padding:8px 12px;border-radius:10px;background:var(--elev2);border:1px solid var(--line2);box-shadow:0 18px 40px -12px rgba(0,0,0,.9);color:var(--text);font:12px var(--font)}
+.railToast.err{border-color:#b91c1c;color:#fecaca}
+.railToast[hidden]{display:none}
 .railNoMatch[hidden]{display:none}
 @container (min-width:180px){.railSearch{display:block}.railGroupBtn{justify-content:flex-start}.railGroupBtn .gName,.railGroupBtn .gCnt{display:inline}}
 @container (min-width:180px){.railBrandName{opacity:1;transform:none}#railToggle .chev{opacity:1}.pk-meta{opacity:1;transform:none}.railActLabel{opacity:1;transform:none}.railWhoName{opacity:1}.pk-pin{display:grid}.railFilterLabel{opacity:1;transform:none}.railFilterBtn .chev{opacity:1}.railPinToggle{display:grid}}
@@ -4006,7 +4017,7 @@ function railHtml(projects, currentName, user, deployConfigured=false, projectCa
  // list, and its tags as badges that each clear on their own. Every change saves at once and the
  // rail is regrouped in place — never a page reload, which would restart the terminal view.
  const categoryMenu = isAdmin ? `<div id="railCategoryMenu" class="railCategoryMenu" role="dialog" aria-label="Organize project" hidden><div class="railCategoryHead"><div id="railCategoryTitle" class="railCategoryTitle"></div></div><label class="railMenuLbl" for="railCatSelect">Category</label><select id="railCatSelect" class="railCategoryInput"></select><span class="railMenuLbl" id="railTagsLbl">Tags</span><div id="railTagChips" class="railTagChips" role="list" aria-labelledby="railTagsLbl"></div><input id="railTagInput" class="railCategoryInput" type="text" maxlength="40" list="railTagList" placeholder="Add a tag, then Enter" autocomplete="off" aria-label="Add a tag"><datalist id="railTagList"></datalist><div id="railCategoryStatus" class="railCategoryStatus" role="status" aria-live="polite"></div><div class="railCategoryActions"><a class="railManageCats" href="${BASE}/settings#categories">Manage categories</a><button id="railCategoryDone" class="save" type="button">Done</button></div></div>` : '';
- return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div>${railFilter}<nav id="railKeys" class="railKeys" aria-label="Projects" data-groups="${esc(JSON.stringify(groups))}"><ul class="railKeysList">${keys}</ul><p id="railNoMatch" class="railNoMatch" hidden>No projects match.</p></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>${categoryMenu}`;
+ return `<aside id="rail" aria-label="Projects"><div id="railPanel"><div class="railHead"><button id="railToggle" type="button" aria-expanded="false" title="Pin the project rail open"><span class="brandGlyph" aria-hidden="true">&gt;_</span><span class="railBrandName">Workbench</span><span class="chev" aria-hidden="true">›</span></button></div>${railFilter}<nav id="railKeys" class="railKeys" aria-label="Projects" data-groups="${esc(JSON.stringify(groups))}"${isAdmin ? ' data-reorder="1"' : ''}><ul class="railKeysList">${keys}</ul><p id="railNoMatch" class="railNoMatch" hidden>No projects match.</p></nav><div class="railFoot">${autoPinBtn}${deployAct}${adminActs}${who}</div></div></aside><div id="railScrim" aria-hidden="true"></div>${categoryMenu}${isAdmin ? '<div id="railToast" class="railToast" role="status" aria-live="polite" hidden></div>' : ''}`;
 }
 
 const railScript = `<script>(function(){
@@ -4156,6 +4167,94 @@ if(search){
   const hit=hits.find(r=>!r.querySelector('.pkey.current'))||hits[0];
   const link=hit&&hit.querySelector('.pkey');if(!link)return;
   e.preventDefault();if(e.key==='Enter'&&q)link.click();else link.focus();
+ });
+}
+// Admin: drag a project to reorder the rail — the global projects.json order, the same one
+// Manage projects edits. Dropping it into another category's section, or on a section header,
+// also moves it into that category, so what you see is what is saved. Alt+ArrowUp/Down moves the
+// focused project within its section. Each move is saved at once and shown in place (never a
+// reload); saves run one at a time, and a failed one is put back with a message.
+if(KEYS.dataset.reorder){
+ const toast=document.getElementById('railToast');let toastTimer=0;
+ function note(t,err){if(!toast)return;toast.textContent=t;toast.classList.toggle('err',!!err);toast.hidden=false;clearTimeout(toastTimer);toastTimer=setTimeout(()=>{toast.hidden=true},err?7000:2400)}
+ async function call(url,method,body){
+  const r=await fetch(url,{method,headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(body)});
+  let j={};try{j=await r.json()}catch{}
+  if(!r.ok||!j.ok)throw new Error(j.error||('Request failed ('+r.status+')'));return j;
+ }
+ let saving=Promise.resolve();
+ // Put row just before ref (null: at the end) in the global order, in section toGroup.
+ function move(row,ref,toGroup){
+  const before=rowsOf().map(r=>({r,order:r.dataset.order,category:r.dataset.category||''}));
+  const rows=rowsOf().filter(r=>r!==row);
+  const at=ref?rows.indexOf(ref):-1;
+  rows.splice(at<0?rows.length:at,0,row);
+  const unchanged=rows.every((r,i)=>r.dataset.order===String(i));
+  const changeCat=REAL.length>0&&toGroup!==groupKey(row);
+  if(unchanged&&!changeCat)return saving;
+  rows.forEach((r,i)=>{r.dataset.order=String(i)});
+  if(changeCat){row.dataset.category=toGroup===UNCAT?'':toGroup;collapsed.delete(toGroup);saveCollapsed()}
+  layoutGroups();applyCatFilter();
+  const name=rowName(row),order=rows.map(rowName);
+  saving=saving.then(async()=>{
+   let catSaved=false;
+   try{
+    if(changeCat){await call('${BASE}/api/projects/'+encodeURIComponent(name)+'/category','PUT',{categoryId:toGroup===UNCAT?null:toGroup});catSaved=true}
+    if(!unchanged)await call('${BASE}/api/projects/reorder','POST',{order});
+    if(changeCat){const g=REAL.find(x=>x.id===toGroup);note('Moved '+name+' to '+(g?'“'+g.name+'”':'Uncategorized'))}
+   }catch(err){
+    // Put the order back; keep a category change the server did accept, so the rail never
+    // shows something other than what is saved.
+    before.forEach(x=>{x.r.dataset.order=x.order;if(!(catSaved&&x.r===row))x.r.dataset.category=x.category});
+    layoutGroups();applyCatFilter();
+    note('Could not move '+name+': '+(err.message||String(err)),true);
+   }
+  });
+  return saving;
+ }
+ rowsOf().forEach(r=>{r.draggable=true});
+ let dragRow=null;
+ const clearMarks=()=>LIST.querySelectorAll('.drop-before,.drop-after,.drop-into').forEach(el=>el.classList.remove('drop-before','drop-after','drop-into'));
+ function dropTarget(e){
+  const head=e.target.closest('.railGroupHead');if(head)return{head};
+  const row=e.target.closest('.pkeyRow');if(!row||row===dragRow)return null;
+  const box=row.getBoundingClientRect();return{row,after:e.clientY>box.top+box.height/2};
+ }
+ LIST.addEventListener('dragstart',e=>{
+  const row=e.target.closest('.pkeyRow');if(!row)return;
+  dragRow=row;row.classList.add('dragging');
+  try{e.dataTransfer.effectAllowed='move';e.dataTransfer.setData('text/plain',rowName(row))}catch{}
+ });
+ LIST.addEventListener('dragend',()=>{if(dragRow)dragRow.classList.remove('dragging');dragRow=null;clearMarks()});
+ LIST.addEventListener('dragover',e=>{
+  if(!dragRow)return;const t=dropTarget(e);clearMarks();if(!t)return;
+  e.preventDefault();try{e.dataTransfer.dropEffect='move'}catch{}
+  if(t.head)t.head.classList.add('drop-into');else t.row.classList.add(t.after?'drop-after':'drop-before');
+ });
+ LIST.addEventListener('dragleave',e=>{if(!LIST.contains(e.relatedTarget))clearMarks()});
+ LIST.addEventListener('drop',e=>{
+  if(!dragRow)return;const t=dropTarget(e);clearMarks();if(!t)return;e.preventDefault();
+  const row=dragRow,others=rowsOf().filter(r=>r!==row);
+  if(t.head){
+   // On a header: the top of that section (or, if it holds only this project, where it is).
+   const g=t.head.dataset.group;
+   const first=others.find(r=>groupKey(r)===g);
+   const all=rowsOf();move(row,first||all[all.indexOf(row)+1]||null,g);
+  }else{
+   const i=others.indexOf(t.row);
+   move(row,t.after?(others[i+1]||null):t.row,groupKey(t.row));
+  }
+ });
+ KEYS.addEventListener('keydown',e=>{
+  if(!e.altKey||(e.key!=='ArrowUp'&&e.key!=='ArrowDown'))return;
+  const link=e.target.closest('.pkey');if(!link)return;
+  e.preventDefault();
+  const row=link.closest('.pkeyRow'),g=groupKey(row);
+  const peers=rowsOf().filter(r=>groupKey(r)===g&&!r.classList.contains('catHidden'));
+  const i=peers.indexOf(row);
+  if(e.key==='ArrowUp'){if(i<=0)return;move(row,peers[i-1],g)}
+  else{if(i<0||i>=peers.length-1)return;const others=rowsOf().filter(r=>r!==row);move(row,others[others.indexOf(peers[i+1])+1]||null,g)}
+  link.focus();
  });
 }
 // Admin: right-click (or the context-menu key) on a project to set its category and tags. Each

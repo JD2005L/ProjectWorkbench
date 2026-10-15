@@ -69,6 +69,8 @@ test('a project\'s category is set, rendered for grouping, and cleared — witho
     assert.deepEqual(groupsOf(html), [cat, other, { id: 'uncategorized', name: 'Uncategorized', builtin: true }],
       'the rail is handed the full order to group by, Uncategorized included');
     assert.match(rowOf(html, name), new RegExp(`data-category="${cat.id}"`), 'and the row its category');
+    assert.match(html, /<nav id="railKeys"[^>]*data-reorder="1"/, 'an admin can drag projects to reorder the rail');
+    assert.match(html, /\/api\/projects\/reorder','POST',\{order\}/, 'which saves through the same reorder route as Manage projects');
     assert.match(html, /id="railSearch"[^>]*aria-label="Search projects by name or tag"/, 'with the search box');
     assert.match(html, /const searchHit=\(row,q\)=>!q\|\|rowName\(row\)\.toLowerCase\(\)\.includes\(q\)\|\|rowTags\(row\)\.some\(/,
       'which matches a project by its name or any of its tags');

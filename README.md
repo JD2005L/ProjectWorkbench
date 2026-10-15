@@ -77,7 +77,9 @@ The project rail down the left of every terminal is organized three ways, so a l
 - **Tags** — any number per project — filter the rail *across* categories from the 🏷 menu at its top (a project matching any selected tag is shown; *No tags* and *📌 Pinned only* are there too).
 - **Search** narrows the list as you type, matching a project's name or any of its tags, and looks inside collapsed sections too. Enter opens the first match, ↓ moves into the list, Esc clears.
 
-Admins set a project's category and tags by right-clicking it in the rail (or the keyboard context-menu key / Shift+F10): tags appear as badges, each with its own ×, and every change is saved and shown at once without reloading the page — the terminal is never restarted by it. The same two fields are in **Manage projects**. The project you are in always stays visible, whatever is filtered or collapsed.
+Admins set a project's category and tags by right-clicking it in the rail (or the keyboard context-menu key / Shift+F10): tags appear as badges, each with its own ×, and every change is saved and shown at once without reloading the page — the terminal is never restarted by it. The same two fields are in **Manage projects**.
+
+Admins can also **drag a project** up or down the rail to reorder it (the same global order Manage projects edits). Dropping it into another category's section, or onto a section header, moves it into that category too. With a project focused, **Alt+↑ / Alt+↓** moves it within its section. Every move saves at once; one that fails is put back with a message. The project you are in always stays visible, whatever is filtered or collapsed.
 
 ### Settings
 A dedicated `/settings` page (admin-only) with sidebar tabs covers the day-to-day controls: **Users & Roles** (full CRUD), **CLIs & Sign-in**, **Environment** (permission mode, MCP mode), **System & Updates** (heal endpoints + readiness checklist), and **First Run** (launches the focused Setup Wizard modal).
