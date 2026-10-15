@@ -29,23 +29,29 @@ const rowOf = (html, name) => html.match(new RegExp(`<li class="pkeyRow"[^>]*>(?
 
 test('the category list: ids are assigned, names cleaned, order kept, duplicates and blanks refused', { timeout: 120000 }, async () => {
   await withCockpit(async ({ base }) => {
-    assert.deepEqual((await json(base, '/api/project-categories', 'GET')).body.categories, [], 'starts empty');
+    const UNCAT = { id: 'uncategorized', name: 'Uncategorized', builtin: true };
+    assert.deepEqual((await json(base, '/api/project-categories', 'GET')).body.categories, [UNCAT],
+      'starts with only the built-in Uncategorized entry');
 
     const saved = await json(base, '/api/project-categories', 'PUT', { categories: [{ name: '  Client   Work ' }, { name: 'Internal' }] });
     assert.equal(saved.status, 200, JSON.stringify(saved.body));
-    assert.deepEqual(saved.body.categories.map((c) => c.name), ['Client Work', 'Internal'], 'cleaned, in the order given');
+    assert.deepEqual(saved.body.categories.map((c) => c.name), ['Client Work', 'Internal', 'Uncategorized'],
+      'cleaned, in the order given, with Uncategorized appended last when the list does not place it');
     for (const c of saved.body.categories) assert.match(c.id, /^[a-z0-9]{1,24}$/, 'each new entry gets an id');
 
     // A rename and a reorder keep the ids.
     const [client, internal] = saved.body.categories;
-    const renamed = await json(base, '/api/project-categories', 'PUT', { categories: [{ id: internal.id, name: 'Internal Tools' }, { id: client.id, name: 'Clients' }] });
-    assert.deepEqual(renamed.body.categories, [{ id: internal.id, name: 'Internal Tools' }, { id: client.id, name: 'Clients' }]);
+    const renamed = await json(base, '/api/project-categories', 'PUT', { categories: [{ id: internal.id, name: 'Internal Tools' }, { id: 'uncategorized', name: 'ignored' }, { id: client.id, name: 'Clients' }] });
+    assert.deepEqual(renamed.body.categories, [{ id: internal.id, name: 'Internal Tools' }, UNCAT, { id: client.id, name: 'Clients' }],
+      'Uncategorized takes the position given, keeping its fixed name');
     assert.deepEqual((await json(base, '/api/project-categories', 'GET')).body.categories, renamed.body.categories, 'persisted');
 
     const dup = await json(base, '/api/project-categories', 'PUT', { categories: [{ name: 'A' }, { name: 'a' }] });
     assert.equal(dup.status, 400, 'names are unique case-insensitively');
     const blank = await json(base, '/api/project-categories', 'PUT', { categories: [{ name: '   ' }] });
     assert.equal(blank.status, 400, 'every category needs a name');
+    const impostor = await json(base, '/api/project-categories', 'PUT', { categories: [{ name: 'uncategorized' }] });
+    assert.equal(impostor.status, 400, 'a category cannot take the built-in name');
     assert.deepEqual((await json(base, '/api/project-categories', 'GET')).body.categories, renamed.body.categories, 'a refused save changes nothing');
   });
 });
@@ -60,7 +66,8 @@ test('a project\'s category is set, rendered for grouping, and cleared — witho
     assert.equal((await configOf(base, name)).project.categoryId, cat.id, 'stored on the project');
 
     const html = await cockpit(base, name);
-    assert.deepEqual(groupsOf(html), [cat, other], 'the rail is handed the ordered list to group by');
+    assert.deepEqual(groupsOf(html), [cat, other, { id: 'uncategorized', name: 'Uncategorized', builtin: true }],
+      'the rail is handed the full order to group by, Uncategorized included');
     assert.match(rowOf(html, name), new RegExp(`data-category="${cat.id}"`), 'and the row its category');
     assert.match(html, /id="railSearch"[^>]*aria-label="Search projects by name or tag"/, 'with the search box');
     assert.match(html, /const searchHit=\(row,q\)=>!q\|\|rowName\(row\)\.toLowerCase\(\)\.includes\(q\)\|\|rowTags\(row\)\.some\(/,
@@ -69,6 +76,8 @@ test('a project\'s category is set, rendered for grouping, and cleared — witho
     const unknown = await json(base, `/api/projects/${encodeURIComponent(name)}/category`, 'PUT', { categoryId: 'nosuchcat' });
     assert.equal(unknown.status, 400, 'an id that is not in the list is refused');
     assert.equal((await configOf(base, name)).project.categoryId, cat.id, 'and changes nothing');
+    const builtin = await json(base, `/api/projects/${encodeURIComponent(name)}/category`, 'PUT', { categoryId: 'uncategorized' });
+    assert.equal(builtin.status, 400, 'the built-in entry is a position, not a category a project can be put in');
     const missing = await json(base, '/api/projects/does-not-exist/category', 'PUT', { categoryId: cat.id });
     assert.equal(missing.status, 404, 'unknown projects are not created by a category edit');
 

@@ -2035,20 +2035,35 @@ function parseCategories(raw){
 // (`projectCategories: [{id, name}]`), and at most one per project as `p.categoryId`. A project
 // points at the id, so renaming a category is an edit to the list alone; an id that is no longer
 // in the list reads as "Uncategorized" and is dropped from projects when the list is saved.
+//
+// "Uncategorized" is itself an entry in the order (reserved id `uncategorized`, `builtin:true`),
+// so it can sit above some categories: movable like any other, but never renamed, deleted or
+// assigned to a project. A list that does not mention it gets it appended last — which is where
+// it always was, so a list saved before this existed renders exactly as it did.
 const PROJECT_CATEGORY_ID_RE = /^[a-z0-9]{1,24}$/;
+const UNCATEGORIZED_ID = 'uncategorized';
+const UNCATEGORIZED_NAME = 'Uncategorized';
 function cleanCategoryName(raw){ return String(raw ?? '').replace(/[|\u0000-\u001f\u007f]/g,'').replace(/\s+/g,' ').trim().slice(0,40); }
 function normalizeProjectCategories(list){
  const out = [];
- const ids = new Set(), names = new Set();
+ const ids = new Set(), names = new Set([UNCATEGORIZED_NAME.toLowerCase()]);
+ let real = 0;
  for(const item of Array.isArray(list) ? list : []){
   const id = typeof item?.id === 'string' ? item.id : '';
+  if(id === UNCATEGORIZED_ID){
+   if(!ids.has(id)){ ids.add(id); out.push({ id, name:UNCATEGORIZED_NAME, builtin:true }); }
+   continue;
+  }
   const name = cleanCategoryName(item?.name);
-  if(!PROJECT_CATEGORY_ID_RE.test(id) || !name || ids.has(id) || names.has(name.toLowerCase())) continue;
-  ids.add(id); names.add(name.toLowerCase());
+  if(!PROJECT_CATEGORY_ID_RE.test(id) || !name || ids.has(id) || names.has(name.toLowerCase()) || real >= 200) continue;
+  ids.add(id); names.add(name.toLowerCase()); real++;
   out.push({ id, name });
  }
- return out.slice(0,200);
+ if(!ids.has(UNCATEGORIZED_ID)) out.push({ id:UNCATEGORIZED_ID, name:UNCATEGORIZED_NAME, builtin:true });
+ return out;
 }
+// The categories a project can be put in: every entry but the built-in Uncategorized.
+function assignableProjectCategories(list){ return normalizeProjectCategories(list).filter(c => !c.builtin); }
 // The Manage form and the register API send `categoryId` as a field; absent means "leave it
 // alone", so a client that predates categories can never clear one by omission. An id that is
 // not in the managed list is refused rather than stored as a grouping nobody can see.
@@ -2056,13 +2071,13 @@ async function categoryIdFromBody(body){
  if(!body || !Object.hasOwn(body, 'categoryId')) return { set:false };
  const id = String(body.categoryId ?? '').trim();
  if(!id) return { set:true, id:'' };
- const categories = normalizeProjectCategories((await loadWorkbenchSettings()).projectCategories);
+ const categories = assignableProjectCategories((await loadWorkbenchSettings()).projectCategories);
  if(!categories.some(c => c.id === id)) throw new Error('Unknown category — it may have been deleted; reload and choose again');
  return { set:true, id };
 }
 function projectCategoryOf(p, categories){
  const id = typeof p?.categoryId === 'string' ? p.categoryId : '';
- return id && categories.some(c => c.id === id) ? id : '';
+ return id && categories.some(c => c.id === id && !c.builtin) ? id : '';
 }
 function hasPreview(p){ return !!(p && p.preview && typeof p.preview.cmd === 'string' && p.preview.cmd.trim() && Number(p.preview.port) > 0); }
 function previewUnit(name){ return `project-preview@${name}.service`; }
@@ -4027,10 +4042,14 @@ const LIST=KEYS.querySelector('.railKeysList');
 const NOMATCH=document.getElementById('railNoMatch');
 let GROUPS=[];try{GROUPS=JSON.parse(KEYS.dataset.groups||'[]')}catch{}
 const UNCAT='|none';
+// GROUPS is the full order, including the built-in Uncategorized entry wherever the admin put it;
+// REAL is what a project can be assigned to. No real categories means no sections at all.
+const REAL=GROUPS.filter(g=>!g.builtin);
+const SECTIONS=(GROUPS.some(g=>g.builtin)?GROUPS:[...GROUPS,{builtin:true}]).map(g=>g.builtin?{id:UNCAT,name:'Uncategorized'}:g);
 const rowsOf=()=>[...LIST.querySelectorAll('.pkeyRow')].sort((a,b)=>Number(a.dataset.order)-Number(b.dataset.order));
 const rowTags=row=>(row&&row.dataset.cats||'').split('|').filter(Boolean);
 const rowName=row=>{const k=row.querySelector('.pkey');return k?(k.dataset.project||''):''};
-function groupKey(row){const id=row.dataset.category||'';return GROUPS.some(g=>g.id===id)?id:UNCAT}
+function groupKey(row){const id=row.dataset.category||'';return REAL.some(g=>g.id===id)?id:UNCAT}
 // What the search box matches: the project's name or any of its tags, case-insensitively, as a
 // substring. One rule for both the filtering and the Enter/ArrowDown jump.
 const searchHit=(row,q)=>!q||rowName(row).toLowerCase().includes(q)||rowTags(row).some(t=>t.toLowerCase().includes(q));
@@ -4039,8 +4058,8 @@ function saveCollapsed(){try{localStorage.setItem('pwRailCollapsed',JSON.stringi
 function layoutGroups(){
  LIST.querySelectorAll('.railGroupHead').forEach(h=>h.remove());
  const rows=rowsOf();
- if(!GROUPS.length){rows.forEach(r=>LIST.appendChild(r));return}
- for(const g of [...GROUPS,{id:UNCAT,name:'Uncategorized'}]){
+ if(!REAL.length){rows.forEach(r=>LIST.appendChild(r));return}
+ for(const g of SECTIONS){
   const members=rows.filter(r=>groupKey(r)===g.id);if(!members.length)continue;
   const li=document.createElement('li');li.className='railGroupHead';li.dataset.group=g.id;
   const b=document.createElement('button');b.type='button';b.className='railGroupBtn';
@@ -4166,9 +4185,9 @@ if(catMenu){
  }
  function fillSelect(){
   sel.textContent='';
-  const none=document.createElement('option');none.value='';none.textContent=GROUPS.length?'— Uncategorized —':'No categories yet — add them in Settings';sel.appendChild(none);
-  GROUPS.forEach(g=>{const o=document.createElement('option');o.value=g.id;o.textContent=g.name;sel.appendChild(o)});
-  const k=groupKey(menuRow);sel.value=k===UNCAT?'':k;sel.disabled=!GROUPS.length;
+  const none=document.createElement('option');none.value='';none.textContent=REAL.length?'— Uncategorized —':'No categories yet — add them in Settings';sel.appendChild(none);
+  REAL.forEach(g=>{const o=document.createElement('option');o.value=g.id;o.textContent=g.name;sel.appendChild(o)});
+  const k=groupKey(menuRow);sel.value=k===UNCAT?'':k;sel.disabled=!REAL.length;
  }
  function openCatMenu(row,x,y){
   menuTrigger=row.querySelector('.pkey');menuProject=menuTrigger?.dataset.project||'';if(!menuProject)return;
@@ -4215,7 +4234,7 @@ if(catMenu){
     await send('${BASE}/api/projects/'+encodeURIComponent(project)+'/category',{categoryId:id||null});
     row.dataset.category=id;collapsed.delete(id||UNCAT);saveCollapsed();
     layoutGroups();applyCatFilter();
-    const g=GROUPS.find(x=>x.id===id);say(g?'Moved to “'+g.name+'”':'Moved to Uncategorized');
+    const g=REAL.find(x=>x.id===id);say(g?'Moved to “'+g.name+'”':'Moved to Uncategorized');
    }catch(err){say(err.message||String(err),true);if(menuRow===row)fillSelect()}
   });
  });
@@ -4810,7 +4829,7 @@ app.put(BASE + '/api/projects/:name/category', requireAdmin, async (req,res) => 
  const raw = req.body?.categoryId;
  if(raw !== null && raw !== '' && typeof raw !== 'string') return res.status(400).json({ ok:false, error:'categoryId must be a string or null' });
  const categoryId = raw || '';
- const categories = normalizeProjectCategories((await loadWorkbenchSettings()).projectCategories);
+ const categories = assignableProjectCategories((await loadWorkbenchSettings()).projectCategories);
  if(categoryId && !categories.some(c => c.id === categoryId)) return res.status(400).json({ ok:false, error:'Unknown category — it may have been deleted; reopen the menu' });
  let found = false;
  await withProjectsLock(async () => {
@@ -4837,12 +4856,14 @@ app.get(BASE + '/api/project-categories', requireAuth, async (_req,res) => { try
 });
 app.put(BASE + '/api/project-categories', requireAdmin, async (req,res) => { try {
  const input = req.body?.categories;
- if(!Array.isArray(input) || input.length > 200) return res.status(400).json({ ok:false, error:'categories must be an array of at most 200 entries' });
+ if(!Array.isArray(input) || input.length > 201) return res.status(400).json({ ok:false, error:'categories must be an array of at most 200 categories (plus Uncategorized)' });
  const draft = [];
  const seen = new Set();
  for(const item of input){
+  if(item?.id === UNCATEGORIZED_ID){ draft.push({ id:UNCATEGORIZED_ID }); continue; }   // its place in the order only
   const name = cleanCategoryName(item?.name);
   if(!name) return res.status(400).json({ ok:false, error:'Every category needs a name' });
+  if(name.toLowerCase() === UNCATEGORIZED_NAME.toLowerCase()) return res.status(400).json({ ok:false, error:'"Uncategorized" is built in — move it in the list instead of adding it' });
   if(seen.has(name.toLowerCase())) return res.status(400).json({ ok:false, error:`"${name}" is listed twice` });
   seen.add(name.toLowerCase());
   const id = typeof item?.id === 'string' && PROJECT_CATEGORY_ID_RE.test(item.id) ? item.id : crypto.randomBytes(5).toString('hex');
@@ -4876,7 +4897,7 @@ app.get(BASE + '/api/projects/config', requireAdmin, async (_req,res)=>{ try {
    pushTokenKind: p.pushToken ? (()=>{ try { return classifyGithubToken(decrypt(p.pushToken)); } catch { return 'unreadable'; } })() : 'none',
    preview: p.preview ? { cmd:p.preview.cmd||'', port:p.preview.port||'', env:p.preview.env||{} } : null,
    tabs: Array.isArray(p.tabs) ? p.tabs : [] })),
-  projectCategories: normalizeProjectCategories(settings.projectCategories),
+  projectCategories: assignableProjectCategories(settings.projectCategories),
   users: users.map(u => ({ username:u.username, hasToken: !!u.ghToken })),
   suggestedPort: nextPort(projects), suggestedPreviewPort: nextPreviewPort(projects) });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
@@ -6043,32 +6064,34 @@ function say(t,err){statusEl.textContent=t||'';statusEl.classList.toggle('err',!
 function mark(){dirty=true;say('Unsaved changes')}
 function render(){
  list.textContent='';
- if(!items.length){const p=document.createElement('p');p.className='muted';p.textContent='No categories yet. Add one below — until then the rail is a single list.';list.appendChild(p);return}
+ if(!items.some(x=>!x.builtin)){const p=document.createElement('p');p.className='muted';p.textContent='No categories yet. Add one below — until then the rail is a single list.';list.appendChild(p)}
  items.forEach((it,i)=>{
-  const row=document.createElement('div');row.className='pc-row';row.setAttribute('role','listitem');
+  const row=document.createElement('div');row.className='pc-row'+(it.builtin?' builtin':'');row.setAttribute('role','listitem');
   const name=document.createElement('input');name.type='text';name.maxLength=40;name.value=it.name;name.setAttribute('aria-label','Category name');
+  // Uncategorized is built in: it can be moved, never renamed or deleted.
+  if(it.builtin){name.disabled=true;name.value='Uncategorized — projects with no category';name.title='Built in. Move it to choose where its section appears.'}
   name.oninput=()=>{it.name=name.value;mark()};
   const mk=(label,title,fn,dis)=>{const b=document.createElement('button');b.type='button';b.className='button secondary small';b.textContent=label;b.title=title;b.setAttribute('aria-label',title+': '+it.name);b.disabled=!!dis;b.onclick=fn;return b};
   row.append(name,
    mk('↑','Move up',()=>{[items[i-1],items[i]]=[items[i],items[i-1]];mark();render()},i===0),
    mk('↓','Move down',()=>{[items[i+1],items[i]]=[items[i],items[i+1]];mark();render()},i===items.length-1),
-   mk('Delete','Delete',()=>{if(it.id&&!confirm('Delete "'+it.name+'"? Its projects move to Uncategorized when you save.'))return;items.splice(i,1);mark();render()}));
+   ...(it.builtin?[]:[mk('Delete','Delete',()=>{if(it.id&&!confirm('Delete "'+it.name+'"? Its projects move to Uncategorized when you save.'))return;items.splice(i,1);mark();render()})]));
   list.appendChild(row);
  });
 }
 async function load(){
- try{const r=await fetch('${BASE}/api/project-categories',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');items=j.categories.map(c=>({id:c.id,name:c.name}));dirty=false;render();say('')}
+ try{const r=await fetch('${BASE}/api/project-categories',{cache:'no-store'});const j=await r.json();if(!j.ok)throw new Error(j.error||'load failed');items=j.categories.map(c=>({id:c.id,name:c.name,builtin:!!c.builtin}));dirty=false;render();say('')}
  catch(e){say(e.message||String(e),true)}
 }
-function add(){const n=addIn.value.replace(/\\s+/g,' ').trim();if(!n)return;if(items.some(x=>x.name.trim().toLowerCase()===n.toLowerCase())){say('"'+n+'" is already in the list',true);return}items.push({name:n});addIn.value='';mark();render()}
+function add(){const n=addIn.value.replace(/\\s+/g,' ').trim();if(!n)return;if(n.toLowerCase()==='uncategorized'){say('"Uncategorized" is built in — move it in the list instead',true);return}if(items.some(x=>!x.builtin&&x.name.trim().toLowerCase()===n.toLowerCase())){say('"'+n+'" is already in the list',true);return}const at=items.length&&items[items.length-1].builtin?items.length-1:items.length;items.splice(at,0,{name:n});addIn.value='';mark();render()}
 addBtn.onclick=add;
 addIn.addEventListener('keydown',e=>{if(e.key==='Enter'){e.preventDefault();add()}});
 saveBtn.onclick=async()=>{
  saveBtn.disabled=true;say('Saving…');
  try{
-  const r=await fetch('${BASE}/api/project-categories',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({categories:items.map(x=>x.id?{id:x.id,name:x.name}:{name:x.name})})});
+  const r=await fetch('${BASE}/api/project-categories',{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({categories:items.map(x=>x.builtin?{id:x.id}:(x.id?{id:x.id,name:x.name}:{name:x.name}))})});
   const j=await r.json();if(!r.ok||!j.ok)throw new Error(j.error||('Save failed ('+r.status+')'));
-  items=j.categories.map(c=>({id:c.id,name:c.name}));dirty=false;render();
+  items=j.categories.map(c=>({id:c.id,name:c.name,builtin:!!c.builtin}));dirty=false;render();
   say('Saved'+(j.cleared&&j.cleared.length?' — '+j.cleared.length+' project'+(j.cleared.length===1?'':'s')+' moved to Uncategorized':'')+'. Open projects show the change on their next load.');
  }catch(e){say(e.message||String(e),true)}
  finally{saveBtn.disabled=false}
@@ -6094,7 +6117,7 @@ const settingsCss = `body{font-family:system-ui,-apple-system,Segoe UI,sans-seri
 .gh-ok{color:#86efac}
 .cellAct:hover{color:#bae6fd;text-decoration-style:solid}
 .cellAct:disabled{opacity:.5;cursor:not-allowed;text-decoration:none}.status-line{margin-top:.65rem;font-size:.82rem;color:#bbf7d0;min-height:1.2em}.status-line.err{color:#fca5a5}.env-grid2{display:grid;grid-template-columns:1fr 1fr;gap:.85rem}.env-grid2 label{display:flex;flex-direction:column;gap:.3rem;color:#cbd5e1;font-size:.85rem}.opt-help{font-size:.78rem;color:#94a3b8;line-height:1.45;margin-top:.2rem;min-height:2.4em}.opt-help.warn{color:#fca5a5}.opt-help b{color:#fde68a}.heal-out{margin:.55rem 0 0;background:#020617;border:1px solid #1f2937;border-radius:8px;padding:.55rem .75rem;font:12px ui-monospace,SFMono-Regular,Menlo,monospace;white-space:pre-wrap;color:#bbf7d0;display:none}.heal-out.show{display:block}.heal-out.err{color:#fca5a5}.cli-row{display:grid;grid-template-columns:1fr auto auto;gap:.5rem .85rem;align-items:center;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.5rem;background:#0b1220}.cli-row .meta{min-width:0;display:flex;flex-direction:column;gap:.15rem}.cli-row .label{font-weight:600}.cli-row .version{color:#94a3b8;font-size:.78rem}.cli-row .version.installed{color:#bbf7d0}.cli-row .signed-in{color:#86efac;font-size:.7rem;background:rgba(16,185,129,.12);border:1px solid #166534;border-radius:999px;padding:0 .55rem;align-self:flex-start;line-height:1.5;margin-top:.1rem}.cli-row .cli-checked{color:#94a3b8;font-size:.72rem;margin-top:.1rem}.t-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:.65rem .9rem;margin-bottom:.75rem}.t-grid label{display:flex;flex-direction:column;gap:.2rem;font-size:.85rem;color:#cbd5e1}/* display:flex above outranks the UA [hidden] rule, so a hidden field stays visible unless this re-asserts it — the same trap as .tabMenu vs .projLinks[hidden]. */.t-grid label[hidden]{display:none}.t-grid label.t-check{flex-direction:row;align-items:center;gap:.4rem}.t-grid label.t-check input{width:auto}.t-cmd{display:flex;flex-direction:column;gap:.25rem;font-size:.85rem;color:#cbd5e1}.t-cmd textarea{font:12px var(--mono,monospace);background:#020617;color:#e5e7eb;border:1px solid #334155;border-radius:8px;padding:.5rem;resize:vertical}.t-agentrow{display:flex;align-items:center;gap:.6rem;margin:.5rem 0 .2rem;font-size:.85rem;color:#cbd5e1}.t-agentrow label{display:flex;align-items:center;gap:.35rem}.t-actions{display:flex;gap:.4rem;flex-wrap:wrap;margin:.6rem 0 .2rem}.task-row{display:flex;align-items:center;gap:.75rem;justify-content:space-between;padding:.55rem .75rem;border:1px solid #1f2937;border-radius:8px;margin-bottom:.4rem;background:#0b1220}.task-row .tr-main{display:flex;flex-direction:column;gap:.15rem;min-width:0}.task-row .tr-name{font-weight:600}.task-row .tr-when,.task-row .tr-last{font-size:.76rem;color:#94a3b8;overflow:hidden;text-overflow:ellipsis}.task-row .tr-last.ok{color:#86efac}.task-row .tr-last.bad{color:#fca5a5}.task-row .tr-off{font-size:.7rem;color:#fca5a5}.task-row .tr-run{font-size:.7rem;color:#fde68a}.task-row .tr-acts{display:flex;gap:.3rem;flex:0 0 auto}.cli-row .cli-checked.bad{color:#fca5a5}.cli-row .note{color:#94a3b8;font-size:.78rem;grid-column:1/-1;margin-top:.15rem}.cli-row .checks{display:flex;gap:.55rem;align-items:center;flex-wrap:wrap}.cli-row .actions{display:flex;gap:.35rem}.cli-row label{margin:0;font-size:.85rem;color:#cbd5e1;display:inline-flex;align-items:center;gap:.3rem}.cli-row label input{width:auto}#authFrame{width:100%;height:340px;border:1px solid #334155;border-radius:8px;background:#1f1f1f;display:block;margin-top:.5rem}#authFrame.hidden{display:none}.check-list{margin:0;padding:0;list-style:none}.check-list li{padding:.3rem 0;color:#cbd5e1;font-size:.9rem;display:flex;align-items:center;gap:.5rem}.check-list .ok{color:#86efac}.check-list .warn{color:#fde68a}.check-list .err{color:#fca5a5}
-.um-form{display:flex;flex-direction:column;gap:.9rem}.um-form label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.um-form label.inline{flex-direction:row;align-items:center;gap:.45rem}.um-form label.inline input[type=checkbox]{width:auto;margin:0}.proj-picker{border:1px solid #1f2937;border-radius:8px;padding:.5rem .65rem;background:#0b1220}.proj-picker .star{display:flex;align-items:center;gap:.45rem;color:#fde68a;font-size:.85rem;padding-bottom:.45rem;border-bottom:1px solid #1f2937;margin-bottom:.45rem}.proj-picker .star input{width:auto;margin:0}.proj-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.3rem .85rem;max-height:240px;overflow-y:auto}.proj-list.disabled{opacity:.45;pointer-events:none}.proj-list label{flex-direction:row;align-items:center;gap:.4rem;font-size:.82rem;color:#cbd5e1;padding:.2rem 0;cursor:pointer}.proj-list label input{width:auto;margin:0}.proj-list .empty{color:#94a3b8;font-style:italic;font-size:.82rem}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}.pc-list{display:flex;flex-direction:column;gap:.45rem}.pc-row{display:flex;gap:.4rem;align-items:center}.pc-row input{flex:1 1 auto;min-width:0}.pc-add{display:flex;gap:.4rem;margin-top:.8rem}.pc-add input{flex:1 1 auto;min-width:0}`;
+.um-form{display:flex;flex-direction:column;gap:.9rem}.um-form label{display:flex;flex-direction:column;gap:.3rem;font-size:.85rem;color:#cbd5e1}.um-form label.inline{flex-direction:row;align-items:center;gap:.45rem}.um-form label.inline input[type=checkbox]{width:auto;margin:0}.proj-picker{border:1px solid #1f2937;border-radius:8px;padding:.5rem .65rem;background:#0b1220}.proj-picker .star{display:flex;align-items:center;gap:.45rem;color:#fde68a;font-size:.85rem;padding-bottom:.45rem;border-bottom:1px solid #1f2937;margin-bottom:.45rem}.proj-picker .star input{width:auto;margin:0}.proj-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:.3rem .85rem;max-height:240px;overflow-y:auto}.proj-list.disabled{opacity:.45;pointer-events:none}.proj-list label{flex-direction:row;align-items:center;gap:.4rem;font-size:.82rem;color:#cbd5e1;padding:.2rem 0;cursor:pointer}.proj-list label input{width:auto;margin:0}.proj-list .empty{color:#94a3b8;font-style:italic;font-size:.82rem}@media(max-width:780px){.s-layout{grid-template-columns:1fr}.s-tabs{display:flex;flex-wrap:wrap;border-right:0;border-bottom:1px solid #1f2937;padding:.5rem}.s-tabs button{width:auto}.row-form{grid-template-columns:1fr}.env-grid2{grid-template-columns:1fr}}.pc-list{display:flex;flex-direction:column;gap:.45rem}.pc-row{display:flex;gap:.4rem;align-items:center}.pc-row input{flex:1 1 auto;min-width:0}.pc-row.builtin input{font-style:italic;color:#94a3b8}.pc-add{display:flex;gap:.4rem;margin-top:.8rem}.pc-add input{flex:1 1 auto;min-width:0}`;
 
 const settingsScript = `<script>(function(){const tabs=document.querySelectorAll('.s-tabs button');const sections=document.querySelectorAll('.s-main section');function activate(id){tabs.forEach(b=>b.classList.toggle('active',b.dataset.tab===id));sections.forEach(s=>s.classList.toggle('active',s.id==='tab-'+id));try{history.replaceState(null,'','#'+id)}catch{}}tabs.forEach(b=>b.addEventListener('click',()=>activate(b.dataset.tab)));const init=(location.hash||'#users').slice(1);activate(['users','clis','env','categories','deployment','tasks','tokens','system','firstrun'].includes(init)?init:'users');function esc(s){return String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function setStatus(el,t,err){if(!el)return;el.textContent=t||'';el.classList.toggle('err',!!err)}
 // --- Users tab ---
@@ -6504,7 +6527,7 @@ app.get(BASE + '/settings', requireAdmin, async (req,res) => {
 <section id="tab-clis"><h2>${PER_USER_CLAUDE ? 'CLIs' : 'CLIs &amp; Sign-in'}</h2><p class="lead" id="cliLead">Install or update each assistant, then sign in. Credentials land in <code>/home/admin</code> and apply to every project terminal.</p><div class="s-card"><div id="cliRows"></div><div class="status-line" id="cliStatus"></div></div><div class="s-card" id="sharedAuthCard"><h3>Shared identity terminal</h3><div id="authHint" class="muted">Click <b>Sign in</b> on a CLI above. The login command is sent into the shared setup terminal below.</div><iframe id="authFrame" class="hidden" title="Setup auth terminal"></iframe></div></section>
 <section id="tab-env"><h2>Environment</h2><p class="lead">Wrapper-level policy applied to every Claude session this instance launches.</p><div class="s-card"><div class="env-grid2"><label>Permission mode<select id="permMode"><option value="prompt">Prompt for each permission (default, recommended)</option><option value="skip">Skip permission prompts (--dangerously-skip-permissions)</option></select><span class="opt-help" id="permHelp"></span></label><label>MCP mode<select id="mcpMode"><option value="inherit">Inherit (account MCP)</option><option value="isolated">Isolated (no external MCP)</option><option value="custom">Custom config</option></select><span class="opt-help" id="mcpHelp"></span></label></div><button class="button" id="envSave" style="margin-top:1rem">Save environment</button><div class="status-line" id="envStatus"></div></div></section>
 ${renderDeploymentSettings(BASE)}
-<section id="tab-categories"><h2>Project categories</h2><p class="lead">Categories group the project rail into sections you can collapse and expand. Each project sits in at most one, chosen from this list by right-clicking it in the rail (or in Manage projects); the order here is the order of the rail's sections. Renaming a category keeps every project in it. Deleting one moves its projects to Uncategorized. Tags are separate: a project can carry any number, they filter the rail across categories, and you set them from the same right-click menu.</p><div class="s-card"><div id="pcList" class="pc-list" role="list"></div><div class="pc-add"><input id="pcNew" type="text" maxlength="40" placeholder="New category name" aria-label="New category name"><button class="button secondary" id="pcAdd" type="button">Add</button></div><button class="button" id="pcSave" type="button" style="margin-top:1rem">Save categories</button><div class="status-line" id="pcStatus" role="status" aria-live="polite"></div></div></section><section id="tab-tasks"><h2>Scheduled tasks</h2><p class="lead">Run a command in your projects on a clock. Each run opens a named tab in the project's terminal, so you can read what it did afterwards.</p>
+<section id="tab-categories"><h2>Project categories</h2><p class="lead">Categories group the project rail into sections you can collapse and expand. Each project sits in at most one, chosen from this list by right-clicking it in the rail (or in Manage projects); the order here is the order of the rail's sections, Uncategorized included — move it to put projects with no category above some categories. Renaming a category keeps every project in it. Deleting one moves its projects to Uncategorized. Tags are separate: a project can carry any number, they filter the rail across categories, and you set them from the same right-click menu.</p><div class="s-card"><div id="pcList" class="pc-list" role="list"></div><div class="pc-add"><input id="pcNew" type="text" maxlength="40" placeholder="New category name" aria-label="New category name"><button class="button secondary" id="pcAdd" type="button">Add</button></div><button class="button" id="pcSave" type="button" style="margin-top:1rem">Save categories</button><div class="status-line" id="pcStatus" role="status" aria-live="polite"></div></div></section><section id="tab-tasks"><h2>Scheduled tasks</h2><p class="lead">Run a command in your projects on a clock. Each run opens a named tab in the project's terminal, so you can read what it did afterwards.</p>
 <div class="s-card"><h3>Tasks</h3><div id="taskRows"><p class="muted">loading…</p></div><div id="taskStatus" class="muted"></div></div>
 <div class="s-card"><h3 id="taskFormTitle">Add a task</h3>
 <div class="t-grid">
