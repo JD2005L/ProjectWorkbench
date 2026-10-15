@@ -75,7 +75,7 @@ The project rail down the left of every terminal is organized three ways, so a l
 
 - **Categories** group it into sections you can collapse and expand (remembered per browser). Each project sits in at most one, chosen from an ordered list an admin manages in **Settings → Project categories**; the list's order is the rail's order, and projects with none sit under *Uncategorized* at the end. Renaming a category keeps its projects; deleting one moves them to Uncategorized.
 - **Tags** — any number per project — filter the rail *across* categories from the 🏷 menu at its top (a project matching any selected tag is shown; *No tags* and *📌 Pinned only* are there too).
-- **Search** narrows the list by project name as you type, looking inside collapsed sections too. Enter opens the first match, ↓ moves into the list, Esc clears.
+- **Search** narrows the list as you type, matching a project's name or any of its tags, and looks inside collapsed sections too. Enter opens the first match, ↓ moves into the list, Esc clears.
 
 Admins set a project's category and tags by right-clicking it in the rail (or the keyboard context-menu key / Shift+F10): tags appear as badges, each with its own ×, and every change is saved and shown at once without reloading the page — the terminal is never restarted by it. The same two fields are in **Manage projects**. The project you are in always stays visible, whatever is filtered or collapsed.
 

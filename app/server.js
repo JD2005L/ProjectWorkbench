@@ -3986,7 +3986,7 @@ function railHtml(projects, currentName, user, deployConfigured=false, projectCa
  // The rail's filter frame and search box. The tag options themselves are built in the browser
  // from the rows' data-cats, so a tag added or removed from the right-click menu is offered (or
  // withdrawn) at once, without a reload, and there is one place that decides what the menu lists.
- const railFilter = `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter the project rail by tag"><span class="railFilterIco" aria-hidden="true">🏷</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><button id="railPinToggle" class="railPinToggle" type="button" aria-pressed="false" title="Pinned only — quick toggle">📌</button><div id="railFilterMenu" class="railFilterMenu" hidden><div id="railFilterOpts" class="railFilterOpts"></div><button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div><div class="railSearch"><input id="railSearch" type="search" placeholder="Search projects…" aria-label="Search projects by name" autocomplete="off" spellcheck="false"></div>`;
+ const railFilter = `<div class="railFilter" id="railFilter"><button id="railFilterBtn" class="railFilterBtn" type="button" aria-haspopup="true" aria-expanded="false" title="Filter the project rail by tag"><span class="railFilterIco" aria-hidden="true">🏷</span><span class="railFilterLabel" id="railFilterLabel">All projects</span><span class="chev" aria-hidden="true">▾</span></button><button id="railPinToggle" class="railPinToggle" type="button" aria-pressed="false" title="Pinned only — quick toggle">📌</button><div id="railFilterMenu" class="railFilterMenu" hidden><div id="railFilterOpts" class="railFilterOpts"></div><button type="button" class="railFilterAll" id="railFilterAll">Show all projects</button></div></div><div class="railSearch"><input id="railSearch" type="search" placeholder="Search projects or tags…" aria-label="Search projects by name or tag" autocomplete="off" spellcheck="false"></div>`;
  // Right-click (or the context-menu key) on a project, admin only: its category from the managed
  // list, and its tags as badges that each clear on their own. Every change saves at once and the
  // rail is regrouped in place — never a page reload, which would restart the terminal view.
@@ -4031,6 +4031,9 @@ const rowsOf=()=>[...LIST.querySelectorAll('.pkeyRow')].sort((a,b)=>Number(a.dat
 const rowTags=row=>(row&&row.dataset.cats||'').split('|').filter(Boolean);
 const rowName=row=>{const k=row.querySelector('.pkey');return k?(k.dataset.project||''):''};
 function groupKey(row){const id=row.dataset.category||'';return GROUPS.some(g=>g.id===id)?id:UNCAT}
+// What the search box matches: the project's name or any of its tags, case-insensitively, as a
+// substring. One rule for both the filtering and the Enter/ArrowDown jump.
+const searchHit=(row,q)=>!q||rowName(row).toLowerCase().includes(q)||rowTags(row).some(t=>t.toLowerCase().includes(q));
 let collapsed=new Set();try{collapsed=new Set(JSON.parse(localStorage.getItem('pwRailCollapsed')||'[]'))}catch{}
 function saveCollapsed(){try{localStorage.setItem('pwRailCollapsed',JSON.stringify([...collapsed]))}catch{}}
 function layoutGroups(){
@@ -4051,7 +4054,7 @@ LIST.addEventListener('click',e=>{const b=e.target.closest('.railGroupBtn');if(!
 // Tag filter: "Pinned only" plus a checkbox per tag (a union) and "No tags", built from the rows
 // so an in-place tag edit is offered or withdrawn at once. Selection persists per browser; names
 // no longer offered are pruned, so a removed tag cannot invisibly filter forever. Search narrows
-// by name as you type and looks inside collapsed groups. The current project stays visible
+// by name or tag as you type and looks inside collapsed groups. The current project stays visible
 // whatever is selected, so the rail can never hide the cockpit you are standing in.
 const filterWrap=document.getElementById('railFilter');
 const filterBtn=document.getElementById('railFilterBtn');
@@ -4098,8 +4101,7 @@ function applyCatFilter(){
   const cur=!!row.querySelector('.pkey.current');
   const tagHit=tagSel.size===0||tags.some(t=>tagSel.has(t))||(tags.length===0&&tagSel.has('|none'));
   const pinHit=!pinnedOnly||row.classList.contains('pinned');
-  const nameHit=!q||rowName(row).toLowerCase().includes(q);
-  const match=tagHit&&pinHit&&nameHit;
+  const match=tagHit&&pinHit&&searchHit(row,q);
   const g=groupKey(row);
   const open=!!q||!collapsed.has(g);
   row.classList.toggle('catHidden',!(cur||(match&&open)));
@@ -4131,7 +4133,7 @@ if(search){
   if(e.key==='Escape'){e.stopPropagation();if(search.value){e.preventDefault();search.value='';applyCatFilter()}else search.blur();return}
   if(e.key!=='Enter'&&e.key!=='ArrowDown')return;
   const q=search.value.trim().toLowerCase();
-  const hits=rowsOf().filter(r=>!r.classList.contains('catHidden')&&(!q||rowName(r).toLowerCase().includes(q)));
+  const hits=rowsOf().filter(r=>!r.classList.contains('catHidden')&&searchHit(r,q));
   const hit=hits.find(r=>!r.querySelector('.pkey.current'))||hits[0];
   const link=hit&&hit.querySelector('.pkey');if(!link)return;
   e.preventDefault();if(e.key==='Enter'&&q)link.click();else link.focus();

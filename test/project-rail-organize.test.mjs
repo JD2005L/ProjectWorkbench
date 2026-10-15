@@ -62,7 +62,9 @@ test('a project\'s category is set, rendered for grouping, and cleared — witho
     const html = await cockpit(base, name);
     assert.deepEqual(groupsOf(html), [cat, other], 'the rail is handed the ordered list to group by');
     assert.match(rowOf(html, name), new RegExp(`data-category="${cat.id}"`), 'and the row its category');
-    assert.match(html, /id="railSearch"/, 'with the name search');
+    assert.match(html, /id="railSearch"[^>]*aria-label="Search projects by name or tag"/, 'with the search box');
+    assert.match(html, /const searchHit=\(row,q\)=>!q\|\|rowName\(row\)\.toLowerCase\(\)\.includes\(q\)\|\|rowTags\(row\)\.some\(/,
+      'which matches a project by its name or any of its tags');
 
     const unknown = await json(base, `/api/projects/${encodeURIComponent(name)}/category`, 'PUT', { categoryId: 'nosuchcat' });
     assert.equal(unknown.status, 400, 'an id that is not in the list is refused');
