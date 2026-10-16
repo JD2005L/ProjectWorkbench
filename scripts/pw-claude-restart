@@ -63,8 +63,11 @@ function isLoader(pid) {
     return path.basename(argv[1] || '') === 'pw-claude-loader';
   } catch { return false; }
 }
+// The loader's directory, made again if something cleaned it away while the session ran, and accepted only if it
+// is a real directory of this account's that nobody else can open.
 function privateDir(dir) {
   if (!dir || !path.isAbsolute(dir)) return false;
+  try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
   try {
     const st = fs.lstatSync(dir);
     return st.isDirectory() && st.uid === UID && (st.mode & 0o077) === 0;
@@ -117,7 +120,8 @@ async function main() {
   // inside another session's tools inherits that session's loader variables, and must not restart it.
   const parent = stat(claudePid)?.ppid ?? 0;
   const underLoader = isLoader(loaderPid) && (parent === loaderPid || stat(parent)?.ppid === loaderPid);
-  if (!underLoader || !privateDir(dir)) say(`Restart is not available. Claude Code was not started through the loader.${byHand}`);
+  if (!underLoader) say(`Restart is not available. Claude Code was not started through the loader.${byHand}`);
+  if (!privateDir(dir)) say(`Restart is not available: ${dir || 'the loader\'s directory'} must be a directory of this account's that only it can open.${byHand}`);
   if (!UUID.test(sid)) say('Restart is not available: this conversation has no id to resume.');
 
   const request = path.join(dir, `${loaderPid}.request.json`);
@@ -139,7 +143,7 @@ async function main() {
     try { fs.unlinkSync(request); } catch { /* not written */ }
     say(`Failed to prepare restart: ${err.message}`);
   }
-  const answer = await waitForAnswer(answerFile, 5000);
+  const answer = await waitForAnswer(answerFile, 8000);
   if (!answer) {
     try { fs.unlinkSync(request); } catch { /* taken */ }
     say('Failed to prepare restart: the loader did not answer.');

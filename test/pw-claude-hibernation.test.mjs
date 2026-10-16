@@ -174,7 +174,7 @@ async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.random
   const paneEnv = {
     PATH: process.env.PATH, HOME: ctx.dir, HISTFILE: '/dev/null',
     PW_CLAUDE_SESSIONS_DIR: ctx.reg, PW_CLAUDE_PROJECTS_DIR: ctx.projects,
-    PW_CLAUDE_BIN: ctx.fake, FAKE_LOG: ctx.fakeLog, ...(loader ? { TMPDIR: ctx.dir } : {}), ...fake,
+    PW_CLAUDE_BIN: loader ? viaLoader(ctx) : ctx.fake, FAKE_LOG: ctx.fakeLog, ...fake,
   };
   const envArgs = Object.entries(paneEnv).map(([k, v]) => `${k}=${JSON.stringify(String(v))}`).join(' ');
   const command = paneRoot ? `env ${envArgs} ${ctx.fake} --session-id ${sid}`
@@ -206,6 +206,12 @@ async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.random
   assert.ok(await until(() => registryFor(ctx, sid)), `the stand-in Claude for ${sid} must register`);
   const { pid } = registryFor(ctx, sid);
   return { sid, pid, target, windowId, paneId, session };
+}
+// `claude` as the wrapper now runs it for an interactive session: through pw-claude-loader.
+function viaLoader(ctx) {
+  const shim = path.join(ctx.dir, 'bin', 'claude-via-loader');
+  fs.writeFileSync(shim, `#!/bin/sh\nexec node ${JSON.stringify(LOADER)} ${JSON.stringify(ctx.fake)} "$@"\n`, { mode: 0o755 });
+  return shim;
 }
 function registryFor(ctx, sid) {
   for (const f of fs.readdirSync(ctx.reg)) {
@@ -322,7 +328,7 @@ test('REGRESSION (session safety): opening the window resumes the SAME conversat
   }
 });
 
-test('a Claude running under pw-claude-loader (/restart) hibernates, and pressing Enter resumes it, like any other', { timeout: 40000 }, async () => {
+test('a Claude running under pw-claude-loader (/restart) hibernates, and pressing Enter resumes it under the loader again', { timeout: 40000 }, async () => {
   const ctx = await setup();
   try {
     const c = await claudeWindow(ctx, { session: 'pw_loader', loader: true });
@@ -332,6 +338,9 @@ test('a Claude running under pw-claude-loader (/restart) hibernates, and pressin
     await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
     assert.ok(await until(() => resumes(ctx).length > 0, 15000), 'Enter resumes the conversation');
     assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
+    const pid = await resumedPid(ctx, c);
+    const parent = fs.readFileSync(`/proc/${pid}/stat`, 'utf8').split(') ')[1].split(' ')[1];
+    assert.match(fs.readFileSync(`/proc/${parent}/cmdline`, 'utf8'), /pw-claude-loader/, 'the resumed Claude runs under the loader too');
   } finally { await teardown(ctx); }
 });
 

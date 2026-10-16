@@ -107,10 +107,10 @@ fi
 
 # An interactive session runs under pw-claude-loader, which stays in the terminal so that /restart can start
 # Claude again there, in the same conversation. Print runs, pipes and redirections run Claude directly, as
-# before. PW_CLAUDE_RESTART=off (in claude-wrapper.env, or for one launch) turns the loader off, and so does
-# a host without it.
+# before. PW_CLAUDE_RESTART=off (or false, 0, no; in claude-wrapper.env, or for one launch) turns the loader
+# off, and so does a host without it.
 PW_CLAUDE_LOADER=/usr/local/bin/pw-claude-loader
-if [[ "$has_print" -eq 0 && "${PW_CLAUDE_RESTART:-on}" != "off" && -t 0 && -t 1 && -x "$PW_CLAUDE_LOADER" && -x /usr/bin/node ]]; then
+if [[ "$has_print" -eq 0 && ! "${PW_CLAUDE_RESTART:-on}" =~ ^(off|false|0|no)$ && -t 0 && -t 1 && -x "$PW_CLAUDE_LOADER" && -x /usr/bin/node ]]; then
   exec /usr/bin/node "$PW_CLAUDE_LOADER" "$REAL" "${args[@]}" "$@"
 fi
 case "$REAL" in

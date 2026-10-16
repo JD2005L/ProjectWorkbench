@@ -169,14 +169,21 @@ function resolveLaunch(entry) {
 }
 
 // ---- the private directory the handshake runs through ------------------------------------------------------
+// $XDG_RUNTIME_DIR when the session has one of its own, otherwise under the home directory: never a predictable
+// name in a world-writable directory, which another account could create first, or which a /tmp cleaner could
+// empty under a long session. It is checked again on every request, and made again if it has gone.
 const UID = process.getuid();
-function privateDir() {
-  const dir = path.join(os.tmpdir(), `pw-claude-loader-${UID}`);
-  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (err) { if (err.code !== 'EEXIST') return null; }
+const isPrivate = (st) => st.isDirectory() && st.uid === UID && (st.mode & 0o077) === 0;
+function handshakeDir() {
+  const xdg = process.env.XDG_RUNTIME_DIR;
   try {
-    const st = fs.lstatSync(dir);
-    return st.isDirectory() && st.uid === UID && (st.mode & 0o077) === 0 ? dir : null;
-  } catch { return null; }
+    if (xdg && path.isAbsolute(xdg) && isPrivate(fs.lstatSync(xdg))) return path.join(xdg, 'pw-claude-loader');
+  } catch { /* use the home directory */ }
+  return path.join(os.homedir(), '.cache', 'pw-claude-loader');
+}
+function ensurePrivate(dir) {
+  try { fs.mkdirSync(dir, { recursive: true, mode: 0o700 }); } catch { return false; }
+  try { return isPrivate(fs.lstatSync(dir)); } catch { return false; }
 }
 const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
 function startTime(pid) {
@@ -250,12 +257,10 @@ function main(argv) {
     process.exit(64);
   }
   const plan = relaunchPlan(args);
-  const dir = privateDir();
-  if (dir) sweep(dir);
+  const dir = handshakeDir();
+  if (ensurePrivate(dir)) sweep(dir);
   const myStart = startTime(process.pid);
-  const childEnv = { ...process.env, PW_CLAUDE_LOADER_PID: String(process.pid) };
-  if (dir) childEnv.PW_CLAUDE_LOADER_DIR = dir;
-  else delete childEnv.PW_CLAUDE_LOADER_DIR;
+  const childEnv = { ...process.env, PW_CLAUDE_LOADER_PID: String(process.pid), PW_CLAUDE_LOADER_DIR: dir };
 
   let child = null;
   let childIsLauncher = false; // child is node running cli-wrapper.cjs, with Claude as its own child
@@ -318,7 +323,7 @@ function main(argv) {
   };
   // SIGUSR2 rather than SIGUSR1, which starts node's inspector.
   process.on('SIGUSR2', () => {
-    if (!dir) return;
+    if (!ensurePrivate(dir)) return;
     const file = path.join(dir, `${process.pid}.request.json`);
     let req = null;
     try {
@@ -328,6 +333,8 @@ function main(argv) {
     try { fs.unlinkSync(file); } catch { /* gone */ }
     const hookPid = Number(req?.hookPid);
     if (!req || typeof req !== 'object' || !Number.isInteger(hookPid) || hookPid <= 1) return;
+    // A hook that has stopped waiting has already told the user it failed; restarting now would contradict it.
+    if (!alive(hookPid)) return;
     const why = refusal(req);
     if (!why) pending = { sid: req.sessionId, transcript: req.transcriptPath };
     try {

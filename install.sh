@@ -335,8 +335,11 @@ install -m 0755 "$SRC_DIR/scripts/pw-claude-restart"      /usr/local/bin/pw-clau
 # app/user-credentials.js), so a hook added to the shared settings.json never reaches one that already has
 # hooks. A drop-in file, so an operator's own managed-settings.json is never touched. Installed after the
 # hook command it names, because Claude Code picks up a changed managed settings file in running sessions.
-install -d -m 0755 /etc/claude-code /etc/claude-code/managed-settings.d /etc/claude-code/.claude \
-  /etc/claude-code/.claude/skills /etc/claude-code/.claude/skills/restart
+# Directories are created only when missing: install -d would also reset the mode of one an operator tightened.
+for d in /etc/claude-code /etc/claude-code/managed-settings.d /etc/claude-code/.claude \
+         /etc/claude-code/.claude/skills /etc/claude-code/.claude/skills/restart; do
+  [ -d "$d" ] || install -d -m 0755 "$d"
+done
 install -m 0644 "$SRC_DIR/config/claude-code/skills/restart/SKILL.md" /etc/claude-code/.claude/skills/restart/SKILL.md
 install -m 0644 "$SRC_DIR/config/claude-code/managed-settings.d/50-project-workbench-restart.json" \
   /etc/claude-code/managed-settings.d/50-project-workbench-restart.json

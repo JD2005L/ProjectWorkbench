@@ -387,6 +387,34 @@ test('a Claude Code updated while the session ran is the one /restart brings bac
   } finally { await teardown(ctx); }
 });
 
+test('the handshake directory: made again if it was cleaned away, and refused if others can open it', { timeout: 60000 }, async () => {
+  const ctx = await setup();
+  try {
+    const sid = crypto.randomUUID();
+    conversation(ctx, sid);
+    // Pane sessions have no XDG_RUNTIME_DIR, so it lives under the home directory, never in a world-writable /tmp.
+    const dir = path.join(ctx.dir, '.cache', 'pw-claude-loader');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    fs.chmodSync(dir, 0o755);
+    const exposed = await launch(ctx, `--resume ${sid}`);
+    await type(ctx, '/restart');
+    const refused = await waitEvent(ctx, (e) => e.event === 'hook' && e.pid === exposed.pid, 'the hook answer');
+    assert.equal(refused.decision.reason, `Restart is not available: ${dir} must be a directory of this account's that only it can open. To restart by hand, run /exit and then: claude --resume ${sid}`);
+    assert.deepEqual(events(ctx).filter((e) => e.event === 'term'), [], 'nothing was stopped');
+    await ended(ctx, () => type(ctx, '/exit'), 0);
+
+    fs.rmSync(dir, { recursive: true });
+    const first = await launch(ctx, `--resume ${sid}`);
+    assert.ok(fs.statSync(dir).isDirectory(), 'sanity: the loader made its directory');
+    fs.rmSync(dir, { recursive: true });
+    await type(ctx, '/restart');
+    const hook = await waitEvent(ctx, (e) => e.event === 'hook' && e.pid === first.pid, 'the hook answer');
+    assert.deepEqual(hook.decision, RESTARTING);
+    await waitEvent(ctx, (e) => e.event === 'start' && e.pid !== first.pid, 'Claude to start again');
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700);
+  } finally { await teardown(ctx); }
+});
+
 test('from the npm package: the native binary runs directly, as cli-wrapper.cjs runs it, and restarts work either way', { timeout: 90000 }, async () => {
   const ctx = await setup();
   try {
@@ -478,6 +506,7 @@ test('the claude wrapper runs interactive sessions under the loader, and nothing
     assert.deepEqual([viaLoader.event, viaLoader.argv], ['loader', [entry, '--remote-control', '--model', 'opus']]);
     assert.deepEqual((await ran('', '-p hello')).event, 'direct', 'a print run');
     assert.deepEqual((await ran('PW_CLAUDE_RESTART=off ', '--model opus')).event, 'direct', 'turned off for one launch');
+    assert.deepEqual((await ran('PW_CLAUDE_RESTART=false ', '--model opus')).event, 'direct', 'false is off too, as in PW_REMOTE_CONTROL');
     assert.deepEqual((await ran('', '--model opus < /dev/null')).event, 'direct', 'stdin is not a terminal');
     assert.deepEqual((await ran('', '--model opus | cat')).event, 'direct', 'stdout is not a terminal');
     fs.appendFileSync(config, 'PW_CLAUDE_RESTART=off\n');
