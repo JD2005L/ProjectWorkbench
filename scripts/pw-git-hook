@@ -59,8 +59,17 @@ case "$name" in
         --trailer "PW-Session: $PW_CI_INSTANCE/$session/$window" "$1" 2>/dev/null || true
     fi
     ;;
-  post-commit|post-merge)
+  post-commit)
     record "$(git rev-parse HEAD 2>/dev/null)"
+    ;;
+  post-merge)
+    # Only a merge commit made HERE. A fast-forward (most `git pull`s) moves HEAD to
+    # somebody else's commit, and a squash merge ($1 = 1) makes no commit at all —
+    # recording either would report another author's CI run as this window's.
+    if [[ "${1:-0}" != "1" ]] && git rev-parse -q --verify 'HEAD^2' >/dev/null 2>&1 \
+       && ! git reflog -1 --format=%gs 2>/dev/null | grep -qi 'fast-forward'; then
+      record "$(git rev-parse HEAD 2>/dev/null)"
+    fi
     ;;
   post-rewrite)
     # stdin is "<old> <new> [extra]" per rewritten commit (amend, rebase). It is read here

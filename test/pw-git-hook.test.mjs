@@ -82,6 +82,28 @@ test('every commit, amend and rebase result is recorded in the ledger with its w
   assert.ok(fs.existsSync(seen), 'the repo\'s own post-rewrite ran');
 });
 
+test('REVIEW: a pull that fast-forwards to somebody else\'s commit is not recorded; a merge made here is', () => {
+  const t = setup();
+  t.commit();
+  const plain = { ...process.env, GIT_CONFIG_GLOBAL: t.pwEnv.GIT_CONFIG_GLOBAL, HOME: t.pwEnv.HOME, TMUX_PANE: '' };
+  // someone else's commits arrive on another clone
+  const other = path.join(t.root, 'other');
+  execFileSync('git', ['clone', '-q', t.repo, other], { env: plain });
+  const ogit = (args) => execFileSync('git', ['-c', 'user.email=o@x', '-c', 'user.name=O', ...args], { cwd: other, env: plain, encoding: 'utf8' });
+  fs.writeFileSync(path.join(other, 'theirs.txt'), '1'); ogit(['add', '-A']); ogit(['commit', '-q', '-m', 'theirs']);
+  const theirs = ogit(['rev-parse', 'HEAD']).trim();
+  const pull = (args) => spawnSync('git', ['-c', 'pull.rebase=false', 'pull', '-q', ...args, other, 'main'], { cwd: t.repo, env: { ...process.env, ...t.pwEnv }, encoding: 'utf8' });
+  assert.equal(pull(['--ff-only']).status, 0);
+  assert.equal(t.head(), theirs);
+  assert.ok(!t.ledger().some((l) => l.startsWith(theirs)), 'a fast-forward to their commit is not ours');
+  // diverge, then a real merge commit is made in this window
+  fs.writeFileSync(path.join(other, 'theirs2.txt'), '2'); ogit(['add', '-A']); ogit(['commit', '-q', '-m', 'theirs 2']);
+  t.commit();
+  const merged = pull(['--no-ff', '--no-edit']);
+  assert.equal(merged.status, 0, merged.stderr);
+  assert.ok(t.ledger().includes(`${t.head()} pw_Demo @12 4242`), 'the merge commit made here is recorded');
+});
+
 test('amending keeps exactly one signature', () => {
   const t = setup();
   t.commit();
