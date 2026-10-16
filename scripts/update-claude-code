@@ -39,9 +39,23 @@ PW_MCP_CONFIG=/etc/project-workbench/empty-mcp.json
 PW_PERMISSION_MODE=prompt
 PW_REMOTE_CONTROL=true
 PW_CLAUDE_RESTART="${PW_CLAUDE_RESTART:-on}"
+PW_CI_RESULTS=off
 if [[ -f "$CONFIG" ]]; then
   # shellcheck source=/etc/project-workbench/claude-wrapper.env
   source "$CONFIG"
+fi
+# CI results (docs/ci-results.md), opt-in per instance: commits this Claude makes carry a
+# PW-Session trailer naming its window, so a finished GitHub Actions run can be routed
+# back to it. Git is pointed at PW's hook directory for THIS process tree only, through
+# GIT_CONFIG_* entries appended after any already set; the hook chains to each repo's own
+# hooks. Off (the default, and what every upgrade gets): nothing here runs.
+PW_GIT_HOOKS=/usr/local/lib/project-workbench/git-hooks
+if [[ "${PW_CI_RESULTS:-off}" == "on" && -x "$PW_GIT_HOOKS/prepare-commit-msg" ]]; then
+  n="${GIT_CONFIG_COUNT:-0}"
+  [[ "$n" =~ ^[0-9]+$ ]] || n=0
+  export "GIT_CONFIG_KEY_$n=core.hooksPath" "GIT_CONFIG_VALUE_$n=$PW_GIT_HOOKS"
+  export GIT_CONFIG_COUNT=$((n + 1))
+  export PW_CI_INSTANCE="${PW_INSTANCE_ID:-$(hostname)}"  # the dashboard's rule: PW_INSTANCE_ID, else the hostname
 fi
 
 args=()

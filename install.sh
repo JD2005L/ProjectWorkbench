@@ -319,6 +319,17 @@ install -m 0755 "$SRC_DIR/scripts/project-preview-start"  /usr/local/bin/project
 install -m 0755 "$SRC_DIR/scripts/setup-terminal-start"   /usr/local/bin/setup-terminal-start
 install -m 0755 "$SRC_DIR/scripts/update-claude-code"     /usr/local/sbin/update-claude-code
 install -m 0755 "$SRC_DIR/scripts/pw-user"                /usr/local/sbin/pw-user
+# CI results (docs/ci-results.md): the git hook directory the Claude wrapper points git at
+# when an instance opts in (PW_CI_RESULTS=on in claude-wrapper.env). Every hook name is a
+# link to one dispatcher that signs commits and then runs the repo's own hook. Installed
+# everywhere, used nowhere unless opted in.
+install -d -m 0755 /usr/local/lib/project-workbench/git-hooks
+install -m 0755 "$SRC_DIR/scripts/pw-git-hook" /usr/local/lib/project-workbench/git-hooks/pw-git-hook
+for h in applypatch-msg pre-applypatch post-applypatch pre-commit pre-merge-commit prepare-commit-msg \
+         commit-msg post-commit pre-rebase post-checkout post-merge pre-push post-rewrite pre-auto-gc \
+         reference-transaction push-to-checkout post-index-change sendemail-validate; do
+  ln -sfn pw-git-hook "/usr/local/lib/project-workbench/git-hooks/$h"
+done
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-save"           /usr/local/bin/pw-tmux-save
 install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux-restore
 # Claude Code hibernation: self-contained (no relative imports), so flat on PATH is correct. The

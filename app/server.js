@@ -3,6 +3,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import { resolveShippedHelper } from './shipped-helpers.js';
 import { createTurnTriage, evaluateTurn, turnOutcomeOptedIn } from './turn-outcome.js';
+import { ciResultsOptedIn, verifyGithubSignature, parseWorkflowRun, repoMatches, createCiResults, composerIsEmpty } from './ci-results.js';
 import { createTurnOutbox, createHermesRelay, createTurnLog } from './turn-outbox.js';
 import path from 'path';
 import os from 'os';
@@ -200,6 +201,9 @@ app.use((req, res, next) => {
  const method = req.method.toUpperCase();
  if(method === 'GET' || method === 'HEAD' || method === 'OPTIONS') return next();
  if(isTrustedLocal(req)) return next();
+ // CI results (ci-results.js) authenticate by GitHub's HMAC over the exact body, not by any
+ // ambient credential a browser could replay, and arrive from the n8n relay with no Origin.
+ if(method === 'POST' && req.path === BASE + '/api/ci/github') return next();
  // A bearer service token is not ambient credential material - a browser never attaches one
  // on a cross-origin request the way it replays nginx Basic Auth - so the Origin/Referer gate
  // is inapplicable. Authorisation still happens in requireScope; a bogus token gets a 401 there.
@@ -831,6 +835,102 @@ if(turnOutbox){
  for(const sig of ['SIGTERM','SIGINT']) process.once(sig, () => {
   turnOutbox.shutdown({ timeoutMs: 2000 }).catch(()=>{}).finally(() => process.kill(process.pid, sig));
  });
+}
+// CI results (ci-results.js, docs/ci-results.md): a finished GitHub Actions run, routed
+// back to the PW Claude window whose signed commit triggered it, so the session that already
+// has the context can fix and resubmit. STRICTLY OPT-IN: on only with PW_CI_RESULTS=on AND
+// the webhook secret file; otherwise the route answers 404 and nothing runs. The commit
+// signature comes from the Claude wrapper's own PW_CI_RESULTS switch (claude-wrapper.env).
+const CI_RESULTS_ENABLED = ciResultsOptedIn(process.env);
+const CI_WEBHOOK_SECRET_PATH = process.env.PW_CI_WEBHOOK_SECRET_PATH || '/etc/project-workbench/github-webhook-secret';
+const CI_STATE_PATH = process.env.PW_CI_STATE_PATH || '/var/lib/project-workbench/ci-results.json';
+const CI_WAKE_EVERY_MS = 5 * 60 * 1000;
+async function readCiWebhookSecret(){
+ if(!CI_RESULTS_ENABLED) return '';
+ try { return (await fs.readFile(CI_WEBHOOK_SECRET_PATH, 'utf8')).trim(); } catch { return ''; }
+}
+async function projectForTmuxSession(session){
+ return (await loadProjects()).find(p => tmuxSession(p.name) === session) || null;
+}
+// Only a pane whose FOREGROUND is Claude (directly, or resumed by the hibernation
+// placeholder) may take the paste: a Claude suspended behind its shell still has a live
+// registry entry, and pasting there would run the status as a command.
+const CI_AGENT_FOREGROUND = /^(claude|claude-resume|node)$/;
+const ciWokeAt = new Map();
+async function deliverCiResult(item){
+ const { run } = item;
+ const p = await projectForTmuxSession(run.session);
+ if(!p) return { gone: `no project owns tmux session ${run.session}` };
+ if(!repoMatches(p.repo, run.repo)) return { gone: `${run.repo} is not the repository of ${p.name}, whose window signed the commit` };
+ let windows;
+ try { windows = await readTmuxWindows(p.name); } catch { return { gone: `${p.name} has no terminal session` }; }
+ const w = windows.find(x => x.windowId === run.windowId);
+ if(!w) return { gone: `window ${run.windowId} in ${p.name} no longer exists` };
+ if(w.hibernated){
+  // Resume it, then deliver on a later sweep once Claude is back and idle.
+  if(Date.now() - (ciWokeAt.get(run.windowId) || 0) > CI_WAKE_EVERY_MS){
+   ciWokeAt.set(run.windowId, Date.now());
+   const { stdout: sockOut } = await tmux(['display-message','-p','#{socket_path}']).catch(()=>({stdout:''}));
+   await tmuxOwned(CLAUDE_WAKE_HELPER, [String(sockOut || '').trim(), w.windowId, '--requested'], { timeout: 15000 }).catch(()=>{});
+  }
+  return 'wait';
+ }
+ if(!CI_AGENT_FOREGROUND.test(String(w.paneCommand || ''))) return 'wait';
+ // Idle = Claude's last turn has ended (the same read turn outcomes use).
+ const tails = await readTurnTailsAsOwner([{ key: 'ci', panePid: w.panePid, credUser: w.credUser || '' }]).catch(()=>null);
+ if(!tails?.ci) return 'wait';
+ // Never on top of somebody's half-written message.
+ const { stdout: screen } = await tmux(['capture-pane','-p','-e','-t',w.windowId]).catch(()=>({stdout:''}));
+ if(!composerIsEmpty(screen)) return 'wait';
+ await pastePromptToWindow(w.windowId, item.text);
+ await audit('ci_result_delivered', { project: p.name, window: w.index, repo: run.repo, sha: run.sha, runId: run.runId, conclusion: run.conclusion, retry: item.streak });
+ console.log(`[ci-results] delivered ${run.conclusion} for ${run.repo}@${run.sha.slice(0,7)} to ${p.name} › ${w.name || w.index}`);
+ return 'delivered';
+}
+// Escalation, until the Paperclip AI org's intake is wired: light the project in the
+// dashboard (its pending marker) and record why.
+async function escalateCiResult({ run, reason }){
+ const p = await projectForTmuxSession(run.session).catch(()=>null);
+ if(p) await fs.writeFile(pendingMarkerPath(p), new Date().toISOString()+'\n').catch(()=>{});
+ console.warn(`[ci-results] ESCALATED ${run.repo}@${run.sha.slice(0,7)} ${run.workflow} ${run.conclusion}${p ? ` (${p.name})` : ''}: ${reason}`);
+ await audit('ci_result_escalated', { project: p?.name || null, repo: run.repo, sha: run.sha, runId: run.runId, conclusion: run.conclusion, reason });
+}
+const ciResults = createCiResults({
+ instanceId: TURN_OUTCOME_INSTANCE,
+ load: async () => { try { return JSON.parse(await fs.readFile(CI_STATE_PATH, 'utf8')); } catch(e){ if(e?.code === 'ENOENT') return null; throw e; } },
+ save: async (state) => { await fs.mkdir(path.dirname(CI_STATE_PATH), { recursive: true }); await writeFileAtomic(CI_STATE_PATH, JSON.stringify(state)+'\n', { mode: 0o600 }); },
+ tryDeliver: deliverCiResult,
+ escalate: escalateCiResult,
+ log: (m) => console.warn(`[ci-results] ${m}`),
+});
+if(CI_RESULTS_ENABLED && !ISOLATED){
+ setInterval(() => { ciResults.tick().catch(e => console.error('[ci-results] sweep failed:', e?.message || e)); }, 15000).unref();
+ console.log(`[ci-results] on — instance ${TURN_OUTCOME_INSTANCE}`);
+}
+// Put a prompt into a Claude pane: paste, then Enter. Shared by the agent API and CI results.
+async function pastePromptToWindow(target, text){
+ // The paste path, not send-keys: see rule 3 in app/agent-sessions.js. The buffer
+ // is named per call and deleted on paste, so two concurrent prompts cannot swap
+ // payloads, and the temp file is 0600 and removed whatever happens — a prompt is
+ // somebody's content and does not belong in /tmp a moment longer than it must.
+ const buffer = `pw-agent-${crypto.randomBytes(6).toString('hex')}`;
+ let prepared = null;
+ try {
+  const owner = DEPLOY_MODE === 'host' ? await terminalOwner() : null;
+  prepared = await prepareAgentPasteFile({
+   fsp: fs, tmpRoot: os.tmpdir(), text,
+   ownership: pasteFileOwnership({ deployMode: DEPLOY_MODE, owner, currentUid: process.getuid?.() ?? null }),
+  });
+  await tmux(['load-buffer','-b',buffer,prepared.file]);
+  await tmux(['paste-buffer','-d','-p','-b',buffer,'-t',target]);
+  // A beat before Enter: a TUI that is still ingesting a bracketed paste can
+  // otherwise swallow the submit and leave the prompt sitting in the composer.
+  await new Promise(r => setTimeout(r, 120));
+  await tmux(['send-keys','-t',target,'Enter']);
+ } finally {
+  if(prepared) await prepared.cleanup().catch(()=>{});
+  await tmux(['delete-buffer','-b',buffer]).catch(()=>{});
+ }
 }
 // Drop credential trees that no longer belong to a current user. Called after a
 // deletion and once at boot, so a tree orphaned while the service was down (or
@@ -1524,30 +1624,8 @@ const agentSessions = createAgentSessions({
  },
  setWindowOption: async (target, option, value) => { await tmux(['set-option','-w','-t',target,option,String(value)]); },
  createWindow: (project, name, cli, launcher) => newTmuxWindow(project, name, cli, launcher),
- pasteToWindow: async (target, text) => {
-  // The paste path, not send-keys: see rule 3 in app/agent-sessions.js. The buffer
-  // is named per call and deleted on paste, so two concurrent prompts cannot swap
-  // payloads, and the temp file is 0600 and removed whatever happens — a prompt is
-  // somebody's content and does not belong in /tmp a moment longer than it must.
-  const buffer = `pw-agent-${crypto.randomBytes(6).toString('hex')}`;
-  let prepared = null;
-  try {
-   const owner = DEPLOY_MODE === 'host' ? await terminalOwner() : null;
-   prepared = await prepareAgentPasteFile({
-    fsp: fs, tmpRoot: os.tmpdir(), text,
-    ownership: pasteFileOwnership({ deployMode: DEPLOY_MODE, owner, currentUid: process.getuid?.() ?? null }),
-   });
-   await tmux(['load-buffer','-b',buffer,prepared.file]);
-   await tmux(['paste-buffer','-d','-p','-b',buffer,'-t',target]);
-   // A beat before Enter: a TUI that is still ingesting a bracketed paste can
-   // otherwise swallow the submit and leave the prompt sitting in the composer.
-   await new Promise(r => setTimeout(r, 120));
-   await tmux(['send-keys','-t',target,'Enter']);
-  } finally {
-   if(prepared) await prepared.cleanup().catch(()=>{});
-   await tmux(['delete-buffer','-b',buffer]).catch(()=>{});
-  }
- },
+ pasteToWindow: (target, text) => pastePromptToWindow(target, text),
+
  // One tmux call for everything the latch needs. #{window_activity} is monotonic
  // and NOT reset by viewing, which is why it carries the completion decision
  // rather than the bell alone (see app/agent-turns.js).
@@ -4773,6 +4851,25 @@ app.post(BASE + '/api/mcp', async (req, res) => {
   return res.status(500).json({ jsonrpc:'2.0', id:null, error:{ code:-32603, message:e?.message || String(e) } });
  }
 });
+
+// CI results: the n8n relay forwards GitHub's workflow_run delivery untouched — the raw body
+// (base64, so not a byte changes) and its X-Hub-Signature-256 — and the signature is verified
+// HERE against the webhook secret, so neither the relay nor the network can forge a result.
+app.post(BASE + '/api/ci/github', async (req,res)=>{ try {
+ if(!CI_RESULTS_ENABLED) return res.status(404).json({ok:false,error:'Not found'});
+ const secret = await readCiWebhookSecret();
+ if(!secret) return res.status(503).json({ok:false,error:'CI results are on but the webhook secret is missing'});
+ const b = req.body || {};
+ const raw = typeof b.raw === 'string' && b.raw ? Buffer.from(b.raw, 'base64') : null;
+ if(!raw || !verifyGithubSignature(raw, b.signature, secret)) return res.status(401).json({ok:false,error:'GitHub signature does not verify'});
+ let payload;
+ try { payload = JSON.parse(raw.toString('utf8')); } catch { return res.status(400).json({ok:false,error:'Body is not JSON'}); }
+ const run = parseWorkflowRun(String(b.event || ''), payload);
+ if(run.ignore) return res.status(202).json({ok:true,accepted:false,reason:run.ignore});
+ const out = await ciResults.receive(run);
+ if(out.accepted && !ISOLATED) ciResults.tick().catch(()=>{});
+ res.status(202).json({ok:true,...out});
+} catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
 app.get(BASE + '/api/agent/projects', ...agentRoute(SCOPES.SESSIONS_READ,
  (token) => agentSessions.projects(token)));

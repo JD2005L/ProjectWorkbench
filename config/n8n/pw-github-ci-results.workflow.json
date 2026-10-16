@@ -1,0 +1,94 @@
+{
+  "name": "PW_GitHubCIResults",
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "nodes": [
+    {
+      "id": "b1f3c0de-0001-4c00-9000-000000000001",
+      "name": "Webhook — GitHub App (workflow_run)",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        0
+      ],
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "pw-github-ci-results",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true,
+          "responseCode": 202
+        }
+      },
+      "webhookId": "pw-github-ci-results"
+    },
+    {
+      "id": "b1f3c0de-0001-4c00-9000-000000000002",
+      "name": "Envelope for each PW instance",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        260,
+        0
+      ],
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "// GitHub workflow_run delivery -> every ProjectWorkbench instance that opted in to CI results.\n// This node does NOT verify anything: each PW instance verifies GitHub's X-Hub-Signature-256\n// itself over the exact raw body, which is why the body is forwarded byte-for-byte (base64).\n// Add a line to TARGETS for each PW instance; an instance ignores runs signed for another.\nconst TARGETS = [\n  'http://10.0.0.25/api/ci/github',   // PVI2\n];\nconst item = $input.first();\nconst h = item.json.headers || {};\nlet raw;\ntry { raw = (await this.helpers.getBinaryDataBuffer(0, 'data')).toString('base64'); }\ncatch (e) { throw new Error('Raw body missing: the Webhook node needs the \"Raw Body\" option on'); }\nconst envelope = {\n  raw,\n  signature: h['x-hub-signature-256'] || '',\n  event: h['x-github-event'] || '',\n  delivery: h['x-github-delivery'] || '',\n};\n// Only completed workflow runs are of interest; everything else stops here (PW would ignore it anyway).\nif (envelope.event !== 'workflow_run') return [];\nreturn TARGETS.map((url) => ({ json: { url, body: envelope } }));\n"
+      }
+    },
+    {
+      "id": "b1f3c0de-0001-4c00-9000-000000000003",
+      "name": "POST to ProjectWorkbench",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        520,
+        0
+      ],
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {
+          "timeout": 15000,
+          "response": {
+            "response": {
+              "neverError": true
+            }
+          }
+        }
+      },
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    }
+  ],
+  "connections": {
+    "Webhook — GitHub App (workflow_run)": {
+      "main": [
+        [
+          {
+            "node": "Envelope for each PW instance",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Envelope for each PW instance": {
+      "main": [
+        [
+          {
+            "node": "POST to ProjectWorkbench",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  }
+}

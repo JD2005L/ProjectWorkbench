@@ -57,6 +57,17 @@ decision exists to prevent.
 A different setting requires measured evidence from a dedicated or high-throughput workload plus the
 reason documented here.
 
+## 2026-10-16 — STANDING: CI results back to the committing session are opt-in per instance
+
+PW can route a finished GitHub Actions run back to the PW Claude window that made the commit
+(docs/ci-results.md: commits signed with a `PW-Session` trailer by the Claude wrapper; GitHub App
+`workflow_run` → n8n relay → `POST /api/ci/github`, which verifies GitHub's signature itself).
+It is OFF unless an instance sets `PW_CI_RESULTS=on` in BOTH claude-wrapper.env (signing) and the
+dashboard's environment with `/etc/project-workbench/github-webhook-secret` (receiving). An upgrade
+— GOA's included — gets neither: no commit trailers, the route answers 404, nothing runs. GOA may
+adopt it later by choice; nothing in promote or install turns it on. Escalations currently light
+the project in the dashboard; they move to the Paperclip AI org once its intake is known.
+
 ## 2026-10-05 — STANDING: turn outcomes (Jev) are opt-in per instance; GOA stays on the old method
 
 James: "it's imperative that the GOA side not run JEV, and continue to utilize the old method, as

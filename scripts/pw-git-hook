@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+# pw-git-hook — the git hooks directory for commits made by PW Claude sessions.
+#
+# CI results (docs/ci-results.md): when a GitHub Actions run finishes, its result is
+# routed back to the PW session that made the commit. The route is a trailer this
+# hook adds to each commit message:
+#
+#   PW-Session: <instance>/<tmux session>/<window id>     e.g. pvi2/pw_TRYGGBUILTPortal/@65
+#
+# The Claude wrapper (scripts/update-claude-code) points git at this directory ONLY
+# for Claude processes, and ONLY when the instance opted in (PW_CI_RESULTS=on in
+# claude-wrapper.env), through GIT_CONFIG_* environment entries. Nothing is changed
+# in any repository's config and nothing system-wide. Every hook name is a link to
+# this one script, which:
+#   1. for prepare-commit-msg, adds the trailer (replacing an older one, as on --amend);
+#   2. then runs the repository's OWN hook of the same name — from the repo's local
+#      core.hooksPath (husky and friends) or its .git/hooks — with the same arguments
+#      and stdin, and exits with its status. A repo's hooks behave exactly as before.
+# Stamping never fails a commit: any problem leaves the message unsigned.
+set -u
+
+name=$(basename "$0")
+
+stamp() {
+  local msgfile="$1"
+  [[ -n "${TMUX_PANE:-}" && -n "${PW_CI_INSTANCE:-}" && -f "$msgfile" ]] || return 0
+  local session window
+  session=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || return 0
+  window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null) || return 0
+  [[ "$session" =~ ^pw_[A-Za-z0-9._-]+$ && "$window" =~ ^@[0-9]+$ && "$PW_CI_INSTANCE" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
+  git interpret-trailers --in-place --if-exists replace \
+    --trailer "PW-Session: $PW_CI_INSTANCE/$session/$window" "$msgfile" 2>/dev/null || true
+}
+
+if [[ "$name" == "prepare-commit-msg" ]]; then
+  stamp "${1:-}"
+fi
+
+# The repository's own hook. core.hooksPath is read from the repo's config FILE
+# (--local): the environment override that brought git here must not be what it reads.
+self=$(readlink -f "$0" 2>/dev/null || echo "$0")
+own=$(git config --local --get core.hooksPath 2>/dev/null || true)
+if [[ -n "$own" ]]; then
+  [[ "$own" == /* ]] || own="$(git rev-parse --show-toplevel 2>/dev/null)/$own"
+  target="$own/$name"
+else
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) || exit 0
+  target="$common/hooks/$name"
+fi
+if [[ -f "$target" && -x "$target" && "$(readlink -f "$target")" != "$self" ]]; then
+  exec "$target" "$@"
+fi
+exit 0
