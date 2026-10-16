@@ -10,6 +10,71 @@
     (document.head || document.documentElement).appendChild(_pwFill);
   } catch {}
 
+  // Phones (James, 2026-10-16): a thumb swipe scrolls the history. The history is tmux's, and tmux
+  // runs with the mouse on, so a mouse wheel scrolls it (tmux enters copy mode, and leaves it again
+  // at the bottom). xterm.js turns a wheel into the mouse report tmux wants, but a swipe into
+  // nothing. So a vertical swipe is replayed as wheel notches, one per 5 rows of finger travel
+  // (what tmux scrolls per notch, so the text follows the finger), and a flick carries on briefly.
+  // A finger moving down shows older lines, as everywhere else on a phone.
+  try {
+    const LINES_PER_NOTCH = 5;
+    let touch = null, glide = 0;
+    const rowPx = (screen) => {
+      const rows = window.term && window.term.rows;
+      return (rows > 0 && screen.clientHeight / rows) || 17;
+    };
+    const travel = (t, dy) => {
+      t.acc += dy;
+      const step = rowPx(t.screen) * LINES_PER_NOTCH;
+      while (Math.abs(t.acc) >= step) {
+        const down = t.acc > 0;
+        t.acc -= down ? step : -step;
+        t.screen.dispatchEvent(new WheelEvent('wheel', { deltaY: down ? -1 : 1, deltaMode: 1, clientX: t.x, clientY: t.y, bubbles: true, cancelable: true, view: window }));
+      }
+    };
+    document.addEventListener('touchstart', (e) => {
+      cancelAnimationFrame(glide);
+      const xterm = e.target.closest && e.target.closest('.xterm');
+      const screen = xterm && xterm.querySelector('.xterm-screen');
+      if (!screen || e.touches.length !== 1) { touch = null; return; }
+      const p = e.touches[0];
+      touch = { screen, x: p.clientX, y: p.clientY, y1: p.clientY, t1: e.timeStamp, v: 0, acc: 0, on: false };
+    }, { capture: true, passive: true });
+    document.addEventListener('touchmove', (e) => {
+      const t = touch;
+      if (!t) return;
+      if (e.touches.length !== 1) { touch = null; return; }
+      const p = e.touches[0];
+      if (!t.on) {
+        const dx = p.clientX - t.x, dy = p.clientY - t.y;
+        if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
+        if (Math.abs(dx) > Math.abs(dy)) { touch = null; return; }
+        t.on = true;
+      }
+      e.preventDefault();
+      e.stopPropagation(); // xterm.js's own touch scrolling has nothing to scroll here
+      const dy = p.clientY - t.y1, dt = e.timeStamp - t.t1;
+      if (dt > 0) t.v = 0.7 * (dy / dt) + 0.3 * t.v;
+      t.y1 = p.clientY; t.t1 = e.timeStamp;
+      travel(t, dy);
+    }, { capture: true, passive: false });
+    document.addEventListener('touchend', (e) => {
+      const t = touch;
+      touch = null;
+      if (!t || !t.on || e.timeStamp - t.t1 > 100 || Math.abs(t.v) < 0.3) return;
+      let v = t.v, last = performance.now();
+      const run = (now) => {
+        const dt = Math.min(48, now - last);
+        last = now;
+        travel(t, v * dt);
+        v *= Math.pow(0.996, dt);
+        if (Math.abs(v) > 0.05) glide = requestAnimationFrame(run);
+      };
+      glide = requestAnimationFrame(run);
+    }, { capture: true, passive: true });
+    document.addEventListener('touchcancel', () => { touch = null; }, { capture: true, passive: true });
+  } catch {}
+
   const ptyMatch = location.pathname.match(/(.*?)\/pty\/([^/]+)/);
   const base = ptyMatch ? ptyMatch[1] : '';
   const project = decodeURIComponent((ptyMatch || [])[2] || '');
