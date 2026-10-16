@@ -30,6 +30,7 @@ const HIBERNATE = path.join(REPO, 'scripts', 'pw-claude-hibernate');
 const SAVE = path.join(REPO, 'scripts', 'pw-tmux-save');
 const WAIT = path.join(REPO, 'scripts', 'pw-claude-wait');
 const WAKE = path.join(REPO, 'scripts', 'pw-claude-wake');
+const LOADER = path.join(REPO, 'scripts', 'pw-claude-loader');
 // The placeholder the live windows were armed with before refresh existed (pw-claude-wait at c819d9a).
 const WAIT_C819D9A = path.join(REPO, 'test', 'fixtures', 'pw-claude-wait-c819d9a');
 const REFUSED = 75;
@@ -168,12 +169,12 @@ function transcript(ctx, sid, ageMs) {
 }
 
 /** A project window whose shell runs the stand-in Claude, exactly like a PW pane running `claude`. */
-async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.randomUUID(), idleMs = 10 * DAY, fake = {}, paneRoot = false, lane = false, wrapped = false, nonInteractive = false, interactiveCommand = false, shellArgs = null, jobControlOff = false, shellFlags = '' } = {}) {
+async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.randomUUID(), idleMs = 10 * DAY, fake = {}, paneRoot = false, lane = false, wrapped = false, nonInteractive = false, interactiveCommand = false, shellArgs = null, jobControlOff = false, shellFlags = '', loader = false } = {}) {
   transcript(ctx, sid, idleMs);
   const paneEnv = {
     PATH: process.env.PATH, HOME: ctx.dir, HISTFILE: '/dev/null',
     PW_CLAUDE_SESSIONS_DIR: ctx.reg, PW_CLAUDE_PROJECTS_DIR: ctx.projects,
-    PW_CLAUDE_BIN: ctx.fake, FAKE_LOG: ctx.fakeLog, ...fake,
+    PW_CLAUDE_BIN: ctx.fake, FAKE_LOG: ctx.fakeLog, ...(loader ? { TMPDIR: ctx.dir } : {}), ...fake,
   };
   const envArgs = Object.entries(paneEnv).map(([k, v]) => `${k}=${JSON.stringify(String(v))}`).join(' ');
   const command = paneRoot ? `env ${envArgs} ${ctx.fake} --session-id ${sid}`
@@ -195,7 +196,9 @@ async function claudeWindow(ctx, { session, name = 'claude', sid = crypto.random
     await until(async () => /\$$/.test((await tmux(ctx.sock, ['capture-pane', '-p', '-t', paneId])).trimEnd()));
     // wrapped: a job leader that dies on the signal at once, with Claude as its child, like the real wrapper.
     // jobControlOff: `set +m` puts Claude in the shell's own process group, so stopping it would signal the shell.
-    const launch = wrapped ? `sh -c '${ctx.fake} --session-id ${sid} & wait'`
+    // loader: what the claude wrapper now runs an interactive session under, for /restart.
+    const launch = loader ? `node ${LOADER} ${ctx.fake} --session-id ${sid}`
+      : wrapped ? `sh -c '${ctx.fake} --session-id ${sid} & wait'`
       : jobControlOff ? `set +m; ${ctx.fake} --session-id ${sid}` : `${ctx.fake} --session-id ${sid}`;
     await tmux(ctx.sock, ['send-keys', '-t', paneId, '-l', launch]);
     await tmux(ctx.sock, ['send-keys', '-t', paneId, 'Enter']);
@@ -317,6 +320,19 @@ test('REGRESSION (session safety): opening the window resumes the SAME conversat
     client?.kill('SIGKILL');
     await teardown(ctx);
   }
+});
+
+test('a Claude running under pw-claude-loader (/restart) hibernates, and pressing Enter resumes it, like any other', { timeout: 40000 }, async () => {
+  const ctx = await setup();
+  try {
+    const c = await claudeWindow(ctx, { session: 'pw_loader', loader: true });
+    await hibernated(ctx, c);
+    assert.equal(alive(c.pid), false, 'the idle Claude process must be gone');
+    assert.equal(await tmux(ctx.sock, ['display-message', '-p', '-t', c.paneId, '#{pane_current_command}']), 'claude-resume');
+    await tmux(ctx.sock, ['send-keys', '-t', c.paneId, 'Enter']);
+    assert.ok(await until(() => resumes(ctx).length > 0, 15000), 'Enter resumes the conversation');
+    assert.deepEqual(resumes(ctx), [`resume ${c.sid} pane=${c.paneId}`]);
+  } finally { await teardown(ctx); }
 });
 
 test('REGRESSION (real Claude proof): the placeholder is armed even when Claude\'s late exit output overwrites the shell prompt', { timeout: 40000 }, async () => {

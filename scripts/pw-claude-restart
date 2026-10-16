@@ -1,0 +1,152 @@
+#!/usr/bin/env node
+// Project Workbench: Claude Code's /restart, which restarts Claude Code in this terminal and continues this
+// same conversation, the way GitHub Copilot CLI's /restart does. A newer Claude Code installed since the
+// session started, and changed settings, hooks, MCP servers, plugins and skills, all take effect.
+//
+// /restart is a skill (installed as /etc/claude-code/.claude/skills/restart/SKILL.md, so every account and
+// config dir has it), and this is its UserPromptExpansion hook (installed in
+// /etc/claude-code/managed-settings.d/). The hook runs when /restart is typed, before anything reaches the
+// model, and always blocks the expansion: either Claude is about to be restarted, or the notice says why not.
+// Nothing is sent to the model either way, and the only trace in the transcript is that notice.
+//
+// The restart itself is pw-claude-loader's job (see the handshake described there), because only a process
+// that outlives Claude in the terminal can start it again there. A Claude Code started some other way (a
+// session that predates the loader, `claude -p`, a nested claude) is told restart is not available, like
+// Copilot's "The CLI was not started through the loader", together with how to restart it by hand.
+import fs from 'node:fs';
+import path from 'node:path';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const UID = process.getuid();
+const SHELLS = new Set(['sh', 'bash', 'dash', 'zsh', 'ksh', 'fish']);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Written with writeSync: process.exit() right after an asynchronous write to a pipe can lose it.
+function say(reason) {
+  fs.writeSync(1, `${JSON.stringify({
+    decision: 'block',
+    reason,
+    hookSpecificOutput: { hookEventName: 'UserPromptExpansion', suppressOriginalPrompt: true },
+  })}\n`);
+  process.exit(0);
+}
+
+function readStdin(limit) {
+  return new Promise((resolve, reject) => {
+    const chunks = [];
+    let size = 0;
+    process.stdin.on('data', (c) => {
+      size += c.length;
+      if (size > limit) reject(new Error('hook input too large'));
+      else chunks.push(c);
+    });
+    process.stdin.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')));
+    process.stdin.on('error', reject);
+  });
+}
+
+function stat(pid) {
+  try {
+    const s = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    const f = s.slice(s.lastIndexOf(') ') + 2).split(' ');
+    return { ppid: Number(f[1]), start: f[19] || '', comm: s.slice(s.indexOf('(') + 1, s.lastIndexOf(')')) };
+  } catch { return null; }
+}
+function ownedByMe(pid) {
+  try { return fs.statSync(`/proc/${pid}`).uid === UID; } catch { return false; }
+}
+// The loader runs as `node /usr/local/bin/pw-claude-loader <entry> ...`.
+function isLoader(pid) {
+  if (!Number.isInteger(pid) || pid <= 1 || !ownedByMe(pid)) return false;
+  try {
+    const argv = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8').split('\0');
+    return path.basename(argv[1] || '') === 'pw-claude-loader';
+  } catch { return false; }
+}
+function privateDir(dir) {
+  if (!dir || !path.isAbsolute(dir)) return false;
+  try {
+    const st = fs.lstatSync(dir);
+    return st.isDirectory() && st.uid === UID && (st.mode & 0o077) === 0;
+  } catch { return false; }
+}
+// The Claude Code running this hook. It names itself in CLAUDE_PID; failing that, it is the nearest ancestor
+// that is not the shell it ran the hook command with.
+function ownClaude() {
+  const ancestors = [];
+  for (let pid = process.ppid, n = 0; pid > 1 && n < 8; n += 1) {
+    ancestors.push(pid);
+    pid = stat(pid)?.ppid ?? 0;
+  }
+  const named = Number(process.env.CLAUDE_PID);
+  if (ancestors.includes(named)) return named;
+  return ancestors.find((pid) => !SHELLS.has(stat(pid)?.comm)) ?? 0;
+}
+function writeAtomic(file, body) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, body, { mode: 0o600, flag: 'wx' });
+  fs.renameSync(tmp, file);
+}
+async function waitForAnswer(file, timeoutMs) {
+  for (const end = Date.now() + timeoutMs; Date.now() < end; await sleep(25)) {
+    try {
+      const st = fs.lstatSync(file);
+      if (!st.isFile() || st.uid !== UID) return null;
+      const answer = JSON.parse(fs.readFileSync(file, 'utf8'));
+      fs.unlinkSync(file);
+      return answer;
+    } catch { /* not there yet */ }
+  }
+  return null;
+}
+
+async function main() {
+  let input;
+  try { input = JSON.parse(await readStdin(1 << 20)); } catch (err) { say(`Failed to prepare restart: ${err.message}`); }
+  // Installed for /restart only; anything else passes through untouched.
+  if (input?.hook_event_name !== 'UserPromptExpansion' || input?.command_name !== 'restart') return;
+  const extra = String(input.command_args ?? '').trim();
+  if (extra) say(`Invalid argument "${extra.split(/\s+/)[0]}". Usage: /restart`);
+
+  const sid = String(input.session_id ?? '');
+  const byHand = UUID.test(sid) ? ` To restart by hand, run /exit and then: claude --resume ${sid}` : '';
+  const loaderPid = Number(process.env.PW_CLAUDE_LOADER_PID);
+  const dir = process.env.PW_CLAUDE_LOADER_DIR || '';
+  const claudePid = ownClaude();
+  // The loader must be this Claude's parent, or its grandparent through cli-wrapper.cjs. A claude started
+  // inside another session's tools inherits that session's loader variables, and must not restart it.
+  const parent = stat(claudePid)?.ppid ?? 0;
+  const underLoader = isLoader(loaderPid) && (parent === loaderPid || stat(parent)?.ppid === loaderPid);
+  if (!underLoader || !privateDir(dir)) say(`Restart is not available. Claude Code was not started through the loader.${byHand}`);
+  if (!UUID.test(sid)) say('Restart is not available: this conversation has no id to resume.');
+
+  const request = path.join(dir, `${loaderPid}.request.json`);
+  const answerFile = path.join(dir, `${loaderPid}.response.${process.pid}.json`);
+  try {
+    // An answer left for an earlier hook that had this pid must not be read as the loader's reply to this one.
+    try { fs.unlinkSync(answerFile); } catch { /* none */ }
+    writeAtomic(request, JSON.stringify({
+      v: 1,
+      loaderPid,
+      loaderStart: stat(loaderPid)?.start ?? '',
+      claudePid,
+      hookPid: process.pid,
+      sessionId: sid,
+      transcriptPath: typeof input.transcript_path === 'string' ? input.transcript_path : '',
+    }));
+    process.kill(loaderPid, 'SIGUSR2');
+  } catch (err) {
+    try { fs.unlinkSync(request); } catch { /* not written */ }
+    say(`Failed to prepare restart: ${err.message}`);
+  }
+  const answer = await waitForAnswer(answerFile, 5000);
+  if (!answer) {
+    try { fs.unlinkSync(request); } catch { /* taken */ }
+    say('Failed to prepare restart: the loader did not answer.');
+  }
+  if (answer.ok === true) say('Restarting Claude Code…');
+  const reason = String(answer.reason || 'the loader refused it');
+  say(`Restart is not available: ${reason}.${/in progress/.test(reason) ? '' : byHand}`);
+}
+
+main().catch((err) => say(`Failed to prepare restart: ${err.message}`));

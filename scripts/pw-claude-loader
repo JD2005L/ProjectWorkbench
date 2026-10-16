@@ -1,0 +1,345 @@
+#!/usr/bin/env node
+// Project Workbench: runs an interactive Claude Code session so that /restart can relaunch it in place.
+//
+// GitHub Copilot CLI's /restart works because Copilot never runs in the terminal on its own: a loader starts
+// it and stays in the foreground, and when the CLI asks to be restarted the loader starts it again with the
+// same command line plus the conversation to resume. The terminal never returns to the shell in between, and
+// the conversation carries on. Claude Code has no such loader, so /usr/local/bin/claude runs this one for
+// interactive sessions, and /restart (scripts/pw-claude-restart, a UserPromptExpansion hook) asks it to do
+// the same thing.
+//
+// The terminal must not return to the shell, even for a moment. Project Workbench reads a pane whose
+// foreground command is a shell as idle, and scheduled tasks type into idle panes, so "exit, then type
+// `claude --resume` into the shell" would open exactly that window.
+//
+// This takes the place of the vendor's cli-wrapper.cjs, which is what the wrapper ran before: a node process
+// that runs the native binary as its child and exits with its status (128 + the signal number when it was
+// killed). Same process count, the same `node` foreground command, the same exit statuses and the same job
+// control, so pane classification, hibernation (which stops the whole job), pw-claude-wait's reading of exit
+// statuses and Ctrl-Z all see what they saw before. Like cli-wrapper.cjs, this leaves SIGINT, SIGTERM, SIGHUP
+// and SIGTSTP at node's defaults: a signal sent to the job reaches Claude directly, as it always did.
+//
+//   pw-claude-loader <claude-entry> [claude arguments...]
+//   pw-claude-loader --relaunch-plan -- [claude arguments...]    prints what /restart would run, as JSON
+//
+// PW_CLAUDE_LOADER_STOP_MS (default 10000) is how long Claude gets to stop for a restart before it is killed.
+//
+// <claude-entry> is what the wrapper would have run: the npm package's cli-wrapper.cjs, whose native binary
+// is then run directly (as cli-wrapper.cjs itself does), or a native binary. It is resolved again on every
+// restart, so a Claude Code updated since the session started is the one that comes back.
+//
+// The restart handshake, with scripts/pw-claude-restart:
+//   1. Claude's environment carries PW_CLAUDE_LOADER_PID and PW_CLAUDE_LOADER_DIR, a 0700 directory.
+//   2. The hook writes <dir>/<loader pid>.request.json and sends this process SIGUSR2.
+//   3. This answers in <dir>/<loader pid>.response.<hook pid>.json: accepted, or the reason it is not.
+//   4. Once accepted, it waits for the hook to exit and for Claude to show the notice, then sends Claude
+//      SIGTERM. That is the stop Claude Code treats as routine: it restores the terminal and keeps the
+//      transcript. When Claude has exited, it starts again with the same arguments, minus the ones that pick
+//      or start a conversation, plus `--resume <id>`. A conversation with no transcript yet gets
+//      `--session-id <id>` instead: Claude Code refuses to resume a conversation it has nothing on disk for.
+import { spawn, spawnSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const STOP_MS = ((n) => (Number.isFinite(n) && n >= 100 && n <= 120000 ? n : 10000))(Number(process.env.PW_CLAUDE_LOADER_STOP_MS));
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+async function until(check, timeoutMs, stepMs = 25) {
+  for (const end = Date.now() + timeoutMs; Date.now() < end; await sleep(stepMs)) if (check()) return true;
+  return check();
+}
+
+// ---- the command line /restart repeats ---------------------------------------------------------------
+// Claude Code's options by what follows them, from `claude --help` (2.1.300). Commander reads them this way:
+// a required value is the next word whatever it looks like; an optional value is the next word unless that
+// looks like an option; a variadic one takes words until one looks like an option.
+const KIND = new Map([
+  ...['--agent', '--agents', '--append-system-prompt', '--autocompact', '--debug-file', '--effort', '--environment',
+    '--fallback-model', '--input-format', '--json-schema', '--max-budget-usd', '--model', '--name', '--output-format',
+    '--permission-mode', '--permission-prompts', '--plugin-dir', '--plugin-url', '--remote-control-session-name-prefix',
+    '--session-id', '--setting-sources', '--settings', '--system-prompt', '--system-prompt-snapshot'].map((o) => [o, 'value']),
+  ...['--add-dir', '--allowedTools', '--betas', '--disallowedTools', '--file', '--mcp-config', '--tools'].map((o) => [o, 'variadic']),
+  ...['--cloud', '--debug', '--from-pr', '--prompt-suggestions', '--remote-control', '--resume', '--teleport', '--tmux',
+    '--worktree'].map((o) => [o, 'optional']),
+  ...['--allow-dangerously-skip-permissions', '--ax-screen-reader', '--background', '--bare', '--brief', '--chrome',
+    '--continue', '--dangerously-skip-permissions', '--desktop', '--disable-slash-commands',
+    '--exclude-dynamic-system-prompt-sections', '--fork-session', '--forward-subagent-text', '--help', '--ide',
+    '--include-hook-events', '--include-partial-messages', '--no-chrome', '--no-session-persistence', '--print',
+    '--replay-user-messages', '--restricted', '--safe-mode', '--strict-mcp-config', '--verbose', '--version'].map((o) => [o, 'flag']),
+]);
+const ALIAS = new Map([
+  ['-c', '--continue'], ['-d', '--debug'], ['-h', '--help'], ['-n', '--name'], ['-p', '--print'], ['-r', '--resume'],
+  ['-v', '--version'], ['-w', '--worktree'], ['--allowed-tools', '--allowedTools'], ['--disallowed-tools', '--disallowedTools'],
+  ['--bg', '--background'],
+]);
+// These pick or start a conversation. /restart names the conversation itself, so they are not repeated.
+const DROP = new Set(['--resume', '--continue', '--session-id', '--fork-session', '--from-pr']);
+// A session started with one of these cannot be repeated by starting Claude again in this terminal.
+const REFUSE = new Map([
+  ['--worktree', 'it was started with --worktree, which would create another worktree'],
+  ['--tmux', 'it was started with --tmux, which would create another worktree'],
+  ['--background', 'it was started as a background session'],
+  ['--cloud', 'it is a cloud session'],
+  ['--teleport', 'it was started with --teleport'],
+  ['--desktop', 'it was opened in the desktop app'],
+  ['--environment', 'it is a cloud session'],
+  ['--print', 'it is not an interactive session'],
+  ['--help', 'it is not a session'],
+  ['--version', 'it is not a session'],
+]);
+const COMMANDS = new Set(['agents', 'attach', 'auth', 'auto-mode', 'doctor', 'gateway', 'help', 'import', 'install', 'logs',
+  'mcp', 'plugin', 'plugins', 'purge', 'respawn', 'rm', 'setup-token', 'stop', 'kill', 'ultrareview', 'update', 'upgrade']);
+const looksLikeOption = (word) => word.length > 1 && word[0] === '-';
+
+/**
+ * The arguments a restart starts Claude with, before the conversation is named: everything the session was
+ * started with except the options that pick or start a conversation and the prompt it was started with (a
+ * restart must not send that prompt again). Anything that cannot be read with certainty refuses the restart
+ * rather than guessing, because a guess that turns an option's value into a prompt would send it to Claude.
+ */
+function relaunchPlan(args) {
+  const kept = [];
+  let positionals = 0;
+  const words = [...args];
+  for (let i = 0; i < words.length;) {
+    const word = words[i];
+    if (word === '--') break; // everything after it is the prompt
+    if (!looksLikeOption(word)) {
+      if (positionals === 0 && COMMANDS.has(word)) return { ok: false, reason: `it ran the "${word}" command, not a conversation` };
+      positionals += 1; // the prompt the session was started with
+      i += 1;
+      continue;
+    }
+    let name = word;
+    let attached = null;
+    if (word.startsWith('--')) {
+      const eq = word.indexOf('=');
+      if (eq > 0) { name = word.slice(0, eq); attached = word.slice(eq + 1); }
+    } else if (word.length > 2) {
+      name = word.slice(0, 2);
+      attached = word.slice(2);
+    }
+    const option = ALIAS.get(name) || name;
+    const kind = KIND.get(option);
+    if (!kind) return { ok: false, reason: `it was started with ${name}, an option /restart does not know how to repeat` };
+    if (REFUSE.has(option)) return { ok: false, reason: REFUSE.get(option) };
+    let end = i + 1;
+    if (attached !== null && kind === 'flag') {
+      if (word.startsWith('--')) return { ok: false, reason: `it was started with ${word}, which /restart cannot read` };
+      // -cX: a cluster of short flags. Commander reads it as -c followed by -X.
+      words.splice(i, 1, name, `-${attached}`);
+      if (!DROP.has(option)) kept.push(name);
+      i += 1;
+      continue;
+    }
+    if (attached === null) {
+      if (kind === 'value' || kind === 'variadic') end = Math.min(words.length, i + 2);
+      else if (kind === 'optional' && i + 1 < words.length && !looksLikeOption(words[i + 1])) end = i + 2;
+      if (kind === 'variadic') while (end < words.length && !looksLikeOption(words[end])) end += 1;
+    }
+    if (!DROP.has(option)) kept.push(...words.slice(i, end));
+    i = end;
+  }
+  return { ok: true, args: kept };
+}
+
+// ---- what to run ----------------------------------------------------------------------------------------
+function platformKey() {
+  const cpu = os.arch();
+  if (process.platform !== 'linux') return `${process.platform}-${cpu}`;
+  const report = typeof process.report?.getReport === 'function' ? process.report.getReport() : null;
+  const musl = report != null && report.header?.glibcVersionRuntime === undefined;
+  return `linux-${cpu}${musl ? '-musl' : ''}`;
+}
+const runnable = (file) => { try { fs.accessSync(file, fs.constants.X_OK); return fs.statSync(file).isFile(); } catch { return false; } };
+
+/**
+ * cli-wrapper.cjs runs the native binary from the platform package installed with it. Run that binary
+ * directly, as it would, so a session costs one node process and not two. Anything else, or a layout this
+ * does not recognise, runs the entry itself.
+ */
+function resolveLaunch(entry) {
+  if (!/\.c?js$/.test(entry)) return { file: entry, prefix: [], env: {} };
+  const pkg = `claude-code-${platformKey()}`;
+  const dir = path.dirname(entry);
+  const native = [path.join(dir, 'node_modules', '@anthropic-ai', pkg, 'claude'), path.join(dir, '..', pkg, 'claude')].find(runnable);
+  if (native) return { file: native, prefix: [], env: { CLAUDE_CODE_INSTALLED_VIA_NPM_WRAPPER: '1' } };
+  return { file: process.execPath, prefix: [entry], env: {} };
+}
+
+// ---- the private directory the handshake runs through ------------------------------------------------------
+const UID = process.getuid();
+function privateDir() {
+  const dir = path.join(os.tmpdir(), `pw-claude-loader-${UID}`);
+  try { fs.mkdirSync(dir, { mode: 0o700 }); } catch (err) { if (err.code !== 'EEXIST') return null; }
+  try {
+    const st = fs.lstatSync(dir);
+    return st.isDirectory() && st.uid === UID && (st.mode & 0o077) === 0 ? dir : null;
+  } catch { return null; }
+}
+const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (err) { return err.code === 'EPERM'; } };
+function startTime(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return stat.slice(stat.lastIndexOf(') ') + 2).split(' ')[19] || '';
+  } catch { return ''; }
+}
+function parentOf(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+    return Number(stat.slice(stat.lastIndexOf(') ') + 2).split(' ')[1]);
+  } catch { return 0; }
+}
+// Requests and answers left behind by a loader or a hook that was killed mid-handshake.
+function sweep(dir) {
+  let names = [];
+  try { names = fs.readdirSync(dir); } catch { return; }
+  for (const name of names) {
+    const m = /^(\d+)\.(?:request|response\.\d+)\.json(?:\.\d+\.tmp)?$/.exec(name);
+    if (!m) continue;
+    const file = path.join(dir, name);
+    try {
+      if (!alive(Number(m[1])) || Date.now() - fs.lstatSync(file).mtimeMs > 10 * 60000) fs.unlinkSync(file);
+    } catch { /* gone */ }
+  }
+}
+function writeAtomic(file, body) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, body, { mode: 0o600, flag: 'wx' });
+  fs.renameSync(tmp, file);
+}
+
+/**
+ * What the conversation has on disk decides how it comes back. Claude Code resumes a transcript holding a
+ * message or a notice (the one /restart leaves is a `system` record), refuses one that holds only settings
+ * ("No conversation found"), and refuses `--session-id` for any id that already has a transcript.
+ */
+function transcriptState(file) {
+  if (typeof file !== 'string' || !path.isAbsolute(file)) return 'unknown';
+  let st;
+  try { st = fs.lstatSync(file); } catch (err) { return err.code === 'ENOENT' ? 'none' : 'unknown'; }
+  if (!st.isFile()) return 'unknown';
+  const found = /"type":\s*"(?:user|assistant|system)"/;
+  let fd;
+  try {
+    fd = fs.openSync(file, 'r');
+    const buf = Buffer.alloc(1 << 20);
+    let tail = '';
+    for (let read = 0, total = 0; total < 64 << 20; total += read) {
+      read = fs.readSync(fd, buf, 0, buf.length, null);
+      if (read <= 0) break;
+      const text = tail + buf.toString('utf8', 0, read);
+      if (found.test(text)) return 'conversation';
+      tail = text.slice(-64);
+    }
+    return 'empty';
+  } catch { return 'unknown'; } finally { if (fd !== undefined) fs.closeSync(fd); }
+}
+
+// ---- running Claude --------------------------------------------------------------------------------------
+function main(argv) {
+  if (argv[0] === '--relaunch-plan') {
+    const rest = argv[1] === '--' ? argv.slice(2) : argv.slice(1);
+    process.stdout.write(`${JSON.stringify(relaunchPlan(rest))}\n`);
+    return;
+  }
+  const [entry, ...args] = argv;
+  if (!entry) {
+    process.stderr.write('usage: pw-claude-loader <claude-entry> [claude arguments...]\n');
+    process.exit(64);
+  }
+  const plan = relaunchPlan(args);
+  const dir = privateDir();
+  if (dir) sweep(dir);
+  const myStart = startTime(process.pid);
+  const childEnv = { ...process.env, PW_CLAUDE_LOADER_PID: String(process.pid) };
+  if (dir) childEnv.PW_CLAUDE_LOADER_DIR = dir;
+  else delete childEnv.PW_CLAUDE_LOADER_DIR;
+
+  let child = null;
+  let childIsLauncher = false; // child is node running cli-wrapper.cjs, with Claude as its own child
+  let pending = null; // an accepted restart, until Claude has exited
+  let forced = false;
+
+  const finish = (code, signal) => {
+    if (signal) process.exit(128 + (os.constants.signals[signal] ?? 0));
+    process.exit(code ?? 1);
+  };
+  const start = (runArgs, relaunch) => {
+    const launch = resolveLaunch(entry);
+    const proc = spawn(launch.file, [...launch.prefix, ...runArgs], { stdio: 'inherit', env: { ...childEnv, ...launch.env } });
+    child = proc;
+    childIsLauncher = launch.prefix.length > 0;
+    proc.on('error', (err) => {
+      process.stderr.write(relaunch ? `Restart failed after shutdown: ${err.message}\n` : `[pw-claude-loader] Failed to execute Claude Code at ${launch.file}\n  ${err.message}\n`);
+      process.exit(1);
+    });
+    proc.on('exit', (code, signal) => {
+      if (!pending) return finish(code, signal);
+      const { sid, transcript } = pending;
+      pending = null;
+      const state = transcriptState(transcript);
+      const pick = state === 'none' ? ['--session-id', sid] : state === 'empty' ? [] : ['--resume', sid];
+      // A Claude that had to be killed could not put the terminal back the way it found it.
+      if (forced) spawnSync('stty', ['sane'], { stdio: 'inherit' });
+      forced = false;
+      process.stderr.write('\r\n\x1b[2mRestarting Claude Code…\x1b[0m\r\n');
+      start([...pick, ...plan.args], true);
+    });
+  };
+
+  const refusal = (req) => {
+    if (req.v !== 1) return 'the request came from a different version of /restart';
+    if (req.loaderPid !== process.pid || String(req.loaderStart) !== myStart) return 'the request was for another loader';
+    if (pending) return 'a restart is already in progress';
+    if (!child || child.exitCode !== null || child.signalCode !== null) return 'Claude Code is not running';
+    // Claude itself, or the native Claude under cli-wrapper.cjs when this had to run that instead.
+    const ours = req.claudePid === child.pid || (childIsLauncher && parentOf(req.claudePid) === child.pid);
+    if (!ours) return 'it came from a Claude Code this loader did not start';
+    if (typeof req.sessionId !== 'string' || !UUID.test(req.sessionId)) return 'the conversation has no id to resume';
+    if (!plan.ok) return plan.reason;
+    return null;
+  };
+  const stopForRestart = async (hookPid, claudePid) => {
+    // Everything here is about THIS process. `child` moves on to the new Claude the moment this one exits,
+    // and a timeout that read `child` would then kill the session it just started.
+    const proc = child;
+    const running = () => proc.exitCode === null && proc.signalCode === null;
+    // The hook runs inside Claude: let it finish, and give Claude a moment to show the notice and record it.
+    await until(() => !alive(hookPid), 5000);
+    await sleep(300);
+    if (!running()) return;
+    try { process.kill(claudePid, 'SIGTERM'); } catch { /* already gone */ }
+    if (await until(() => !running(), STOP_MS, 50)) return;
+    forced = true;
+    try { process.kill(claudePid, 'SIGKILL'); } catch { /* already gone */ }
+    try { process.kill(proc.pid, 'SIGKILL'); } catch { /* already gone */ }
+  };
+  // SIGUSR2 rather than SIGUSR1, which starts node's inspector.
+  process.on('SIGUSR2', () => {
+    if (!dir) return;
+    const file = path.join(dir, `${process.pid}.request.json`);
+    let req = null;
+    try {
+      const st = fs.lstatSync(file);
+      if (st.isFile() && st.uid === UID && st.size <= 64 * 1024) req = JSON.parse(fs.readFileSync(file, 'utf8'));
+    } catch { req = null; }
+    try { fs.unlinkSync(file); } catch { /* gone */ }
+    const hookPid = Number(req?.hookPid);
+    if (!req || typeof req !== 'object' || !Number.isInteger(hookPid) || hookPid <= 1) return;
+    const why = refusal(req);
+    if (!why) pending = { sid: req.sessionId, transcript: req.transcriptPath };
+    try {
+      writeAtomic(path.join(dir, `${process.pid}.response.${hookPid}.json`), JSON.stringify(why ? { ok: false, reason: why } : { ok: true }));
+    } catch {
+      pending = null; // the hook cannot be told, so it reports a timeout and nothing restarts
+      return;
+    }
+    if (!why) stopForRestart(hookPid, req.claudePid);
+  });
+
+  start(args, false);
+}
+
+main(process.argv.slice(2));

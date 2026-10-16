@@ -326,6 +326,20 @@ install -m 0755 "$SRC_DIR/scripts/pw-tmux-restore"        /usr/local/bin/pw-tmux
 install -m 0755 "$SRC_DIR/scripts/pw-claude-hibernate"    /usr/local/bin/pw-claude-hibernate
 install -m 0755 "$SRC_DIR/scripts/pw-claude-wait"         /usr/local/bin/pw-claude-wait
 install -m 0755 "$SRC_DIR/scripts/pw-claude-wake"         /usr/local/bin/pw-claude-wake
+# Claude Code's /restart: the loader the claude wrapper runs interactive sessions under, and the hook that
+# asks it to restart. Self-contained like the hibernation scripts.
+install -m 0755 "$SRC_DIR/scripts/pw-claude-loader"       /usr/local/bin/pw-claude-loader
+install -m 0755 "$SRC_DIR/scripts/pw-claude-restart"      /usr/local/bin/pw-claude-restart
+# The /restart skill and its hook go in Claude Code's managed settings directory, the one place every account
+# and every CLAUDE_CONFIG_DIR on the host reads: per-user config dirs are seeded fill-only (see
+# app/user-credentials.js), so a hook added to the shared settings.json never reaches one that already has
+# hooks. A drop-in file, so an operator's own managed-settings.json is never touched. Installed after the
+# hook command it names, because Claude Code picks up a changed managed settings file in running sessions.
+install -d -m 0755 /etc/claude-code /etc/claude-code/managed-settings.d /etc/claude-code/.claude \
+  /etc/claude-code/.claude/skills /etc/claude-code/.claude/skills/restart
+install -m 0644 "$SRC_DIR/config/claude-code/skills/restart/SKILL.md" /etc/claude-code/.claude/skills/restart/SKILL.md
+install -m 0644 "$SRC_DIR/config/claude-code/managed-settings.d/50-project-workbench-restart.json" \
+  /etc/claude-code/managed-settings.d/50-project-workbench-restart.json
 # Flat is correct here, unlike the two helpers below: plain bash, no relative
 # import to break. Repairs a workspace tree that a root process wrote into before
 # the writers were dropped to the pane account.

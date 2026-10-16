@@ -1,0 +1,12 @@
+{
+  "hooks": {
+    "UserPromptExpansion": [
+      {
+        "matcher": "^restart$",
+        "hooks": [
+          { "type": "command", "command": "/usr/local/bin/pw-claude-restart", "timeout": 15 }
+        ]
+      }
+    ]
+  }
+}

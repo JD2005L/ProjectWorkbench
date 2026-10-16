@@ -111,6 +111,9 @@ A `/manage` page clones repos into workspaces — or stands up empty local works
 ### Daily Claude Code updater
 A nightly `systemd` timer keeps Claude Code (and any other enabled CLIs) on their latest releases without touching the rest of the install.
 
+### `/restart` in Claude Code
+Type `/restart` in a Claude Code tab to restart Claude in that same tab and carry on the same conversation, the way GitHub Copilot CLI's `/restart` works. It picks up a Claude Code update installed since the session started, and changed settings, hooks, MCP servers, plugins and skills. The `claude` wrapper runs interactive sessions under `pw-claude-loader`, which stays in the terminal so the tab never drops to a shell prompt in between; the command itself is a skill plus a hook in `/etc/claude-code`, so every account has it. A session started before this was installed says so and shows the `claude --resume <id>` to use instead. `PW_CLAUDE_RESTART=off` in `claude-wrapper.env` (or for one launch) goes back to running Claude directly.
+
 ---
 
 ## How it works
@@ -367,7 +370,7 @@ sudo npm install -g @anthropic-ai/claude-code
 sudo /usr/local/sbin/update-claude-code
 ```
 
-The updater also writes `/usr/local/bin/claude` as a wrapper that applies this instance's permission/MCP policy from `/etc/project-workbench/claude-wrapper.env`.
+The updater also writes `/usr/local/bin/claude` as a wrapper that applies this instance's permission/MCP policy from `/etc/project-workbench/claude-wrapper.env`. For `/restart`, `install.sh` also installs `scripts/pw-claude-loader` and `scripts/pw-claude-restart` to `/usr/local/bin`, and `config/claude-code/` to `/etc/claude-code` (the skill under `.claude/skills/restart/`, the hook as a `managed-settings.d` drop-in).
 
 ### 5. systemd units
 
