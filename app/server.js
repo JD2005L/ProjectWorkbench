@@ -3072,7 +3072,10 @@ function nginxConfig(projects){
  // script tag is silently dropped, breaking mouse-drag-copy (OSC 52 sniffer).
  // auth_request gates each terminal/preview block per-project; in soft mode
  // (PW_AUTH_ENFORCE=false) the dashboard returns 200 for anonymous callers.
- const locations = projects.map(p => `    location ${BASE}/pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="${BASE}/terminal-preload.js"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}${ttydProxyBase}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
+ // The preload's URL carries the release: Cloudflare (and the phone behind it) kept serving a
+ // copy from before the swipe-scroll fix long after it shipped (James, 2026-10-16). A new release
+ // is a new URL, which no cache can answer with an old copy; the routes also say no-cache.
+ const locations = projects.map(p => `    location ${BASE}/pty/${p.name}/ {\n        auth_request /pw-auth-check;\n        sub_filter_once off;\n        sub_filter_types text/html;\n        sub_filter '</head>' '<script src="${BASE}/terminal-preload.js?v=${RELEASE_VERSION}"></script></head>';\n        proxy_set_header Accept-Encoding "";\n        proxy_pass http://127.0.0.1:${p.port}${ttydProxyBase}/pty/${p.name}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_read_timeout 86400;\n    }\n`).join('');
  const previewRoutes = previewProjects.map(p => `    location ${BASE}/preview/${p.name}/ {\n        auth_request /pw-auth-check;\n        proxy_pass http://127.0.0.1:${p.preview.port}/;\n        proxy_http_version 1.1;\n        proxy_set_header Upgrade $http_upgrade;\n        proxy_set_header Connection $connection_upgrade;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_set_header X-Forwarded-Prefix ${BASE}/preview/${p.name};\n        proxy_redirect ~^(https?://[^/]+)?/(?!preview/${p.name}/)(.*)$ ${BASE}/preview/${p.name}/$2;\n        proxy_buffering off;\n        proxy_read_timeout 86400;\n        proxy_send_timeout 86400;\n    }\n`).join('');
  const refererMaps = previewProjects.length ? `map $http_referer $pw_preview_name {\n    default "";\n    "~^https?://[^/]+${BASE}/preview/(?<pname>[^/]+)/" "$pname";\n}\nmap $pw_preview_name $pw_preview_port {\n    default 0;\n${previewProjects.map(p => `    "${p.name}" ${p.preview.port};`).join('\n')}\n}\n` : '';
  const dashboardPathNames = ['api','pty','term','file','manage','preview','terminal-preload','terminal-paste','healthz','favicon','robots',...(DEPLOY_CENTRE?['deploy']:[])].join('|');
@@ -6338,8 +6341,10 @@ app.post(BASE + '/api/setup/cli/auth', requireAdmin, async (req,res)=>{ try {
  res.json({ ok:true, command: cfg.authCmd });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
 
-app.get(BASE + '/terminal-preload.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-preload.js','utf8')); });
-app.get(BASE + '/terminal-paste.js', async (_req,res)=>{ res.type('application/javascript').send(await fs.readFile('/opt/project-workbench/app/terminal-paste.js','utf8')); });
+// no-cache: a cache may keep these only if it asks again each time (see the preload's URL in
+// nginxConfig). Read from beside this file, which on an install is the same /opt path as before.
+app.get(BASE + '/terminal-preload.js', async (_req,res)=>{ res.set('Cache-Control', 'no-cache').type('application/javascript').send(await fs.readFile(path.join(APP_DIR, 'terminal-preload.js'),'utf8')); });
+app.get(BASE + '/terminal-paste.js', async (_req,res)=>{ res.set('Cache-Control', 'no-cache').type('application/javascript').send(await fs.readFile(path.join(APP_DIR, 'terminal-paste.js'),'utf8')); });
 app.get(BASE + '/healthz', (_req,res)=>res.json({ok:true}));
 // The app manifest and its icons are public like /healthz: the browser fetches them on its own,
 // and they say nothing about any project. start_url lands where / always does, in the last project.
