@@ -1,0 +1,33 @@
+{
+  "category": "common",
+  "title": "Common \u2014 identical in every environment",
+  "summary": "The shared trunk. Code here may never name or branch on an environment, and any configuration value that is the same everywhere belongs here and nowhere else.",
+  "evidence": "verified",
+  "env": {
+    "NODE_ENV": "production",
+    "PW_USERS_PATH": "/etc/project-workbench/users.json",
+    "PW_SECRET_KEY_PATH": "/etc/project-workbench/.secret-key",
+    "PW_AUTH_ENFORCE": "true"
+  },
+  "sharedTrees": [
+    "app/",
+    "test/",
+    "standards/",
+    "config/",
+    "contract/",
+    "docs/",
+    "tools/"
+  ],
+  "enforcedTrees": [
+    "app/"
+  ],
+  "invariants": [
+    "No file under an enforcedTree may branch on an environment identity (a site name, a host name, an organisation). Checked by test/env-profiles.test.mjs. enforcedTrees is product code only: test/ is a shared tree but its fixtures may legitimately contain a real account or domain name as DATA.",
+    "Every environment difference reaches the shared trees as a PW_* variable, never as a conditional.",
+    "A value identical in every environment lives in this profile only; an environment profile may not repeat it.",
+    "A value that differs lives in each environment profile that sets it, and may not appear in this profile."
+  ],
+  "notes": [
+    "PW_AUTH_ENFORCE lives here because every environment requires it. The no-overlap gate (test/env-profiles.test.mjs) moved it: it was declared identically in both environment profiles."
+  ]
+}

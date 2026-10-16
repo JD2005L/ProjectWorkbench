@@ -1,0 +1,59 @@
+{
+  "category": "corporate",
+  "title": "Corporate \u2014 the GOA side",
+  "instances": [
+    "goa"
+  ],
+  "summary": "Rootful-podman container instance behind a reverse proxy, directory (LDAP) auth, many operators, Windows deploy targets. Promotion runs through an administrator-approved path on an unprivileged account with no npm-registry access.",
+  "evidence": "reconstructed",
+  "evidenceNote": "NOT read from the live instance \u2014 this workspace cannot reach it. Every value below is reconstructed from repo source (app/isolation.js, app/server.js, app/user-credentials.js, deploy/host/README.md), DEPLOY.md's knob table and DECISIONS.md. Treat it as a proposal to confirm: one `systemctl show project-workbench -p Environment` from a GOA operator turns this into evidence. Until then do not generate a GOA environment file from it.",
+  "terminalModel": "container",
+  "installer": "deploy/host/install.sh",
+  "env": {
+    "PW_DEPLOY_MODE": "container",
+    "PW_CANONICAL_REGISTRY": "/etc/project-workbench/projects.json",
+    "PW_REGISTRY_PATH": "/etc/project-workbench/projects.json",
+    "PW_TMUX_OWNER_CGROUP": "pw-tmux.slice",
+    "PW_AUTH_MODE": "ldap",
+    "PW_LOGIN_ORG": "your GOA account",
+    "PW_BASE_PATH": "/workbench",
+    "PW_EXTRA_NGINX": "/etc/project-workbench/extra-nginx.conf",
+    "PW_DEPLOY_CENTRE": "true",
+    "PW_PER_USER_CLAUDE": "true",
+    "PW_PER_LAUNCHER_CLAUDE": "true"
+  },
+  "unconfirmedEnv": [
+    "PW_AUTH_HEADER",
+    "PW_SSO_USER_HEADER",
+    "PW_LDAP_URL",
+    "PW_LDAP_SUFFIX",
+    "PW_LDAP_CACERT",
+    "PW_TLS_ENABLED",
+    "PW_TLS_CERT",
+    "PW_TLS_KEY",
+    "PW_TLS_SERVER_NAME",
+    "PW_APP_DIR",
+    "PW_TMUX_STATE_DIR",
+    "PW_USER_CRED_BASE",
+    "PW_DOTNET_CHANNELS",
+    "PW_TMUX_HOST_ALIAS_ARGS"
+  ],
+  "forbiddenEnv": [
+    "PW_TURN_OUTCOME",
+    "PW_TURN_OUTCOME_HERMES",
+    "PW_TURN_OUTCOME_KEY_PATH",
+    "PW_TURN_OUTCOME_OUTBOX_PATH",
+    "PW_TURN_OUTCOME_RELAY_CONFIG"
+  ],
+  "hostHooks": [
+    "deploy/host/files/usr/local/sbin/pw-harden-sudoers.sh",
+    "deploy/host/files/usr/local/sbin/pw-ensure-dotnet.sh",
+    "deploy/host/files/usr/local/sbin/pw-promote-runner"
+  ],
+  "notes": [
+    "Turn outcomes (Jev) must never ship here: forbiddenEnv above makes DECISIONS.md 2026-10-05 a test failure instead of a sentence someone has to remember.",
+    "The container is recreated from the image on every (re)start, so anything not baked or persisted is re-applied by the hostHooks as systemd ExecStartPost.",
+    "install.sh at the repo root refuses PW_DEPLOY_MODE=container by design (install.sh:34); this environment never runs it.",
+    "The Deploy Centre (app/deployment/, ~6100 lines) is off by default everywhere and on only here."
+  ]
+}

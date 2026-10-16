@@ -1,0 +1,46 @@
+{
+  "category": "personal",
+  "title": "Personal \u2014 the PVI/PVE side",
+  "instances": [
+    "pvi2"
+  ],
+  "summary": "Bare-metal/VM instance, host terminal model, local password auth, single operator. Runs the agent-facing subsystems the corporate side deliberately does not carry.",
+  "evidence": "verified",
+  "evidenceNote": "Read on 2026-10-16 from the live instance: systemctl show project-workbench, /etc/systemd/system/project-workbench.service.d/*.conf and /etc/project-workbench/pw.env.",
+  "terminalModel": "host",
+  "installer": "install.sh",
+  "env": {
+    "PW_DEPLOY_MODE": "host",
+    "PW_REGISTRY_PATH": "/opt/project-workbench/projects.json",
+    "PW_APP_DIR": "/opt/project-workbench/app",
+    "PW_TMUX_STATE_DIR": "/var/lib/project-workbench/tmux-persist",
+    "PW_AUTH_MODE": "local",
+    "PW_PER_USER_CLAUDE": "false",
+    "PW_USER_CRED_BASE": "/home/admin/pw-users",
+    "PW_ORCHESTRATOR_ENABLED": "true",
+    "PW_ORCHESTRATOR_INSTANCE_ID": "pvi2-ct2115",
+    "PW_ORCHESTRATOR_BASE_PATH": "/api/orchestrator/v1",
+    "PW_ORCHESTRATOR_TOKENS_PATH": "/etc/project-workbench/orchestrator-tokens.json",
+    "PW_ORCHESTRATOR_PROJECTS_PATH": "/etc/project-workbench/orchestrator-projects.json",
+    "PW_ORCHESTRATOR_DATA_DIR": "/var/lib/project-workbench/orchestrator",
+    "PW_ORCHESTRATOR_CLAUDE_BIN": "/usr/lib/node_modules/@anthropic-ai/claude-code/bin/claude.exe",
+    "PW_ORCHESTRATOR_CLI_SHA256": "674f61f20ff306f3100cf9200e4c36c4b70278b5bef2884549819b942a89c863",
+    "PW_ORCHESTRATOR_CONFIG_GENERATION": "1",
+    "PW_ORCHESTRATOR_TMUX_USER": "admin",
+    "PW_ORCHESTRATOR_REQUIRE_SEPARATE_APPROVER": "true",
+    "PW_TURN_OUTCOME": "on",
+    "PW_TURN_OUTCOME_HERMES": "on"
+  },
+  "secretEnv": [
+    "PW_INTERNAL_HANDOFF_TOKEN"
+  ],
+  "dropIns": [
+    "/etc/systemd/system/project-workbench.service.d/auth.conf",
+    "/etc/systemd/system/project-workbench.service.d/orchestrator.conf",
+    "/etc/systemd/system/project-workbench.service.d/turn-outcome.conf"
+  ],
+  "notes": [
+    "PW_TURN_OUTCOME (Jev) is opt-in per instance and is on here; the corporate profile forbids it (DECISIONS.md 2026-10-05).",
+    "PW_PER_USER_CLAUDE is false: one operator, one Claude login, so the per-user credential tree is unused."
+  ]
+}

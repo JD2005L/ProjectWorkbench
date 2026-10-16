@@ -86,6 +86,16 @@ PW_NGINX_RELOAD_CMD="nsenter -t 1 -m -- systemctl reload nginx"
 `applyRouting` still validates with the test command and rolls back to the
 previous config on failure before reloading.
 
+## Which environment sets what
+
+This table documents what each knob *does*. Which environment actually *sets* it
+is declared as data in `environments/`, in three categories — `common`,
+`corporate` (GOA) and `personal` (PVI/PVE) — and enforced by
+`test/env-profiles.test.mjs`: a value identical everywhere lives in `common/`
+once, a value that diverges lives in the environment profiles and not in
+`common/`, and a standing "never ship this here" rule is a `forbiddenEnv` entry
+that fails CI rather than a sentence in DECISIONS.md. See `environments/README.md`.
+
 ## Environment knobs (all optional; defaults keep upstream behavior)
 
 | Var | Default | Purpose |

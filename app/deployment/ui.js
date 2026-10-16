@@ -172,7 +172,7 @@ function credentialCard(target, title, hint) {
   return `<div class="s-card"><form id="dc-form-${target}">
 <h3>${escape(title)} deploy account</h3>
 <p class="muted">${escape(hint)}</p>
-<label for="dc-user-${target}">Windows account</label><input id="dc-user-${target}" type="text" maxlength="128" autocomplete="off" placeholder="GOA\\account.name" spellcheck="false">
+<label for="dc-user-${target}">Windows account</label><input id="dc-user-${target}" type="text" maxlength="128" autocomplete="off" placeholder="DOMAIN\\account.name" spellcheck="false">
 <label for="dc-password-${target}">Password (leave blank to keep)</label><input id="dc-password-${target}" type="password" maxlength="256" autocomplete="new-password">
 <label for="dc-note-${target}">Note (optional)</label><input id="dc-note-${target}" type="text" maxlength="200" autocomplete="off" placeholder="what this account may reach">
 <p id="dc-state-${target}" class="muted"></p>
