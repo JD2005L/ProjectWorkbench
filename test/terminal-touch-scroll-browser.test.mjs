@@ -80,9 +80,21 @@ test('BROWSER: a thumb swipe scrolls tmux history, and a tap or a sideways swipe
     await sleep(300);
     assert.deepEqual(state(), { mode: 0, pos: 0 }, 'a tap does not scroll');
 
+    // From live output, even a short swipe shows something: tmux spends the first notch on
+    // entering copy mode, and the preload pays for it up front.
+    const rowPx = await page.evaluate(() => document.querySelector('.xterm-screen').clientHeight / window.term.rows);
+    await swipe(200, 300, 200, 300 + 4 * rowPx, { steps: 4 });
+    const short = state();
+    assert.ok(short.mode === 1 && short.pos > 0, `a 4-row swipe already scrolls: ${JSON.stringify(short)}`);
+    for (let i = 0; i < 6 && state().mode === 1; i++) await swipe(200, 600, 200, 100);
+    assert.equal(state().mode, 0);
+
     await swipe(200, 150, 200, 600);
     const first = state();
-    assert.ok(first.mode === 1 && first.pos > 0, `a swipe down opens the history and goes back: ${JSON.stringify(first)}`);
+    // "Can it thumb scroll a bit quicker?" (James, 2026-10-16): two lines of history per row of
+    // finger travel, where it used to be one.
+    const rows = 450 / rowPx;
+    assert.ok(first.mode === 1 && first.pos >= 1.5 * rows, `a swipe down goes back about 2 lines per row travelled (${rows.toFixed(1)} rows): ${JSON.stringify(first)}`);
     await swipe(200, 600, 200, 300);
     assert.ok(state().pos < first.pos, 'a swipe up comes forward again');
     for (let i = 0; i < 6 && state().mode === 1; i++) await swipe(200, 600, 200, 100);

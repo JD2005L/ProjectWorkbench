@@ -13,23 +13,27 @@
   // Phones (James, 2026-10-16): a thumb swipe scrolls the history. The history is tmux's, and tmux
   // runs with the mouse on, so a mouse wheel scrolls it (tmux enters copy mode, and leaves it again
   // at the bottom). xterm.js turns a wheel into the mouse report tmux wants, but a swipe into
-  // nothing. So a vertical swipe is replayed as wheel notches, one per 5 rows of finger travel
-  // (what tmux scrolls per notch, so the text follows the finger), and a flick carries on briefly.
-  // A finger moving down shows older lines, as everywhere else on a phone.
+  // nothing. So a vertical swipe is replayed as wheel notches, SPEED lines of history per row of
+  // finger travel, and a flick carries on briefly. A finger moving down shows older lines, as
+  // everywhere else on a phone.
   try {
-    const LINES_PER_NOTCH = 5;
+    const LINES_PER_NOTCH = 5; // what tmux's copy mode scrolls per wheel notch
+    // 1 would make the text follow the finger exactly; James found that slow ("Can it thumb scroll a
+    // bit quicker?", 2026-10-16).
+    const SPEED = 2;
     let touch = null, glide = 0;
     const rowPx = (screen) => {
       const rows = window.term && window.term.rows;
       return (rows > 0 && screen.clientHeight / rows) || 17;
     };
+    const notch = (t, older) => t.screen.dispatchEvent(new WheelEvent('wheel', { deltaY: older ? -1 : 1, deltaMode: 1, clientX: t.x, clientY: t.y, bubbles: true, cancelable: true, view: window }));
     const travel = (t, dy) => {
       t.acc += dy;
-      const step = rowPx(t.screen) * LINES_PER_NOTCH;
+      const step = rowPx(t.screen) * LINES_PER_NOTCH / SPEED;
       while (Math.abs(t.acc) >= step) {
-        const down = t.acc > 0;
-        t.acc -= down ? step : -step;
-        t.screen.dispatchEvent(new WheelEvent('wheel', { deltaY: down ? -1 : 1, deltaMode: 1, clientX: t.x, clientY: t.y, bubbles: true, cancelable: true, view: window }));
+        const older = t.acc > 0;
+        t.acc -= older ? step : -step;
+        notch(t, older);
       }
     };
     document.addEventListener('touchstart', (e) => {
@@ -50,6 +54,10 @@
         if (Math.abs(dx) < 10 && Math.abs(dy) < 10) return;
         if (Math.abs(dx) > Math.abs(dy)) { touch = null; return; }
         t.on = true;
+        // From live output, tmux spends a swipe's first notch on entering copy mode, so a short
+        // swipe showed nothing at all. One notch up front pays for that; in copy mode already, it
+        // is just a little more scroll.
+        if (dy > 0) notch(t, true);
       }
       e.preventDefault();
       e.stopPropagation(); // xterm.js's own touch scrolling has nothing to scroll here
