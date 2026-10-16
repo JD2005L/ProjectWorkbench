@@ -10,9 +10,9 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HOOK = fileURLToPath(new URL('../scripts/pw-git-hook', import.meta.url));
-const NAMES = ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'pre-push', 'post-checkout'];
+const NAMES = ['pre-commit', 'prepare-commit-msg', 'commit-msg', 'post-commit', 'post-merge', 'post-rewrite', 'pre-push', 'post-checkout'];
 
-function setup({ session = 'pw_Demo', window = '@12' } = {}) {
+function setup({ session = 'pw_Demo', window = '@12', panePid = '4242' } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-git-hook-'));
   const hooks = path.join(root, 'hooks');
   fs.mkdirSync(hooks);
@@ -23,11 +23,12 @@ function setup({ session = 'pw_Demo', window = '@12' } = {}) {
   fs.mkdirSync(bin);
   fs.writeFileSync(path.join(bin, 'tmux'), `#!/bin/sh
 case "$*" in
-  *session_name*) echo "${session}" ;;
-  *window_id*) echo "${window}" ;;
+  *session_name*) echo "${session} ${window} ${panePid}" ;;
   *) exit 1 ;;
 esac
 `, { mode: 0o755 });
+  const home = path.join(root, 'home');
+  fs.mkdirSync(home);
   const repo = path.join(root, 'repo');
   fs.mkdirSync(repo);
   const git = (args, env = {}) => execFileSync('git', args, { cwd: repo, env: { ...process.env, ...env }, encoding: 'utf8' });
@@ -38,8 +39,10 @@ esac
   const pwEnv = {
     PATH: `${bin}:${process.env.PATH}`,
     GIT_CONFIG_COUNT: '1', GIT_CONFIG_KEY_0: 'core.hooksPath', GIT_CONFIG_VALUE_0: hooks,
-    TMUX_PANE: '%5', PW_CI_INSTANCE: 'pvi2',
+    TMUX_PANE: '%5', PW_CI_INSTANCE: 'pvi2', HOME: home,
+    GIT_CONFIG_GLOBAL: path.join(root, 'gitconfig-global'),
   };
+  fs.writeFileSync(pwEnv.GIT_CONFIG_GLOBAL, '');
   let n = 0;
   const commit = (env = pwEnv, extra = []) => {
     fs.writeFileSync(path.join(repo, `f${n++}.txt`), String(n));
@@ -47,13 +50,36 @@ esac
     return spawnSync('git', ['commit', '-q', '-m', 'change', ...extra], { cwd: repo, env: { ...process.env, ...env }, encoding: 'utf8' });
   };
   const lastMessage = () => git(['log', '-1', '--format=%B']);
-  return { root, repo, hooks, git, pwEnv, commit, lastMessage };
+  const ledgerFile = path.join(home, '.local', 'state', 'project-workbench', 'ci-commits.log');
+  const ledger = () => (fs.existsSync(ledgerFile) ? fs.readFileSync(ledgerFile, 'utf8').trim().split('\n').map((l) => l.split(' ').slice(0, 4).join(' ')) : []);
+  const head = () => git(['rev-parse', 'HEAD']).trim();
+  return { root, repo, hooks, git, pwEnv, commit, lastMessage, ledger, ledgerFile, head };
 }
 
 test('a commit made in a PW pane is signed with instance/session/window', () => {
   const t = setup();
   assert.equal(t.commit().status, 0);
   assert.match(t.lastMessage(), /^PW-Session: pvi2\/pw_Demo\/@12$/m);
+});
+
+test('every commit, amend and rebase result is recorded in the ledger with its window and pane', () => {
+  const t = setup();
+  t.commit();
+  const first = t.head();
+  assert.deepEqual(t.ledger(), [`${first} pw_Demo @12 4242`]);
+  assert.equal(fs.statSync(t.ledgerFile).mode & 0o777, 0o600);
+  const amend = spawnSync('git', ['commit', '-q', '--amend', '-m', 'changed'], { cwd: t.repo, env: { ...process.env, ...t.pwEnv }, encoding: 'utf8' });
+  assert.equal(amend.status, 0, amend.stderr);
+  assert.ok(t.ledger().includes(`${t.head()} pw_Demo @12 4242`), 'the amended commit');
+  // a rebase rewrites commits: the new SHAs are recorded, and the repo's own post-rewrite
+  // still receives the old -> new list on stdin
+  const seen = path.join(t.root, 'rewrite-seen');
+  fs.writeFileSync(path.join(t.repo, '.git', 'hooks', 'post-rewrite'), `#!/bin/sh\ncat > "${seen}"\n`, { mode: 0o755 });
+  t.commit(); t.commit();
+  const r = spawnSync('git', ['rebase', '-q', '--exec', 'true', 'HEAD~2'], { cwd: t.repo, env: { ...process.env, ...t.pwEnv, GIT_SEQUENCE_EDITOR: 'true' }, encoding: 'utf8' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(t.ledger().includes(`${t.head()} pw_Demo @12 4242`), 'the rebased head');
+  assert.ok(fs.existsSync(seen), 'the repo\'s own post-rewrite ran');
 });
 
 test('amending keeps exactly one signature', () => {
@@ -70,6 +96,7 @@ test('outside a PW pane, or in a non-PW tmux session, nothing is added', () => {
   // Explicitly empty: the test runner may itself be inside tmux.
   assert.equal(t.commit({ ...t.pwEnv, TMUX_PANE: '' }).status, 0);
   assert.doesNotMatch(t.lastMessage(), /PW-Session/);
+  assert.deepEqual(t.ledger(), [], 'and nothing is recorded');
   const other = setup({ session: 'scratch' });
   assert.equal(other.commit().status, 0);
   assert.doesNotMatch(other.lastMessage(), /PW-Session/);
@@ -106,6 +133,17 @@ test('a repo with its own core.hooksPath (husky-style) keeps using it', () => {
   assert.equal(t.commit().status, 0);
   assert.equal(fs.readFileSync(path.join(t.repo, 'husky-ran'), 'utf8'), 'husky\n');
   assert.match(t.lastMessage(), /PW-Session: pvi2\/pw_Demo\/@12/);
+});
+
+test('REVIEW P2: a hooks path set globally (not in the repo) is still honoured, ~ expanded', () => {
+  const t = setup();
+  const glob = path.join(t.pwEnv.HOME, 'global-hooks');
+  fs.mkdirSync(glob);
+  fs.writeFileSync(path.join(glob, 'post-commit'), `#!/bin/sh\necho global >> "${path.join(t.root, 'global-ran')}"\n`, { mode: 0o755 });
+  fs.writeFileSync(t.pwEnv.GIT_CONFIG_GLOBAL, '[core]\n\thooksPath = ~/global-hooks\n');
+  assert.equal(t.commit().status, 0);
+  assert.equal(fs.readFileSync(path.join(t.root, 'global-ran'), 'utf8'), 'global\n');
+  assert.equal(t.ledger().length, 1, 'still recorded');
 });
 
 test('without the wrapper\'s opt-in environment the hook directory is never consulted', () => {

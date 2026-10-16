@@ -3,7 +3,7 @@ import fs from 'fs/promises';
 import fsSync from 'fs';
 import { resolveShippedHelper } from './shipped-helpers.js';
 import { createTurnTriage, evaluateTurn, turnOutcomeOptedIn } from './turn-outcome.js';
-import { ciResultsOptedIn, verifyGithubSignature, parseWorkflowRun, repoMatches, createCiResults, composerIsEmpty } from './ci-results.js';
+import { ciResultsOptedIn, verifyGithubSignature, parseWorkflowRun, repoMatches, createCiResults, composerIsEmpty, screenShowsBusy } from './ci-results.js';
 import { createTurnOutbox, createHermesRelay, createTurnLog } from './turn-outbox.js';
 import path from 'path';
 import os from 'os';
@@ -845,6 +845,13 @@ const CI_RESULTS_ENABLED = ciResultsOptedIn(process.env);
 const CI_WEBHOOK_SECRET_PATH = process.env.PW_CI_WEBHOOK_SECRET_PATH || '/etc/project-workbench/github-webhook-secret';
 const CI_STATE_PATH = process.env.PW_CI_STATE_PATH || '/var/lib/project-workbench/ci-results.json';
 const CI_WAKE_EVERY_MS = 5 * 60 * 1000;
+// Which window made a commit: the git hook's ledger in the pane account's home, read by the
+// credential helper AS that account (never by this root process). Overridable for tests.
+async function readCiLedgerAsOwner(sha){
+ const plan = credentialExecutionPlan({ owner: await terminalOwner(), currentUid: process.getuid?.() ?? null });
+ const out = await spawnCredentialJob({ spawn, argv: gitCredentialArgv(plan), job: { action: 'ci-ledger', sha, ...(process.env.PW_CI_LEDGER_PATH ? { file: process.env.PW_CI_LEDGER_PATH } : {}) } });
+ return out?.entry || null;
+}
 async function readCiWebhookSecret(){
  if(!CI_RESULTS_ENABLED) return '';
  try { return (await fs.readFile(CI_WEBHOOK_SECRET_PATH, 'utf8')).trim(); } catch { return ''; }
@@ -866,6 +873,8 @@ async function deliverCiResult(item){
  try { windows = await readTmuxWindows(p.name); } catch { return { gone: `${p.name} has no terminal session` }; }
  const w = windows.find(x => x.windowId === run.windowId);
  if(!w) return { gone: `window ${run.windowId} in ${p.name} no longer exists` };
+ // tmux reuses window ids after a restart; the pane process is what made the commit.
+ if(String(w.panePid) !== String(run.panePid)) return { gone: `the window that made the commit in ${p.name} has since been replaced` };
  if(w.hibernated){
   // Resume it, then deliver on a later sweep once Claude is back and idle.
   if(Date.now() - (ciWokeAt.get(run.windowId) || 0) > CI_WAKE_EVERY_MS){
@@ -879,9 +888,9 @@ async function deliverCiResult(item){
  // Idle = Claude's last turn has ended (the same read turn outcomes use).
  const tails = await readTurnTailsAsOwner([{ key: 'ci', panePid: w.panePid, credUser: w.credUser || '' }]).catch(()=>null);
  if(!tails?.ci) return 'wait';
- // Never on top of somebody's half-written message.
+ // Never mid-turn, and never on top of somebody's half-written message.
  const { stdout: screen } = await tmux(['capture-pane','-p','-e','-t',w.windowId]).catch(()=>({stdout:''}));
- if(!composerIsEmpty(screen)) return 'wait';
+ if(screenShowsBusy(screen) || !composerIsEmpty(screen)) return 'wait';
  await pastePromptToWindow(w.windowId, item.text);
  await audit('ci_result_delivered', { project: p.name, window: w.index, repo: run.repo, sha: run.sha, runId: run.runId, conclusion: run.conclusion, retry: item.streak });
  console.log(`[ci-results] delivered ${run.conclusion} for ${run.repo}@${run.sha.slice(0,7)} to ${p.name} › ${w.name || w.index}`);
@@ -896,7 +905,6 @@ async function escalateCiResult({ run, reason }){
  await audit('ci_result_escalated', { project: p?.name || null, repo: run.repo, sha: run.sha, runId: run.runId, conclusion: run.conclusion, reason });
 }
 const ciResults = createCiResults({
- instanceId: TURN_OUTCOME_INSTANCE,
  load: async () => { try { return JSON.parse(await fs.readFile(CI_STATE_PATH, 'utf8')); } catch(e){ if(e?.code === 'ENOENT') return null; throw e; } },
  save: async (state) => { await fs.mkdir(path.dirname(CI_STATE_PATH), { recursive: true }); await writeFileAtomic(CI_STATE_PATH, JSON.stringify(state)+'\n', { mode: 0o600 }); },
  tryDeliver: deliverCiResult,
@@ -4866,7 +4874,10 @@ app.post(BASE + '/api/ci/github', async (req,res)=>{ try {
  try { payload = JSON.parse(raw.toString('utf8')); } catch { return res.status(400).json({ok:false,error:'Body is not JSON'}); }
  const run = parseWorkflowRun(String(b.event || ''), payload);
  if(run.ignore) return res.status(202).json({ok:true,accepted:false,reason:run.ignore});
- const out = await ciResults.receive(run);
+ // The authority on who made the commit is this instance's own ledger, never the message.
+ const entry = await readCiLedgerAsOwner(run.sha);
+ if(!entry) return res.status(202).json({ok:true,accepted:false,reason:'commit not made by a PW session on this instance'});
+ const out = await ciResults.receive({ ...run, session: entry.session, windowId: entry.windowId, panePid: entry.panePid });
  if(out.accepted && !ISOLATED) ciResults.tick().catch(()=>{});
  res.status(202).json({ok:true,...out});
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});

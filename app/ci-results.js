@@ -3,9 +3,12 @@
 //
 //   GitHub App (workflow_run: completed) -> n8n relay -> POST /api/ci/github -> here
 //
-// The commit carries the route: scripts/pw-git-hook signs every commit a PW Claude
-// session makes with `PW-Session: <instance>/<tmux session>/<window id>`, and the
-// workflow_run payload includes the head commit's message. See docs/ci-results.md.
+// The route is the LEDGER (scripts/pw-git-hook): every commit a PW Claude window makes
+// is recorded locally as <sha> <tmux session> <window id> <pane pid>. A run is delivered
+// only when its head SHA is in this instance's ledger and that window still has that
+// pane. The PW-Session trailer on the commit is a visible label and decides nothing — a
+// commit message is text anyone can write (a fork's pull request included), while the
+// ledger is what this machine saw its own sessions do. See docs/ci-results.md.
 //
 // Trust: n8n is only a pipe. It forwards GitHub's raw body and X-Hub-Signature-256
 // untouched, and PW verifies that signature itself with the webhook secret, so
@@ -14,6 +17,8 @@
 // commit message, the log, or anything else a commit author controls as free text.
 
 import crypto from 'node:crypto';
+import { constants as fsConstants } from 'node:fs';
+import path from 'node:path';
 
 export const FAILED = Object.freeze(['failure', 'timed_out', 'startup_failure']);
 export const REPORTED = Object.freeze([...FAILED, 'success']); // cancelled/skipped/neutral: superseded or irrelevant
@@ -36,22 +41,6 @@ export function verifyGithubSignature(raw, header, secret) {
   return got.length === want.length && crypto.timingSafeEqual(got, want);
 }
 
-const SIG = /^([A-Za-z0-9._-]{1,64})\/(pw_[A-Za-z0-9_]{1,120})\/(@[0-9]{1,9})$/;
-export function parseSignature(value) {
-  const m = SIG.exec(String(value || '').trim());
-  return m ? { instance: m[1], session: m[2], windowId: m[3] } : null;
-}
-
-// The LAST PW-Session trailer wins, as git's own trailer handling would have it.
-export function signatureFromMessage(message) {
-  let found = null;
-  for (const line of String(message || '').split('\n')) {
-    const m = /^PW-Session:\s*(\S+)\s*$/.exec(line);
-    if (m) found = m[1];
-  }
-  return found;
-}
-
 // Text that came from GitHub and is shown inside a prompt: names only, no markup,
 // no newlines, bounded. A workflow or branch name is chosen by whoever can push.
 function safe(text, max = 100) {
@@ -63,6 +52,13 @@ function safe(text, max = 100) {
  */
 export function parseWorkflowRun(event, payload) {
   if (event !== 'workflow_run') return { ignore: `event ${safe(event, 40) || 'missing'}` };
+  // Only runs a commit actually caused: a push, or a pull request from a branch of the SAME
+  // repository. A fork's pull request, a schedule or a manual dispatch is not "your commit".
+  const trigger = String(payload?.workflow_run?.event || '');
+  if (trigger === 'pull_request') {
+    const head = payload?.workflow_run?.head_repository?.full_name;
+    if (!head || head !== payload?.repository?.full_name) return { ignore: 'pull request from another repository' };
+  } else if (trigger !== 'push') return { ignore: `triggered by ${safe(trigger, 40) || 'unknown'}` };
   if (payload?.action !== 'completed') return { ignore: `action ${safe(payload?.action, 40) || 'missing'}` };
   const run = payload.workflow_run || {};
   const conclusion = String(run.conclusion || '');
@@ -71,13 +67,10 @@ export function parseWorkflowRun(event, payload) {
   if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(repo)) return { ignore: 'no repository' };
   const sha = String(run.head_sha || '');
   if (!/^[0-9a-f]{40}$/.test(sha)) return { ignore: 'no head sha' };
-  const sig = parseSignature(signatureFromMessage(run.head_commit?.message));
-  if (!sig) return { ignore: 'commit not signed by a PW session' };
   const url = String(run.html_url || '');
   const runId = Number(run.id);
   if (!Number.isSafeInteger(runId)) return { ignore: 'no run id' };
   return {
-    ...sig,
     repo, sha, runId,
     attempt: Number(run.run_attempt) || 1,
     branch: safe(run.head_branch, 120) || '(detached)',
@@ -85,6 +78,44 @@ export function parseWorkflowRun(event, payload) {
     conclusion,
     url: /^https:\/\/github\.com\/[A-Za-z0-9._\/-]+$/.test(url) ? url : `https://github.com/${repo}/actions/runs/${runId}`,
   };
+}
+
+/**
+ * The ledger entry for a commit, newest first, or null. `text` is the ledger file's
+ * content (or its tail): lines of "<sha> <tmux session> <window id> <pane pid> <epoch>".
+ */
+export function ledgerLookup(text, sha) {
+  if (!/^[0-9a-f]{40}$/.test(String(sha || ''))) return null;
+  const lines = String(text || '').split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const f = lines[i].trim().split(/\s+/);
+    if (f[0] !== sha || f.length < 5) continue;
+    const [, session, windowId, panePid, at] = f;
+    if (!/^pw_[A-Za-z0-9_]{1,120}$/.test(session) || !/^@[0-9]{1,9}$/.test(windowId) || !/^[0-9]{1,10}$/.test(panePid)) continue;
+    return { session, windowId, panePid, at: Number(at) || 0 };
+  }
+  return null;
+}
+
+/** Where the git hook keeps the ledger, in the pane account's home. */
+export function ledgerPath(home) { return path.join(home, '.local', 'state', 'project-workbench', 'ci-commits.log'); }
+
+/**
+ * Look a commit up in the ledger file. Runs AS the pane account (credential-writer.mjs,
+ * action 'ci-ledger'): the ledger is that account's file. Only the newest 4 MB is read.
+ */
+export async function readLedgerEntry({ fsp, file, sha }) {
+  let handle;
+  try {
+    handle = await fsp.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+    const stat = await handle.stat();
+    if (!stat.isFile()) return null;
+    const bytes = Math.min(stat.size, 4 * 1024 * 1024);
+    const buffer = Buffer.alloc(bytes);
+    const { bytesRead } = await handle.read(buffer, 0, bytes, Math.max(0, stat.size - bytes));
+    return ledgerLookup(buffer.subarray(0, bytesRead).toString('utf8'), sha);
+  } catch { return null; }
+  finally { if (handle) await handle.close().catch(() => {}); }
 }
 
 export function repoMatches(projectRepo, fullName) {
@@ -101,59 +132,73 @@ export function statusPrompt(run, { streak = 0, cap = RETRY_CAP } = {}) {
       + 'Nothing is needed unless you were waiting on this run.';
   }
   return `[PW CI] Run FAILED (${run.conclusion}) — ${what}. Run: ${run.url}\n`
-    + 'This is an automated CI status from ProjectWorkbench, not a message from James. A commit signed by this window triggered it. '
+    + 'This is an automated CI status from ProjectWorkbench, not a message from James. A commit made in this window triggered it. '
     + `If this change is still yours: inspect it with \`gh run view ${run.runId} --repo ${run.repo} --log-failed\`, fix the cause, and push again. `
     + `Automatic retry ${streak} of ${cap}; if it fails again after that, it stops coming here and goes to James.`;
 }
 
 /**
  * The queue between "GitHub said" and "the session heard". Persisted through
- * load/save so a restart loses nothing. tryDeliver(item) answers 'delivered',
+ * load/save so a restart loses nothing. A run handed to receive() already carries its
+ * ledger route (session, windowId, panePid). tryDeliver(item) answers 'delivered',
  * 'wait' (busy, mid-turn, someone's draft in the composer, still waking) or
- * { gone: reason } (window closed, wrong repository...), which escalates.
+ * { gone: reason } (window closed or replaced, wrong repository...), which escalates.
  */
 export function createCiResults({
-  instanceId, load, save, tryDeliver, escalate, log = () => {}, now = () => Date.now(),
+  load, save, tryDeliver, escalate, log = () => {}, now = () => Date.now(),
   cap = RETRY_CAP, maxWaitMs = MAX_WAIT_MS,
 }) {
-  let state = null;
+  let loading = null;
   let ticking = false;
 
-  async function current() {
-    if (state) return state;
-    let loaded = null;
-    try { loaded = await load(); } catch (error) { log(`state unreadable, starting empty: ${error?.message || error}`); }
-    state = {
-      seen: Array.isArray(loaded?.seen) ? loaded.seen.slice(-SEEN_LIMIT) : [],
-      streaks: loaded?.streaks && typeof loaded.streaks === 'object' ? loaded.streaks : {},
-      queue: Array.isArray(loaded?.queue) ? loaded.queue : [],
-    };
-    return state;
+  // Loaded once; every caller shares the same state object.
+  function current() {
+    if (!loading) {
+      loading = (async () => {
+        let loaded = null;
+        try { loaded = await load(); } catch (error) { log(`state unreadable, starting empty: ${error?.message || error}`); }
+        return {
+          seen: Array.isArray(loaded?.seen) ? loaded.seen.slice(-SEEN_LIMIT) : [],
+          streaks: loaded?.streaks && typeof loaded.streaks === 'object' ? loaded.streaks : {},
+          queue: Array.isArray(loaded?.queue) ? loaded.queue : [],
+        };
+      })();
+    }
+    return loading;
   }
-  const persist = () => save(state).catch((error) => log(`state not saved: ${error?.message || error}`));
   const lane = (r) => `${r.session}|${r.windowId}|${r.repo}|${r.branch}|${r.workflow}`;
 
   return {
     async receive(run) {
       const s = await current();
-      if (run.instance !== instanceId) return { accepted: false, reason: `signed for instance ${run.instance}, this is ${instanceId}` };
       const id = `${run.runId}:${run.attempt}`;
       if (s.seen.includes(id)) return { accepted: false, reason: 'already received' };
-      s.seen.push(id);
-      if (s.seen.length > SEEN_LIMIT) s.seen.splice(0, s.seen.length - SEEN_LIMIT);
       const key = lane(run);
+      // All or nothing: if the save fails, the state is as if this delivery never came, so
+      // GitHub/n8n retrying it is accepted rather than discarded as "already received".
+      const before = { queue: s.queue, streak: s.streaks[key], seen: s.seen.length };
       const failed = FAILED.includes(run.conclusion);
       const streak = failed ? (Number(s.streaks[key]) || 0) + 1 : 0;
       if (failed) s.streaks[key] = streak; else delete s.streaks[key];
       // A newer result for the same lane supersedes one still waiting to be delivered.
       s.queue = s.queue.filter((q) => lane(q.run) !== key);
-      if (failed && streak > cap) {
-        await persist();
-        await escalate({ run, reason: `failed ${streak} times in a row; automatic retries stopped after ${cap}` });
+      const over = failed && streak > cap;
+      if (!over) s.queue.push({ run, streak, receivedAt: now(), text: statusPrompt(run, { streak, cap }) });
+      // Seen only once it is safely recorded: a save that throws leaves it retryable.
+      s.seen.push(id);
+      try { await save(s); }
+      catch (error) {
+        s.queue = before.queue;
+        if (before.streak === undefined) delete s.streaks[key]; else s.streaks[key] = before.streak;
+        s.seen.length = before.seen;
+        throw error;
+      }
+      if (s.seen.length > SEEN_LIMIT) s.seen.splice(0, s.seen.length - SEEN_LIMIT);
+      if (over) {
+        try { await escalate({ run, reason: `failed ${streak} times in a row; automatic retries stopped after ${cap}` }); }
+        catch (error) { log(`escalation failed: ${error?.message || error}`); }
         return { accepted: true, reason: 'retry limit reached: escalated instead of delivered' };
       }
-      s.queue.push({ run, streak, receivedAt: now(), text: statusPrompt(run, { streak, cap }) });
-      await persist();
       return { accepted: true, reason: 'queued for the session' };
     },
     async tick() {
@@ -161,26 +206,26 @@ export function createCiResults({
       ticking = true;
       try {
         const s = await current();
-        const keep = [];
-        let changed = false;
-        for (const item of s.queue) {
+        // Work on a snapshot, then remove ONLY what was handled from the live queue: a
+        // result received meanwhile (or one that superseded an item) is never overwritten.
+        const handled = new Set();
+        for (const item of [...s.queue]) {
           let outcome;
           try { outcome = await tryDeliver(item); }
           catch (error) { log(`delivery check failed: ${error?.message || error}`); outcome = 'wait'; }
-          if (outcome === 'delivered') { changed = true; continue; }
-          if (outcome && typeof outcome === 'object' && outcome.gone) {
-            changed = true;
-            await escalate({ run: item.run, reason: outcome.gone }).catch((error) => log(`escalation failed: ${error?.message || error}`));
-            continue;
+          if (outcome === 'delivered') { handled.add(item); continue; }
+          let reason = null;
+          if (outcome && typeof outcome === 'object' && outcome.gone) reason = outcome.gone;
+          else if (now() - item.receivedAt > maxWaitMs) reason = 'the session did not become free to receive it within 24 hours';
+          if (reason) {
+            handled.add(item);
+            await Promise.resolve().then(() => escalate({ run: item.run, reason })).catch((error) => log(`escalation failed: ${error?.message || error}`));
           }
-          if (now() - item.receivedAt > maxWaitMs) {
-            changed = true;
-            await escalate({ run: item.run, reason: 'the session did not become free to receive it within 24 hours' }).catch(() => {});
-            continue;
-          }
-          keep.push(item);
         }
-        if (changed) { s.queue = keep; await persist(); }
+        if (handled.size) {
+          s.queue = s.queue.filter((q) => !handled.has(q));
+          await save(s).catch((error) => log(`state not saved: ${error?.message || error}`));
+        }
       } finally {
         ticking = false;
       }
@@ -204,7 +249,12 @@ export function composerIsEmpty(capture) {
       .replace(/\x1b\[2m[\s\S]*?(?:\x1b\[(?:0|22)?m|$)/g, '') // dim suggestion text
       .replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '') // every other escape sequence
       .replace(/\u00a0/g, ' ');
-    if (/^\s*❯/.test(plain)) return plain.trim() === '❯';
+    if (/^\s*❯/.test(plain)) return plain.trim() === '❯' && !/\[(Pasted text|Image)\b/.test(lines[i]);
   }
   return false;
+}
+
+/** A turn in progress: Claude Code's footer offers to interrupt it. */
+export function screenShowsBusy(capture) {
+  return /esc to interrupt/i.test(String(capture || '').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ''));
 }

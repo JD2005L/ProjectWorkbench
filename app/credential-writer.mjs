@@ -14,6 +14,7 @@
 //         {"action":"prune","base":…,"keep":[…]}
 //         {"action":"status","base":…,"username":…}   -> {signedIn, copilotSignedIn}
 //         {"action":"gh-token","base":…,"username":…}  -> {token} ('' when none stored)
+//         {"action":"ci-ledger","sha":…}        -> {entry: {session,windowId,panePid,at}|null}
 //         {"action":"turn-tail","panes":[{key,panePid,credUser}],"base":…}
 //                                                  -> {<key>: {sessionId,uuid,at,digest,assistant,user}|null}
 //            (assistant/user are redacted, bounded excerpts — never the raw transcript; see turn-context.js)
@@ -29,6 +30,7 @@ import fsp from 'node:fs/promises';
 import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir, userClaudeConfigDir, applyUserClaudeTranscript } from './user-credentials.js';
 import { readStoredGhToken } from './gh-cli.js';
 import { readTurnTails } from './turn-outcome.js';
+import { readLedgerEntry, ledgerPath } from './ci-results.js';
 import os from 'node:os';
 import path from 'node:path';
 import { execFile as execFileCb } from 'node:child_process';
@@ -105,6 +107,10 @@ async function main() {
         ghConfigDir: userGhConfigDir(job.base, job.username),
         env: process.env,
       }) }
+      : job.action === 'ci-ledger'
+      // CI results (ci-results.js): which window, if any, made this commit — from the
+      // ledger the git hook keeps in this account's home.
+      ? { entry: await readLedgerEntry({ fsp, file: job.file ? String(job.file) : ledgerPath(os.userInfo().homedir), sha: String(job.sha || '') }) }
       : job.action === 'turn-tail'
       // The final message of the Claude running under each pane (turn-outcome.js).
       // Registry and transcripts are this account's files, read with its authority:

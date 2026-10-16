@@ -2,44 +2,79 @@
 # pw-git-hook — the git hooks directory for commits made by PW Claude sessions.
 #
 # CI results (docs/ci-results.md): when a GitHub Actions run finishes, its result is
-# routed back to the PW session that made the commit. The route is a trailer this
-# hook adds to each commit message:
+# routed back to the PW window that made the commit. Two records make that possible:
 #
-#   PW-Session: <instance>/<tmux session>/<window id>     e.g. pvi2/pw_TRYGGBUILTPortal/@65
+#   * the LEDGER — the authority. Every commit this window makes is appended to a log
+#     only the pane account writes ($HOME/.local/state/project-workbench/ci-commits.log):
+#       <sha> <tmux session> <window id> <pane pid> <epoch>
+#     The dashboard delivers a result only for a head SHA found there, and only to a
+#     window that still has that pane. A commit message is text anyone can write; the
+#     ledger is what this machine itself saw happen.
+#   * the TRAILER — a visible label on the commit, informational only:
+#       PW-Session: <instance>/<tmux session>/<window id>
 #
-# The Claude wrapper (scripts/update-claude-code) points git at this directory ONLY
-# for Claude processes, and ONLY when the instance opted in (PW_CI_RESULTS=on in
-# claude-wrapper.env), through GIT_CONFIG_* environment entries. Nothing is changed
-# in any repository's config and nothing system-wide. Every hook name is a link to
-# this one script, which:
-#   1. for prepare-commit-msg, adds the trailer (replacing an older one, as on --amend);
-#   2. then runs the repository's OWN hook of the same name — from the repo's local
-#      core.hooksPath (husky and friends) or its .git/hooks — with the same arguments
-#      and stdin, and exits with its status. A repo's hooks behave exactly as before.
-# Stamping never fails a commit: any problem leaves the message unsigned.
+# The Claude wrapper (scripts/update-claude-code) points git here ONLY for Claude
+# processes, and ONLY when the instance opted in (PW_CI_RESULTS in claude-wrapper.env),
+# through GIT_CONFIG_* environment entries; nothing is changed in any repository's
+# config or system-wide. Every hook name is a link to this script, which records what it
+# should and then runs the repository's OWN hook of the same name with the same
+# arguments and stdin, exiting with its status. Recording never fails a git operation.
 set -u
 
 name=$(basename "$0")
+LEDGER="${HOME:-/nonexistent}/.local/state/project-workbench/ci-commits.log"
 
-stamp() {
-  local msgfile="$1"
-  [[ -n "${TMUX_PANE:-}" && -n "${PW_CI_INSTANCE:-}" && -f "$msgfile" ]] || return 0
-  local session window
-  session=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name}' 2>/dev/null) || return 0
-  window=$(tmux display-message -p -t "$TMUX_PANE" '#{window_id}' 2>/dev/null) || return 0
-  [[ "$session" =~ ^pw_[A-Za-z0-9._-]+$ && "$window" =~ ^@[0-9]+$ && "$PW_CI_INSTANCE" =~ ^[A-Za-z0-9._-]+$ ]] || return 0
-  git interpret-trailers --in-place --if-exists replace \
-    --trailer "PW-Session: $PW_CI_INSTANCE/$session/$window" "$msgfile" 2>/dev/null || true
+# This pane's identity, or nothing when the commit is not being made in a PW pane.
+pane_identity() {
+  [[ -n "${TMUX_PANE:-}" && -n "${PW_CI_INSTANCE:-}" ]] || return 1
+  local out session window panepid
+  out=$(tmux display-message -p -t "$TMUX_PANE" '#{session_name} #{window_id} #{pane_pid}' 2>/dev/null) || return 1
+  read -r session window panepid <<<"$out"
+  [[ "$session" =~ ^pw_[A-Za-z0-9_]+$ && "$window" =~ ^@[0-9]+$ && "$panepid" =~ ^[0-9]+$ \
+     && "$PW_CI_INSTANCE" =~ ^[A-Za-z0-9._-]+$ ]] || return 1
+  printf '%s %s %s\n' "$session" "$window" "$panepid"
 }
 
-if [[ "$name" == "prepare-commit-msg" ]]; then
-  stamp "${1:-}"
-fi
+record() { # record <sha>...
+  local id; id=$(pane_identity) || return 0
+  local session window panepid; read -r session window panepid <<<"$id"
+  mkdir -p "$(dirname "$LEDGER")" 2>/dev/null || return 0
+  local sha now; now=$(date +%s)
+  for sha in "$@"; do
+    [[ "$sha" =~ ^[0-9a-f]{40}$ ]] && printf '%s %s %s %s %s\n' "$sha" "$session" "$window" "$panepid" "$now" >> "$LEDGER"
+  done
+  # Bounded: keep the newest 10000 entries once it passes 20000.
+  if [[ $(wc -l < "$LEDGER" 2>/dev/null || echo 0) -gt 20000 ]]; then
+    tail -n 10000 "$LEDGER" > "$LEDGER.tmp" 2>/dev/null && mv -f "$LEDGER.tmp" "$LEDGER"
+  fi
+  chmod 600 "$LEDGER" 2>/dev/null || true
+}
 
-# The repository's own hook. core.hooksPath is read from the repo's config FILE
-# (--local): the environment override that brought git here must not be what it reads.
+stdin_copy=""
+case "$name" in
+  prepare-commit-msg)
+    if id=$(pane_identity); then
+      read -r session window _ <<<"$id"
+      [[ -f "${1:-}" ]] && git interpret-trailers --in-place --if-exists replace \
+        --trailer "PW-Session: $PW_CI_INSTANCE/$session/$window" "$1" 2>/dev/null || true
+    fi
+    ;;
+  post-commit|post-merge)
+    record "$(git rev-parse HEAD 2>/dev/null)"
+    ;;
+  post-rewrite)
+    # stdin is "<old> <new> [extra]" per rewritten commit (amend, rebase). It is read here
+    # and handed on unchanged to the repository's own post-rewrite below.
+    stdin_copy=$(cat)
+    record $(printf '%s\n' "$stdin_copy" | awk '{print $2}')
+    ;;
+esac
+
+# The repository's own hook, wherever git itself would have looked for it: the effective
+# core.hooksPath from every config scope EXCEPT the environment entries that brought git
+# here (GIT_CONFIG_COUNT unset for this one lookup), else <common git dir>/hooks.
 self=$(readlink -f "$0" 2>/dev/null || echo "$0")
-own=$(git config --local --get core.hooksPath 2>/dev/null || true)
+own=$(env -u GIT_CONFIG_COUNT git config --type=path --get core.hooksPath 2>/dev/null || true)
 if [[ -n "$own" ]]; then
   [[ "$own" == /* ]] || own="$(git rev-parse --show-toplevel 2>/dev/null)/$own"
   target="$own/$name"
@@ -48,6 +83,9 @@ else
   target="$common/hooks/$name"
 fi
 if [[ -f "$target" && -x "$target" && "$(readlink -f "$target")" != "$self" ]]; then
+  if [[ "$name" == "post-rewrite" ]]; then
+    printf '%s\n' "$stdin_copy" | "$target" "$@"; exit $?
+  fi
   exec "$target" "$@"
 fi
 exit 0

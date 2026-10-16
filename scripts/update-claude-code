@@ -50,7 +50,8 @@ fi
 # GIT_CONFIG_* entries appended after any already set; the hook chains to each repo's own
 # hooks. Off (the default, and what every upgrade gets): nothing here runs.
 PW_GIT_HOOKS=/usr/local/lib/project-workbench/git-hooks
-if [[ "${PW_CI_RESULTS:-off}" == "on" && -x "$PW_GIT_HOOKS/prepare-commit-msg" ]]; then
+case "${PW_CI_RESULTS,,}" in on|true|1|yes) pw_ci=1 ;; *) pw_ci=0 ;; esac  # the dashboard's own values
+if [[ "$pw_ci" == 1 && -x "$PW_GIT_HOOKS/prepare-commit-msg" ]]; then
   n="${GIT_CONFIG_COUNT:-0}"
   [[ "$n" =~ ^[0-9]+$ ]] || n=0
   export "GIT_CONFIG_KEY_$n=core.hooksPath" "GIT_CONFIG_VALUE_$n=$PW_GIT_HOOKS"
