@@ -55,6 +55,14 @@ test('a runAsRoot deploy hands that one workspace back to the pane account', asy
  assert.ok(reclaim.options.timeout > 0, 'a hung repair must not hold the deploy open forever');
 });
 
+test('every deploy keeps the boxes out of git before its script runs (5c5dd78)', async t => {
+ const { root } = manifestWorkspace(t);
+ const h = deployRouteHarness(root, { project: slotProject, config: paneSlot });
+ const result = await h.call('POST', deployRoute, { params, body: {} });
+ assert.equal(result.body.ok, true, result.body.output);
+ assert.deepEqual(h.boxesIgnored, ['demo']);
+});
+
 test('an ordinary pane-account deploy never invokes the repair', async t => {
  const { root } = manifestWorkspace(t);
  const h = deployRouteHarness(root, { project: slotProject, config: paneSlot });

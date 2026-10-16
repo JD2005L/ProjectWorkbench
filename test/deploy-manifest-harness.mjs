@@ -60,7 +60,7 @@ export function serverTemplate(name) {
 export const FIX_OWNERSHIP_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'pw-fix-workspace-ownership');
 
 export function deployRouteHarness(root, options = {}) {
- const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [];
+ const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [];
  const project = { name: 'demo', path: root, ...options.project };
  let config = options.config || { demo: { dev: { script: 'legacy-saved-script', versionCmd: 'legacy-version-command', reauth: false } } };
  const user = { username: 'operator', role: 'admin', projects: '*', ...options.user };
@@ -126,6 +126,9 @@ export function deployRouteHarness(root, options = {}) {
   loadDeployConfig: async () => structuredClone(config),
   saveDeployConfig: async next => { config = plain(next); saves++; },
   loadProjects: async () => [project],
+  // 5c5dd78: every deploy keeps _inbox/ and _outbox/ out of git before its script runs. The real
+  // one is a box-worker job as the pane account; here it is recorded, and never fatal.
+  ensureBoxesIgnored: async (p) => { boxesIgnored.push(p?.name); return { status: 'unchanged' }; },
   filterProjectsForUser: projects => projects,
   projectByName: async name => name === project.name ? project : null,
   workspacePath: () => root,
@@ -180,7 +183,7 @@ export function deployRouteHarness(root, options = {}) {
  vm.runInContext(helpers + '\n' + deployment, context, { filename: 'server-deployment-routes.js' });
  context.deployScript = serverTemplate('deployScript');
  return {
-  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, context,
+  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, context,
   get config() { return config; },
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },

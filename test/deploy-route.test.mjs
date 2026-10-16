@@ -25,6 +25,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { addIdentity, manifestDocument, writeJson } from './deploy-manifest-fixtures.mjs';
 import { REAUTH_UNREADABLE } from '../app/deploy-reauth.js';
+import { selfOwnedTerminalEnv } from './terminal-owner-fixture.mjs';
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const appDir = path.dirname(serverJs);
@@ -731,7 +732,10 @@ test('REGRESSION: a deploy in flight is watchable, and its output is still there
 // through the workspace worker — no commit to the project's repo.
 test('REGRESSION: a deploy keeps _inbox/ and _outbox/ out of git before its script runs', { timeout: 30000 }, async () => {
   const port = 3942;
-  const inst = makeInstance(port);
+  // The exclude is written by the box worker AS the terminal owner. Name the account actually
+  // running this suite: the host-mode default is the literal `admin`, real on PVI2 and absent on a
+  // GitHub runner, where the exclude silently failed and the porcelain gate saw _inbox/.
+  const inst = makeInstance(port, selfOwnedTerminalEnv());
   const proj = path.join(inst.dir, 'workspaces', 'demo');
   fs.mkdirSync(path.join(proj, '_inbox'), { recursive: true });
   const { execFileSync } = await import('node:child_process');
