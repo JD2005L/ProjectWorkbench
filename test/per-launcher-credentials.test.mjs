@@ -256,7 +256,7 @@ test('the new-tab route hands newTmuxWindow the person who asked for it', () => 
   // would invent an identity, so it must pass as "no launcher".
   assert.match(SRC, /req\.user\?\.implicit \? ''/,
     'the implicit admin must not be attributed to a real user record');
-  assert.match(SRC, /async function newTmuxWindow\(p,name='new task',cmd='',launcher=''\)/);
+  assert.match(SRC, /async function newTmuxWindow\(p,name='new task',cmd='',launcher='',\{ trustClaude = false \} = \{\}\)/);
   // Default '' so every non-human caller (scheduled tasks, bots) keeps owner keying.
   assert.match(SRC, /await newTmuxWindow\(p, task\.window, buildTaskCommand\(task\)\)/,
     'a scheduled task has no launcher and must stay on the project owner');

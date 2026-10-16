@@ -258,6 +258,13 @@ Three things to know before you use it:
 - **`completed` means the agent STOPPED, not that it succeeded.** A refusal, a
   crash, a question asked back to the operator and a finished task all end a turn
   the same way. Read the output and judge.
+- **A Claude session you create runs unattended**: auto permission mode (routine
+  work approved, risky actions refused rather than asked), deploy and host commands
+  denied, the workspace pre-trusted, and a system prompt saying it acts for the
+  person your token acts as. Its first prompt waits for Claude to be ready. A
+  session showing a dialog lists `pending_dialog` and refuses prompts with 409
+  until a person answers it. See docs/agent-mcp.md, "Sessions created here run
+  unattended".
 - **A prompt is pasted whole**, up to 256 KB. For more than that, upload the
   content to the project's `_inbox/` and name the path in a short prompt instead.
 

@@ -113,7 +113,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: 'pw_list_sessions',
-    description: 'List the named sessions in one project. `running` is the pane\'s foreground command, `working` means mid-turn, `finished_turn` that it rang the done signal, `runs_as` whose CLI credentials it spends, and `promptable` whether you may send a prompt into it — with `not_promptable_because` naming the reason when you may not, so you do not have to infer it.',
+    description: 'List the named sessions in one project. `running` is the pane\'s foreground command, `working` means mid-turn, `finished_turn` that it rang the done signal, `runs_as` whose CLI credentials it spends, and `promptable` whether you may send a prompt into it — with `not_promptable_because` naming the reason when you may not, so you do not have to infer it. `pending_dialog` (workspace_trust, permission, mcp_approval, auto_mode_setup, login or choice) means the agent is showing a dialog right now: a prompt\'s Enter would answer it, so the session is not promptable until a person answers it in the dashboard.',
     inputSchema: closed({ project: NAME }, ['project']),
   },
   {
@@ -124,6 +124,8 @@ export const TOOL_DEFINITIONS = Object.freeze([
       'If the session does not exist and create_if_missing is true, it is created — and `cli` is then REQUIRED, because starting Claude and starting Copilot spend different credentials and there is no safe default.',
       'You may prompt any session running a coding agent in a project you can reach, including ones you did not create. Refused, with the reason: a pane running a shell (the text would be executed), a session spending another account\'s CLI credentials, and a hibernated session (resume it first).',
       'An existing session continues with whatever it is already running; `cli` is ignored for one.',
+      'A Claude session created here runs unattended: auto permission mode (routine work approved, risky actions refused rather than asked), deploy and host commands denied, and a system prompt saying it acts for the person this credential acts as. Its first prompt waits for Claude to be ready (up to about 45 seconds) instead of pasting into a starting pane.',
+      'Refused with pending_dialog (409) when the session is showing a dialog, and with session_not_ready (503) when a just-created Claude did not start; in both cases the session exists and nothing was sent.',
       'Returns a turn_id. Use pw_wait_for_turn to learn when that turn ends, then pw_read_session with since_turn to read what it produced.',
     ].join(' '),
     inputSchema: closed({
@@ -141,7 +143,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
   },
   {
     name: 'pw_wait_for_turn',
-    description: 'Wait for a turn to end, holding the request open up to timeout_ms (10 minutes maximum). A reply of `running` means the timeout was reached, not that anything failed — call again to keep waiting. Same caveat as pw_get_turn: completed means stopped, not succeeded.',
+    description: 'Wait for a turn to end, holding the request open up to timeout_ms (10 minutes maximum; the workbench proxy allows 11 minutes, but a proxy or client of your own may cut a long wait short, so prefer 5 minutes or less and call again). A reply of `running` means the timeout was reached, not that anything failed — call again to keep waiting. Same caveat as pw_get_turn: completed means stopped, not succeeded.',
     inputSchema: closed({
       project: NAME, session: NAME, turn_id: TURN,
       timeout_ms: { type: 'integer', minimum: 1000, maximum: 600000 },

@@ -60,7 +60,9 @@ from output that stopped changing.
 `{ project, session, turn_id, timeout_ms = 60000 }`
 → `{ state: "completed" | "running", waited_ms }`
 
-Long-polls, server-side, up to a bounded timeout (≤ 10 min). `running` on timeout
+Long-polls, server-side, up to a bounded timeout (≤ 10 min). The generated nginx
+config gives `/api/agent/` and `/api/mcp` an 11-minute read timeout for this; the
+default 60 s answered long waits with a 504 while the app was still waiting. `running` on timeout
 is not an error and not a failure — it means "ask again", and an agent that wants
 to keep waiting calls it again. See *Completion* below for what `completed`
 actually asserts.
@@ -229,6 +231,55 @@ Windows this surface creates are still marked (`@pw_agent_token`,
 now a fast path and an audit aid rather than the gate. And `pw_list_sessions`
 answers `promptable` per session with `not_promptable_because`, so a caller reads
 the answer instead of inferring it and getting it wrong in both directions.
+
+A pane that passes every row above can still be showing a **dialog** — the
+workspace-trust question, a permission prompt, "Teach auto mode about your
+environment?" — where a prompt's Enter is an *answer*. Those sessions list as
+`promptable: false` with `pending_dialog: <kind>`, and a prompt into one is refused
+`409 pending_dialog`, override or not: `sessions:prompt:any` is permission to type
+there, not to answer a dialog blind.
+
+## Sessions created here run unattended (2026-10-16)
+
+Nobody is at the keyboard of a session this surface creates, and three things used
+to stop one and wait for a human (seen with the Paperclip GitHub Repo Steward's
+`dependabot` lanes in SkillHub, TeamPulse and VisualIdentity):
+
+1. **Workspace trust.** PW pre-trusted workspaces in the pane account's
+   `~/.claude.json`, which a per-user session (`CLAUDE_CONFIG_DIR=<base>/<user>/claude`)
+   never reads. In a project the person had never opened Claude in, the session
+   opened on the trust dialog, the pasted prompt's Enter chose "No, exit", and the
+   lane was left at bash. Now `newTmuxWindow(..., { trustClaude })` marks the
+   workspace trusted in the config the pane will read, through the
+   privilege-dropped credential helper (`trust-project` job).
+2. **Permission prompts.** A created Claude runs `--permission-mode auto`, which
+   approves routine work and refuses risky actions instead of asking, with
+   `--disallowedTools` for anything that deploys or reaches a host (podman, docker,
+   systemctl, ssh, scp, sudo, deploy and promote scripts, …), and an
+   `autoMode.environment` passed as `--settings` (without one, auto mode offers a
+   setup dialog after a few refusals that would take the next prompt's Enter).
+3. **Authority.** `--append-system-prompt` says the session was created by a token
+   acting for `<user>` (label `<label>`), that its prompts are that person's
+   instructions, that Steward dependency work orders carry their standing direction
+   to incorporate or close dependency PRs (including merging PRs they authored and
+   the Steward's `paperclip/` PRs), and not to deploy.
+
+The first prompt into a created Claude waits (up to `PW_AGENT_READY_TIMEOUT_MS`,
+default 45 s) for Claude's ready footer, and is refused — `409 pending_dialog` or
+`503 session_not_ready`, the session left in place — rather than pasted into a
+dialog or a shell. Copilot sessions and every window a person opens are unchanged.
+
+Everything is configured from the dashboard's environment, in `app/agent-launch.js`:
+`PW_AGENT_AUTONOMOUS=false` (plain `claude`, as before), `PW_AGENT_CLAUDE_PERMISSION_MODE`
+(`auto` | `acceptEdits` | `manual` | `plan` | `dontAsk`; `bypassPermissions` is not
+accepted), `PW_AGENT_CLAUDE_DISALLOWED_TOOLS` / `PW_AGENT_CLAUDE_ALLOWED_TOOLS`
+(comma-separated; acceptEdits defaults to a build/test/git allow list),
+`PW_AGENT_SYSTEM_PROMPT` (`{user}`, `{label}`), `PW_AGENT_AUTO_MODE_ENVIRONMENT`
+(newline-separated) and `PW_AGENT_READY_TIMEOUT_MS`. A deny rule on a command prefix
+is a speed bump, not a sandbox; auto mode's refusals and the workspace boundary in
+CLAUDE.md are the other layers. These flags apply at launch, so a lane created
+before them keeps running without them until it is closed and re-created, and a
+hibernated lane resumes as plain `claude --resume`.
 
 ## Completion: how PW already knows a turn ended
 

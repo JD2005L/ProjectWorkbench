@@ -102,7 +102,9 @@ export function createAgentSessions({
   listWindows,           // (projectName) -> [{ index, name, bell, working, hibernated, credUser }]
   windowOption,          // (target, option) -> string
   setWindowOption,       // (target, option, value) -> void
-  createWindow,          // (project, name, cli, launcher) -> index
+  createWindow,          // (project, name, cli, launcher, agent:{ actsAs, tokenId, tokenLabel }) -> index
+  paneState,             // (target) -> { state:'ready'|'dialog'|'starting', dialog? } (optional; app/agent-launch.js)
+  waitForReady,          // (target, { cli }) -> the same, once settled or timed out (optional)
   pasteToWindow,         // (target, text) -> void
   capturePane,           // (target, { lines, scrollback }) -> string
   targetFor,             // (projectName, index) -> tmux target string
@@ -137,6 +139,12 @@ export function createAgentSessions({
     return { windows, window: matches[0] || null };
   }
 
+  async function pendingDialog(tmuxTarget) {
+    if (!paneState) return null;
+    const seen = await Promise.resolve().then(() => paneState(tmuxTarget)).catch(() => null);
+    return seen?.state === 'dialog' ? (seen.dialog || { kind: 'choice', message: 'The session is showing a dialog.' }) : null;
+  }
+
   async function ownership(tmuxTarget) {
     const tokenId = await windowOption(tmuxTarget, MARKER_TOKEN);
     const user = await windowOption(tmuxTarget, MARKER_USER);
@@ -159,11 +167,16 @@ export function createAgentSessions({
       const sessions = [];
       for (const w of windows) {
         const mark = await ownership(targetFor(projectName, w.index));
-        const refusal = promptRefusal(w, {
+        let refusal = promptRefusal(w, {
           actsAs: token.actsAs || '',
           owned: !!mark.tokenId && mark.tokenId === token.id,
           override: !!token.scopes?.includes('sessions:prompt:any'),
         });
+        // A pane that would take a prompt in principle can still be showing a
+        // dialog right now, where a prompt's Enter is an ANSWER. Say so here
+        // rather than reporting promptable:true and letting the prompt choose.
+        const dialog = refusal ? null : await pendingDialog(targetFor(projectName, w.index));
+        if (dialog) refusal = { code: 'pending_dialog', message: dialog.message };
         sessions.push({
           session: w.name,
           index: w.index,
@@ -179,6 +192,7 @@ export function createAgentSessions({
           // above and get it wrong in both directions.
           promptable: !refusal,
           ...(refusal ? { not_promptable_because: refusal.message } : {}),
+          ...(dialog ? { pending_dialog: dialog.kind } : {}),
         });
       }
       return { project: projectName, sessions };
@@ -211,7 +225,10 @@ export function createAgentSessions({
           refuse(`Creating a session needs cli: ${SUPPORTED_CLIS.join(' | ')} — the two spend different credentials, so there is no default`,
             400, 'cli_required');
         }
-        const index = await createWindow(verdict.project, session, cli, verdict.user.username);
+        // The token's identity goes with the request so the launch can say whose
+        // instructions this session carries (app/agent-launch.js).
+        const index = await createWindow(verdict.project, session, cli, verdict.user.username,
+          { actsAs: verdict.user.username, tokenId: token.id, tokenLabel: token.label || '' });
         const fresh = targetFor(projectName, index);
         // Marked BEFORE the prompt goes in: a pane must never become addressable as
         // this token's lane only after it has already been typed into.
@@ -220,6 +237,26 @@ export function createAgentSessions({
         await setWindowOption(fresh, MARKER_CREATED, now().toISOString());
         window = { index, name: session };
         created = true;
+        // A new CLI takes seconds to start, and whatever is on screen in the
+        // meantime receives the paste: the shell (which would execute it) or a
+        // first-run dialog (whose answer would be the prompt's Enter). So the
+        // first prompt waits for the CLI's own ready footer. Claude only: its
+        // footer is known. Copilot keeps the old immediate paste.
+        if (waitForReady && cli === 'claude') {
+          const seen = await waitForReady(fresh, { cli }).catch(() => ({ state: 'starting' }));
+          if (seen?.state !== 'ready') {
+            const dialog = seen?.state === 'dialog' ? seen.dialog : null;
+            await audit('agent_session_not_ready', {
+              tokenId: token.id, label: token.label, actsAs: verdict.user.username,
+              project: projectName, session, window: index, dialog: dialog?.kind || null,
+            });
+            if (dialog) {
+              refuse(`Session "${session}" was created, but nothing was sent: ${dialog.message}`, 409, 'pending_dialog');
+            }
+            refuse(`Session "${session}" was created, but its CLI did not become ready, so nothing was sent. Check it with pw_read_session, then prompt again.`,
+              503, 'session_not_ready');
+          }
+        }
       } else {
         const mark = await ownership(targetFor(projectName, window.index));
         const refusal = promptRefusal(window, {
@@ -228,6 +265,10 @@ export function createAgentSessions({
           override: !!token.scopes?.includes('sessions:prompt:any'),
         });
         if (refusal) refuse(refusal.message, 403, refusal.code);
+        // Applies to every caller, override included: sessions:prompt:any is
+        // permission to type here, not permission to answer a dialog blind.
+        const dialog = await pendingDialog(targetFor(projectName, window.index));
+        if (dialog) refuse(dialog.message, 409, 'pending_dialog');
       }
 
       const tmuxTarget = targetFor(projectName, window.index);

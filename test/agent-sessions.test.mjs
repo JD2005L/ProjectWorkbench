@@ -14,8 +14,8 @@ import {
 const BOT = { id: 'tok-1', label: 'PVIBot', actsAs: 'kev',
   scopes: ['sessions:read', 'sessions:prompt', 'sessions:create'] };
 
-function harness({ windows = [], markers = {}, projects = ['Demo', 'Other'], reach = () => true } = {}) {
-  const calls = { created: [], pasted: [], options: [], captured: [], audit: [] };
+function harness({ windows = [], markers = {}, projects = ['Demo', 'Other'], reach = () => true, extra = {} } = {}) {
+  const calls = { created: [], agents: [], pasted: [], options: [], captured: [], audit: [], order: [] };
   const state = { windows: [...windows], markers: { ...markers } };
   const engine = createAgentSessions({
     authorize: async (project, token) => (projects.includes(project) && reach(project, token)
@@ -29,16 +29,19 @@ function harness({ windows = [], markers = {}, projects = ['Demo', 'Other'], rea
       calls.options.push([target, option, value]);
       state.markers[`${target}|${option}`] = value;
     },
-    createWindow: async (project, name, cli, launcher) => {
+    createWindow: async (project, name, cli, launcher, agent) => {
       calls.created.push({ project: project.name, name, cli, launcher });
+      calls.agents.push(agent);
+      calls.order.push('create');
       const index = 7;
       state.windows.push({ index, name, bell: false, working: true });
       return index;
     },
-    pasteToWindow: async (target, text) => calls.pasted.push([target, text]),
+    pasteToWindow: async (target, text) => { calls.order.push('paste'); calls.pasted.push([target, text]); },
     capturePane: async (target, opts) => { calls.captured.push([target, opts]); return 'line1\nline2\n'; },
     audit: async (event, detail) => calls.audit.push([event, detail]),
     now: () => new Date('2026-09-23T16:00:00Z'),
+    ...extra,
   });
   return { engine, calls, state };
 }
@@ -382,4 +385,91 @@ test('the inbox write is the only write, is bounded, and says what to do next', 
   }
   await fails(engine.putInbox(BOT, { project: 'Demo', filename: 'empty.txt', content: '' }), 'empty_file');
   await fails(engine.putInbox(BOT, { project: 'Demo', filename: 'huge.bin', content: 'x'.repeat(9 * 1024 * 1024) }), 'file_too_large');
+});
+
+// ── unattended sessions: readiness and dialogs (app/agent-launch.js) ────────
+
+const TRUST = { state: 'dialog', dialog: { kind: 'workspace_trust', message: 'The session is showing the workspace-trust dialog.' } };
+
+test('a created session is told who it acts for, and its first prompt waits for Claude to be ready', async () => {
+  const waited = [];
+  const { engine, calls } = harness({ extra: {
+    waitForReady: async (target, opts) => { calls.order.push('wait'); waited.push([target, opts]); return { state: 'ready' }; },
+  } });
+  await engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'bump deps', cli: 'claude' });
+  assert.deepEqual(calls.agents, [{ actsAs: 'kev', tokenId: 'tok-1', tokenLabel: 'PVIBot' }],
+    'the launch gets the acting user and the token label for its system prompt');
+  assert.deepEqual(waited, [['pw_Demo:7', { cli: 'claude' }]]);
+  assert.deepEqual(calls.order, ['create', 'wait', 'paste'], 'nothing is pasted into a starting pane');
+});
+
+test('a created session showing a dialog gets nothing pasted: its Enter would have been the answer', async () => {
+  const { engine, calls } = harness({ extra: { waitForReady: async () => TRUST } });
+  const error = await fails(engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'bump deps', cli: 'claude' }),
+    'pending_dialog');
+  assert.equal(error.status, 409);
+  assert.match(error.message, /was created, but nothing was sent/);
+  assert.equal(calls.pasted.length, 0);
+  assert.ok(calls.options.some(([, option]) => option === MARKER_TOKEN), 'the lane is still marked as this token\'s');
+  assert.deepEqual(calls.audit.at(-1), ['agent_session_not_ready', { tokenId: 'tok-1', label: 'PVIBot', actsAs: 'kev',
+    project: 'Demo', session: 'dependabot', window: 7, dialog: 'workspace_trust' }]);
+});
+
+test('a created Claude that never becomes ready is reported, not typed into', async () => {
+  const { engine, calls } = harness({ extra: { waitForReady: async () => ({ state: 'starting' }) } });
+  const error = await fails(engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'x', cli: 'claude' }),
+    'session_not_ready');
+  assert.equal(error.status, 503);
+  assert.equal(calls.pasted.length, 0);
+});
+
+test('a created Copilot session keeps the immediate paste: its ready screen is not known', async () => {
+  let waited = 0;
+  const { engine, calls } = harness({ extra: { waitForReady: async () => { waited += 1; return { state: 'starting' }; } } });
+  await engine.prompt(BOT, { project: 'Demo', session: 'cop', prompt: 'x', cli: 'copilot' });
+  assert.equal(waited, 0);
+  assert.equal(calls.pasted.length, 1);
+});
+
+test('an existing session showing a dialog is refused, even with sessions:prompt:any', async () => {
+  const ANY = { ...BOT, scopes: [...BOT.scopes, 'sessions:prompt:any'] };
+  const { engine, calls } = harness({
+    windows: [{ index: 2, name: 'dependabot', paneCommand: 'claude' }],
+    extra: { paneState: async (target) => (target === 'pw_Demo:2' ? TRUST : { state: 'ready' }) },
+  });
+  for (const token of [BOT, ANY]) {
+    const error = await fails(engine.prompt(token, { project: 'Demo', session: 'dependabot', prompt: 'x' }), 'pending_dialog');
+    assert.equal(error.status, 409);
+  }
+  assert.equal(calls.pasted.length, 0);
+});
+
+test('the session list reports a pending dialog instead of promptable:true', async () => {
+  const { engine } = harness({
+    windows: [
+      { index: 2, name: 'dependabot', paneCommand: 'claude' },
+      { index: 3, name: 'other', paneCommand: 'claude' },
+      { index: 4, name: 'shell', paneCommand: 'bash' },
+    ],
+    extra: { paneState: async (target) => (target === 'pw_Demo:2' ? TRUST
+      : target === 'pw_Demo:4' ? assert.fail('a pane already refused is not captured') : { state: 'ready' }) },
+  });
+  const { sessions } = await engine.sessions(BOT, 'Demo');
+  const [dialog, ready, shell] = sessions;
+  assert.equal(dialog.promptable, false);
+  assert.equal(dialog.pending_dialog, 'workspace_trust');
+  assert.match(dialog.not_promptable_because, /workspace-trust dialog/);
+  assert.equal(ready.promptable, true);
+  assert.equal('pending_dialog' in ready, false);
+  assert.equal(shell.promptable, false);
+  assert.equal('pending_dialog' in shell, false);
+});
+
+test('a pane that cannot be captured does not block prompting', async () => {
+  const { engine, calls } = harness({
+    windows: [{ index: 2, name: 'dependabot', paneCommand: 'claude' }],
+    extra: { paneState: async () => { throw new Error('tmux hiccup'); } },
+  });
+  await engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'x' });
+  assert.equal(calls.pasted.length, 1);
 });

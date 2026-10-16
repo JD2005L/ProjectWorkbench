@@ -467,6 +467,55 @@ export async function applyCredentialJob({ fsp, base, username, ghToken = '', sh
   return { configDir, copilotHome, ghConfigDir, envFile: ghToken ? envFile : '', seeded };
 }
 
+// Mark a workspace trusted in ONE PERSON's Claude config — the one a pane with
+// CLAUDE_CONFIG_DIR=<their dir> actually reads. server.js's trustClaudeProject()
+// writes the pane account's ~/.claude.json, which no per-user session consults,
+// so a project somebody had never opened Claude in greeted an API-created
+// session with the trust dialog, and the pasted prompt's Enter answered it
+// "No, exit". Only this one project's entry is touched, and an unparseable
+// config is refused rather than replaced: it is the person's whole Claude state.
+export async function applyTrustClaudeProject({ fsp, base, username, projectPath }) {
+  if (typeof projectPath !== 'string' || !path.isAbsolute(projectPath) || projectPath.includes('\0')) {
+    throw new Error('trust: an absolute project path is required');
+  }
+  const configDir = userClaudeConfigDir(base, username);
+  await mkdirChecked(fsp, base, { recursive: true });
+  await mkdirChecked(fsp, userCredRoot(base, username), { enforceMode: true });
+  await mkdirChecked(fsp, configDir, { enforceMode: true });
+  const file = path.join(configDir, '.claude.json');
+  let current = {};
+  if (await regularFileExists(fsp, file)) {
+    try { current = JSON.parse(await fsp.readFile(file, 'utf8')); }
+    catch { throw new Error(`trust: ${file} is not valid JSON; leaving it alone`); }
+    if (!current || typeof current !== 'object' || Array.isArray(current)) {
+      throw new Error(`trust: ${file} is not a JSON object; leaving it alone`);
+    }
+  }
+  const projects = (current.projects && typeof current.projects === 'object' && !Array.isArray(current.projects))
+    ? current.projects : {};
+  const entry = (projects[projectPath] && typeof projects[projectPath] === 'object') ? projects[projectPath] : {};
+  if (entry.hasTrustDialogAccepted === true) return { trusted: true, changed: false };
+  // The same defaults scripts/project-terminal-start writes, so the entry looks
+  // like one Claude made itself.
+  current.projects = {
+    ...projects,
+    [projectPath]: {
+      allowedTools: [], mcpContextUris: [], mcpServers: {}, enabledMcpjsonServers: [], disabledMcpjsonServers: [],
+      projectOnboardingSeenCount: 0, hasClaudeMdExternalIncludesApproved: false,
+      hasClaudeMdExternalIncludesWarningShown: false, hasCompletedProjectOnboarding: true,
+      ...entry,
+      hasTrustDialogAccepted: true,
+    },
+  };
+  // Claude rewrites this file constantly, so replace atomically rather than
+  // truncating under a reader.
+  const tmp = `${file}.pw-trust`;
+  await fsp.rm(tmp, { force: true });
+  await writeChecked(fsp, tmp, `${JSON.stringify(current, null, 2)}\n`);
+  await fsp.rename(tmp, file);
+  return { trusted: true, changed: true };
+}
+
 // Remove credential trees that no longer belong to a current user, so a deleted
 // user's Claude login and GitHub token do not linger on disk.
 export async function pruneUserCredentials({ fsp, base, keep = [] }) {
@@ -607,6 +656,12 @@ export async function ensureUserCredentials({
     seeded: !!result.seeded,
     fingerprint: credentialFingerprint({ username, configDir: result.configDir, ghToken }),
   };
+}
+
+export async function trustUserClaudeProject({ fsp, base, username, projectPath, owner = null, currentUid = null, runJob = null }) {
+  const job = { action: 'trust-project', base, username, projectPath };
+  const plan = credentialExecutionPlan({ owner, currentUid });
+  return plan.drop ? runJob(job, plan) : applyTrustClaudeProject({ fsp, ...job });
 }
 
 export async function pruneCredentials({ fsp, base, keep = [], owner = null, currentUid = null, runJob = null }) {

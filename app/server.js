@@ -20,6 +20,7 @@ import { resolveDeployReauth, REAUTH_UNREADABLE } from './deploy-reauth.js';
 import { readStoredDeployPassword, makeDeployIdentity } from './deploy-credential.js';
 import { createDeployRuns } from './deploy-runs.js';
 import { createAgentSessions, AgentSessionError, MARKER_TOKEN, MARKER_USER } from './agent-sessions.js';
+import { agentLaunchConfig, agentClaudeCommand, classifyAgentPane } from './agent-launch.js';
 import { createAgentTurns } from './agent-turns.js';
 import { createAgentMcp } from './agent-mcp.js';
 import { prepareAgentPasteFile, pasteFileOwnership } from './agent-paste-file.js';
@@ -29,7 +30,7 @@ import { deployFollowClientSrc } from './deploy-follow.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { renderWrapperEnv } from './wrapper-env.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
-import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken, readUserClaudeTranscript, sharedCliSeedPaths } from './user-credentials.js';
+import { ensureUserCredentials, pruneCredentials, credentialDropArgv, credentialExecutionPlan, spawnCredentialJob, credentialFingerprint, sessionCredentialState, userClaudeConfigDir, CREDENTIALS_OFF, checkUserCliSignIn, isEncodedUserName, decodeUserName, readUserGhToken, readUserClaudeTranscript, sharedCliSeedPaths, trustUserClaudeProject } from './user-credentials.js';
 import { ghLoginCommand, GH_DEFAULT_SCOPES } from './gh-cli.js';
 import { makeSecretCrypto } from './secret-crypto.js';
 import { resolveProjectCredentialOwner, resolveLauncherCredentialOwner } from './project-owner.js';
@@ -1608,10 +1609,15 @@ async function withApiTokensLock(mutate){
 // interesting while somebody is waiting on it, and a dashboard restart takes the
 // panes' agents with it anyway.
 const agentTurns = createAgentTurns({});
+// The longest a turn wait holds a request open, and the nginx read timeout for the
+// agent routes, which must stay above it (see nginxConfig).
+const AGENT_MAX_WAIT_MS = 600000;
+const AGENT_PROXY_TIMEOUT_S = Math.ceil(AGENT_MAX_WAIT_MS / 1000) + 60;
 // The scopes that make a token a session credential at all.
 const SESSION_SCOPES = [SCOPES.SESSIONS_READ, SCOPES.SESSIONS_PROMPT, SCOPES.SESSIONS_CREATE, SCOPES.SESSIONS_PROMPT_ANY];
 const agentSessions = createAgentSessions({
  turns: agentTurns,
+ maxWaitMs: AGENT_MAX_WAIT_MS,
  authorize: async (projectName, token) => {
   if(!validName(projectName)) return { ok:false, reason:`No such project: ${projectName}`, status:404 };
   const authority = tokenAuthority(token, { users: await loadUsers(), hasProjectAccess: userHasProjectAccess });
@@ -1631,7 +1637,31 @@ const agentSessions = createAgentSessions({
   catch { return ''; }
  },
  setWindowOption: async (target, option, value) => { await tmux(['set-option','-w','-t',target,option,String(value)]); },
- createWindow: (project, name, cli, launcher) => newTmuxWindow(project, name, cli, launcher),
+ // A window created here has nobody at its keyboard, so a Claude one is launched
+ // to run unattended (app/agent-launch.js) in a workspace pre-trusted in the
+ // config it will read. Copilot, and every window a person opens, are unchanged.
+ createWindow: (project, name, cli, launcher, agent = null) => {
+  const unattended = !!agent && cli === 'claude';
+  const cmd = unattended
+   ? agentClaudeCommand({ actsAs: agent.actsAs, tokenLabel: agent.tokenLabel, config: agentLaunchConfig() })
+   : cli;
+  return newTmuxWindow(project, name, cmd, launcher, { trustClaude: unattended });
+ },
+ paneState: async (target) => {
+  const { stdout } = await tmux(['capture-pane','-p','-t',target]);
+  return classifyAgentPane(stdout);
+ },
+ waitForReady: async (target) => {
+  const deadline = Date.now() + agentLaunchConfig().readyTimeoutMs;
+  let seen = { state: 'starting' };
+  while(Date.now() < deadline){
+   const { stdout } = await tmux(['capture-pane','-p','-t',target]).catch(() => ({ stdout: '' }));
+   seen = classifyAgentPane(stdout);
+   if(seen.state !== 'starting') return seen;
+   await new Promise(r => setTimeout(r, 500));
+  }
+  return seen;
+ },
  pasteToWindow: (target, text) => pastePromptToWindow(target, text),
 
  // One tmux call for everything the latch needs. #{window_activity} is monotonic
@@ -2826,7 +2856,12 @@ async function injectPvikpbotPrompt(p,prompt){
 // switched on, every grandfathered session refused to open a new tab at all —
 // "existing session credentials are stale … recycle required" — because the live
 // session predated the flag.)
-async function newTmuxWindow(p,name='new task',cmd='',launcher=''){
+// `trustClaude` pre-marks the workspace trusted in the Claude config this pane
+// will read before anything is launched in it — the person's own
+// CLAUDE_CONFIG_DIR when the pane carries one, else the pane account's
+// ~/.claude.json. Only the agent surface asks for it (see createAgentSessions
+// above): a person at the keyboard answers the dialog themselves.
+async function newTmuxWindow(p,name='new task',cmd='',launcher='',{ trustClaude = false } = {}){
  const safeName = String(name || 'new task').replace(/[\r\n\t]/g,' ').trim().slice(0,80) || 'new task';
  const sess = tmuxSession(p.name);
  const cred = await credentialContext(p, launcher);
@@ -2850,6 +2885,18 @@ async function newTmuxWindow(p,name='new task',cmd='',launcher=''){
    await tmux(['kill-window','-t',newWindowId || `${sess}:${idx}`]).catch(()=>{});
    throw new Error(`[per-user-claude] project "${p.name}": created a window for "${cred.username}" but could not record whose credentials it runs on (${e?.message || e}). The window was closed rather than left unlabelled — try again.`);
   }
+ }
+ if(trustClaude){
+  // Best effort: when it fails the session still starts, and the agent surface's
+  // readiness check reports the dialog instead of letting a prompt answer it.
+  try {
+   if(cred.username){
+    await trustUserClaudeProject({ fsp: fs, base: USER_CRED_BASE, username: cred.username, projectPath: p.path,
+     owner: await terminalOwner(), currentUid: process.getuid?.() ?? null, runJob: runCredentialJob });
+   } else {
+    await trustClaudeProject(p);
+   }
+  } catch(e){ console.warn(`[agent] could not pre-trust ${p.path} for ${cred.username || 'the pane account'}: ${e?.message || e}`); }
  }
  const trimmedCmd = String(cmd || '').trim();
  if(trimmedCmd){
@@ -3090,7 +3137,14 @@ function nginxConfig(projects){
  // express on the endpoint itself, same as the JSON upload route).
  const uploadRoute = `    location ${BASE}/api/upload-stream/ {\n        client_max_body_size 0;\n        proxy_request_buffering off;\n        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout 3600s;\n        proxy_send_timeout 3600s;\n    }\n`;
  const _pwPrelude = `map $http_upgrade $connection_upgrade { default upgrade; '' close; }\n${refererMaps}`;
- const _pwBody = `    client_max_body_size 100m;\n${extraLocations}${deployRoute}${uploadRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}`;
+ // The agent surface holds a request open while it waits for a turn
+ // (pw_wait_for_turn, ?wait_ms, up to agent-sessions' 10-minute cap), and a fresh
+ // session's first prompt waits for its CLI to start. nginx's default 60s read
+ // timeout answered both with a 504 while the app was still waiting, so these
+ // two get a timeout just past the longest wait the app will hold.
+ const agentApiHeaders = `        proxy_pass http://127.0.0.1:3000;\n        proxy_set_header Host $host;\n        proxy_set_header X-Real-IP $remote_addr;\n        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\n        proxy_set_header X-Forwarded-Proto $scheme;\n        proxy_read_timeout ${AGENT_PROXY_TIMEOUT_S}s;\n        proxy_send_timeout ${AGENT_PROXY_TIMEOUT_S}s;\n`;
+ const agentRoute = `    location ${BASE}/api/agent/ {\n${agentApiHeaders}    }\n    location = ${BASE}/api/mcp {\n${agentApiHeaders}    }\n`;
+ const _pwBody = `    client_max_body_size 100m;\n${extraLocations}${deployRoute}${agentRoute}${uploadRoute}${rootLocation}${authCheckRoute}${setupRoute}${locations}${previewRoutes}${previewFallbackLocation}`;
  // TLS off → byte-identical canonical HTTP-only server. TLS on → :80 redirects
  // to the configured server name (never the client-controlled $host) and the
  // full body — auth_request, /pty, previews, uploads, deploy, extra-nginx —

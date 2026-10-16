@@ -15,6 +15,7 @@
 //         {"action":"status","base":…,"username":…}   -> {signedIn, copilotSignedIn}
 //         {"action":"gh-token","base":…,"username":…}  -> {token} ('' when none stored)
 //         {"action":"ci-ledger","sha":…}        -> {entry: {session,windowId,panePid,at}|null}
+//         {"action":"trust-project","base":…,"username":…,"projectPath":…} -> {trusted, changed}
 //         {"action":"turn-tail","panes":[{key,panePid,credUser}],"base":…}
 //                                                  -> {<key>: {sessionId,uuid,at,digest,assistant,user}|null}
 //            (assistant/user are redacted, bounded excerpts — never the raw transcript; see turn-context.js)
@@ -27,7 +28,7 @@
 // This file is installed root-owned and is not writable by the pane account.
 
 import fsp from 'node:fs/promises';
-import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir, userClaudeConfigDir, applyUserClaudeTranscript } from './user-credentials.js';
+import { applyCredentialJob, pruneUserCredentials, userSignedIn, userCopilotSignedIn, userGhConfigDir, userClaudeConfigDir, applyUserClaudeTranscript, applyTrustClaudeProject } from './user-credentials.js';
 import { readStoredGhToken } from './gh-cli.js';
 import { readTurnTails } from './turn-outcome.js';
 import { readLedgerEntry, ledgerPath } from './ci-results.js';
@@ -42,7 +43,7 @@ import { runGitCredentialJob, remediateGitCredentials, nodeJobDeps, nodeRunGit }
 // Jobs that operate on the per-user credential TREE are addressed by `base`.
 // The git-credential job addresses a project REPOSITORY instead, so it carries
 // a workspace root and a project path and has no `base` at all.
-const TREE_ACTIONS = new Set(['ensure', 'prune', 'status', 'gh-token', 'transcript']);
+const TREE_ACTIONS = new Set(['ensure', 'prune', 'status', 'gh-token', 'transcript', 'trust-project']);
 
 async function readStdin() {
   const chunks = [];
@@ -122,6 +123,13 @@ async function main() {
         panes: Array.isArray(job.panes) ? job.panes.slice(0, 64) : [],
         claudeDirs: [path.join(os.userInfo().homedir, '.claude')],
         perUserDir: job.base ? (user) => userClaudeConfigDir(job.base, user) : null,
+      })
+      : job.action === 'trust-project'
+      ? await applyTrustClaudeProject({
+        fsp,
+        base: job.base,
+        username: job.username,
+        projectPath: job.projectPath,
       })
       : job.action === 'transcript'
       ? await applyUserClaudeTranscript({
