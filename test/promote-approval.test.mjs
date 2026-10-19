@@ -182,6 +182,10 @@ test('the agent can ask and read, but nothing short of a signed-in administrator
     assert.match(lines, /"event":"promote_request"/);
     assert.match(lines, /"event":"promote_approve_refused".*"reason":"password"/);
     assert.match(lines, /"event":"promote_approve".*"user":"boss"/);
+    // Every turned-away approval leaves a reason, so a lost approval can be explained afterwards.
+    assert.match(lines, /"event":"promote_approval_refused".*"code":"promote_approval_local".*"why":"on-box caller"/);
+    assert.match(lines, /"event":"promote_approval_refused".*"why":"not signed in"/);
+    assert.match(lines, /"event":"promote_approval_refused".*"user":"dev".*"why":"role developer"/);
   });
 });
 

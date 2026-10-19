@@ -5122,10 +5122,19 @@ function promoteFailure(res, e){ return res.status(e?.status || 500).json({ ok:f
 // tokens. Approve additionally re-checks the administrator's password, so script running in a
 // page on this origin — an agent's preview, or a file it left in a box — cannot approve with the
 // session cookie alone.
+// Every refusal here is audited with WHY, because an approval that silently goes nowhere is
+// indistinguishable, afterwards, from one that was never attempted. (Two real approvals on
+// 2026-10-16 left no trace at all, and nobody could tell which had happened.)
 function requireHumanAdminSession(req, res, next){
- if(isTrustedLocal(req)) return res.status(403).json({ ok:false, code:'promote_approval_local', error:'Approvals cannot come from an on-box caller. Approve in the dashboard, signed in.' });
+ const refuse = (code, error, why) => {
+  void audit('promote_approval_refused', { requestId: String(req.params?.id || ''), action: req.path.endsWith('/reject') ? 'reject' : 'approve', code, why }, req);
+  return res.status(403).json({ ok:false, code, error });
+ };
+ if(isTrustedLocal(req)) return refuse('promote_approval_local', 'Approvals cannot come from an on-box caller. Approve in the dashboard, signed in.', 'on-box caller');
  if(!req.user || req.user.implicit || !req.sessionId || req.apiToken || req.user.role !== 'admin'){
-  return res.status(403).json({ ok:false, code:'promote_approval_requires_admin', error:'Approving or rejecting a promote needs an administrator signed in to the dashboard.' });
+  const why = !req.user ? 'not signed in' : req.user.implicit ? 'implicit soft-mode admin' : req.apiToken ? 'API token'
+   : !req.sessionId ? 'no dashboard session (header or dev-user identity)' : `role ${req.user.role}`;
+  return refuse('promote_approval_requires_admin', 'Approving or rejecting a promote needs an administrator signed in to the dashboard.', why);
  }
  return next();
 }
