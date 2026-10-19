@@ -294,7 +294,19 @@ say "live tree backed up -> $BAK ($(du -h "$BAK" | cut -f1))"
 # do roll the code back, the data may need restoring too. Deliberately NOT
 # automatic: re-applying config wholesale could discard legitimate changes made
 # between now and then. Contains secrets, hence 600.
-tar -C /etc/project-workbench -cf "$CFGBAK" . 2>/dev/null || die "config backup failed; nothing changed"
+#
+# Not the promote spool (./promote: the approved snapshots, and THIS promote's own log, which the
+# runner is writing while we read — GNU tar exits 1 "file changed as we read it" on exactly that,
+# and it aborted the 2026-10-19 19:26 promote) nor the deploy run archives (./deploy-runs). Exit 1
+# means a file changed while it was read: the backup is still written, so warn and go on. Anything
+# worse (2: unreadable, disk full) still stops the promote before it changes anything.
+cfg_rc=0
+cfg_err=$(tar -C /etc/project-workbench --exclude=./promote --exclude=./deploy-runs -cf "$CFGBAK" . 2>&1) || cfg_rc=$?
+if [ "$cfg_rc" -eq 1 ]; then
+  say "WARNING: a config file changed while it was backed up (kept going): $(printf '%s' "$cfg_err" | head -3 | tr '\n' ' ')"
+elif [ "$cfg_rc" -ne 0 ]; then
+  die "config backup failed (tar exit $cfg_rc: $(printf '%s' "$cfg_err" | head -3 | tr '\n' ' ')); nothing changed"
+fi
 chmod 600 "$CFGBAK"
 say "config backed up -> $CFGBAK ($(du -h "$CFGBAK" | cut -f1)) [secrets inside; mode 600]"
 
