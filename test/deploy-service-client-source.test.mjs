@@ -247,3 +247,23 @@ test('upstream: the helper answers --upstream over stdin as a separate process',
   });
   assert.equal(JSON.parse(result).state, process.getuid?.() === 0 ? 'unknown' : 'in_sync');
 });
+
+test('upstream with paths: lists what would ship uncommitted — untracked and ignored too, node_modules and other paths not', async t => {
+  const { work, git } = await upstreamFixture(t);
+  await fs.mkdir(path.join(work, 'app', 'node_modules', 'dep'), { recursive: true });
+  await fs.mkdir(path.join(work, 'docs'));
+  await fs.writeFile(path.join(work, '.gitignore'), '*.log\nnode_modules/\n');
+  await fs.writeFile(path.join(work, 'app', 'kept.js'), 'kept\n');
+  await git(work)('add', '--', '.gitignore', 'app/kept.js'); await git(work)('commit', '--quiet', '-m', 'app'); await git(work)('push', '--quiet');
+  const clean = await checkUpstream(gitRunner(work), { paths: ['app', 'scripts'] });
+  assert.deepEqual([clean.state, clean.dirtyCount], ['in_sync', 0]);
+  await fs.writeFile(path.join(work, 'app', 'node_modules', 'dep', 'index.js'), 'x\n');
+  await fs.writeFile(path.join(work, 'docs', 'notes.md'), 'not shipped\n');
+  await fs.writeFile(path.join(work, 'app', 'debug.log'), 'ignored but would ship\n');
+  await fs.writeFile(path.join(work, 'app', 'new.js'), 'untracked\n');
+  await git(work)('mv', 'app/kept.js', 'app/renamed.js');
+  const dirty = await checkUpstream(gitRunner(work), { paths: ['app', 'scripts', '../escape'] });
+  assert.deepEqual(dirty.dirty.sort(), ['app/debug.log', 'app/new.js', 'app/renamed.js']);
+  assert.equal(dirty.dirtyCount, 3);
+  assert.equal(dirty.state, 'in_sync', 'the upstream comparison still runs alongside');
+});

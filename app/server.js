@@ -5139,7 +5139,37 @@ app.get(BASE + '/api/promote/requests/:id', requireAdminOrLocal, async (req,res)
  if(!r) return res.status(404).json({ ok:false, code:'promote_not_found', error:'No such promote request.' });
  res.json({ ok:true, request:r });
 } catch(e){ promoteFailure(res, e); } });
+// A promote copies the WORKING TREE of this checkout, so a request is accepted only when
+// what would be snapshotted is exactly a pushed commit: app/ and scripts/ fully committed
+// (untracked and ignored files count — they would ship), and HEAD exactly origin/main. It
+// never pulls. Read as the pane account (deployment/source.js), like every deploy check.
+// This is hygiene, not the security gate — the administrator's approval of the snapshot
+// digest is that. An emergency promote is a human's `sudo pw-promote-app --skip-git-check`.
+const PROMOTE_WORKSPACE = process.env.PW_PROMOTE_WORKSPACE || workspacePath('ProjectWorkbench');
+async function promoteGitRefusal(){
+ let check;
+ try {
+  check = await checkWorkspaceUpstream({ workspace: PROMOTE_WORKSPACE, paths: ['app', 'scripts'],
+   owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
+ } catch { check = { state:'unknown' }; }
+ if(check.dirtyCount){
+  const list = (check.dirty || []).slice(0, 10).join(', ') + (check.dirtyCount > 10 ? `, and ${check.dirtyCount - 10} more` : '');
+  return { check, error:`Promote refused: ${check.dirtyCount} file${check.dirtyCount === 1 ? '' : 's'} under app/ or scripts/ ${check.dirtyCount === 1 ? 'is' : 'are'} not committed (${list}). A promote copies the working tree, so ${check.dirtyCount === 1 ? 'it' : 'they'} would ship. Commit (they may be another session's) and push, then request again.` };
+ }
+ if(check.state === 'in_sync' && check.branch === 'main' && check.upstream === 'origin/main') return null;
+ if(check.state === 'in_sync') return { check, error:`Promote refused: the checkout is on ${check.branch} tracking ${check.upstream}, not main tracking origin/main. Switch to main, then request again.` };
+ if(check.state === 'ahead') return { check, error:`Promote refused: ${check.ahead} local commit${check.ahead === 1 ? ' is' : 's are'} not pushed to ${check.upstream}. Push first, so the live app is a commit anyone can check out, then request again.` };
+ if(check.state === 'behind') return { check, error:`Promote refused: the checkout is ${check.behind ? `${check.behind} commit${check.behind === 1 ? '' : 's'} ` : ''}behind ${check.upstream}, so this promote would roll back pushed work. Run \`git pull --ff-only\` in ${PROMOTE_WORKSPACE}, re-test, then request again.` };
+ if(check.state === 'diverged') return { check, error:`Promote refused: the checkout and ${check.upstream} have diverged (${check.ahead} local, ${check.behind} remote). Reconcile and push, re-test, then request again.` };
+ return { check, error:`Promote refused: the checkout could not be confirmed to be exactly origin/main (${check.state}${check.upstream ? `, ${check.upstream}` : ''}). Try again when GitHub is reachable; an emergency promote is a human's \`sudo pw-promote-app --skip-git-check\` on the host.` };
+}
 app.post(BASE + '/api/promote/requests', requireAdminOrLocal, async (req,res) => { try {
+ // Not installed is the more useful answer, and needs no Git read to give.
+ const refusal = await promoteRequests.installed() ? await promoteGitRefusal() : null;
+ if(refusal){
+  await audit('promote_request_refused', { reason:'git', ...upstreamAudit(refusal.check), dirty: refusal.check.dirtyCount || 0 }, req);
+  return res.status(409).json({ ok:false, code:'promote_git_not_origin_main', error:refusal.error });
+ }
  const local = isTrustedLocal(req);
  const named = req.user && !req.user.implicit ? req.user.username : '';
  const requestedBy = local ? (named ? `${named} (on-box)` : 'on-box agent') : named;

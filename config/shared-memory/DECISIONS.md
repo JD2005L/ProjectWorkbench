@@ -57,6 +57,27 @@ decision exists to prevent.
 A different setting requires measured evidence from a dedicated or high-throughput workload plus the
 reason documented here.
 
+## 2026-10-19 — PROPOSED (GOA): a deploy never pulls; it compares with the remote and refuses when stale
+
+James asked whether every deployment should begin with a `git pull`. Decision: **no automatic pull** —
+it would ship commits nobody tested here, could create an unreviewed merge in a shared workspace,
+and would make deploying write to the repository. Instead every Deployment Centre deploy (local
+slot script and external backend alike) compares the workspace's commit with its branch's upstream
+first, as the pane account, reading the remote tip with `git ls-remote` (no fetch, nothing written):
+- **behind** or **diverged** → refused (409 `deployment_workspace_behind` / `_diverged`) before any
+  password prompt, run claim or script, with the command to run. The operator pulls and re-tests.
+- **ahead** (unpushed commits), detached HEAD (a rollback), no upstream, remote unreachable → deploys
+  with a warning in the output, history and audit, so an outage never blocks reviewed local code.
+- `PW_DEPLOY_UPSTREAM_CHECK=off` in the dashboard's environment turns the check off per instance.
+Promoting PW itself is stricter, because a promote copies the working tree: a promote request
+(`scripts/pw-promote request`, `POST /api/promote/requests`) is refused (409
+`promote_git_not_origin_main`) unless app/ and scripts/ are fully committed — untracked and ignored
+files count, node_modules excepted — and HEAD is exactly origin/main. A manual
+`sudo pw-promote-app` applies the same rule itself (git as the workspace owner via setpriv, never
+root); `--skip-git-check` is a human's emergency override. This is hygiene, not the security gate:
+the administrator's approval of the snapshot digest remains that.
+Status PROPOSED until PVI2 confirms the Deployment Centre half on its side.
+
 ## 2026-10-16 — STANDING: CI results back to the committing session are opt-in per instance
 
 PW can route a finished GitHub Actions run back to the PW Claude window that made the commit

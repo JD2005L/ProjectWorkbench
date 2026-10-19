@@ -156,11 +156,30 @@ export async function exportCommittedSource(runGit) {
 // GitHub outage or a missing push credential never blocks reviewed local code.
 export const UPSTREAM_REFUSES = Object.freeze(['behind', 'diverged']);
 
-export async function checkUpstream(runGit, { timeoutMs = 20000 } = {}) {
+//
+// With `paths`, it also lists what under those paths is not committed — untracked
+// and ignored files included, node_modules excepted — for callers that copy the
+// working tree rather than a commit (the PW promote), where those files would ship.
+const PLAIN_PATH = /^[A-Za-z0-9._-][A-Za-z0-9._\/-]{0,200}$/;
+export async function checkUpstream(runGit, { timeoutMs = 20000, paths = null } = {}) {
   const text = async (args, options = {}) => utf8(await runGit(args, { maxBytes: 4096, ...options })).trim();
   let head;
   try { head = await text(['rev-parse', '--verify', 'HEAD^{commit}']); } catch { return { state: 'not_git' }; }
   if (!REVISION.test(head)) return { state: 'not_git' };
+  if (Array.isArray(paths)) {
+    const scoped = paths.filter(item => typeof item === 'string' && PLAIN_PATH.test(item) && !item.split('/').includes('..')).slice(0, 8);
+    const raw = utf8(await runGit(['status', '--porcelain=v1', '-z', '--ignored', '--untracked-files=all', '--', ...scoped], { maxBytes: 1024 * 1024 }));
+    const rows = raw.split('\0'), dirty = [];
+    for (let i = 0; i < rows.length; i++) {
+      const row = rows[i];
+      if (!row) continue;
+      if (/^[RC]/.test(row)) i++; // a rename or copy carries its source path as the next entry
+      const name = row.slice(3);
+      if (!/(^|\/)node_modules\//.test(name)) dirty.push(name);
+    }
+    const result = await checkUpstream(runGit, { timeoutMs });
+    return { ...result, dirty: dirty.slice(0, 50), dirtyCount: dirty.length };
+  }
   let branch;
   try { branch = await text(['symbolic-ref', '--quiet', '--short', 'HEAD']); } catch { return { state: 'detached', head }; }
   let remote = '', merge = '';
@@ -211,11 +230,11 @@ export function upstreamCheckEnabled(env = process.env) {
   return !['off', 'false', '0', 'no'].includes(String(env?.PW_DEPLOY_UPSTREAM_CHECK ?? '').trim().toLowerCase());
 }
 
-export async function checkWorkspaceUpstream({ workspace, owner, home, currentUid, env = process.env, spawnProcess = spawn }) {
+export async function checkWorkspaceUpstream({ workspace, paths, owner, home, currentUid, env = process.env, spawnProcess = spawn }) {
   let raw;
   try {
     raw = await boundedCommand(snapshotArgv({ owner, currentUid, mode: '--upstream' }), {
-      input: JSON.stringify({ workspace }), maxBytes: 16384, timeoutMs: 30000,
+      input: JSON.stringify({ workspace, ...(Array.isArray(paths) ? { paths } : {}) }), maxBytes: 65536, timeoutMs: 30000,
       env: gitEnvironment(env, owner, home), spawnProcess,
     });
   } catch { return { state: 'unknown' }; }
@@ -282,7 +301,8 @@ async function upstreamMain() {
       raw += chunk;
       if (Buffer.byteLength(raw) > 8192) throw new Error('request too large');
     }
-    result = await checkUpstream(gitRunner(JSON.parse(raw).workspace));
+    const request = JSON.parse(raw);
+    result = await checkUpstream(gitRunner(request.workspace), { paths: Array.isArray(request.paths) ? request.paths : null });
   } catch { result = { state: 'unknown' }; }
   process.stdout.write(JSON.stringify(result));
 }

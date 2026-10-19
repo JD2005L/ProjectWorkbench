@@ -9,6 +9,8 @@
 # PW_PROMOTE_SRC / PW_PROMOTE_SCRIPTS_SRC. It can still be run by hand from a host shell:
 #   sudo pw-promote-app --dry-run
 #   sudo pw-promote-app
+# By hand it refuses unless the checkout's app/ (and scripts/) are fully committed and HEAD is
+# exactly origin/main — it never pulls. --skip-git-check is for an emergency only.
 # (Do not run a copy from persistent/admin-home: that is /home/admin, which the agent account
 # can write, so a script there is not pinned at all.)
 #
@@ -45,11 +47,13 @@ CONTAINER=project-workbench
 HEALTH_URL='https://127.0.0.1/workbench/'
 DRY=0
 WITH_SCRIPTS=1
+GIT_CHECK=1
 for a in "$@"; do
   case "$a" in
     --dry-run)  DRY=1 ;;
     --app-only) WITH_SCRIPTS=0 ;;
-    *) printf 'unknown option: %s\nusage: %s [--dry-run] [--app-only]\n' "$a" "$0" >&2; exit 2 ;;
+    --skip-git-check) GIT_CHECK=0 ;;
+    *) printf 'unknown option: %s\nusage: %s [--dry-run] [--app-only] [--skip-git-check]\n' "$a" "$0" >&2; exit 2 ;;
   esac
 done
 
@@ -74,6 +78,75 @@ if [ "$WITH_SCRIPTS" -eq 1 ]; then
   say "promoting app/ AND scripts/"
 else
   say "promoting app/ only (--app-only)"
+fi
+
+# ----------------------------------------- preflight: exactly origin/main ----
+# A manual promote copies the WORKING TREE, not a commit, so whatever is sitting
+# in the shared checkout ships — including another session's uncommitted work. It
+# therefore refuses unless every file it would copy is committed and HEAD is
+# exactly origin/main's tip: the live app is then always a commit anyone can
+# check out from GitHub. It never pulls; when behind, it says what to run.
+#
+# Through pw-promote-runner (PW_PROMOTE_SRC set) the source is an approved
+# snapshot with no .git; the dashboard applied this same rule when the request
+# was made (promoteGitRefusal in app/server.js), so it is not repeated here.
+#
+# Git runs as the workspace's OWNER, never as root: root operating on a
+# pane-owned repository would honour that repository's own config (fsmonitor,
+# hooks), which is a root escalation from the pane account. The remote tip is
+# read with ls-remote, so nothing under .git is written.
+# --skip-git-check exists for an emergency only and is announced loudly.
+REPO=$(dirname "$SRC")
+if [ -n "${PW_PROMOTE_SRC:-}" ]; then
+  hr "preflight: git check done at request time (approved snapshot)"
+elif [ "$GIT_CHECK" -eq 1 ]; then
+  hr "preflight: the checkout is clean and exactly origin/main"
+  command -v git >/dev/null 2>&1 || die "git is not on the host PATH, so the checkout cannot be verified.
+      Install git on the host, or re-run with --skip-git-check (emergency only)."
+  command -v setpriv >/dev/null 2>&1 || die "setpriv is not on the host PATH; git will not be run as root against the workspace.
+      Re-run with --skip-git-check (emergency only)."
+  OWNER_UID=$(stat -c %u "$REPO"); OWNER_GID=$(stat -c %g "$REPO")
+  [ "$OWNER_UID" -gt 0 ] 2>/dev/null || die "the workspace $REPO is owned by root; refusing to run git there as root"
+  pgit(){
+    env -i PATH=/usr/local/bin:/usr/bin:/bin HOME=/nonexistent LANG=C.UTF-8 GIT_TERMINAL_PROMPT=0 \
+      GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 \
+      setpriv --reuid="$OWNER_UID" --regid="$OWNER_GID" --clear-groups --no-new-privs -- \
+      git -c core.fsmonitor=false -c core.hooksPath=/dev/null -c safe.directory="$REPO" -C "$REPO" "$@"
+  }
+  PATHS=(app); [ "$WITH_SCRIPTS" -eq 1 ] && PATHS+=(scripts)
+  HEAD=$(pgit rev-parse --verify 'HEAD^{commit}' 2>/dev/null) || die "could not read HEAD in $REPO as uid $OWNER_UID"
+  BRANCH=$(pgit symbolic-ref --quiet --short HEAD 2>/dev/null || echo '(detached)')
+  # Untracked AND ignored files count: the copy is `ls -A` of app/, so an ignored
+  # file there ships too. Only app/node_modules is excluded, exactly as the copy excludes it.
+  DIRTY=$(pgit status --porcelain=v1 --ignored --untracked-files=all -- "${PATHS[@]}" 2>/dev/null \
+    | grep -vE '^!! app/node_modules/' || true)
+  if [ -n "$DIRTY" ]; then
+    printf '%s\n' "$DIRTY" | head -20 | sed 's/^/  /'
+    die "the checkout has changes that are not committed (above). The promote copies the working
+      tree, so they would ship. Commit or remove them (they may be another session's), push,
+      then re-run. Nothing changed."
+  fi
+  say "${PATHS[*]}: nothing uncommitted"
+  TIP=$(pgit ls-remote --exit-code -- origin refs/heads/main 2>/dev/null | awk '$2=="refs/heads/main"{print $1}')
+  if [ -z "$TIP" ]; then
+    TIP=$(pgit rev-parse --verify --quiet refs/remotes/origin/main 2>/dev/null || true)
+    [ -n "$TIP" ] || die "origin could not be reached and there is no local origin/main to compare with.
+      Re-run when GitHub is reachable, or with --skip-git-check (emergency only)."
+    printf '  WARNING origin unreachable; comparing with the last-fetched origin/main (%s)\n' "${TIP:0:12}"
+  fi
+  if [ "$HEAD" != "$TIP" ]; then
+    COUNTS=$(pgit rev-list --left-right --count "$TIP...$HEAD" 2>/dev/null || echo '? ?')
+    BEHIND=${COUNTS%%[[:space:]]*}; AHEAD=${COUNTS##*[[:space:]]}
+    die "the checkout is not exactly origin/main.
+      branch $BRANCH at ${HEAD:0:12}; origin/main at ${TIP:0:12}; behind $BEHIND, ahead $AHEAD
+      (behind '?' = origin has commits not yet fetched here).
+      Behind: as uid $OWNER_UID in $REPO run   git pull --ff-only   and re-test.
+      Ahead:  push the local commits first. Then re-run. Nothing changed."
+  fi
+  say "HEAD ${HEAD:0:12} on $BRANCH is exactly origin/main"
+else
+  hr "preflight: git check SKIPPED (--skip-git-check)"
+  printf '  WARNING the live app may not match any pushed commit; record why this was needed\n'
 fi
 
 # ------------------------------------------------------------- manifest ------

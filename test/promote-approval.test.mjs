@@ -14,7 +14,7 @@
 // Origin, exactly what nginx and a browser send.
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import net from 'node:net';
 import crypto from 'node:crypto';
 import fs from 'node:fs';
@@ -38,7 +38,25 @@ const freePort = () => new Promise((resolve, reject) => {
   srv.once('error', reject);
   srv.listen(0, '127.0.0.1', () => { const { port } = srv.address(); srv.close(() => resolve(port)); });
 });
-async function withInstance(extraEnv, fn, { spool = true } = {}) {
+function gitIn(dir, ...args) {
+  return execFileSync('git', ['-C', dir, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    '-c', 'commit.gpgSign=false', ...args], { env: { PATH: process.env.PATH, HOME: dir, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' }, encoding: 'utf8' });
+}
+async function promoteWorkspace(dir, shape = 'in-sync') {
+  const remote = path.join(dir, 'remote.git'), ws = path.join(dir, 'workspaces', 'ProjectWorkbench');
+  execFileSync('git', ['init', '--quiet', '--bare', '-b', 'main', remote]);
+  fs.mkdirSync(path.join(ws, 'app'), { recursive: true }); fs.mkdirSync(path.join(ws, 'scripts'));
+  fs.writeFileSync(path.join(ws, 'app', 'server.js'), 'console.log(1)\n');
+  fs.writeFileSync(path.join(ws, 'scripts', 'run.sh'), 'echo hi\n');
+  gitIn(ws, 'init', '--quiet', '-b', 'main');
+  gitIn(ws, 'add', '-A'); gitIn(ws, 'commit', '--quiet', '-m', 'one');
+  gitIn(ws, 'remote', 'add', 'origin', remote);
+  gitIn(ws, 'push', '--quiet', '-u', 'origin', 'main');
+  if (shape === 'dirty') fs.writeFileSync(path.join(ws, 'app', 'half-done.js'), 'export {}\n');
+  if (shape === 'ahead') { fs.writeFileSync(path.join(ws, 'app', 'local.js'), 'export {}\n'); gitIn(ws, 'add', '-A'); gitIn(ws, 'commit', '--quiet', '-m', 'local'); }
+  return ws;
+}
+async function withInstance(extraEnv, fn, { spool = true, ...options } = {}) {
   const port = await freePort();
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pw-promote-approval-'));
   fs.mkdirSync(path.join(dir, 'workspaces'));
@@ -52,6 +70,10 @@ async function withInstance(extraEnv, fn, { spool = true } = {}) {
   ] }));
   fs.writeFileSync(path.join(dir, 'projects.json'), '[]');
   const audit = path.join(dir, 'audit.log');
+  // A request is accepted only for a checkout whose app/ and scripts/ are committed and exactly
+  // origin/main (the promote copies the working tree), so the workspace is a real clone of a
+  // local bare remote, in sync.
+  const workspace = await promoteWorkspace(dir, options.workspace);
   const env = {
     PATH: process.env.PATH, HOME: process.env.HOME, LANG: 'C.UTF-8', PORT: String(port), PW_ISOLATED: '1',
     PW_AUTH_ENFORCE: 'true', PW_REGISTRY_PATH: path.join(dir, 'projects.json'), PW_USERS_PATH: path.join(dir, 'users.json'),
@@ -73,7 +95,7 @@ async function withInstance(extraEnv, fn, { spool = true } = {}) {
       if (!up) await new Promise((r) => setTimeout(r, 125));
     }
     assert.ok(up, `server did not come up\n${logs.join('')}`);
-    await fn({ base, spool: spoolDir, audit, logs });
+    await fn({ base, spool: spoolDir, audit, logs, workspace });
   } finally {
     child.kill('SIGTERM');
     await new Promise((r) => setTimeout(r, 150));
@@ -234,4 +256,17 @@ test('without the host install, asking says so instead of pretending', { timeout
     assert.equal(r.body.code, 'promote_not_installed');
     assert.equal((await call(base, 'GET', '/api/promote/requests')).body.installed, false);
   }, { spool: false });
+});
+
+test('a request is refused unless app/ and scripts/ are committed and exactly origin/main', { timeout: 60000 }, async () => {
+  for (const [shape, pattern] of [['dirty', /1 file under app\/ or scripts\/ is not committed \(app\/half-done\.js\)/], ['ahead', /1 local commit is not pushed to origin\/main/]]) {
+    await withInstance({}, async ({ base, spool, audit }) => {
+      const r = await call(base, 'POST', '/api/promote/requests', { body: { note: shape } });
+      assert.equal(r.status, 409, `${shape}: ${JSON.stringify(r.body)}`);
+      assert.equal(r.body.code, 'promote_git_not_origin_main');
+      assert.match(r.body.error, pattern);
+      assert.deepEqual(fs.readdirSync(path.join(spool, 'queue')), [], `${shape}: nothing is queued for the runner`);
+      assert.match(fs.readFileSync(audit, 'utf8'), /"promote_request_refused"/);
+    }, { workspace: shape });
+  }
 });
