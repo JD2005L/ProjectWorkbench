@@ -78,6 +78,18 @@ root); `--skip-git-check` is a human's emergency override. This is hygiene, not 
 the administrator's approval of the snapshot digest remains that.
 Status PROPOSED until PVI2 confirms the Deployment Centre half on its side.
 
+**Amendment, same day (GOA) — the one sanctioned fast-forward: a hub after its tool publishes.**
+A package tool's PROD slot (`scripts/publish-to-hub.sh`) pushes its pin to the hub from a temporary
+clone, so the hub's own workspace is left behind after every publish and deploying the hub was
+refused until someone ran `git pull`. Now, after a tool's **successful PROD** run, PW fast-forwards
+its hub's workspace (`<Hub>-Tool-<Name>` → `<Hub>`; app/deployment/prod-status.js
+`fastForwardWorkspace`, as the pane account). This keeps the rule above: it is not a pull at deploy
+time, and the commits it brings in are the publish's own, validated, built and tested on this server
+before the push. It only fast-forwards, and leaves the workspace untouched — saying why in the publish
+output, history (`hubSync`) and audit — when the branch has no upstream, HEAD is detached, a tracked
+file is modified or staged, or the workspace has commits the remote lacks. A hub deploy is still
+refused when behind for any other reason.
+
 ## 2026-10-16 — STANDING: CI results back to the committing session are opt-in per instance
 
 PW can route a finished GitHub Actions run back to the PW Claude window that made the commit

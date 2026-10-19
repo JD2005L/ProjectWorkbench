@@ -161,6 +161,64 @@ export async function inspectRepo(runGit, { deployed = null, csproj = null, tags
   return facts;
 }
 
+// After a tool publishes, bring its hub's workspace up to date with the commit the publish
+// pushed, so deploying the hub is not refused as "behind" (deployment/source.js) and nobody has to
+// `git pull` by hand first.
+//
+// This is NOT the "pull before every deploy" that DECISIONS.md (2026-10-19) rules out: it runs once,
+// right after a successful publish, and the commits it brings in are the publish's own — validated,
+// built and tested by scripts/publish-to-hub.sh on this server before it pushed them. It only ever
+// fast-forwards, and leaves the workspace alone, saying why, unless that is plainly safe:
+//   - on a branch that tracks a remote branch;
+//   - no tracked file modified or staged (an agent may be working in the hub);
+//   - HEAD is an ancestor of the fetched remote tip (otherwise: local commits, diverged — a person
+//     decides).
+// Runs as the pane account, like every Git read here.
+export async function fastForwardWorkspace(runGit) {
+  const head = await quiet(() => text(runGit, ['rev-parse', '--verify', 'HEAD^{commit}']));
+  if (!REVISION.test(head || '')) return { state: 'skipped', reason: 'not a Git workspace' };
+  const branch = await quiet(() => text(runGit, ['symbolic-ref', '--quiet', '--short', 'HEAD']));
+  if (!branch) return { state: 'skipped', reason: 'detached HEAD', head };
+  const upstream = await quiet(() => text(runGit, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}']));
+  if (!upstream) return { state: 'skipped', reason: `branch ${branch} has no upstream`, head };
+  if (!(await quiet(() => runGit(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head'], { timeoutMs: 60000, maxBytes: 65536 })))) {
+    return { state: 'skipped', reason: `could not fetch ${upstream}`, head };
+  }
+  const tip = await quiet(() => text(runGit, ['rev-parse', '--verify', '@{upstream}^{commit}']));
+  if (!REVISION.test(tip || '')) return { state: 'skipped', reason: `${upstream} could not be read`, head };
+  if (tip === head) return { state: 'up_to_date', head, upstream };
+  if (!(await quiet(() => runGit(['merge-base', '--is-ancestor', head, tip], { maxBytes: 256 })))) {
+    return { state: 'skipped', reason: `the workspace has commits ${upstream} does not (pull/rebase by hand)`, head, tip, upstream };
+  }
+  const dirty = await quiet(() => text(runGit, ['status', '--porcelain=v1', '--untracked-files=no']));
+  if (dirty === null) return { state: 'skipped', reason: 'git status failed', head };
+  if (dirty) return { state: 'skipped', reason: `uncommitted changes to tracked files (${dirty.split('\n').length})`, head, tip, upstream };
+  const count = Number(await quiet(() => text(runGit, ['rev-list', '--count', `${head}..${tip}`])));
+  if (!(await quiet(() => runGit(['merge', '--ff-only', '--quiet', tip], { timeoutMs: 60000, maxBytes: 65536 })))) {
+    return { state: 'skipped', reason: 'the fast-forward was refused by Git (a file in the way?)', head, tip, upstream };
+  }
+  return { state: 'fast_forwarded', from: head, to: tip, upstream, count: Number.isSafeInteger(count) ? count : null };
+}
+
+// One fast-forward, as the pane account (helper process; see helperArgv).
+export async function fastForwardAsOwner(workspace, { owner, home, currentUid, env = process.env, spawnProcess = spawn }) {
+  try {
+    const raw = await boundedCommand(helperArgv({ owner, currentUid }), {
+      input: JSON.stringify({ fastForward: workspace }), maxBytes: 65536, timeoutMs: 150000,
+      env: gitEnvironment(env, owner, home), spawnProcess,
+    });
+    const result = JSON.parse(raw.toString('utf8'));
+    return result?.ok === true && result.fastForward ? result.fastForward : { state: 'skipped', reason: 'the helper failed' };
+  } catch { return { state: 'skipped', reason: 'the helper failed' }; }
+}
+
+export function describeFastForward(hub, r) {
+  const short = (v) => String(v || '').slice(0, 7);
+  if (r?.state === 'fast_forwarded') return `Hub ${hub}: workspace fast-forwarded to ${r.upstream} (${r.count ?? '?'} commit${r.count === 1 ? '' : 's'}, ${short(r.from)}..${short(r.to)}), so deploying ${hub} needs no git pull.`;
+  if (r?.state === 'up_to_date') return `Hub ${hub}: workspace already matches ${r.upstream}.`;
+  return `Hub ${hub}: workspace NOT updated — ${r?.reason || 'unknown'}. Run \`git pull --ff-only\` in ${hub} before deploying it.`;
+}
+
 async function inspectAll(repos, { concurrency = 4 } = {}) {
   const out = {};
   const queue = repos.slice(0, MAX_REPOS);
@@ -275,6 +333,12 @@ async function helperMain() {
       if (Buffer.byteLength(raw) > 1024 * 1024) throw new Error('request too large');
     }
     const request = JSON.parse(raw);
+    if (typeof request.fastForward === 'string') {
+      if (!path.isAbsolute(request.fastForward)) throw new Error('absolute workspace required');
+      result = { ok: true, fastForward: await fastForwardWorkspace(gitRunner(request.fastForward)) };
+      process.stdout.write(JSON.stringify(result));
+      return;
+    }
     const repos = (Array.isArray(request.repos) ? request.repos : []).filter(r => r && typeof r.id === 'string'
       && typeof r.workspace === 'string' && path.isAbsolute(r.workspace)).map(r => ({
       id: r.id, workspace: r.workspace, deployed: r.deployed && typeof r.deployed === 'object' ? r.deployed : null,

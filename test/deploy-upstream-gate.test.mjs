@@ -88,3 +88,34 @@ test('a successful deploy records the commit it finished on and nudges the PROD 
  assert.deepEqual(bad.headReads, []);
  assert.equal(bad.prodRefreshes.length, 1);
 });
+
+test("a tool's successful PROD publish brings its hub's workspace up to date, and says so", async t => {
+ const { root } = manifestWorkspace(t);
+ const run = (opts) => deployRouteHarness(root, { project: slotProject, hubOf: { demo: 'Hub' },
+  config: { demo: { prod: { script: 'publish.sh', reauth: false }, dev: { script: 'check.sh', reauth: false } } },
+  onExec: async () => ({ stdout: 'published', stderr: '' }), ...opts });
+ const ok = run({ hubSync: { state: 'fast_forwarded', from: 'a'.repeat(40), to: 'b'.repeat(40), upstream: 'origin/main', count: 1 } });
+ const r = await ok.call('POST', deployRoute, { params, body: {} });
+ assert.equal(r.body.ok, true, r.body.output);
+ assert.deepEqual(ok.hubSyncs, ['Hub']);
+ assert.match(r.body.output, /Hub Hub: workspace fast-forwarded to origin\/main \(1 commit, aaaaaaa\.\.bbbbbbb\), so deploying Hub needs no git pull\./);
+ assert.deepEqual(ok.history.at(-1).hubSync, { hub: 'Hub', state: 'fast_forwarded', to: 'b'.repeat(40) });
+
+ const dirty = run({ hubSync: { state: 'skipped', reason: 'uncommitted changes to tracked files (1)' } });
+ const d = await dirty.call('POST', deployRoute, { params, body: {} });
+ assert.equal(d.body.ok, true, 'a hub that cannot be updated never fails the publish itself');
+ assert.match(d.body.output, /Hub Hub: workspace NOT updated — uncommitted changes to tracked files \(1\)\. Run `git pull --ff-only` in Hub/);
+
+ const check = run({});
+ await check.call('POST', deployRoute, { params: { project: 'demo', target: 'dev' }, body: {} });
+ assert.deepEqual(check.hubSyncs, [], 'a check (dev) pushes nothing, so nothing is synced');
+
+ const failed = run({ onExec: async () => { throw Object.assign(new Error('boom'), { code: 1 }); } });
+ await failed.call('POST', deployRoute, { params, body: {} });
+ assert.deepEqual(failed.hubSyncs, [], 'nor after a failed publish');
+
+ const app = deployRouteHarness(root, { project: slotProject, config: { demo: { prod: { script: 'publish.sh', reauth: false } } },
+  onExec: async () => ({ stdout: 'x', stderr: '' }) });
+ await app.call('POST', deployRoute, { params, body: {} });
+ assert.deepEqual(app.hubSyncs, [], 'nor for a project that is not a tool');
+});

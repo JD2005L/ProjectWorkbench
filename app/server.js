@@ -58,7 +58,7 @@ import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
 import { exportWorkspaceSnapshot, checkWorkspaceUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES } from './deployment/source.js';
-import { planRepos, lastProdDeploys, summarize as summarizeProd, readRepoFacts } from './deployment/prod-status.js';
+import { planRepos, lastProdDeploys, summarize as summarizeProd, readRepoFacts, classifyProjects, fastForwardAsOwner, describeFastForward } from './deployment/prod-status.js';
 import { promotePromptHtml } from './promote-prompt.js';
 import { mountDeploymentRoutes, sendDeploymentHealth } from './deployment/routes.js';
 import { deploymentSubmitClientSrc, renderDeploymentSettings, deploymentSettingsScript, renderDeploymentNotice, renderExecutionRecipe } from './deployment/ui.js';
@@ -1911,6 +1911,15 @@ async function refreshProdStatus(){
  return prodStatusRun;
 }
 function soonProdStatus(ms = 5000){ clearTimeout(prodStatusTimer); prodStatusTimer = setTimeout(() => { void refreshProdStatus(); }, ms); prodStatusTimer.unref?.(); }
+// The hub a project publishes into, when it is a package tool (<Hub>-Tool-<Name> with <Hub> registered).
+async function toolHubOf(project){
+ try { return classifyProjects((await loadProjects()).map(p => p.name)).tools[project]?.hub || null; } catch { return null; }
+}
+async function syncHubWorkspace(hubName){
+ const hub = await projectByName(hubName);
+ if(!hub) return { state:'skipped', reason:'the hub is not registered here' };
+ return fastForwardAsOwner(hub.path || workspacePath(hub.name), { owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
+}
 // The HEAD a deploy finished on, so the next PROD comparison is exact rather than matched by time.
 async function workspaceHead(workspace){
  try {
@@ -8325,11 +8334,25 @@ if(DEPLOY_CENTRE){
   } else if(tc.versionCmd){
    try { const { stdout } = await deployExec(tc, ['bash','-c',tc.versionCmd], {...process.env, DEPLOY_USER:deployUser, DEPLOY_PASSWORD:deployPassword, DEPLOY_OPERATOR:operatorName, DEPLOY_IDENTITY_SOURCE:identitySource, DEPLOY_OPTION:option}, 30000); version = stdout.trim()||null; } catch {}
   }
+  // A tool's PROD slot publishes into its hub from a temporary clone, which leaves the hub's own
+  // workspace behind, and deploying a workspace that is behind is refused. Bring the hub up to the
+  // commit the publish pushed (fast-forward only, as the pane account; see fastForwardWorkspace).
+  let hubSync;
+  if(target === 'prod' && status === 'success'){
+   const hubName = await toolHubOf(project);
+   if(hubName){
+    const result = await syncHubWorkspace(hubName);
+    const line = describeFastForward(hubName, result);
+    hubSync = { hub: hubName, state: result.state, ...(result.reason ? { reason: result.reason } : {}), ...(result.to ? { to: result.to } : {}) };
+    output += '\n' + line + '\n';
+    deployRuns.append(runId, '\n' + line + '\n');
+   }
+  }
   const selectionLog = manifest ? { inputs:selection.inputs, currentVersion:selection.currentVersion, targetVersion:selection.targetVersion, manifestRevision:manifest.revision } : {};
   // With a shared credential every deploy looks like one account on the app
   // server, so PW's own records are the only place the human survives: keep both.
   const commit = status === 'success' ? await workspaceHead(state.workspace) : undefined;
-  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, upstream: upstream.check.state, commit, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
+  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, upstream: upstream.check.state, commit, ...(hubSync ? { hubSync } : {}), version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
   // Archived before the route answers: a finished run must be retrievable from
   // History even if this process dies immediately afterwards.
   await deployRuns.finish(runId, { status, version, duration, error: status === 'failed' ? 'the deploy script exited non-zero' : null });

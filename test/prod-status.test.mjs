@@ -10,6 +10,7 @@ import { execFileSync } from 'node:child_process';
 import { gitRunner } from '../app/deployment/source.js';
 import {
   compareVersions, parsePins, classifyProjects, lastProdDeploys, planRepos, inspectRepo, summarize, readRepoFacts,
+  fastForwardWorkspace, fastForwardAsOwner, describeFastForward,
 } from '../app/deployment/prod-status.js';
 
 const git = (cwd, ...args) => execFileSync('git', args, { cwd, encoding: 'utf8',
@@ -186,4 +187,68 @@ test('the helper process answers the same facts, and nothing under .git is writt
 test('the helper refuses to be started as root', async () => {
   await assert.rejects(readRepoFacts([], { owner: null, currentUid: 0 }), /non-root pane account/);
   await assert.rejects(readRepoFacts([], { owner: { uid: 0, gid: 0, user: 'root' }, currentUid: 0 }), /non-root pane account/);
+});
+
+test('after a publish, the hub workspace is fast-forwarded only when that is plainly safe', async t => {
+  const root = fixture(t);
+  const hub = repo(t, root, 'Hub');
+  commit(hub, 'pins.txt', '1', 'base');
+  git(hub, 'push', '-q', '-u', 'origin', 'main');
+  const clone = path.join(root, 'publish-clone');
+  git(root, 'clone', '-q', path.join(root, 'Hub.git'), clone);
+  const publish = (v) => { commit(clone, 'pins.txt', v, `Publish ${v}`); git(clone, 'push', '-q'); return git(clone, 'rev-parse', 'HEAD'); };
+
+  // Clean and behind: fast-forwarded to exactly what the publish pushed.
+  let tip = publish('2');
+  const before = git(hub, 'rev-parse', 'HEAD');
+  let r = await fastForwardWorkspace(gitRunner(hub));
+  assert.equal(r.state, 'fast_forwarded');
+  assert.deepEqual([r.from, r.to, r.count, r.upstream], [before, tip, 1, 'origin/main']);
+  assert.equal(git(hub, 'rev-parse', 'HEAD'), tip);
+  assert.equal(fs.readFileSync(path.join(hub, 'pins.txt'), 'utf8'), '2');
+  assert.match(describeFastForward('Hub', r), /fast-forwarded to origin\/main \(1 commit, .{7}\.\..{7}\), so deploying Hub needs no git pull/);
+  assert.equal((await fastForwardWorkspace(gitRunner(hub))).state, 'up_to_date');
+
+  // An agent's uncommitted edit to a tracked file: left alone.
+  tip = publish('3');
+  fs.writeFileSync(path.join(hub, 'pins.txt'), 'agent was here');
+  r = await fastForwardWorkspace(gitRunner(hub));
+  assert.equal(r.state, 'skipped');
+  assert.match(r.reason, /uncommitted changes/);
+  assert.equal(fs.readFileSync(path.join(hub, 'pins.txt'), 'utf8'), 'agent was here');
+  assert.match(describeFastForward('Hub', r), /NOT updated — uncommitted changes.*git pull --ff-only` in Hub/);
+  git(hub, 'checkout', '-q', '--', 'pins.txt');
+
+  // An untracked file does not block it.
+  fs.writeFileSync(path.join(hub, 'notes.md'), 'scratch');
+  assert.equal((await fastForwardWorkspace(gitRunner(hub))).state, 'fast_forwarded');
+  assert.equal(git(hub, 'rev-parse', 'HEAD'), tip);
+
+  // Local commits the remote lacks: never merged or rebased for anyone.
+  publish('4');
+  commit(hub, 'other.txt', 'x', 'local work');
+  const local = git(hub, 'rev-parse', 'HEAD');
+  r = await fastForwardWorkspace(gitRunner(hub));
+  assert.equal(r.state, 'skipped');
+  assert.match(r.reason, /commits origin\/main does not/);
+  assert.equal(git(hub, 'rev-parse', 'HEAD'), local);
+
+  // A detached HEAD (how a rollback looks): left alone.
+  git(hub, 'checkout', '-q', '--detach', 'HEAD~1');
+  assert.equal((await fastForwardWorkspace(gitRunner(hub))).reason, 'detached HEAD');
+});
+
+test('the fast-forward runs in the helper process too', async t => {
+  if (process.getuid?.() === 0) { t.skip('the helper refuses to run as root'); return; }
+  const root = fixture(t);
+  const hub = repo(t, root, 'Hub');
+  commit(hub, 'a.txt', '1', 'base');
+  git(hub, 'push', '-q', '-u', 'origin', 'main');
+  const clone = path.join(root, 'c');
+  git(root, 'clone', '-q', path.join(root, 'Hub.git'), clone);
+  commit(clone, 'a.txt', '2', 'publish'); git(clone, 'push', '-q');
+  const r = await fastForwardAsOwner(hub, { owner: null, currentUid: process.getuid() });
+  assert.equal(r.state, 'fast_forwarded');
+  assert.equal(git(hub, 'rev-parse', 'HEAD'), git(clone, 'rev-parse', 'HEAD'));
+  assert.equal((await fastForwardAsOwner(path.join(root, 'missing'), { owner: null, currentUid: process.getuid() })).state, 'skipped');
 });
