@@ -60,7 +60,7 @@ export function serverTemplate(name) {
 export const FIX_OWNERSHIP_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'pw-fix-workspace-ownership');
 
 export function deployRouteHarness(root, options = {}) {
- const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [], upstreamChecks = [];
+ const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [], upstreamChecks = [], headReads = [], prodRefreshes = [];
  const project = { name: 'demo', path: root, ...options.project };
  let config = options.config || { demo: { dev: { script: 'legacy-saved-script', versionCmd: 'legacy-version-command', reauth: false } } };
  const user = { username: 'operator', role: 'admin', projects: '*', ...options.user };
@@ -150,6 +150,10 @@ export function deployRouteHarness(root, options = {}) {
    return password === 'good-password' ? user : null;
   },
   appendDeployLog: async entry => history.push(plain(entry)),
+  // The HEAD a deploy finished on (real Git as the pane account in server.js) and the background
+  // PROD-status refresh it nudges: recorded here, never run.
+  workspaceHead: async (workspace) => { headReads.push(workspace); return options.workspaceHead; },
+  soonProdStatus: () => { prodRefreshes.push(Date.now()); },
   readDeployLog: async () => history.map(plain),
   audit: async (event, detail) => audit.push({ event, ...plain(detail) }),
   getLocalVersion: async () => { sourceReads++; return { version: 'V1.26.0909.1200', hash: 'abc123' }; },
@@ -191,7 +195,7 @@ export function deployRouteHarness(root, options = {}) {
  vm.runInContext(helpers + '\n' + deployment, context, { filename: 'server-deployment-routes.js' });
  context.deployScript = serverTemplate('deployScript');
  return {
-  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, upstreamChecks, context,
+  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, upstreamChecks, headReads, prodRefreshes, context,
   get config() { return config; },
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },

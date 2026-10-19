@@ -58,6 +58,7 @@ import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
 import { exportWorkspaceSnapshot, checkWorkspaceUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES } from './deployment/source.js';
+import { planRepos, lastProdDeploys, summarize as summarizeProd, readRepoFacts } from './deployment/prod-status.js';
 import { mountDeploymentRoutes, sendDeploymentHealth } from './deployment/routes.js';
 import { deploymentSubmitClientSrc, renderDeploymentSettings, deploymentSettingsScript, renderDeploymentNotice, renderExecutionRecipe } from './deployment/ui.js';
 import { DeploymentError, validateRecipe } from './deployment/protocol.js';
@@ -1883,6 +1884,38 @@ async function readDeployLog(project){
   const lines = raw.trim().split('\n').filter(Boolean).map(l => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
   return project ? lines.filter(e => e.project === project) : lines;
  } catch { return []; }
+}
+// What is waiting to reach PROD, per project: the amber marker on the project rail
+// (deployment/prod-status.js). Computed in the background and served from this cache by
+// /api/projects/status, which the rail already polls, so a deploy, a publish or a push shows up
+// without reloading any page. Recomputed every few minutes and shortly after every deploy.
+let prodStatus = {};
+let prodStatusRun = null, prodStatusTimer = null;
+const PROD_STATUS_MS = Math.max(5, Number(process.env.PW_PROD_STATUS_SECONDS) || 180) * 1000;
+async function refreshProdStatus(){
+ if(prodStatusRun) return prodStatusRun;
+ prodStatusRun = (async () => {
+  try {
+   const projects = (await loadProjects()).map(p => ({ name: p.name, workspace: p.path || workspacePath(p.name) }));
+   // ProjectWorkbench reaches PROD by promote, not by a Deploy Centre slot.
+   const overrides = {};
+   const promoted = (await promoteRequests.list(50).catch(() => [])).find(r => r.state === 'promoted' && r.head?.commit);
+   if(promoted) overrides.ProjectWorkbench = { commit: promoted.head.commit, ts: promoted.finishedAt || promoted.createdAt };
+   const plan = planRepos(projects, lastProdDeploys(await readDeployLog()), overrides);
+   const facts = await readRepoFacts(plan.repos, { owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
+   prodStatus = summarizeProd(plan, facts);
+  } catch(e) { console.error('[prod-status] refresh failed:', e?.message || e); }
+  finally { prodStatusRun = null; }
+ })();
+ return prodStatusRun;
+}
+function soonProdStatus(ms = 5000){ clearTimeout(prodStatusTimer); prodStatusTimer = setTimeout(() => { void refreshProdStatus(); }, ms); prodStatusTimer.unref?.(); }
+// The HEAD a deploy finished on, so the next PROD comparison is exact rather than matched by time.
+async function workspaceHead(workspace){
+ try {
+  const facts = await readRepoFacts([{ id:'w', workspace, remote:false }], { owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined, timeoutMs: 20000 });
+  return facts.w?.ok ? facts.w.head : undefined;
+ } catch { return undefined; }
 }
 // Run a deploy slot's operator-authored shell text as the PANE ACCOUNT.
 //
@@ -4001,6 +4034,14 @@ body.rail-open #railToggle .chev{transform:rotate(180deg)}
 .pk-name{font-size:12.5px;font-weight:650;color:inherit;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
 .pk-sub{font-size:10.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
 .pkey.lit .pk-sub{color:#ffd98a}
+/* Something waiting to reach PROD (deployment/prod-status.js): a violet arrow on the monogram's corner,
+   kept apart from the amber 'needs you' signal. The tooltip lists what is waiting. */
+.pk-prod{position:absolute;left:35px;top:4px;width:14px;height:14px;border-radius:50%;display:none;place-items:center;background:#7c3aed;color:#fff;font:800 9px/1 var(--font);box-shadow:0 0 0 2px #0a1120;pointer-events:none}
+.pk-prod::before{content:'\\2191'}
+.pkey.prod .pk-prod{display:grid}
+.pkey.prod .pk-sub.prodSub{color:#c4b5fd}
+.railGroupBtn .gProd{display:none;color:#c4b5fd;font:700 10.5px var(--mono);letter-spacing:0}
+.railGroupHead.prodWaiting .gProd{display:inline}
 .pk-dot{position:absolute;top:7px;right:7px;width:7px;height:7px;border-radius:50%;background:#334155;opacity:0;transition:opacity .2s}
 .pk-live{position:absolute;bottom:7px;right:7px;width:7px;height:7px;border-radius:50%;background:var(--ok);opacity:0;transition:opacity .25s}
 .pkey.working .pk-live{opacity:1;animation:pwLivePulse 1.5s ease-in-out infinite}
@@ -4187,7 +4228,7 @@ function railHtml(projects, currentName, user, deployConfigured=false, projectCa
   // way to pin was with a mouse. aria-pressed carries the state that the tile's
   // colour used to carry alone. The custom properties sit on the row so both
   // children inherit them.
-  return `<li class="pkeyRow" style="--h:${projHue(p.name)};--i:${i}" data-order="${i}" data-category="${esc(projectCategoryOf(p, groups))}" data-cats="${esc(projCats(p).join('|'))}"><a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span></a><button class="pk-pin" type="button" data-project="${esc(p.name)}" aria-pressed="false" aria-label="Pin ${esc(p.name)}"><span aria-hidden="true">📌</span></button></li>`;
+  return `<li class="pkeyRow" style="--h:${projHue(p.name)};--i:${i}" data-order="${i}" data-category="${esc(projectCategoryOf(p, groups))}" data-cats="${esc(projCats(p).join('|'))}"><a class="pkey${cur?' current':''}" href="${BASE}/term/${encodeURIComponent(p.name)}/" data-project="${esc(p.name)}"${cur?' aria-current="page"':''}><span class="pk-edge"></span><span class="pk-mono">${esc(projMonogram(p.name))}</span><span class="pk-meta"><span class="pk-name">${esc(p.name)}</span><span class="pk-sub">${cur?'active session':''}</span></span><span class="pk-dot" aria-hidden="true"></span><span class="pk-live" aria-hidden="true"></span><span class="pk-prod" aria-hidden="true"></span></a><button class="pk-pin" type="button" data-project="${esc(p.name)}" aria-pressed="false" aria-label="Pin ${esc(p.name)}"><span aria-hidden="true">📌</span></button></li>`;
  }).join('');
  const adminActs = isAdmin
   ? `<a class="railAct" id="manageEntry" href="${BASE}/manage" title="Manage projects"><span class="railActIco">✎</span><span class="railActLabel">Manage projects</span></a><a class="railAct" href="${BASE}/settings" title="Settings"><span class="railActIco">⚙</span><span class="railActLabel">Settings</span></a>`
@@ -4290,7 +4331,8 @@ function relayout(){
   const ch=document.createElement('span');ch.className='chev';ch.setAttribute('aria-hidden','true');ch.textContent='▾';
   const nm=document.createElement('span');nm.className='gName';nm.textContent=g.name;
   const ct=document.createElement('span');ct.className='gCnt';
-  b.append(ch,nm,ct);li.appendChild(b);LIST.appendChild(li);members.forEach(m=>LIST.appendChild(m));
+  const pd=document.createElement('span');pd.className='gProd';
+  b.append(ch,nm,ct,pd);li.appendChild(b);LIST.appendChild(li);members.forEach(m=>LIST.appendChild(m));
  }
 }
 LIST.addEventListener('click',e=>{const b=e.target.closest('.railGroupBtn');if(!b)return;const g=b.parentElement.dataset.group;if(collapsed.has(g))collapsed.delete(g);else collapsed.add(g);saveCollapsed();applyCatFilter()});
@@ -4319,6 +4361,7 @@ function rebuildTagMenu(){
  filterOpts.textContent='';
  const opt=(key,label,n,cls)=>{const l=document.createElement('label');l.className='railFilterOpt'+(cls?' '+cls:'');const i=document.createElement('input');i.type='checkbox';i.dataset.cat=key;const t=document.createElement('span');t.className='n';t.textContent=label;l.append(i,t);if(n!=null){const c=document.createElement('span');c.className='cnt';c.textContent=String(n);l.appendChild(c)}filterOpts.appendChild(l)};
  opt('|pinned','📌 Pinned only',null,tags.length?'pinnedOpt':'');
+ opt('|prod','\u2191 Waiting for PROD',null,'');
  tags.forEach(t=>opt(t.name,t.name,t.n));
  if(tags.length&&untagged)opt('|none','No tags',untagged);
  const known=new Set([...filterOpts.querySelectorAll('input[data-cat]')].map(b=>b.dataset.cat.toLowerCase()));
@@ -4331,20 +4374,21 @@ function applyCatFilter(){
   const sel=new Set([...catFilter].map(c=>c.toLowerCase()));
   const boxes=[...filterOpts.querySelectorAll('input[data-cat]')];
   boxes.forEach(b=>{b.checked=sel.has(b.dataset.cat.toLowerCase())});
-  const names=boxes.filter(b=>b.checked).map(b=>b.dataset.cat==='|none'?'No tags':(b.dataset.cat==='|pinned'?'Pinned only':b.dataset.cat));
+  const names=boxes.filter(b=>b.checked).map(b=>b.dataset.cat==='|none'?'No tags':(b.dataset.cat==='|pinned'?'Pinned only':b.dataset.cat==='|prod'?'Waiting for PROD':b.dataset.cat));
   filterLabel.textContent=names.length===0?'All projects':(names.length===1?names[0]:names.length+' filters');
   filterBtn.classList.toggle('filtering',names.length>0);
   if(pinToggle)pinToggle.setAttribute('aria-pressed',catFilter.has('|pinned')?'true':'false');
  }
- const pinnedOnly=catFilter.has('|pinned');
- const tagSel=new Set([...catFilter].filter(c=>c!=='|pinned').map(c=>c.toLowerCase()));
+ const pinnedOnly=catFilter.has('|pinned'),prodOnly=catFilter.has('|prod');
+ const tagSel=new Set([...catFilter].filter(c=>c!=='|pinned'&&c!=='|prod').map(c=>c.toLowerCase()));
  const shown=new Map();let any=false;
  rowsOf().forEach(row=>{
   const tags=rowTags(row).map(t=>t.toLowerCase());
   const cur=!!row.querySelector('.pkey.current');
   const tagHit=tagSel.size===0||tags.some(t=>tagSel.has(t))||(tags.length===0&&tagSel.has('|none'));
   const pinHit=!pinnedOnly||row.classList.contains('pinned');
-  const match=tagHit&&pinHit&&searchHit(row,q);
+  const prodHit=!prodOnly||row.classList.contains('prodWaiting');
+  const match=tagHit&&pinHit&&prodHit&&searchHit(row,q);
   const g=groupKey(row);
   const open=!!q||!collapsed.has(g);
   row.classList.toggle('catHidden',!(cur||(match&&open)));
@@ -4359,6 +4403,16 @@ function applyCatFilter(){
   b.title=h.querySelector('.gName').textContent+(q?'':(open?' — click to collapse':' — click to expand'));
  });
  if(NOMATCH)NOMATCH.hidden=any||!(q||catFilter.size);
+ markGroupsProd();
+}
+// A group header counts its projects waiting for PROD, so a collapsed group still says so.
+function markGroupsProd(){
+ const rows=rowsOf();
+ LIST.querySelectorAll('.railGroupHead').forEach(h=>{
+  const n=rows.filter(r=>groupKey(r)===h.dataset.group&&r.classList.contains('prodWaiting')).length;
+  h.classList.toggle('prodWaiting',n>0);
+  const el=h.querySelector('.gProd');if(el){el.textContent=n?'\u2191'+n:'';el.title=n?n+' waiting for PROD':''}
+ });
 }
 function setFilterOpen(open){if(!filterWrap)return;filterMenu.hidden=!open;filterBtn.setAttribute('aria-expanded',open?'true':'false')}
 if(filterWrap){
@@ -4565,23 +4619,30 @@ let first=true;
 const RAIL_OUTCOME={needs_input:'waiting for your answer',blocked:'blocked — needs you to act',failed:'failed — click to view'};
 async function refreshRail(){try{
 const r=await fetch('${BASE}/api/projects/status',{cache:'no-store'});if(r.status===401){if(window.pwAuthLost)window.pwAuthLost();return}const j=await r.json();if(!j||!j.ok)return;
-let anyLit=false;
+let anyLit=false,prodChanged=false;
 for(const p of (j.projects||[])){
 const key=KEYS.querySelector('[data-project="'+p.name+'"]');if(!key)continue;
 const out=(p.pending&&p.name!==CUR)?(p.outcome||''):'';const lit=!!p.pending&&p.name!==CUR&&out!=='working'&&out!=='done';if(lit)anyLit=true;
 for(const o of ['needs_input','blocked','failed','done','working'])key.classList.toggle('o-'+o,out===o);
-if(p.outcomeAsk&&lit)key.title=(RAIL_OUTCOME[out]||'finished')+'\\n\u201C'+p.outcomeAsk+'\u201D';else key.removeAttribute('title');
+const pr=p.prod&&p.prod.waiting?p.prod:null;
+const row=key.closest('.pkeyRow');if(!!pr!==key.classList.contains('prod'))prodChanged=true;
+key.classList.toggle('prod',!!pr);if(row)row.classList.toggle('prodWaiting',!!pr);
+const tip=[];if(p.outcomeAsk&&lit)tip.push((RAIL_OUTCOME[out]||'finished')+'\\n\u201C'+p.outcomeAsk+'\u201D');
+if(pr)tip.push('Waiting for PROD:\\n'+(pr.lines||[pr.summary]).join('\\n'));
+if(tip.length)key.title=tip.join('\\n\\n');else key.removeAttribute('title');
 const was=key.classList.contains('lit');
 key.classList.toggle('lit',lit);
 key.classList.toggle('working',!!p.working);
 const sub=key.querySelector('.pk-sub');
-if(sub)sub.textContent=(p.name===CUR)?(p.working?'working…':'active session'):(lit?(RAIL_OUTCOME[out]||'finished — click to view'):(out==='done'?'done — nothing needed':out==='working'?'still working…':(p.working?'working…':(p.hibernated?'hibernated — open to resume':''))));
+if(sub){sub.textContent=(p.name===CUR)?(p.working?'working…':'active session'):(lit?(RAIL_OUTCOME[out]||'finished — click to view'):(out==='done'?'done — nothing needed':out==='working'?'still working…':(p.working?'working…':(p.hibernated?'hibernated — open to resume':''))));
+const ps=!sub.textContent&&pr;sub.classList.toggle('prodSub',!!ps);if(ps)sub.textContent='\u2191 '+pr.summary}
 if(lit&&!was&&!first){key.classList.add('struck');key.addEventListener('animationend',()=>key.classList.remove('struck'),{once:true})}
 if(lit&&autoPin&&!pinned.has(p.name)){pinned.add(p.name);savePins();applyPins()}
 }
 const known=new Set((j.projects||[]).map(x=>x.name));
 let pruned=false;for(const n of [...pinned]){if(!known.has(n)){pinned.delete(n);pruned=true}}
 if(pruned){savePins();applyPins()}
+if(prodChanged){if(catFilter.has('|prod'))applyCatFilter();else markGroupsProd()}
 document.title=(anyLit?'● ':'')+baseTitle;
 document.body.classList.toggle('rail-attn',anyLit);
 first=false;
@@ -5103,7 +5164,7 @@ app.get(BASE + '/api/projects/status', requireAuth, async (req,res)=>{ try {
   return { name: p.name, ...pend, bell: sig.bell, working: sig.working, hibernated: sig.hibernated || 0, outcome: sig.outcome || null,
    // A line of the turn's own words: only for a role that can already open this terminal.
    outcomeAsk: TERMINAL_ROLES.has(req.user.role) ? (sig.outcomeAsk || null) : null,
-   pending: pend.pending || sig.bell, credentialsStale: await credentialsStale(p) };
+   pending: pend.pending || sig.bell, credentialsStale: await credentialsStale(p), prod: prodStatus[p.name] ?? null };
  }));
  res.json({ ok:true, projects: out });
 } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }});
@@ -8260,11 +8321,13 @@ if(DEPLOY_CENTRE){
   const selectionLog = manifest ? { inputs:selection.inputs, currentVersion:selection.currentVersion, targetVersion:selection.targetVersion, manifestRevision:manifest.revision } : {};
   // With a shared credential every deploy looks like one account on the app
   // server, so PW's own records are the only place the human survives: keep both.
-  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, upstream: upstream.check.state, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
+  const commit = status === 'success' ? await workspaceHead(state.workspace) : undefined;
+  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, upstream: upstream.check.state, commit, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
   // Archived before the route answers: a finished run must be retrievable from
   // History even if this process dies immediately afterwards.
   await deployRuns.finish(runId, { status, version, duration, error: status === 'failed' ? 'the deploy script exited non-zero' : null });
   await appendDeployLog(logEntry);
+  soonProdStatus();
   await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource, ...upstreamAudit(upstream.check) }, req);
   // Report the recomputed comparison rather than leaving the client to redo it:
   // the badge is now wrong the instant a deploy lands, and the server is the only
@@ -8402,6 +8465,7 @@ const PORT = parseInt(process.env.PORT || '3000', 10);
 const srv = app.listen(PORT,'127.0.0.1',()=>{
  console.log(`dashboard listening on 127.0.0.1:${PORT}`);
  console.log(`[deploy-mode] ${DEPLOY_MODE}`);
+ if(process.env.PW_PROD_STATUS === 'on' || (!ISOLATED && process.env.PW_PROD_STATUS !== 'off')){ soonProdStatus(Number(process.env.PW_PROD_STATUS_FIRST_MS) || 15000); setInterval(() => { void refreshProdStatus(); }, PROD_STATUS_MS).unref(); }
  if(!ISOLATED && PER_USER_CLAUDE){
   pruneUserCredentialTrees()
    .then(r => { if(r.removed?.length) console.log(`[per-user-claude] pruned ${r.removed.length} orphaned credential tree(s)`); })

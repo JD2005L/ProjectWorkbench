@@ -81,6 +81,13 @@ Admins set a project's category and tags by right-clicking it in the rail (or th
 
 Admins can also **drag a project** up or down the rail to reorder it (the same global order Manage projects edits). Dropping it into another category's section, or onto a section header, moves it into that category too. With a project focused, **Alt+↑ / Alt+↓** moves it within its section. Every move saves at once; one that fails is put back with a message. The project you are in always stays visible, whatever is filtered or collapsed.
 
+**Waiting for PROD.** A violet ↑ on a project's monogram means something of it has not reached production yet; hover for what, and *↑ Waiting for PROD* in the 🏷 menu lists only those (a collapsed section's header counts them too). It is worked out in the background and arrives with the rail's normal 4-second refresh, so a deploy, a publish or a push shows up without reloading the page (within about three minutes, and shortly after any deploy). Per kind of project (`app/deployment/prod-status.js`):
+- **App** — commits on its branch (local, pushed, or on the remote) that its last successful PROD deploy did not ship. PW itself counts its last *promote*.
+- **Package hub** (a project that `<Hub>-Tool-*` projects publish into) — the same, plus which tool versions its next PROD deploy would carry.
+- **Tool** (`<Hub>-Tool-<Name>`) — either hop that is outstanding: commits since its last published `v<version>` tag (*not published to &lt;Hub&gt;*), or a published version the hub's PROD deploy does not pin yet (*waiting for &lt;Hub&gt; PROD deploy*). A tag the hub never pinned is a publish that stopped part-way, and says so.
+
+Each deploy now records the commit it finished on; deploys from before that are matched by time and the tooltip says *approximate*. Git is read as the pane account, never as root, and nothing is fetched. `PW_PROD_STATUS=off` turns it off; `PW_PROD_STATUS_SECONDS` sets the interval (default 180).
+
 ### Settings
 A dedicated `/settings` page (admin-only) with sidebar tabs covers the day-to-day controls: **Users & Roles** (full CRUD), **CLIs & Sign-in**, **Environment** (permission mode, MCP mode), **System & Updates** (heal endpoints + readiness checklist), and **First Run** (launches the focused Setup Wizard modal).
 

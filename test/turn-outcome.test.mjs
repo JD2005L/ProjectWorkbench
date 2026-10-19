@@ -1047,8 +1047,9 @@ test('the tab and rail tooltips show the excerpt as text, beside the colours the
   assert.match(src, /tab\.title=[^;]*OUTCOME_TIP\[outc\]/);
   // In server.js's template literal, '\\n' becomes the tooltip's line break in the served script.
   assert.match(src, /OUTCOME_TIP\[outc\]\?OUTCOME_TIP\[outc\]\+\(w\.outcomeAsk\?'\\\\n\\u201C'\+w\.outcomeAsk\+'\\u201D':''\)/);
-  assert.match(src, /if\(p\.outcomeAsk&&lit\)key\.title=/);
-  assert.match(src, /else key\.removeAttribute\('title'\)/);
+  // The rail tile's tooltip is composed: the excerpt while lit, then anything waiting for PROD.
+  assert.match(src, /if\(p\.outcomeAsk&&lit\)tip\.push\(/);
+  assert.match(src, /if\(tip\.length\)key\.title=tip\.join\([^)]*\);else key\.removeAttribute\('title'\)/);
   assert.equal((src.match(/innerHTML[^;]*outcomeAsk/g) || []).length, 0, 'never parsed as HTML');
 });
 

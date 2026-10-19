@@ -70,3 +70,21 @@ test('an in-sync or unchecked workspace deploys with its output untouched', asyn
   assert.equal(result.body.output, 'deploy said this', check.state);
  }
 });
+
+test('a successful deploy records the commit it finished on and nudges the PROD status; a failed one records none', async t => {
+ const { root } = manifestWorkspace(t);
+ const head = 'c'.repeat(40);
+ const ok = deployRouteHarness(root, { project: slotProject, workspaceHead: head,
+  config: { demo: { prod: { script: 'publish.sh', reauth: false } } }, onExec: async () => ({ stdout: 'done', stderr: '' }) });
+ assert.equal((await ok.call('POST', deployRoute, { params, body: {} })).body.ok, true);
+ assert.equal(ok.history.at(-1).commit, head);
+ assert.deepEqual(ok.headReads, [root]);
+ assert.equal(ok.prodRefreshes.length, 1);
+
+ const bad = deployRouteHarness(root, { project: slotProject, workspaceHead: head,
+  config: { demo: { prod: { script: 'publish.sh', reauth: false } } }, onExec: async () => { throw Object.assign(new Error('boom'), { code: 1 }); } });
+ assert.equal((await bad.call('POST', deployRoute, { params, body: {} })).body.ok, false);
+ assert.equal(bad.history.at(-1).commit, undefined);
+ assert.deepEqual(bad.headReads, []);
+ assert.equal(bad.prodRefreshes.length, 1);
+});
