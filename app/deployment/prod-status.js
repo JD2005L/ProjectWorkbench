@@ -20,8 +20,17 @@
 //
 // Every Git read runs as the pane account in a child process (the same rule as source.js: root
 // performs no filesystem operation below a path the terminal account controls). Remote tips come
-// from `ls-remote`; nothing is fetched and nothing under .git is written. Anything that cannot be
-// judged answers null, which the rail shows as no marker at all.
+// from `ls-remote`, and apps and tools are never fetched. HUBS are: a tool's publish pushes its pin
+// to the hub from a temporary clone, so the hub's workspace never sees it otherwise, and without
+// the pin at the hub's tip a published tool cannot be told from an unpublished one. That fetch
+// (`git fetch --no-tags`, as the pane account) only moves the hub's remote-tracking refs; its
+// branch and working tree are untouched. Anything that cannot be judged answers null, which the
+// rail shows as no marker at all.
+//
+// A tool is in one of two stages, shown differently on the rail because they need different
+// people to act: stage 'publish' (something in the tool is not in the hub: publish it) and stage
+// 'hub' (everything is in the hub; it reaches PROD with the hub's next PROD deploy). The hub's
+// tooltip lists both sides: what its next deploy carries, and which tools it will NOT carry yet.
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
@@ -97,10 +106,12 @@ const quiet = async (fn) => { try { return await fn(); } catch { return null; } 
 //   csproj    path                       hubs: read the tool pins at both ends
 //   tags      true                       tools: the newest v<version> tag and what came after it
 //   remote    false                      skip ls-remote (tests; the deploy route's HEAD probe)
-export async function inspectRepo(runGit, { deployed = null, csproj = null, tags = false, remote = true } = {}) {
+//   fetch     true                       hubs: fetch the branch's remote first (see the top)
+export async function inspectRepo(runGit, { deployed = null, csproj = null, tags = false, remote = true, fetch = false } = {}) {
   const head = await quiet(() => text(runGit, ['rev-parse', '--verify', 'HEAD^{commit}']));
   if (!REVISION.test(head || '')) return { ok: false };
   const facts = { ok: true, head };
+  if (fetch) facts.fetched = !!(await quiet(() => runGit(['fetch', '--quiet', '--no-tags', '--no-write-fetch-head'], { timeoutMs: 30000, maxBytes: 65536 })));
   const refs = [head];
   const local = await quiet(() => text(runGit, ['rev-parse', '--verify', '--quiet', '@{upstream}^{commit}']));
   if (REVISION.test(local || '') && local !== head) refs.push(local);
@@ -195,40 +206,45 @@ export function planRepos(projects, deploys, overrides = {}) {
     const kind = kinds[p.name];
     const deployed = overrides[p.name] || deploys[p.name] || null;
     if (kind === 'tool') repos.push({ id: p.name, workspace: p.workspace, tags: true });
-    else if (kind === 'hub') repos.push({ id: p.name, workspace: p.workspace, deployed, csproj: hubCsproj(p.name) });
+    else if (kind === 'hub') repos.push({ id: p.name, workspace: p.workspace, deployed, csproj: hubCsproj(p.name), fetch: true });
     else if (deployed) repos.push({ id: p.name, workspace: p.workspace, deployed });
   }
   return { repos, kinds, tools };
 }
 
-// → { name: { waiting, kind, summary, lines[], approximate } | null }
+// → { name: { waiting, kind, stage?, summary, lines[], approximate } | null }
 export function summarize({ kinds, tools }, facts) {
   const out = {};
   const pinsOf = (hub, which) => parsePins(facts[hub]?.[which], hub);
-  const toolLine = {};
+  const carries = {}, missing = {};
   for (const [name, { hub, tool }] of Object.entries(tools)) {
     const f = facts[name];
     if (!f?.ok) { out[name] = null; continue; }
-    const lines = [];
-    const hubDeployed = facts[hub]?.deployed ? pinsOf(hub, 'csprojDeployed') : null;
-    if (!f.published) lines.push(`never published to ${hub}`);
+    const hubFacts = facts[hub]?.ok ? facts[hub] : null;
+    const pinned = hubFacts ? pinsOf(hub, 'csprojNewest')[tool] : undefined;
+    const live = hubFacts?.deployed ? pinsOf(hub, 'csprojDeployed')[tool] : undefined;
+    const since = f.published ? (f.sincePublished?.count || 0) : 0;
+    const publish = [], hubWait = [];
+    if (!f.published) publish.push(`never published to ${hub}`);
     else {
-      const since = f.sincePublished?.count || 0;
-      if (since) lines.push(`${plural(since, 'commit')} not published to ${hub}`, ...f.sincePublished.subjects.map(s => `  ${s}`));
       // A tag the hub never pinned is a publish that stopped part-way (the tag is made before the
       // hub's tests and push): it is not on its way to PROD at all.
-      const pinned = facts[hub]?.ok ? pinsOf(hub, 'csprojNewest')[tool] : undefined;
-      if (facts[hub]?.ok && (!pinned || compareVersions(f.published, pinned) > 0)) {
-        lines.unshift(facts[hub].unfetched
-          ? `v${f.published} tagged; not in ${hub} as this server last fetched it`
+      if (hubFacts && (!pinned || compareVersions(f.published, pinned) > 0)) {
+        publish.push(hubFacts.unfetched && !hubFacts.fetched
+          ? `v${f.published} tagged; not in ${hub} as this server last saw it`
           : `v${f.published} tagged but not pinned in ${hub}: the publish did not finish, publish again`);
-      } else if (hubDeployed && (!hubDeployed[tool] || compareVersions(f.published, hubDeployed[tool]) > 0)) {
-        const msg = `v${f.published} published, waiting for ${hub} PROD deploy`;
-        lines.unshift(msg);
-        toolLine[hub] = [...(toolLine[hub] || []), `${tool} ${f.published}`];
       }
+      if (since) publish.push(`${plural(since, 'commit')} since v${f.published}, not published to ${hub}`, ...f.sincePublished.subjects.map(s => `  ${s}`));
     }
-    out[name] = lines.length ? { waiting: true, kind: 'tool', summary: lines[0], lines, approximate: false } : { waiting: false, kind: 'tool' };
+    if (pinned && hubFacts?.deployed && (!live || compareVersions(pinned, live) > 0)) {
+      hubWait.push(`v${pinned} is in ${hub}, waiting for ${hub}'s PROD deploy${live ? ` (PROD has v${live})` : ''}`);
+      (carries[hub] ||= []).push(`${tool} ${pinned}`);
+    }
+    if (publish.length) (missing[hub] ||= []).push(`${tool} (${publish[0].replace(` to ${hub}`, '').replace(/^v[\d.]+ /, '')})`);
+    const lines = [...publish, ...hubWait];
+    if (!lines.length) { out[name] = { waiting: false, kind: 'tool' }; continue; }
+    // Anything to publish is this project's own job, so it wins the stage.
+    out[name] = { waiting: true, kind: 'tool', stage: publish.length ? 'publish' : 'hub', summary: lines[0], lines, approximate: false };
   }
   for (const [name, kind] of Object.entries(kinds)) {
     if (kind === 'tool') continue;
@@ -237,10 +253,12 @@ export function summarize({ kinds, tools }, facts) {
     const lines = [];
     const n = f.deployed.count || 0;
     if (n) lines.push(`${plural(n, 'commit')} not in PROD`, ...f.deployed.subjects.map(s => `  ${s}`));
-    if (f.unfetched) lines.push('the remote has newer commits this server has not fetched');
-    if (kind === 'hub' && toolLine[name]?.length) lines.push(`carries ${toolLine[name].join(', ')}`);
-    if (!lines.length) { out[name] = { waiting: false, kind }; continue; }
-    const summary = n ? lines[0] : lines.find(l => !l.startsWith('  '));
+    if (f.unfetched && !f.fetched) lines.push('the remote has newer commits this server has not fetched');
+    if (kind === 'hub' && carries[name]?.length) lines.push(`its next PROD deploy carries: ${carries[name].join(', ')}`);
+    if (kind === 'hub' && missing[name]?.length) lines.push(`it will NOT carry yet (publish first): ${missing[name].join('; ')}`);
+    const waiting = !!(n || (f.unfetched && !f.fetched) || carries[name]?.length);
+    if (!waiting) { out[name] = lines.length ? { waiting: false, kind, lines } : { waiting: false, kind }; continue; }
+    const summary = n ? lines[0] : (carries[name]?.length ? `carries ${carries[name].length} tool update${carries[name].length === 1 ? '' : 's'} to PROD` : lines[0]);
     if (f.deployed.approximate) lines.push('(last PROD deploy matched by time; approximate)');
     out[name] = { waiting: true, kind, summary, lines, approximate: !!f.deployed.approximate };
   }
@@ -261,7 +279,7 @@ async function helperMain() {
       && typeof r.workspace === 'string' && path.isAbsolute(r.workspace)).map(r => ({
       id: r.id, workspace: r.workspace, deployed: r.deployed && typeof r.deployed === 'object' ? r.deployed : null,
       csproj: typeof r.csproj === 'string' && /^[A-Za-z0-9._\/-]{1,200}$/.test(r.csproj) && !r.csproj.split('/').includes('..') ? r.csproj : null,
-      tags: r.tags === true, remote: r.remote !== false,
+      tags: r.tags === true, remote: r.remote !== false, fetch: r.fetch === true,
     }));
     result = { ok: true, facts: await inspectAll(repos) };
   } catch { result = { ok: false }; }

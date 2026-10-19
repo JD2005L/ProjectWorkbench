@@ -107,14 +107,18 @@ test('a remote ahead of what this server fetched is still reported as waiting', 
   assert.equal(fs.existsSync(path.join(ws, '.git', 'FETCH_HEAD')), false, 'nothing is fetched');
 });
 
-test('a hub and its tools: unpublished work, a publish waiting for the hub, a stalled publish, and what the hub carries', async t => {
+test('a hub and its tools: each stage on its own, and what the hub will and will not carry', async t => {
   const root = fixture(t);
   const hub = repo(t, root, 'Hub');
   const pinFile = 'src/Hub.Web/Hub.Web.csproj';
   const deployed = commit(hub, pinFile, csproj({ A: '1.26.1001.1000', B: '1.26.1001.1000', C: '1.26.1001.1000' }), 'base');
   git(hub, 'push', '-q', '-u', 'origin', 'main');
-  commit(hub, pinFile, csproj({ A: '1.26.1002.1000', B: '1.26.1001.1000', C: '1.26.1001.1000' }), 'Publish A 1.26.1002.1000');
-  git(hub, 'push', '-q');
+  // The way publish-to-hub.sh pins a tool: from its own clone of the hub, pushed straight to the
+  // remote. The hub's workspace on this server does not see it until something fetches.
+  const clone = path.join(root, 'publish-clone');
+  git(root, 'clone', '-q', path.join(root, 'Hub.git'), clone);
+  commit(clone, pinFile, csproj({ A: '1.26.1002.1000', B: '1.26.1001.1000', C: '1.26.1001.1000' }), 'Publish A 1.26.1002.1000');
+  git(clone, 'push', '-q');
 
   const tools = {};
   for (const [name, tags, extra] of [['A', ['1.26.1001.1000', '1.26.1002.1000'], 0], ['B', ['1.26.1001.1000'], 2], ['C', ['1.26.1001.1000', '1.26.1003.1000'], 0], ['D', [], 1]]) {
@@ -127,26 +131,38 @@ test('a hub and its tools: unpublished work, a publish waiting for the hub, a st
   }
   const projects = [{ name: 'Hub', workspace: hub }, ...Object.entries(tools).map(([n, ws]) => ({ name: `Hub-Tool-${n}`, workspace: ws }))];
   const plan = planRepos(projects, { Hub: { commit: deployed } });
+  assert.equal(plan.repos.find(r => r.id === 'Hub').fetch, true, 'only the hub is fetched');
+  assert.ok(plan.repos.filter(r => r.id !== 'Hub').every(r => !r.fetch));
   const facts = {};
   for (const r of plan.repos) facts[r.id] = await inspectRepo(gitRunner(r.workspace), r);
+  assert.equal(facts.Hub.fetched, true);
+  assert.equal(git(hub, 'rev-parse', 'HEAD'), deployed, "the fetch leaves the hub's branch where it was");
   const s = summarize(plan, facts);
 
-  assert.equal(s['Hub-Tool-A'].summary, 'v1.26.1002.1000 published, waiting for Hub PROD deploy');
-  assert.equal(s['Hub-Tool-B'].summary, '2 commits not published to Hub');
+  assert.equal(s['Hub-Tool-A'].stage, 'hub', 'A is fully published: it only waits for the hub');
+  assert.equal(s['Hub-Tool-A'].summary, "v1.26.1002.1000 is in Hub, waiting for Hub's PROD deploy (PROD has v1.26.1001.1000)");
+  assert.equal(s['Hub-Tool-B'].stage, 'publish');
+  assert.equal(s['Hub-Tool-B'].summary, '2 commits since v1.26.1001.1000, not published to Hub');
   assert.match(s['Hub-Tool-B'].lines.join('\n'), /work 1[\s\S]*work 0/);
+  assert.equal(s['Hub-Tool-C'].stage, 'publish');
   assert.equal(s['Hub-Tool-C'].summary, 'v1.26.1003.1000 tagged but not pinned in Hub: the publish did not finish, publish again');
   assert.equal(s['Hub-Tool-D'].summary, 'never published to Hub');
   assert.equal(s.Hub.summary, '1 commit not in PROD');
-  assert.ok(s.Hub.lines.includes('carries A 1.26.1002.1000'), s.Hub.lines.join('\n'));
-  assert.ok(!s.Hub.lines.some(l => /C 1\.26\.1003/.test(l)), 'a tag the hub never pinned is not carried');
+  assert.ok(s.Hub.lines.includes('its next PROD deploy carries: A 1.26.1002.1000'), s.Hub.lines.join('\n'));
+  const not = s.Hub.lines.find(l => l.startsWith('it will NOT carry yet'));
+  assert.match(not, /B \(2 commits since v1\.26\.1001\.1000, not published\)/);
+  assert.match(not, /C \(tagged but not pinned/);
+  assert.match(not, /D \(never published\)/);
 
   // Once the hub deploys its tip, A is in PROD; the rest are unchanged.
+  git(hub, 'merge', '-q', '--ff-only', 'origin/main');
   const after = planRepos(projects, { Hub: { commit: git(hub, 'rev-parse', 'HEAD') } });
   const f2 = { ...facts, Hub: await inspectRepo(gitRunner(hub), after.repos.find(r => r.id === 'Hub')) };
   const s2 = summarize(after, f2);
-  assert.deepEqual(s2.Hub, { waiting: false, kind: 'hub' });
+  assert.equal(s2.Hub.waiting, false, 'nothing to deploy in the hub itself');
+  assert.match(s2.Hub.lines.join('\n'), /will NOT carry yet/, 'but it still says which tools are not in it');
   assert.deepEqual(s2['Hub-Tool-A'], { waiting: false, kind: 'tool' });
-  assert.equal(s2['Hub-Tool-B'].waiting, true);
+  assert.equal(s2['Hub-Tool-B'].stage, 'publish');
 });
 
 test('the helper process answers the same facts, and nothing under .git is written', async t => {

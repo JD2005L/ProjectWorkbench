@@ -373,8 +373,9 @@ scripts/pw-promote wait        # follows it to the end, through the dashboard's 
 1. **Request.** A host service snapshots `app/` (minus `node_modules`) and `scripts/` and runs
    a dry run against the snapshot. The request is refused while another promote is approved or
    running. A newer request replaces one that has not been approved yet.
-2. **Ask James to approve it.** He does that in **Settings → System & Updates → Promote Project
-   Workbench**, signed in, with his password. Tell him the request id and what it ships.
+2. **Ask James to approve it.** A modal asking for his password opens by itself on any dashboard
+   page he has open (or he uses **Settings → System & Updates → Promote Project Workbench**),
+   signed in, with his password. Tell him the request id and what it ships.
    Nothing on the agent's side can approve, and nothing should try: no on-box call to the app,
    no forged header, no script left for a browser to run. Looking for a way around the
    approval is out of bounds, exactly like the workspace boundary above.

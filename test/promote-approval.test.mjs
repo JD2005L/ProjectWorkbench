@@ -274,3 +274,31 @@ test('a request is refused unless app/ and scripts/ are committed and exactly or
     }, { workspace: shape });
   }
 });
+
+// The prompt that brings the approval to the administrator (app/promote-prompt.js) rides the
+// status bar of every page, for a signed-in administrator only; it approves through the same
+// route as the card, so everything above still holds for it.
+test('every page carries the approval prompt for a signed-in administrator, and nobody else', { timeout: 60000 }, async () => {
+  await withInstance({}, async ({ base }) => {
+    const admin = await login(base, 'boss');
+    const dev = await login(base, 'dev');
+    const page = (cookie) => fetch(`${base}/`, { headers: { Cookie: cookie, ...viaNginx(base) }, redirect: 'manual' }).then((r) => r.text());
+    const forAdmin = await page(admin);
+    assert.match(forAdmin, /id="pwPromotePrompt"/);
+    assert.match(forAdmin, /type='password'|pw\.type='password'/);
+    assert.doesNotMatch(await page(dev), /pwPromotePrompt/, 'a developer gets no prompt');
+    const settings = await fetch(`${base}/settings`, { headers: { Cookie: admin, ...viaNginx(base) } }).then((r) => r.text());
+    assert.match(settings, /window\.pwPromoteCardRefresh=load/, 'on Settings it refreshes the card');
+  });
+});
+
+test('a page that has shown a project preview never asks for the password itself', async () => {
+  const src = fs.readFileSync(serverJs, 'utf8');
+  assert.match(src, /function loadIframe\(url\)\{if\(lastIframeUrl===url\)return;lastIframeUrl=url;try\{window\.pwPromoteTaint&&window\.pwPromoteTaint\(\)\}catch\{\}/,
+    'the preview marks the page before its frame loads');
+  const { promotePromptHtml } = await import('../app/promote-prompt.js');
+  const html = promotePromptHtml('/wb');
+  new Function(html.split('<script>')[1].split('</script>')[0]);
+  assert.match(html, /let tainted=false;\nwindow\.pwPromoteTaint=function\(\)\{tainted=true\};/, 'and only ever sets the flag, never clears it');
+  assert.match(html, /if\(tainted\)\{[^]*?window\.open\(SETTINGS,'_blank','noopener,noreferrer'\)[^]*?return;\n \}/);
+});

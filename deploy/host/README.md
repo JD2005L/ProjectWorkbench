@@ -85,6 +85,16 @@ password and approves. The host service then promotes **exactly that snapshot**,
 the result. The promote restarts the dashboard's node process; the runner is a host service,
 so it finishes on its own and the dashboard shows the result after its restart.
 
+**The prompt.** The administrator does not have to go looking for it. Every dashboard page a
+signed-in administrator has open checks every 10 seconds, and when a request is waiting it
+opens a modal on its own (`app/promote-prompt.js`) with the commit, the snapshot, the dry-run
+summary and a password box. **OK** approves through the same route and checks as the card, then
+the modal follows the promote through the restart to *Promoted* (or the error). **Later** hides
+that request for 30 minutes in every tab; **Reject** rejects it. The password is still typed every
+time and is never stored. A page that has shown a project **preview** does not take the password
+itself (preview code is same-origin and can reach the page around its frame); its modal opens
+Settings in a fresh tab instead.
+
 **Why the agent cannot approve.** Each layer closes a specific route:
 
 - **The approve route admits only a person.** It needs a real dashboard session: the opaque
