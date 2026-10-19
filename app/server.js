@@ -58,7 +58,7 @@ import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
 import { exportWorkspaceSnapshot, checkWorkspaceUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES } from './deployment/source.js';
-import { planRepos, lastProdDeploys, summarize as summarizeProd, readRepoFacts, classifyProjects, fastForwardAsOwner, describeFastForward } from './deployment/prod-status.js';
+import { planRepos, lastProdDeploys, summarize as summarizeProd, readRepoFacts, classifyProjects, fastForwardAsOwner, describeFastForward, describeWorkspacePull } from './deployment/prod-status.js';
 import { promotePromptHtml } from './promote-prompt.js';
 import { mountDeploymentRoutes, sendDeploymentHealth } from './deployment/routes.js';
 import { deploymentSubmitClientSrc, renderDeploymentSettings, deploymentSettingsScript, renderDeploymentNotice, renderExecutionRecipe } from './deployment/ui.js';
@@ -1920,6 +1920,11 @@ async function syncHubWorkspace(hubName){
  if(!hub) return { state:'skipped', reason:'the hub is not registered here' };
  return fastForwardAsOwner(hub.path || workspacePath(hub.name), { owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
 }
+// "Pull latest" in the Deploy panel: the operator's own fast-forward of a workspace that a deploy
+// refused as behind. Same rules and account as the hub sync (fastForwardWorkspace).
+async function pullDeployWorkspace(workspace){
+ return fastForwardAsOwner(workspace, { owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
+}
 // The HEAD a deploy finished on, so the next PROD comparison is exact rather than matched by time.
 async function workspaceHead(workspace){
  try {
@@ -3600,7 +3605,7 @@ const deployModalScript = `<script>(function(){
    const selected=deployInputs.collect(card);if(!selected)return;
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft'))&&!confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
-   deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
+   card.querySelectorAll('.pull-offer').forEach(e=>e.remove());deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
    pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};if(pw){bd.password=pw;if(save)bd.savePassword=true}
@@ -3631,7 +3636,7 @@ const deployModalScript = `<script>(function(){
     if(j.queued){const warn=(j.warnings||[]).map(w=>w+'\\n\\n').join('');output.textContent=warn+(j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.');return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
-    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
+    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));(function(card,output,project,j,base,after){card.querySelectorAll('.pull-offer').forEach(e=>e.remove());if(!j||j.upstream!=='behind')return;const idle='⬇ Pull latest (fast-forward)';const wrap=document.createElement('div');wrap.className='pull-offer';const b=document.createElement('button');b.type='button';b.className='pull-btn';b.textContent=idle;const note=document.createElement('span');note.className='pull-note';note.textContent='Brings this workspace up to its remote, as git pull --ff-only would. Deploys nothing.';wrap.append(b,note);output.insertAdjacentElement('afterend',wrap);b.onclick=async()=>{b.disabled=true;b.textContent='Pulling…';try{const r=await fetch(base+'/api/deploy/'+encodeURIComponent(project)+'/workspace/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});let x=null;try{x=await r.json()}catch{}if(!x)throw new Error('The dashboard is not answering ('+r.status+')');output.textContent=(x.ok?'✅ ':'⚠️ ')+(x.message||x.error||('HTTP '+r.status));if(x.ok){wrap.remove();if(after)after(x)}else{b.disabled=false;b.textContent=idle}}catch(e){output.textContent='⚠️ '+(e.message||String(e));b.disabled=false;b.textContent=idle}}})(card,output,project,j,'${BASE}',()=>refreshDeployState(container));return}
     /* Name whose run this is. The "Last:" line is rendered when the panel opens and
        used to be rewritten only on success, so a failure left the previous line —
        often another operator's successful deploy — sitting directly above this
@@ -3743,7 +3748,7 @@ const deployScript = `<script>
    const selected=deployInputs.collect(card);if(!selected)return;
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
-   deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
+   card.querySelectorAll('.pull-offer').forEach(e=>e.remove());deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
    pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};
@@ -3778,7 +3783,7 @@ const deployScript = `<script>
     if(j.queued){const warn=(j.warnings||[]).map(w=>w+'\\n\\n').join('');output.textContent=warn+(j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.');return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
-    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
+    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));(function(card,output,project,j,base,after){card.querySelectorAll('.pull-offer').forEach(e=>e.remove());if(!j||j.upstream!=='behind')return;const idle='⬇ Pull latest (fast-forward)';const wrap=document.createElement('div');wrap.className='pull-offer';const b=document.createElement('button');b.type='button';b.className='pull-btn';b.textContent=idle;const note=document.createElement('span');note.className='pull-note';note.textContent='Brings this workspace up to its remote, as git pull --ff-only would. Deploys nothing.';wrap.append(b,note);output.insertAdjacentElement('afterend',wrap);b.onclick=async()=>{b.disabled=true;b.textContent='Pulling…';try{const r=await fetch(base+'/api/deploy/'+encodeURIComponent(project)+'/workspace/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});let x=null;try{x=await r.json()}catch{}if(!x)throw new Error('The dashboard is not answering ('+r.status+')');output.textContent=(x.ok?'✅ ':'⚠️ ')+(x.message||x.error||('HTTP '+r.status));if(x.ok){wrap.remove();if(after)after(x)}else{b.disabled=false;b.textContent=idle}}catch(e){output.textContent='⚠️ '+(e.message||String(e));b.disabled=false;b.textContent=idle}}})(card,output,project,j,'${BASE}',()=>refreshOpenLog(card.closest('.project-card')));return}
     // Same reason as the cockpit modal: name whose run this is, on failure too.
     // The failure branch returned early and left the "Last:" line from page load
     // — often another operator's success — immediately above this text.
@@ -8155,6 +8160,25 @@ if(DEPLOY_CENTRE){
    }));
    res.json({ok:true, projects: status});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ // A deploy refuses a workspace that is behind its upstream and names `git pull --ff-only`; this
+ // is that command as a button, for whoever may deploy the project. Fast-forward only, as the pane
+ // account: it never merges, rebases or touches a modified tracked file, and it deploys nothing.
+ app.post(BASE + '/api/deploy/:project/workspace/pull', requireAuth, requireDeployRole, requireProjectAccess, async (req,res)=>{
+  try {
+   const project = req.params.project;
+   if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+   const p = await projectByName(project);
+   if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+   const workspace = p.path || workspacePath(p.name);
+   const result = await pullDeployWorkspace(workspace);
+   const ok = result.state === 'fast_forwarded' || result.state === 'up_to_date';
+   await audit('deploy_workspace_pull', { project, state: result.state, from: result.from, to: result.to, count: result.count, reason: result.reason }, req);
+   if(result.state === 'fast_forwarded') soonProdStatus();
+   const src = ok ? await getLocalVersion(workspace) : null;
+   res.status(ok ? 200 : 409).json({ ok, state: result.state, count: result.count ?? null, message: describeWorkspacePull(result), sourceVersion: src?.version || null });
+  } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }
  });
 
  app.post(BASE + '/api/deploy/:project/:target', requireAuth, requireDeployRole, requireProjectAccess, async (req,res)=>{

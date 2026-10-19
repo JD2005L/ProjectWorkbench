@@ -17,7 +17,7 @@ import { agentSpawnDrop, resolveTerminalPriv } from '../app/terminal-priv.js';
 import { deploymentSubmitClientSrc, renderDeploymentNotice, renderExecutionRecipe } from '../app/deployment/ui.js';
 import { deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from '../app/deployment/pw.js';
 import { DeploymentError, validateRecipe } from '../app/deployment/protocol.js';
-import { describeFastForward } from '../app/deployment/prod-status.js';
+import { describeFastForward, describeWorkspacePull } from '../app/deployment/prod-status.js';
 
 export const serverSource = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8').replace(/\r\n/g, '\n');
 const plain = value => JSON.parse(JSON.stringify(value));
@@ -61,7 +61,7 @@ export function serverTemplate(name) {
 export const FIX_OWNERSHIP_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'pw-fix-workspace-ownership');
 
 export function deployRouteHarness(root, options = {}) {
- const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [], upstreamChecks = [], headReads = [], prodRefreshes = [], hubSyncs = [];
+ const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [], upstreamChecks = [], headReads = [], prodRefreshes = [], hubSyncs = [], pulls = [];
  const project = { name: 'demo', path: root, ...options.project };
  let config = options.config || { demo: { dev: { script: 'legacy-saved-script', versionCmd: 'legacy-version-command', reauth: false } } };
  const user = { username: 'operator', role: 'admin', projects: '*', ...options.user };
@@ -160,6 +160,8 @@ export function deployRouteHarness(root, options = {}) {
   toolHubOf: async (name) => options.hubOf?.[name] || null,
   syncHubWorkspace: async (hub) => { hubSyncs.push(hub); return options.hubSync || { state: 'up_to_date', upstream: 'origin/main' }; },
   describeFastForward,
+  describeWorkspacePull,
+  pullDeployWorkspace: async (workspace) => { pulls.push(workspace); return options.pull || { state: 'up_to_date', upstream: 'origin/main' }; },
   readDeployLog: async () => history.map(plain),
   audit: async (event, detail) => audit.push({ event, ...plain(detail) }),
   getLocalVersion: async () => { sourceReads++; return { version: 'V1.26.0909.1200', hash: 'abc123' }; },
@@ -201,7 +203,7 @@ export function deployRouteHarness(root, options = {}) {
  vm.runInContext(helpers + '\n' + deployment, context, { filename: 'server-deployment-routes.js' });
  context.deployScript = serverTemplate('deployScript');
  return {
-  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, upstreamChecks, headReads, prodRefreshes, hubSyncs, context,
+  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, upstreamChecks, headReads, prodRefreshes, hubSyncs, pulls, context,
   get config() { return config; },
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },

@@ -90,6 +90,13 @@ output, history (`hubSync`) and audit — when the branch has no upstream, HEAD 
 file is modified or staged, or the workspace has commits the remote lacks. A hub deploy is still
 refused when behind for any other reason.
 
+**Amendment 2 (GOA) — "Pull latest" is the operator's pull, as a button.** When a deploy is refused
+as **behind**, the Deploy panel offers **Pull latest (fast-forward)** under the refusal
+(`POST /api/deploy/:project/workspace/pull`, deploy role + project access, audited
+`deploy_workspace_pull`). It is the `git pull --ff-only` the refusal tells the operator to run, with
+the same safety rules and account as the hub sync, and it deploys nothing: the operator still
+re-tests if needed and presses Deploy. Not offered for **diverged** (a person reconciles).
+
 ## 2026-10-16 — STANDING: CI results back to the committing session are opt-in per instance
 
 PW can route a finished GitHub Actions run back to the PW Claude window that made the commit

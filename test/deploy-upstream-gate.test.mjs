@@ -7,6 +7,7 @@
 // history and the audit; the external backend carries the warning in its queued response.
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { manifestWorkspace } from './deploy-manifest-fixtures.mjs';
 import { deployRouteHarness } from './deploy-manifest-harness.mjs';
 import { describeUpstream } from '../app/deployment/source.js';
@@ -119,4 +120,41 @@ test("a tool's successful PROD publish brings its hub's workspace up to date, an
   onExec: async () => ({ stdout: 'x', stderr: '' }) });
  await app.call('POST', deployRoute, { params, body: {} });
  assert.deepEqual(app.hubSyncs, [], 'nor for a project that is not a tool');
+});
+
+test('"Pull latest": the refused deploy\'s git pull --ff-only as a route, audited, deploying nothing', async t => {
+ const { root } = manifestWorkspace(t);
+ const pullRoute = '/api/deploy/:project/workspace/pull';
+ const h = deployRouteHarness(root, { project: slotProject,
+  pull: { state: 'fast_forwarded', from: 'a'.repeat(40), to: 'b'.repeat(40), upstream: 'origin/master', count: 3 } });
+ assert.ok(h.routes.has(`POST /pw${pullRoute}`) || [...h.routes.keys()].some(k => k.endsWith(pullRoute)), 'the route is registered');
+ const r = await h.call('POST', pullRoute, { params: { project: 'demo' }, body: {} });
+ assert.equal(r.statusCode ?? 200, 200);
+ assert.equal(r.body.ok, true);
+ assert.equal(r.body.message, 'Pulled 3 commits from origin/master (aaaaaaa..bbbbbbb), fast-forward only. Re-test if these changes need it, then deploy again.');
+ assert.deepEqual(h.pulls, [root]);
+ assert.deepEqual(h.executions, [], 'nothing is deployed');
+ assert.equal(h.history.length, 0);
+ const a = h.audit.find(e => e.event === 'deploy_workspace_pull');
+ assert.deepEqual([a.project, a.state, a.count], ['demo', 'fast_forwarded', 3]);
+ assert.equal(h.prodRefreshes.length, 1);
+
+ const no = deployRouteHarness(root, { project: slotProject, pull: { state: 'skipped', reason: 'uncommitted changes to tracked files (2)' } });
+ const n = await no.call('POST', pullRoute, { params: { project: 'demo' }, body: {} });
+ assert.equal(n.statusCode, 409);
+ assert.equal(n.body.ok, false);
+ assert.equal(n.body.message, 'Not pulled: uncommitted changes to tracked files (2). Nothing in the workspace was changed.');
+ assert.equal(no.prodRefreshes.length, 0);
+
+ const unknown = await h.call('POST', pullRoute, { params: { project: 'nope' }, body: {} });
+ assert.equal(unknown.statusCode, 404);
+});
+
+test('the refusal offers the Pull button in both deploy UIs, and only for "behind"', () => {
+ const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
+ const offers = src.match(/if\(!j\|\|j\.upstream!=='behind'\)return;/g) || [];
+ assert.equal(offers.length, 2, 'cockpit modal and Deployment Centre page');
+ assert.equal((src.match(/'\/api\/deploy\/'\+encodeURIComponent\(project\)\+'\/workspace\/pull'/g) || []).length, 2);
+ assert.equal((src.match(/card\.querySelectorAll\('\.pull-offer'\)\.forEach\(e=>e\.remove\(\)\);deployInputs\.setBusy\(card,true\)/g) || []).length, 2,
+  'a new deploy clears an old offer');
 });

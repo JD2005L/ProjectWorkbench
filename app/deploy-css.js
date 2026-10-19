@@ -100,5 +100,10 @@ body.deploy-page{font-family:system-ui,-apple-system,Segoe UI,sans-serif;margin:
 :is(.deploy-page,#deployBackdrop) .deploy-tab{background:transparent;border:none;color:#94a3b8;padding:.5rem 1.2rem;font:inherit;font-size:.9rem;cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-2px;transition:color .15s,border-color .15s}
 :is(.deploy-page,#deployBackdrop) .deploy-tab:hover{color:#e5e7eb}
 :is(.deploy-page,#deployBackdrop) .deploy-tab.active{color:#93c5fd;border-bottom-color:#3b82f6;font-weight:600}
+:is(.deploy-page,#deployBackdrop) .pull-offer{display:flex;flex-wrap:wrap;align-items:center;gap:.6rem;margin-top:.6rem}
+:is(.deploy-page,#deployBackdrop) .pull-btn{background:#1d4ed8;color:#fff;border:0;border-radius:8px;padding:.45rem .85rem;font:inherit;font-size:.85rem;font-weight:600;cursor:pointer}
+:is(.deploy-page,#deployBackdrop) .pull-btn:hover{filter:brightness(1.12)}
+:is(.deploy-page,#deployBackdrop) .pull-btn:disabled{opacity:.6;cursor:wait}
+:is(.deploy-page,#deployBackdrop) .pull-note{color:#94a3b8;font-size:.78rem}
 @media(max-width:760px){:is(.deploy-page,#deployBackdrop) .targets{grid-template-columns:minmax(0,1fr)}:is(.deploy-page,#deployBackdrop) .top{align-items:flex-start;flex-direction:column}}
 `;

@@ -219,6 +219,15 @@ export function describeFastForward(hub, r) {
   return `Hub ${hub}: workspace NOT updated — ${r?.reason || 'unknown'}. Run \`git pull --ff-only\` in ${hub} before deploying it.`;
 }
 
+// The same fast-forward, asked for by the operator from the Deploy panel when a deploy was refused
+// because the workspace is behind ("Pull latest"). One sentence for the panel.
+export function describeWorkspacePull(r) {
+  const short = (v) => String(v || '').slice(0, 7);
+  if (r?.state === 'fast_forwarded') return `Pulled ${r.count ?? '?'} commit${r.count === 1 ? '' : 's'} from ${r.upstream} (${short(r.from)}..${short(r.to)}), fast-forward only. Re-test if these changes need it, then deploy again.`;
+  if (r?.state === 'up_to_date') return `Already up to date with ${r.upstream}. Deploy again.`;
+  return `Not pulled: ${r?.reason || 'unknown'}. Nothing in the workspace was changed.`;
+}
+
 async function inspectAll(repos, { concurrency = 4 } = {}) {
   const out = {};
   const queue = repos.slice(0, MAX_REPOS);
