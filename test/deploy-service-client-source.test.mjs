@@ -2,10 +2,11 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs/promises';
 import path from 'node:path';
+import os from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { exportCommittedSource, gitRunner, gitEnvironment, snapshotArgv } from '../app/deployment/source.js';
+import { exportCommittedSource, gitRunner, gitEnvironment, snapshotArgv, checkUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES } from '../app/deployment/source.js';
 import { MAX_SOURCE_BYTES, MAX_SOURCE_FILES, snapshotDigest } from '../app/deployment/protocol.js';
 
 const execute = promisify(execFile);
@@ -136,4 +137,113 @@ test('source: Git child environment excludes service/deployment secrets and Git 
   for (const key of ['DEPLOY_PASSWORD', 'PW_SERVICE_TOKEN', 'GIT_CONFIG_COUNT', 'GIT_CONFIG_VALUE_0', 'GIT_DIR', 'NODE_OPTIONS']) assert.equal(env[key], undefined);
   assert.equal(env.GIT_OPTIONAL_LOCKS, '0');
   assert.equal(env.GIT_NO_REPLACE_OBJECTS, '1');
+});
+
+// ── upstream comparison before a deploy (checkUpstream) ─────────────────────
+// Real Git throughout: a bare repository stands in for the remote, and a second
+// clone stands in for a colleague who pushes.
+async function upstreamFixture(t) {
+  const base = await fs.mkdtemp(path.join(testDirectory, '.deploy-upstream-fixture-'));
+  t.after(() => fs.rm(base, { recursive: true, force: true }));
+  const env = gitEnvironment();
+  const at = dir => (...args) => execute('git', ['-C', dir, '-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.test',
+    '-c', 'commit.gpgSign=false', '-c', 'init.defaultBranch=main', ...args], { env });
+  const remote = path.join(base, 'remote.git'), work = path.join(base, 'work'), other = path.join(base, 'other');
+  await execute('git', ['init', '--quiet', '--bare', '-b', 'main', remote], { env });
+  await execute('git', ['clone', '--quiet', remote, work], { env });
+  const commit = async (dir, name) => {
+    await fs.writeFile(path.join(dir, name), `${name}\n`);
+    await at(dir)('add', '--', name);
+    await at(dir)('commit', '--quiet', '-m', name);
+  };
+  await at(work)('checkout', '--quiet', '-b', 'main');
+  await commit(work, 'first.txt');
+  await at(work)('push', '--quiet', '-u', 'origin', 'main');
+  await execute('git', ['clone', '--quiet', remote, other], { env });
+  return { base, remote, work, other, commit, git: at };
+}
+
+test('upstream: a workspace at the remote tip is in sync and says nothing', async t => {
+  const { work } = await upstreamFixture(t);
+  const check = await checkUpstream(gitRunner(work));
+  assert.equal(check.state, 'in_sync');
+  assert.equal(check.upstream, 'origin/main');
+  assert.equal(check.head, check.remoteTip);
+  assert.equal(describeUpstream(check), '');
+});
+
+test('upstream: a push the workspace has not fetched refuses as behind, without fetching', async t => {
+  const { work, other, commit, git } = await upstreamFixture(t);
+  await commit(other, 'colleague.txt');
+  await git(other)('push', '--quiet');
+  const refsBefore = (await git(work)('for-each-ref')).stdout;
+  const check = await checkUpstream(gitRunner(work));
+  assert.equal(check.state, 'behind');
+  assert.equal(check.unfetched, true);
+  assert.ok(UPSTREAM_REFUSES.includes(check.state));
+  assert.match(describeUpstream(check, work), /refused.*behind origin\/main.*git pull --ff-only.*Nothing was deployed/s);
+  assert.equal((await git(work)('for-each-ref')).stdout, refsBefore, 'the check must not fetch or move any ref');
+});
+
+test('upstream: a fetched-but-not-pulled push refuses as behind, with the count', async t => {
+  const { work, other, commit, git } = await upstreamFixture(t);
+  await commit(other, 'a.txt'); await commit(other, 'b.txt');
+  await git(other)('push', '--quiet');
+  await git(work)('fetch', '--quiet');
+  const check = await checkUpstream(gitRunner(work));
+  assert.deepEqual([check.state, check.behind, check.ahead], ['behind', 2, 0]);
+  assert.match(describeUpstream(check), /2 commits behind/);
+});
+
+test('upstream: unpushed local commits deploy with a warning, not a refusal', async t => {
+  const { work, commit } = await upstreamFixture(t);
+  await commit(work, 'local.txt');
+  const check = await checkUpstream(gitRunner(work));
+  assert.deepEqual([check.state, check.ahead, check.behind], ['ahead', 1, 0]);
+  assert.equal(UPSTREAM_REFUSES.includes(check.state), false);
+  assert.match(describeUpstream(check), /^Warning: 1 local commit is not pushed to origin\/main/);
+});
+
+test('upstream: local and remote commits on both sides refuse as diverged', async t => {
+  const { work, other, commit, git } = await upstreamFixture(t);
+  await commit(other, 'remote.txt'); await git(other)('push', '--quiet');
+  await commit(work, 'local.txt'); await git(work)('fetch', '--quiet');
+  const check = await checkUpstream(gitRunner(work));
+  assert.deepEqual([check.state, check.ahead, check.behind], ['diverged', 1, 1]);
+  assert.match(describeUpstream(check), /refused.*diverged/);
+});
+
+test('upstream: what cannot be judged only warns — detached, no upstream, unreachable, not Git', async t => {
+  const { base, work, remote, git } = await upstreamFixture(t);
+  await git(work)('checkout', '--quiet', '--detach');
+  assert.equal((await checkUpstream(gitRunner(work))).state, 'detached');
+  await git(work)('checkout', '--quiet', '-b', 'local-only');
+  assert.equal((await checkUpstream(gitRunner(work))).state, 'no_upstream');
+  await git(work)('checkout', '--quiet', 'main');
+  await fs.rename(remote, `${remote}.gone`);
+  const gone = await checkUpstream(gitRunner(work));
+  assert.equal(gone.state, 'unreachable');
+  assert.match(describeUpstream(gone), /^Warning: origin\/main could not be reached/);
+  // Outside this checkout, or Git would find the repository above the fixture.
+  const plain = await fs.mkdtemp(path.join(os.tmpdir(), 'pw-upstream-plain-'));
+  t.after(() => fs.rm(plain, { recursive: true, force: true }));
+  assert.equal((await checkUpstream(gitRunner(plain))).state, 'not_git');
+  for (const state of ['detached', 'no_upstream', 'unreachable', 'not_git', 'unknown']) assert.equal(UPSTREAM_REFUSES.includes(state), false, state);
+});
+
+test('upstream: PW_DEPLOY_UPSTREAM_CHECK=off (or false/0/no) is the only way to turn the check off', () => {
+  assert.equal(upstreamCheckEnabled({}), true);
+  assert.equal(upstreamCheckEnabled({ PW_DEPLOY_UPSTREAM_CHECK: 'on' }), true);
+  assert.equal(upstreamCheckEnabled({ PW_DEPLOY_UPSTREAM_CHECK: 'typo' }), true);
+  for (const off of ['off', 'OFF', ' false ', '0', 'no']) assert.equal(upstreamCheckEnabled({ PW_DEPLOY_UPSTREAM_CHECK: off }), false, off);
+});
+
+test('upstream: the helper answers --upstream over stdin as a separate process', async t => {
+  const { work } = await upstreamFixture(t);
+  const helper = path.join(testDirectory, '..', 'app', 'deployment', 'source.js');
+  const result = await new Promise((resolve, reject) => {
+    const child = execFile(process.execPath, [helper, '--upstream'], { env: gitEnvironment() }, (error, stdout) => error ? reject(error) : resolve(stdout));
+    child.stdin.end(JSON.stringify({ workspace: work }));
+  });
+  assert.equal(JSON.parse(result).state, process.getuid?.() === 0 ? 'unknown' : 'in_sync');
 });

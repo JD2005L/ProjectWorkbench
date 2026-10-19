@@ -535,3 +535,40 @@ test('PW settings readback surfaces all use redacted deployment settings', () =>
   assert.ok(serverSource.indexOf("app.get(BASE + '/api/deploy-service/health'") < serverSource.indexOf('app.use(attachUser)'),
     'public deployment readiness must not touch authentication/account stores');
 });
+
+test('PW slot backend: the upstream gate covers the external backend too — behind never submits, ahead submits with a warning', async t => {
+  const root = await workspace(t);
+  const submitted = [];
+  class Client {
+    async health() { return health; }
+    async submit(request) {
+      submitted.push(request);
+      return { ...makeJob('job-upstream-001', request.project, request.target, 'queued'), revision: request.revision };
+    }
+  }
+  const service = () => createDeploymentService({
+    settingsStore: {
+      load: async () => ({ deployment: { backend: 'local' } }),
+      connection: async draft => draft === undefined ? null : { endpoint: 'https://deploy.example.test', token: TOKEN },
+    },
+    snapshot: async () => sourceSnapshot([{ path: 'deploy.sh', data: Buffer.from('printf deployed').toString('base64'), executable: true }]),
+    Client,
+  });
+  const config = { demo: { dev: { script: 'external script', backend: 'external' } } };
+  const check = state => ({ state, head: 'a'.repeat(40), remoteTip: 'b'.repeat(40), upstream: 'origin/main', ahead: state === 'ahead' ? 1 : 0, behind: state === 'behind' ? 3 : 0 });
+
+  const stale = deployRouteHarness(root, { config, deploymentService: service(),
+    upstream: { check: check('behind'), refuse: true, message: 'Deployment refused: behind.' } });
+  const refused = await stale.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
+  assert.equal(refused.statusCode, 409);
+  assert.equal(refused.body.code, 'deployment_workspace_behind');
+  assert.equal(submitted.length, 0, 'a stale workspace must never reach the deployment service');
+
+  const local = deployRouteHarness(root, { config, deploymentService: service(),
+    upstream: { check: check('ahead'), refuse: false, message: 'Warning: 1 local commit is not pushed.' } });
+  const queued = await local.call('POST', '/api/deploy/:project/:target', { params: { project: 'demo', target: 'dev' } });
+  assert.equal(queued.statusCode, 202);
+  assert.deepEqual(queued.body.warnings, ['Warning: 1 local commit is not pushed.']);
+  assert.equal(submitted.length, 1);
+  assert.equal(local.audit.find(entry => entry.event === 'deploy_service_enqueue')?.upstream, 'ahead');
+});

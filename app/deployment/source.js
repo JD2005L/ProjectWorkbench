@@ -143,13 +143,95 @@ export async function exportCommittedSource(runGit) {
   return { revision, source: validateSnapshot({ sha256: snapshotDigest(files), files }) };
 }
 
-export function snapshotArgv({ owner, currentUid = process.getuid?.() ?? null, execPath = process.execPath }) {
+// Where the workspace's commit stands against its branch's upstream, compared
+// before anything deploys. A deploy never pulls: pulling at click time would ship
+// commits nobody tested here, could create an unreviewed merge in a shared
+// workspace, and would make a deploy write to the repository. Instead the remote
+// tip is read with `ls-remote` (no fetch, nothing written under .git) and the
+// operator is told to pull and re-test when the workspace is stale.
+//
+// Only 'behind' and 'diverged' refuse. 'ahead' (local commits not pushed) and
+// every case that cannot be judged — no Git, a detached HEAD (how a rollback
+// looks), no upstream, the remote unreachable — deploy with a warning, so a
+// GitHub outage or a missing push credential never blocks reviewed local code.
+export const UPSTREAM_REFUSES = Object.freeze(['behind', 'diverged']);
+
+export async function checkUpstream(runGit, { timeoutMs = 20000 } = {}) {
+  const text = async (args, options = {}) => utf8(await runGit(args, { maxBytes: 4096, ...options })).trim();
+  let head;
+  try { head = await text(['rev-parse', '--verify', 'HEAD^{commit}']); } catch { return { state: 'not_git' }; }
+  if (!REVISION.test(head)) return { state: 'not_git' };
+  let branch;
+  try { branch = await text(['symbolic-ref', '--quiet', '--short', 'HEAD']); } catch { return { state: 'detached', head }; }
+  let remote = '', merge = '';
+  try {
+    remote = await text(['config', '--get', `branch.${branch}.remote`]);
+    merge = await text(['config', '--get', `branch.${branch}.merge`]);
+  } catch {}
+  if (!remote || remote === '.' || !merge.startsWith('refs/heads/')) return { state: 'no_upstream', head, branch };
+  const upstream = `${remote}/${merge.slice('refs/heads/'.length)}`;
+  let tip = '';
+  try {
+    const line = (await text(['ls-remote', '--exit-code', '--', remote, merge], { timeoutMs, maxBytes: 16384 }))
+      .split('\n').find(row => row.endsWith(`\t${merge}`)) || '';
+    tip = line.split('\t')[0];
+  } catch { return { state: 'unreachable', head, branch, upstream }; }
+  if (!REVISION.test(tip)) return { state: 'unreachable', head, branch, upstream };
+  const base = { head, branch, upstream, remoteTip: tip, ahead: 0, behind: 0 };
+  if (tip === head) return { state: 'in_sync', ...base };
+  // A remote tip this repository does not hold cannot be an ancestor of HEAD, so
+  // the remote has commits the workspace lacks: behind, or diverged — refuse either.
+  try { await runGit(['cat-file', '-e', `${tip}^{commit}`], { maxBytes: 256 }); }
+  catch { return { state: 'behind', ...base, behind: null, unfetched: true }; }
+  const counts = (await text(['rev-list', '--left-right', '--count', `${tip}...${head}`])).split(/\s+/).map(Number);
+  const [behind, ahead] = counts;
+  if (!Number.isSafeInteger(behind) || !Number.isSafeInteger(ahead)) return { state: 'unreachable', head, branch, upstream };
+  const state = behind && ahead ? 'diverged' : behind ? 'behind' : 'ahead';
+  return { state, ...base, ahead, behind };
+}
+
+// One operator-facing sentence per state. Refusals name the commands to run.
+export function describeUpstream(check, workspace = '') {
+  const short = value => String(value || '').slice(0, 12);
+  const where = workspace ? ` in ${workspace}` : '';
+  switch (check?.state) {
+    case 'in_sync': return '';
+    case 'behind': return `Deployment refused: this workspace is ${check.behind ? `${check.behind} commit${check.behind === 1 ? '' : 's'} ` : ''}behind ${check.upstream} (workspace ${short(check.head)}, remote ${short(check.remoteTip)}). Someone has pushed changes this deploy would overwrite. Run \`git pull --ff-only\`${where}, re-test, then deploy again. Nothing was deployed.`;
+    case 'diverged': return `Deployment refused: this workspace and ${check.upstream} have diverged (${check.ahead} local, ${check.behind} remote commit${check.behind === 1 ? '' : 's'}). Reconcile them${where} (\`git pull --rebase\` or a merge), re-test, push, then deploy again. Nothing was deployed.`;
+    case 'ahead': return `Warning: ${check.ahead} local commit${check.ahead === 1 ? ' is' : 's are'} not pushed to ${check.upstream}; this deploy ships code that exists only on this server. Push it so the release can be traced and rebuilt.`;
+    case 'detached': return `Warning: the workspace is on a detached HEAD (${short(check.head)}); it was not compared with any remote.`;
+    case 'no_upstream': return `Warning: branch ${check.branch} has no upstream; the workspace was not compared with any remote.`;
+    case 'unreachable': return `Warning: ${check.upstream || 'the remote'} could not be reached; the workspace was deployed without comparing it to the remote.`;
+    case 'not_git': case 'skipped': return '';
+    default: return 'Warning: the workspace could not be compared with its remote.';
+  }
+}
+
+export function upstreamCheckEnabled(env = process.env) {
+  return !['off', 'false', '0', 'no'].includes(String(env?.PW_DEPLOY_UPSTREAM_CHECK ?? '').trim().toLowerCase());
+}
+
+export async function checkWorkspaceUpstream({ workspace, owner, home, currentUid, env = process.env, spawnProcess = spawn }) {
+  let raw;
+  try {
+    raw = await boundedCommand(snapshotArgv({ owner, currentUid, mode: '--upstream' }), {
+      input: JSON.stringify({ workspace }), maxBytes: 16384, timeoutMs: 30000,
+      env: gitEnvironment(env, owner, home), spawnProcess,
+    });
+  } catch { return { state: 'unknown' }; }
+  try {
+    const result = JSON.parse(raw.toString('utf8'));
+    return result && typeof result.state === 'string' ? result : { state: 'unknown' };
+  } catch { return { state: 'unknown' }; }
+}
+
+export function snapshotArgv({ owner, currentUid = process.getuid?.() ?? null, execPath = process.execPath, mode = '--snapshot' }) {
   if ((owner && (!Number.isSafeInteger(owner.uid) || owner.uid <= 0 || !Number.isSafeInteger(owner.gid) || owner.gid <= 0))
       || (!owner && (currentUid === null || currentUid === 0))) {
     throw sourceError('External deployment requires a resolved non-root pane account. Source will not be read as root.', 'deployment_source_owner', 503);
   }
   const plan = credentialExecutionPlan({ owner, currentUid });
-  return [...(plan.drop ? credentialDropArgv({ owner, execPath, helperPath: HELPER }) : [execPath, HELPER]), '--snapshot'];
+  return [...(plan.drop ? credentialDropArgv({ owner, execPath, helperPath: HELPER }) : [execPath, HELPER]), mode];
 }
 
 export async function exportWorkspaceSnapshot({ workspace, owner, home, currentUid, env = process.env, spawnProcess = spawn }) {
@@ -189,4 +271,23 @@ async function main() {
   }
 }
 
-if (process.argv[2] === '--snapshot' && process.argv[1] && path.resolve(process.argv[1]) === HELPER) await main();
+// The upstream comparison, as the pane account. It never fails a deploy by
+// itself erroring: anything unexpected answers 'unknown', which only warns.
+async function upstreamMain() {
+  let result = { state: 'unknown' };
+  try {
+    if (!process.getuid || process.getuid() === 0) throw new Error('refusing to run as root');
+    let raw = '';
+    for await (const chunk of process.stdin) {
+      raw += chunk;
+      if (Buffer.byteLength(raw) > 8192) throw new Error('request too large');
+    }
+    result = await checkUpstream(gitRunner(JSON.parse(raw).workspace));
+  } catch { result = { state: 'unknown' }; }
+  process.stdout.write(JSON.stringify(result));
+}
+
+if (process.argv[1] && path.resolve(process.argv[1]) === HELPER) {
+  if (process.argv[2] === '--snapshot') await main();
+  else if (process.argv[2] === '--upstream') await upstreamMain();
+}

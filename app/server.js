@@ -57,7 +57,7 @@ import { githubOauthConfig, startDeviceFlow, pollDeviceFlow, verifyToken, descri
 import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
-import { exportWorkspaceSnapshot } from './deployment/source.js';
+import { exportWorkspaceSnapshot, checkWorkspaceUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES } from './deployment/source.js';
 import { mountDeploymentRoutes, sendDeploymentHealth } from './deployment/routes.js';
 import { deploymentSubmitClientSrc, renderDeploymentSettings, deploymentSettingsScript, renderDeploymentNotice, renderExecutionRecipe } from './deployment/ui.js';
 import { DeploymentError, validateRecipe } from './deployment/protocol.js';
@@ -1858,6 +1858,22 @@ const deploymentService = createDeploymentService({
 });
 
 // ─── Deploy Centre helpers ──────────────────────────────────────────────────
+// Before any deploy, the workspace's commit is compared with its branch's
+// upstream (deployment/source.js checkUpstream, run as the pane account). Behind
+// or diverged refuses; ahead, detached, no upstream or an unreachable remote only
+// warns. A deploy never pulls. PW_DEPLOY_UPSTREAM_CHECK=off turns the check off.
+async function deployUpstreamGate(workspace){
+ if(!workspace || !upstreamCheckEnabled()) return { check:{ state:'skipped' }, refuse:false, message:'' };
+ let check;
+ try {
+  check = await checkWorkspaceUpstream({ workspace, owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
+ } catch { check = { state:'unknown' }; }
+ return { check, refuse: UPSTREAM_REFUSES.includes(check.state), message: describeUpstream(check, workspace) };
+}
+function upstreamAudit(check){
+ return { upstream: check.state, head: check.head || undefined, remoteTip: check.remoteTip || undefined,
+  ahead: check.ahead ?? undefined, behind: check.behind ?? undefined };
+}
 async function loadDeployConfig(){ try { return JSON.parse(await fs.readFile(deployConfigPath,'utf8')); } catch { return {}; } }
 async function saveDeployConfig(cfg){ await fs.mkdir(path.dirname(deployConfigPath),{recursive:true}); await fs.writeFile(deployConfigPath, JSON.stringify(cfg,null,2)+'\n'); }
 async function appendDeployLog(entry){ await fs.mkdir(path.dirname(deployLogPath),{recursive:true}); await fs.appendFile(deployLogPath, JSON.stringify(entry)+'\n'); }
@@ -3569,7 +3585,7 @@ const deployModalScript = `<script>(function(){
      return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
-    if(j.queued){output.textContent=j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.';return}
+    if(j.queued){const warn=(j.warnings||[]).map(w=>w+'\\n\\n').join('');output.textContent=warn+(j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.');return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
     else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
@@ -3716,7 +3732,7 @@ const deployScript = `<script>
      return;
     }
     j=await followExternalDeployment(j,{base:'${BASE}',output,card});
-    if(j.queued){output.textContent=j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.';return}
+    if(j.queued){const warn=(j.warnings||[]).map(w=>w+'\\n\\n').join('');output.textContent=warn+(j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.');return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
     else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));return}
@@ -8036,6 +8052,12 @@ if(DEPLOY_CENTRE){
   }
   const execution = manifest?.execution ?? tc?.execution ?? p.deploySlots?.[target]?.execution;
   if(!tc || (!tc.script && execution?.adapter !== 'podman')) return res.status(400).json({ok:false,error:`No deployment script configured for ${project}/${target}`});
+  // Checked before any password prompt: a stale workspace is refused outright.
+  const upstream = await deployUpstreamGate(state.workspace);
+  if(upstream.refuse){
+   await audit('deploy_upstream_refused', { project, target, ...upstreamAudit(upstream.check) }, req);
+   return res.status(409).json({ ok:false, code:`deployment_workspace_${upstream.check.state}`, upstream:upstream.check.state, error:upstream.message });
+  }
   const users = await loadUsers();
   const currentUser = users.find(u => u.username === req.user?.username);
   const submitted = req.body?.password || '';
@@ -8121,8 +8143,8 @@ if(DEPLOY_CENTRE){
      execution:p.deploySlots?.[target]?.execution, deployUser, deployPassword,
      deployOperator:operatorName, identitySource, forceExternal:true,
     });
-    await audit('deploy_service_enqueue', { project, target, backend, jobId:job.id, revision:job.revision }, req);
-    return res.status(202).json({ ok:true, backend:'external', queued:true, job,
+    await audit('deploy_service_enqueue', { project, target, backend, jobId:job.id, revision:job.revision, ...upstreamAudit(upstream.check) }, req);
+    return res.status(202).json({ ok:true, backend:'external', queued:true, job, warnings: upstream.message ? [upstream.message] : [],
      jobUrl:BASE + '/deploy-service?job=' + encodeURIComponent(job.id), user:req.user?.username });
    });
    if(validateRecipe(manifest?.execution ?? tc.execution ?? p.deploySlots?.[target]?.execution).adapter !== 'script'){
@@ -8149,11 +8171,13 @@ if(DEPLOY_CENTRE){
     error:`${project}/${target} is already deploying (started by ${claim.run.user || 'someone'} at ${claim.run.startedAt.replace('T',' ').replace(/\..*/,' UTC')}). Watch that run rather than starting a second one.` });
   }
   const runId = claim.id;
+  const upstreamNote = upstream.message ? `${upstream.message}\n\n` : '';
+  if(upstreamNote) deployRuns.append(runId, upstreamNote);
   let output = '', status = 'success', version = null, freshManifest = null, manifestError = '', staleManifest = false;
   {
    const result = await deployExecStream(tc, ['bash','-c',tc.script,'pw-deploy',...(manifest ? [] : [option])],
     executionEnv, 300000, manifest ? state.workspace : undefined, chunk => deployRuns.append(runId, chunk));
-   output = result.output;
+   output = upstreamNote + result.output;
    if(result.failed) status = 'failed';
   }
   // A root deploy can leave root-owned drift in the workspace (e.g. a publish that
@@ -8187,12 +8211,12 @@ if(DEPLOY_CENTRE){
   const selectionLog = manifest ? { inputs:selection.inputs, currentVersion:selection.currentVersion, targetVersion:selection.targetVersion, manifestRevision:manifest.revision } : {};
   // With a shared credential every deploy looks like one account on the app
   // server, so PW's own records are the only place the human survives: keep both.
-  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
+  const logEntry = { ts: new Date().toISOString(), project, target, backend:'local', option: option||undefined, ...selectionLog, upstream: upstream.check.state, version, user: req.user?.username||'unknown', deployUser, identitySource, status, duration, runId, outputSnippet: output.slice(0,500) };
   // Archived before the route answers: a finished run must be retrievable from
   // History even if this process dies immediately afterwards.
   await deployRuns.finish(runId, { status, version, duration, error: status === 'failed' ? 'the deploy script exited non-zero' : null });
   await appendDeployLog(logEntry);
-  await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource }, req);
+  await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource, ...upstreamAudit(upstream.check) }, req);
   // Report the recomputed comparison rather than leaving the client to redo it:
   // the badge is now wrong the instant a deploy lands, and the server is the only
   // side that knows how a release stamp is ordered.

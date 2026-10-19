@@ -60,7 +60,7 @@ export function serverTemplate(name) {
 export const FIX_OWNERSHIP_HELPER = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'scripts', 'pw-fix-workspace-ownership');
 
 export function deployRouteHarness(root, options = {}) {
- const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [];
+ const routes = new Map(), executions = [], audit = [], history = [], boundaryCalls = [], reclaims = [], boxesIgnored = [], upstreamChecks = [];
  const project = { name: 'demo', path: root, ...options.project };
  let config = options.config || { demo: { dev: { script: 'legacy-saved-script', versionCmd: 'legacy-version-command', reauth: false } } };
  const user = { username: 'operator', role: 'admin', projects: '*', ...options.user };
@@ -129,6 +129,13 @@ export function deployRouteHarness(root, options = {}) {
   // 5c5dd78: every deploy keeps _inbox/ and _outbox/ out of git before its script runs. The real
   // one is a box-worker job as the pane account; here it is recorded, and never fatal.
   ensureBoxesIgnored: async (p) => { boxesIgnored.push(p?.name); return { status: 'unchanged' }; },
+  // The upstream comparison is real Git run as the pane account (deployment/source.js, tested
+  // there); here it is recorded and answers options.upstream, 'skipped' when a test does not care.
+  deployUpstreamGate: async (workspace) => {
+   upstreamChecks.push(workspace);
+   const answer = options.upstream || { check: { state: 'skipped' }, refuse: false, message: '' };
+   return typeof answer === 'function' ? answer(workspace) : answer;
+  },
   filterProjectsForUser: projects => projects,
   projectByName: async name => name === project.name ? project : null,
   workspacePath: () => root,
@@ -175,6 +182,7 @@ export function deployRouteHarness(root, options = {}) {
   functionSource('getDeployedVersion'),
   functionSource('deploymentHistory'),
   functionSource('reclaimWorkspaceOwnership'),
+  functionSource('upstreamAudit'),
   section('const DEFAULT_DEPLOY_SLOTS = ', 'async function getLocalVersion('),
   section('const DEPLOY_BACKENDS = ', 'async function getDeployedVersion('),
   section('const DEPLOY_STAMP_RE = ', 'function hasDeployConfigFor('),
@@ -183,7 +191,7 @@ export function deployRouteHarness(root, options = {}) {
  vm.runInContext(helpers + '\n' + deployment, context, { filename: 'server-deployment-routes.js' });
  context.deployScript = serverTemplate('deployScript');
  return {
-  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, context,
+  routes, executions, audit, history, middleware, boundaryCalls, users, reclaims, boxesIgnored, upstreamChecks, context,
   get config() { return config; },
   get credentialReads() { return credentialReads; },
   get sourceReads() { return sourceReads; },
