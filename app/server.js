@@ -8358,7 +8358,7 @@ if(DEPLOY_CENTRE){
   await deployRuns.finish(runId, { status, version, duration, error: status === 'failed' ? 'the deploy script exited non-zero' : null });
   await appendDeployLog(logEntry);
   soonProdStatus();
-  await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource, ...upstreamAudit(upstream.check) }, req);
+  await audit('deploy_execute', { project, target, backend:'local', option: option||undefined, ...selectionLog, status, version, duration, deployUser, identitySource, ...upstreamAudit(upstream.check), ...(hubSync ? { hubSync } : {}) }, req);
   // Report the recomputed comparison rather than leaving the client to redo it:
   // the badge is now wrong the instant a deploy lands, and the server is the only
   // side that knows how a release stamp is ordered.

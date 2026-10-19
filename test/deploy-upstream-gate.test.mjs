@@ -100,6 +100,7 @@ test("a tool's successful PROD publish brings its hub's workspace up to date, an
  assert.deepEqual(ok.hubSyncs, ['Hub']);
  assert.match(r.body.output, /Hub Hub: workspace fast-forwarded to origin\/main \(1 commit, aaaaaaa\.\.bbbbbbb\), so deploying Hub needs no git pull\./);
  assert.deepEqual(ok.history.at(-1).hubSync, { hub: 'Hub', state: 'fast_forwarded', to: 'b'.repeat(40) });
+ assert.deepEqual(ok.audit.find(e => e.event === 'deploy_execute').hubSync, { hub: 'Hub', state: 'fast_forwarded', to: 'b'.repeat(40) });
 
  const dirty = run({ hubSync: { state: 'skipped', reason: 'uncommitted changes to tracked files (1)' } });
  const d = await dirty.call('POST', deployRoute, { params, body: {} });
