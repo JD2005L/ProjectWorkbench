@@ -6571,7 +6571,7 @@ const hist=document.getElementById('promoteHistory'),statusEl=document.getElemen
 const API='${BASE}/api/promote/requests';
 const LIVE=new Set(['queued','snapshotting','dry-running','awaiting-approval','approved','promoting']);
 const LABEL={queued:'Queued','snapshotting':'Taking a snapshot','dry-running':'Dry run in progress','awaiting-approval':'Waiting for approval',approved:'Approved — promote queued',promoting:'Promoting now',promoted:'Promoted','failed':'Failed','refused':'Refused by the runner','dry-run-failed':'Dry run failed',rejected:'Rejected',superseded:'Superseded by a newer request',expired:'Approval expired',stale:'Dry run too old to approve'};
-let timer=0;
+let timer=0,loadErr=false,lastLive='';
 function el(tag,cls,text){const e=document.createElement(tag);if(cls)e.className=cls;if(text!=null)e.textContent=text;return e}
 function say(t,err){statusEl.textContent=t||'';statusEl.classList.toggle('err',!!err)}
 function when(iso){if(!iso)return '—';const d=new Date(iso);return isNaN(d)?iso:d.toLocaleString()}
@@ -6617,17 +6617,27 @@ function renderHistory(list){
   hist.appendChild(item);
  });
 }
+// A promote restarts the dashboard, so for a minute every refresh fails and nginx answers with
+// an HTML error page. That is expected: say so, keep trying, and clear it once a refresh works —
+// a stale "Unexpected token '<'" under a card that already shows Promoted is just noise.
 async function load(){
  clearTimeout(timer);
  try{
-  const r=await fetch(API,{cache:'no-store'});const j=await r.json();
+  const r=await fetch(API,{cache:'no-store'});
+  let j;try{j=await r.json()}catch{throw new Error(r.ok?'The dashboard sent something unexpected':'The dashboard is not answering ('+r.status+')')}
   if(!j.ok)throw new Error(j.error||'load failed');
+  if(loadErr){say('');loadErr=false}
   if(!j.installed){pend.textContent='';pend.appendChild(el('p','muted','Not installed on this host. A human installs it once from deploy/host (see its README); until then promotes are run by hand.'));hist.textContent='';return}
   const live=j.requests.find(x=>LIVE.has(x.state));
   renderPending(live?await detail(live.id):null);
   renderHistory(j.requests.filter(x=>x!==live));
+  lastLive=live?live.state:'';
   if(live)timer=setTimeout(load,live.state==='awaiting-approval'?20000:4000);
- }catch(e){say(e.message||String(e),true);timer=setTimeout(load,15000)}
+ }catch(e){
+  loadErr=true;
+  if(lastLive==='approved'||lastLive==='promoting'){say('The dashboard is restarting for the promote — reconnecting…');timer=setTimeout(load,4000)}
+  else{say(e.message||String(e),true);timer=setTimeout(load,15000)}
+ }
 }
 load();
 })();</script>`;
