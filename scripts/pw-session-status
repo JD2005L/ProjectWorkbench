@@ -1,0 +1,189 @@
+#!/usr/bin/env node
+// Project Workbench: read and write the shared session board.
+//
+//   pw-session-status show [--json] [--project P]   what every live session is doing
+//   pw-session-status claims <path> [--json]        who else is holding this file
+//   pw-session-status set --task "..." [--waiting-on "..."] [--done]
+//   pw-session-status hook [--event pre-tool|stop]  called BY a Claude Code hook, reads JSON on stdin
+//   pw-session-status prune [--apply]               drop sidecars whose session is gone
+//
+// The board joins a PW-owned sidecar onto Claude Code's own session registry; see
+// app/session-board.js for why liveness is checked against /proc start time.
+//
+// Exit codes: 0 fine, 3 a collision was reported by `claims`, 64 usage,
+// 70 an internal failure. `hook` always exits 0 — a status board must never be
+// the reason a tool call fails.
+import fs from 'node:fs';
+import path from 'node:path';
+import os from 'node:os';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+
+const HERE = path.dirname(fs.realpathSync(fileURLToPath(import.meta.url)));
+const APP = process.env.PW_APP_DIR && fs.existsSync(path.join(process.env.PW_APP_DIR, 'session-board.js'))
+  ? process.env.PW_APP_DIR
+  : path.join(HERE, '..', 'app');
+const B = await import(path.join(APP, 'session-board.js'));
+
+const EXIT_USAGE = 64;
+const EXIT_COLLISION = 3;
+const BOARD = B.resolveBoardDir(process.env);
+const REG = B.resolveRegistryDir(process.env);
+
+function usage(msg) {
+  if (msg) process.stderr.write(`pw-session-status: ${msg}\n`);
+  process.stderr.write('usage: pw-session-status show|claims|set|hook|prune [options]  (see the header of this script)\n');
+  process.exit(EXIT_USAGE);
+}
+
+// ---- which session am I? ----------------------------------------------------
+// A hook runs as a child of Claude Code, and a shell inside a pane runs as a
+// descendant too, so the registered pid is the nearest ancestor that the registry
+// knows. An explicit --pid or a session id from hook stdin wins over the walk.
+function ancestors(pid, limit = 24) {
+  const out = [];
+  let cur = Number(pid);
+  for (let i = 0; i < limit && cur > 1; i++) {
+    out.push(cur);
+    const st = B.procStart(cur);
+    if (!st) break;
+    try {
+      const s = fs.readFileSync(`/proc/${cur}/stat`, 'utf8');
+      cur = Number(s.slice(s.lastIndexOf(') ') + 2).split(' ')[1]);
+    } catch { break; }
+  }
+  return out;
+}
+
+function resolveSelf({ pid, sessionId }) {
+  const reg = B.readRegistry(REG);
+  if (pid) return reg.find((r) => Number(r.pid) === Number(pid)) || { pid: Number(pid) };
+  if (sessionId) {
+    const hit = reg.find((r) => String(r.sessionId) === String(sessionId));
+    if (hit) return hit;
+  }
+  const known = new Map(reg.map((r) => [Number(r.pid), r]));
+  for (const a of ancestors(process.ppid)) if (known.has(a)) return known.get(a);
+  return null;
+}
+
+function branchOf(cwd) {
+  const r = spawnSync('git', ['-C', cwd || process.cwd(), 'rev-parse', '--abbrev-ref', 'HEAD'],
+    { encoding: 'utf8', timeout: 5000 });
+  return r.status === 0 ? r.stdout.trim() : '';
+}
+
+function update(self, patch) {
+  const prev = B.readEntry(BOARD, self.pid);
+  const cwd = self.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  return B.writeEntry(BOARD, B.mergeEntry(prev, {
+    pid: self.pid,
+    sessionId: self.sessionId,
+    project: B.projectOf(cwd),
+    ...patch,
+  }));
+}
+
+// ---- rendering --------------------------------------------------------------
+const age = (ms) => (ms == null ? '-' : ms < 60000 ? `${Math.round(ms / 1000)}s` : ms < 3600000 ? `${Math.round(ms / 60000)}m` : `${Math.round(ms / 3600000)}h`);
+
+function renderBoard(rows) {
+  if (!rows.length) return 'No live sessions registered.\n';
+  const out = [];
+  let project = null;
+  for (const r of rows) {
+    if (r.project !== project) { project = r.project; out.push(`\n${project || '(no project)'}`); }
+    const head = `  ${String(r.pid).padEnd(8)} ${(r.branch || '-').padEnd(22)} ${age(r.staleMs).padStart(4)} ago`;
+    out.push(r.reporting ? head : `${head}  (not reporting)`);
+    if (r.task) out.push(`      task:    ${r.task}`);
+    if (r.waitingOn) out.push(`      waiting: ${r.waitingOn}`);
+    for (const f of r.filesInFlight.slice(0, 8)) out.push(`      holds:   ${f}`);
+    if (r.filesInFlight.length > 8) out.push(`      holds:   ... and ${r.filesInFlight.length - 8} more`);
+  }
+  return `${out.join('\n')}\n`;
+}
+
+// ---- commands ---------------------------------------------------------------
+const argv = process.argv.slice(2);
+const cmd = argv.shift();
+const flag = (name) => { const i = argv.indexOf(name); return i === -1 ? undefined : argv[i + 1]; };
+const has = (name) => argv.includes(name);
+const json = has('--json');
+
+try {
+  if (cmd === 'show') {
+    let rows = B.loadBoard({ boardDir: BOARD, registryDir: REG });
+    const only = flag('--project');
+    if (only) rows = rows.filter((r) => r.project === only);
+    process.stdout.write(json ? `${JSON.stringify(rows, null, 2)}\n` : renderBoard(rows));
+    process.exit(0);
+  }
+
+  if (cmd === 'claims') {
+    const target = argv.find((a) => !a.startsWith('--'));
+    if (!target) usage('claims needs a path');
+    const self = resolveSelf({ pid: flag('--pid') });
+    const rows = B.loadBoard({ boardDir: BOARD, registryDir: REG });
+    const res = B.findCollisions(rows, { file: target, excludePid: self?.pid || 0 });
+    if (json) { process.stdout.write(`${JSON.stringify(res, null, 2)}\n`); process.exit(res.exact.length ? EXIT_COLLISION : 0); }
+    if (res.exact.length) {
+      process.stdout.write(`CONFLICT: ${res.exact.length} other live session(s) hold ${res.file}\n`);
+      for (const r of res.exact) process.stdout.write(`  pid ${r.pid}  ${r.branch || '-'}  ${r.task || '(no task set)'}\n`);
+    } else {
+      process.stdout.write(`No other live session holds ${res.file}\n`);
+    }
+    if (res.sameProject.length) {
+      process.stdout.write(`\n${res.sameProject.length} other session(s) are working in ${res.project}:\n`);
+      for (const r of res.sameProject) process.stdout.write(`  pid ${r.pid}  ${r.branch || '-'}  ${r.task || '(no task set)'}\n`);
+    }
+    process.exit(res.exact.length ? EXIT_COLLISION : 0);
+  }
+
+  if (cmd === 'set') {
+    const self = resolveSelf({ pid: flag('--pid'), sessionId: flag('--session-id') });
+    if (!self) usage('cannot tell which session this is; pass --pid');
+    const patch = {};
+    if (flag('--task') !== undefined) patch.task = flag('--task');
+    if (flag('--waiting-on') !== undefined) patch.waitingOn = flag('--waiting-on');
+    if (has('--done')) { patch.task = ''; patch.waitingOn = ''; patch.filesInFlight = []; }
+    patch.branch = flag('--branch') || branchOf(self.cwd);
+    const e = update(self, patch);
+    process.stdout.write(json ? `${JSON.stringify(e, null, 2)}\n` : `recorded for pid ${e.pid}${e.task ? `: ${e.task}` : ''}\n`);
+    process.exit(0);
+  }
+
+  if (cmd === 'hook') {
+    // Never fail a tool call because the board could not be written.
+    try {
+      const raw = fs.readFileSync(0, 'utf8');
+      const input = raw.trim() ? JSON.parse(raw) : {};
+      const event = flag('--event') || 'pre-tool';
+      const self = resolveSelf({ sessionId: input.session_id });
+      if (self?.pid) {
+        if (event === 'stop') update(self, { filesInFlight: [], branch: branchOf(self.cwd) });
+        else {
+          const f = input?.tool_input?.file_path || input?.tool_input?.notebook_path || '';
+          if (f) update(self, { addFiles: [f], branch: branchOf(self.cwd) });
+        }
+      }
+    } catch { /* deliberately silent */ }
+    process.exit(0);
+  }
+
+  if (cmd === 'prune') {
+    const stale = B.staleSidecars({ boardDir: BOARD, registryDir: REG });
+    if (!has('--apply')) {
+      process.stdout.write(stale.length ? `would remove ${stale.length} stale sidecar(s): ${stale.join(', ')}\n` : 'nothing stale\n');
+      process.exit(0);
+    }
+    let n = 0;
+    for (const pid of stale) { try { fs.unlinkSync(B.sidecarPath(BOARD, pid)); n++; } catch { /* already gone */ } }
+    process.stdout.write(`removed ${n} stale sidecar(s)\n`);
+    process.exit(0);
+  }
+
+  usage(cmd ? `unknown command ${cmd}` : undefined);
+} catch (err) {
+  process.stderr.write(`pw-session-status: ${err?.message || err}\n`);
+  process.exit(70);
+}

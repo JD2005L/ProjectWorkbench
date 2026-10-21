@@ -7,7 +7,8 @@
     "NODE_ENV": "production",
     "PW_USERS_PATH": "/etc/project-workbench/users.json",
     "PW_SECRET_KEY_PATH": "/etc/project-workbench/.secret-key",
-    "PW_AUTH_ENFORCE": "true"
+    "PW_AUTH_ENFORCE": "true",
+    "PW_SESSION_BOARD_DIR": "/opt/project-workbench/state/sessions"
   },
   "sharedTrees": [
     "app/",
@@ -28,6 +29,7 @@
     "A value that differs lives in each environment profile that sets it, and may not appear in this profile."
   ],
   "notes": [
-    "PW_AUTH_ENFORCE lives here because every environment requires it. The no-overlap gate (test/env-profiles.test.mjs) moved it: it was declared identically in both environment profiles."
+    "PW_AUTH_ENFORCE lives here because every environment requires it. The no-overlap gate (test/env-profiles.test.mjs) moved it: it was declared identically in both environment profiles.",
+    "PW_SESSION_BOARD_DIR is common: the session board is host-local coordination, identical in every environment. A deployment that relocates it declares it in its own profile and removes it from here, which the no-overlap gate will require."
   ]
 }
