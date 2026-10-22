@@ -150,11 +150,22 @@ test('"Pull latest": the refused deploy\'s git pull --ff-only as a route, audite
  assert.equal(unknown.statusCode, 404);
 });
 
-test('the refusal offers the Pull button in both deploy UIs, and only for "behind"', () => {
+test('both deploy UIs ask up front, and re-ask after a refusal', () => {
  const src = fs.readFileSync(new URL('../app/server.js', import.meta.url), 'utf8');
- const offers = src.match(/if\(!j\|\|j\.upstream!=='behind'\)return;/g) || [];
- assert.equal(offers.length, 2, 'cockpit modal and Deployment Centre page');
- assert.equal((src.match(/'\/api\/deploy\/'\+encodeURIComponent\(project\)\+'\/workspace\/pull'/g) || []).length, 2);
- assert.equal((src.match(/card\.querySelectorAll\('\.pull-offer'\)\.forEach\(e=>e\.remove\(\)\);deployInputs\.setBusy\(card,true\)/g) || []).length, 2,
-  'a new deploy clears an old offer');
+ assert.equal((src.match(/\$\{deployPullClientSrc\}/g) || []).length, 2, 'cockpit modal and Deployment Centre page');
+ assert.match(src, /bindDeployActions\(body\);pwDeployPull\.check\(body,name,'\$\{BASE\}'\);/, 'the modal asks when it opens');
+ assert.match(src, /document\.querySelectorAll\('\.project-card\[data-project\]'\)[^]{0,200}pwDeployPull\.check\(c,c\.dataset\.project,'\$\{BASE\}'\)/, 'the page asks for every project');
+ assert.equal((src.match(/if\(j&&\(j\.upstream==='behind'\|\|j\.upstream==='diverged'\)\)pwDeployPull\.check\(/g) || []).length, 2, 'and both re-ask after a refusal');
+});
+
+test('the upstream route answers what a deploy would find first', async t => {
+ const { root } = manifestWorkspace(t);
+ const route = '/api/deploy/:project/workspace/upstream';
+ const h = deployRouteHarness(root, { project: slotProject, upstream: gate(behind) });
+ const r = await h.call('GET', route, { params: { project: 'demo' } });
+ assert.deepEqual(r.body, { ok: true, state: 'behind', behind: 2, ahead: 0, upstream: 'origin/main', unfetched: false, refuse: true });
+ assert.deepEqual(h.upstreamChecks, [root]);
+ assert.deepEqual(h.executions, []);
+ const clean = deployRouteHarness(root, { project: slotProject });
+ assert.equal((await clean.call('GET', route, { params: { project: 'demo' } })).body.state, 'skipped');
 });

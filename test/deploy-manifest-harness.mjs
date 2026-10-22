@@ -9,6 +9,7 @@ import { execFile } from 'node:child_process';
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from '../app/deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from '../app/deploy-inputs.js';
 import { deployFollowClientSrc } from '../app/deploy-follow.js';
+import { deployPullClientSrc } from '../app/deploy-pull.js';
 import { deployCss } from '../app/deploy-css.js';
 import { resolveDeployReauth, REAUTH_UNREADABLE } from '../app/deploy-reauth.js';
 import { makeDeployIdentity, readStoredDeployPassword } from '../app/deploy-credential.js';
@@ -52,7 +53,7 @@ export function deploymentSectionCallees() {
 export function serverTemplate(name) {
  const match = new RegExp('const ' + name + ' = `([\\s\\S]*?)`;\\n').exec(serverSource);
  if (!match) throw new Error(`Server template missing: ${name}`);
- return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc, deployFollowClientSrc });
+ return vm.runInNewContext('`' + match[1] + '`', { BASE: '/pw', deployInputsClientSrc, deploymentSubmitClientSrc, deployFollowClientSrc, deployPullClientSrc });
 }
 
 // scripts/ is a sibling of app/ in every deployment, and server.js builds this exact path for the

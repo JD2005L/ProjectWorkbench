@@ -27,6 +27,7 @@ import { prepareAgentPasteFile, pasteFileOwnership } from './agent-paste-file.js
 import { DeployManifestError, resolveDeployManifest, validateDeployInputs } from './deploy-manifest.js';
 import { deployInputNotice, deployInputsClientSrc, describeDeploySelection, renderDeployInputs } from './deploy-inputs.js';
 import { deployFollowClientSrc } from './deploy-follow.js';
+import { deployPullClientSrc } from './deploy-pull.js';
 import { resolveTerminalPriv, wrapAgentEnv, agentLoginDrop, agentSpawnDrop } from './terminal-priv.js';
 import { renderWrapperEnv } from './wrapper-env.js';
 import { hostTerminalUser, makePasswdLookup, resolveTerminalOwner } from './terminal-owner.js';
@@ -3512,6 +3513,7 @@ const deployModalScript = `<script>(function(){
  ${deployInputsClientSrc}
  ${deploymentSubmitClientSrc}
  ${deployFollowClientSrc}
+ ${deployPullClientSrc}
  const backdrop=document.getElementById('deployBackdrop');if(!backdrop)return;
  const title=document.getElementById('deployModalTitle'),body=document.getElementById('deployModalBody'),closeBtn=document.getElementById('deployCloseBtn');
  let loadGeneration=0,opener=null;
@@ -3535,7 +3537,7 @@ const deployModalScript = `<script>(function(){
    const r=await fetch('${BASE}/api/deploy/'+encodeURIComponent(name)+'/card',{cache:'no-store'});
    const j=await r.json();if(generation!==loadGeneration)return;
    if(!j.ok)throw new Error(j.error||'load failed');
-   body.dataset.project=name;body.innerHTML=j.html;bindDeployActions(body);(body.querySelector('.deploy-input')||closeBtn).focus();
+   body.dataset.project=name;body.innerHTML=j.html;bindDeployActions(body);pwDeployPull.check(body,name,'${BASE}');(body.querySelector('.deploy-input')||closeBtn).focus();
   }catch(e){if(generation===loadGeneration)body.innerHTML='<p role="alert" style="color:#fca5a5">'+escHtml(e.message||String(e))+'</p>'}
  }
  function srcIsNewer(src,dep){var re=/^V1\\.\\d{2}\\.\\d{4}\\.\\d{4}$/;return !!src&&!!dep&&re.test(src)&&re.test(dep)&&src>dep}
@@ -3570,6 +3572,7 @@ const deployModalScript = `<script>(function(){
  }
  function bindDeployActions(container){
   deployInputs.bind(container);
+  if(!container.__pwPullBound){container.__pwPullBound=true;container.addEventListener('pw-pulled',()=>refreshDeployState(container))}
   /* Reattach to whatever each slot is doing, every time the panel opens. The run
      lives on the server, so closing the modal mid-deploy no longer loses it — and
      a slot that finished hours ago still shows its result instead of an empty box. */
@@ -3605,7 +3608,7 @@ const deployModalScript = `<script>(function(){
    const selected=deployInputs.collect(card);if(!selected)return;
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft'))&&!confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
-   card.querySelectorAll('.pull-offer').forEach(e=>e.remove());deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
+   deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
    pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};if(pw){bd.password=pw;if(save)bd.savePassword=true}
@@ -3636,7 +3639,7 @@ const deployModalScript = `<script>(function(){
     if(j.queued){const warn=(j.warnings||[]).map(w=>w+'\\n\\n').join('');output.textContent=warn+(j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.');return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
-    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));(function(card,output,project,j,base,after){card.querySelectorAll('.pull-offer').forEach(e=>e.remove());if(!j||j.upstream!=='behind')return;const idle='⬇ Pull latest (fast-forward)';const wrap=document.createElement('div');wrap.className='pull-offer';const b=document.createElement('button');b.type='button';b.className='pull-btn';b.textContent=idle;const note=document.createElement('span');note.className='pull-note';note.textContent='Brings this workspace up to its remote, as git pull --ff-only would. Deploys nothing.';wrap.append(b,note);output.insertAdjacentElement('afterend',wrap);b.onclick=async()=>{b.disabled=true;b.textContent='Pulling…';try{const r=await fetch(base+'/api/deploy/'+encodeURIComponent(project)+'/workspace/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});let x=null;try{x=await r.json()}catch{}if(!x)throw new Error('The dashboard is not answering ('+r.status+')');output.textContent=(x.ok?'✅ ':'⚠️ ')+(x.message||x.error||('HTTP '+r.status));if(x.ok){wrap.remove();if(after)after(x)}else{b.disabled=false;b.textContent=idle}}catch(e){output.textContent='⚠️ '+(e.message||String(e));b.disabled=false;b.textContent=idle}}})(card,output,project,j,'${BASE}',()=>refreshDeployState(container));return}
+    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));if(j&&(j.upstream==='behind'||j.upstream==='diverged'))pwDeployPull.check(container,project,'${BASE}');return}
     /* Name whose run this is. The "Last:" line is rendered when the panel opens and
        used to be rewritten only on success, so a failure left the previous line —
        often another operator's successful deploy — sitting directly above this
@@ -3689,7 +3692,12 @@ const deployScript = `<script>
  ${deployInputsClientSrc}
  ${deploymentSubmitClientSrc}
  ${deployFollowClientSrc}
+ ${deployPullClientSrc}
  deployInputs.bind(document);
+ /* Pull latest, up front: every project card asks once whether its workspace is behind, four
+    at a time (each is one ls-remote as the pane account). */
+ (async()=>{const cards=[...document.querySelectorAll('.project-card[data-project]')];let i=0;
+  await Promise.all(Array.from({length:Math.min(4,cards.length)},async()=>{while(i<cards.length){const c=cards[i++];await pwDeployPull.check(c,c.dataset.project,'${BASE}')}}))})();
  function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":"&#39;"}[c]))}
  /* Same reattachment as the cockpit modal: this page is a reload away from losing
     a deploy it started, and the run is on the server precisely so it does not. */
@@ -3748,7 +3756,7 @@ const deployScript = `<script>
    const selected=deployInputs.collect(card);if(!selected)return;
    const opt=selected.option||'',summary=deployInputs.describe(card),detail=summary||opt;
    if((target==='prod'||selected.inputs||(opt&&opt!=='draft')) && !confirm('Confirm "'+(card.dataset.label||'this slot')+'"'+(detail?' ('+detail+')':'')+' for '+project+'? This action is logged.'))return;
-   card.querySelectorAll('.pull-offer').forEach(e=>e.remove());deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
+   deployInputs.setBusy(card,true);btn.textContent=btn.dataset.busy||'Deploying…';output.className='deploy-output show';output.textContent=btn.dataset.running||'Running deployment script…';
    pwRunFollower.setCardState(card,'running');
    async function runDeploy(pw,save){
     const bd={...selected};
@@ -3783,7 +3791,7 @@ const deployScript = `<script>
     if(j.queued){const warn=(j.warnings||[]).map(w=>w+'\\n\\n').join('');output.textContent=warn+(j.interrupted?j.error+'\\nThe external job remains active until the host reports a terminal outcome.':'The external job continues on the host. Use its job link for status.');return}
     deployInputs.applyResult(card,j);
     if(j.runId||j.job||j.duration!==undefined)pwRunFollower.finishResult(card,output,j,{base:'${BASE}',project,target});
-    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));(function(card,output,project,j,base,after){card.querySelectorAll('.pull-offer').forEach(e=>e.remove());if(!j||j.upstream!=='behind')return;const idle='⬇ Pull latest (fast-forward)';const wrap=document.createElement('div');wrap.className='pull-offer';const b=document.createElement('button');b.type='button';b.className='pull-btn';b.textContent=idle;const note=document.createElement('span');note.className='pull-note';note.textContent='Brings this workspace up to its remote, as git pull --ff-only would. Deploys nothing.';wrap.append(b,note);output.insertAdjacentElement('afterend',wrap);b.onclick=async()=>{b.disabled=true;b.textContent='Pulling…';try{const r=await fetch(base+'/api/deploy/'+encodeURIComponent(project)+'/workspace/pull',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'});let x=null;try{x=await r.json()}catch{}if(!x)throw new Error('The dashboard is not answering ('+r.status+')');output.textContent=(x.ok?'✅ ':'⚠️ ')+(x.message||x.error||('HTTP '+r.status));if(x.ok){wrap.remove();if(after)after(x)}else{b.disabled=false;b.textContent=idle}}catch(e){output.textContent='⚠️ '+(e.message||String(e));b.disabled=false;b.textContent=idle}}})(card,output,project,j,'${BASE}',()=>refreshOpenLog(card.closest('.project-card')));return}
+    else{pwRunFollower.restore(card,output,'❌ FAILED\\n'+(j.error||'Deployment was refused before a run started.'));if(j&&(j.upstream==='behind'||j.upstream==='diverged'))pwDeployPull.check(card.closest('.project-card')||card,project,'${BASE}');return}
     // Same reason as the cockpit modal: name whose run this is, on failure too.
     // The failure branch returned early and left the "Last:" line from page load
     // — often another operator's success — immediately above this text.
@@ -8175,6 +8183,20 @@ if(DEPLOY_CENTRE){
    }));
    res.json({ok:true, projects: status});
   } catch(e){ res.status(500).json({ok:false,error:e.message}); }
+ });
+
+ // What a deploy would find first (deployUpstreamGate), asked when the panel opens, so a workspace
+ // that is behind shows "Pull latest" in place of Deploy instead of a refusal after the click.
+ app.get(BASE + '/api/deploy/:project/workspace/upstream', requireAuth, requireDeployRole, requireProjectAccess, async (req,res)=>{
+  try {
+   const project = req.params.project;
+   if(!validName(project)) return res.status(400).json({ok:false,error:'Invalid project name'});
+   const p = await projectByName(project);
+   if(!p) return res.status(404).json({ok:false,error:'Unknown project'});
+   const gate = await deployUpstreamGate(p.path || workspacePath(p.name));
+   const c = gate.check || {};
+   res.json({ ok:true, state:c.state || 'unknown', behind:c.behind ?? null, ahead:c.ahead ?? null, upstream:c.upstream || null, unfetched:!!c.unfetched, refuse:!!gate.refuse });
+  } catch(e){ res.status(500).json({ok:false,error:e.message||String(e)}); }
  });
 
  // A deploy refuses a workspace that is behind its upstream and names `git pull --ff-only`; this
