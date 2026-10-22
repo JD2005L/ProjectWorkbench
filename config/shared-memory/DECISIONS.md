@@ -199,3 +199,42 @@ expressible through it.
 `pw-session-status set --task "..."` so your own row says something useful. See
 `docs/session-board.md`. This exists because concurrent sessions edited the same file twice and
 found out by accident.
+
+## 2026-10-22 — STANDING: CI on main is the gate, and a locally-green fixture may still be host-specific
+
+`origin/main` was red for eleven consecutive pushes (2026-10-19 → 2026-10-22) and no session
+noticed, because every failing test passed on the box it was written on. Before treating main as
+shippable or deployable, check the newest run for main (`gh run list --limit 5`). A local run is
+not the gate.
+
+**The failure class to expect is a fixture that assumes its host.** The pane account is resolved
+by name and defaults to the literal `admin`, which exists on a PW host and not on a CI runner.
+`resolveTerminalOwner` **throws** when the name does not resolve, and a caller that catches it
+cannot tell that apart from an unreachable remote — so a gate can refuse every request and look
+like it passed through. The repair belongs in the **fixture**, never in production: a hermetic
+instance declares the account already running the suite (`selfOwnedTerminalEnv()` in
+`test/terminal-owner-fixture.mjs`), which weakens no production fallback. A suite that got
+noticeably *faster* when a gate was added is the tell that the gate is being skipped.
+
+Anything under `app/` (plus `install.sh`) that ships obliges an `app/VERSION` bump in the same
+push. Leaving VERSION alone so as not to clobber another session's bump stays correct — but the
+bump is then owed by whoever ships next.
+
+## 2026-10-22 — A promote on a rootful container cannot read Git, and refuses (affects container mode)
+
+A promote request reads the workspace **as the pane account** and fails closed when it cannot. On
+a **rootful container with no `PW_TERMINAL_UID`**, `terminalOwnerPlan` answers
+`{kind:'none', reason:'container-root'}`, the owner is `null`, and the source reader then refuses
+to read the workspace as root — so every promote request is refused. Host mode hits the same path
+when `PW_HOST_TERMINAL_USER` names an account the host lacks.
+
+Until 2026-10-22 the refusal said "try again when GitHub is reachable", which for either cause
+never comes true; it now names them as configuration and prints the keys to set, and is audited as
+`upstream=no_pane_account`. The refusal itself is deliberate and stays: a promote whose source
+cannot be confirmed does not ship.
+
+**For a container deployment:** set `PW_TERMINAL_UID`/`PW_TERMINAL_GID` to an unprivileged account
+if promote is wanted there; otherwise an emergency promote is a human's
+`sudo pw-promote-app --skip-git-check` on the host. These keys are not yet declared in
+`environments/corporate/profile.json` — confirm them with
+`systemctl show project-workbench -p Environment`.
