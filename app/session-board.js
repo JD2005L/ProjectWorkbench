@@ -42,11 +42,44 @@ export const BOARD_DIR_ENV = 'PW_SESSION_BOARD_DIR';
 // cheap read even with every session on the host reporting.
 export const LIMITS = Object.freeze({ task: 300, waitingOn: 300, branch: 120, files: 40, pathLen: 400 });
 
-export function resolveBoardDir(env = process.env) {
-  return env[BOARD_DIR_ENV] || DEFAULT_BOARD_DIR;
+// Where sidecars go. PW_SESSION_BOARD_DIR wins. Otherwise the default — unless it cannot exist
+// for the account running this: in container mode the pane account cannot create anything under
+// /opt/project-workbench (root's, from the image), so every write would silently fail and the
+// board would stay empty. Then the board lives in the pane account's own state directory, which
+// is the same path for every pane on the host because they all run as that account.
+export function resolveBoardDir(env = process.env, { fsImpl = fs } = {}) {
+  if (env[BOARD_DIR_ENV]) return env[BOARD_DIR_ENV];
+  if (usableDir(DEFAULT_BOARD_DIR, fsImpl)) return DEFAULT_BOARD_DIR;
+  return path.join(env.HOME || os.homedir(), '.local', 'state', 'pw-session-board');
+}
+function usableDir(dir, fsImpl) {
+  for (let d = dir; ; d = path.dirname(d)) {
+    try { fsImpl.accessSync(d, fs.constants.W_OK); return true; }
+    catch (e) { if (e?.code !== 'ENOENT') return false; }
+    if (path.dirname(d) === d) return false;
+  }
 }
 export function resolveRegistryDir(env = process.env) {
   return env.PW_CLAUDE_SESSIONS_DIR || path.join(env.HOME || os.homedir(), '.claude', 'sessions');
+}
+// Every Claude Code registry on the host. One per config dir: ~/.claude, this process's
+// CLAUDE_CONFIG_DIR, and — where PW gives each person their own Claude (PW_PER_USER_CLAUDE) —
+// <PW_USER_CRED_BASE>/<user>/claude*. Reading only ~/.claude/sessions made the board empty on such
+// an instance, and `claims` then said "free" for every file.
+export function resolveRegistryDirs(env = process.env, { fsImpl = fs } = {}) {
+  if (env.PW_CLAUDE_SESSIONS_DIR) return [env.PW_CLAUDE_SESSIONS_DIR];
+  const home = env.HOME || os.homedir();
+  const dirs = [path.join(home, '.claude', 'sessions')];
+  if (env.CLAUDE_CONFIG_DIR) dirs.push(path.join(env.CLAUDE_CONFIG_DIR, 'sessions'));
+  const base = env.PW_USER_CRED_BASE || '/home/admin/pw-users'; // user-credentials.js's default
+  let users = [];
+  try { users = fsImpl.readdirSync(base); } catch { /* no per-user trees here */ }
+  for (const u of users) {
+    let entries = [];
+    try { entries = fsImpl.readdirSync(path.join(base, u)); } catch { continue; }
+    for (const e of entries) if (/^claude(?:$|[-_.])/.test(e)) dirs.push(path.join(base, u, e, 'sessions'));
+  }
+  return [...new Set(dirs.map((d) => path.resolve(d)))];
 }
 
 const clip = (v, n) => (v == null ? '' : String(v).replace(/\s+/g, ' ').trim().slice(0, n));
@@ -146,16 +179,19 @@ export function mergeEntry(previous, update) {
 }
 
 // ---- the join ---------------------------------------------------------------
+// One directory or several (resolveRegistryDirs); a pid is one session, first seen wins.
 export function readRegistry(registryDir, { fsImpl = fs } = {}) {
-  let names = [];
-  try { names = fsImpl.readdirSync(registryDir); } catch { return []; }
-  const out = [];
-  for (const n of names) {
-    if (!/^\d+\.json$/.test(n)) continue;
-    try {
-      const r = JSON.parse(fsImpl.readFileSync(path.join(registryDir, n), 'utf8'));
-      if (Number.isInteger(Number(r.pid))) out.push(r);
-    } catch { /* a registry file mid-write is not an error here */ }
+  const out = [], seen = new Set();
+  for (const dir of Array.isArray(registryDir) ? registryDir : [registryDir]) {
+    let names = [];
+    try { names = fsImpl.readdirSync(dir); } catch { continue; }
+    for (const n of names) {
+      if (!/^\d+\.json$/.test(n)) continue;
+      try {
+        const r = JSON.parse(fsImpl.readFileSync(path.join(dir, n), 'utf8'));
+        if (Number.isInteger(Number(r.pid)) && !seen.has(Number(r.pid))) { seen.add(Number(r.pid)); out.push(r); }
+      } catch { /* a registry file mid-write is not an error here */ }
+    }
   }
   return out;
 }

@@ -47,7 +47,8 @@ function fakeFs({ procs = {}, files = {}, dirs = {} } = {}) {
 // --- resolution --------------------------------------------------------------
 
 test('the board directory is a knob with a documented default', () => {
-  assert.equal(resolveBoardDir({}), DEFAULT_BOARD_DIR);
+  // Where the default can be created (a PW host); the container-mode fallback is tested below.
+  assert.equal(resolveBoardDir({}, { fsImpl: { accessSync: () => {} } }), DEFAULT_BOARD_DIR);
   assert.equal(resolveBoardDir({ [BOARD_DIR_ENV]: '/tmp/elsewhere' }), '/tmp/elsewhere');
   assert.equal(BOARD_DIR_ENV, 'PW_SESSION_BOARD_DIR');
 });
@@ -258,4 +259,34 @@ test('a corrupt sidecar reads as absent rather than poisoning the board', async 
   } finally {
     await fsp.rm(dir, { recursive: true, force: true });
   }
+});
+
+// GOA (PW_PER_USER_CLAUDE): every person's Claude has its own config dir, so its sessions
+// register under <PW_USER_CRED_BASE>/<user>/claude/sessions, not ~/.claude/sessions. And in
+// container mode the pane account cannot create /opt/project-workbench/state.
+test('per-user Claude config dirs are all read, and the board falls back to a writable home', async (t) => {
+  const { resolveRegistryDirs, resolveBoardDir, readRegistry } = await import('../app/session-board.js');
+  const fsm = await import('node:fs');
+  const osm = await import('node:os');
+  const pathm = await import('node:path');
+  const root = fsm.mkdtempSync(pathm.join(osm.tmpdir(), 'pw-board-goa-'));
+  t.after(() => fsm.rmSync(root, { recursive: true, force: true }));
+  const home = pathm.join(root, 'home'), base = pathm.join(root, 'pw-users');
+  const reg = (dir, pid) => { fsm.mkdirSync(dir, { recursive: true }); fsm.writeFileSync(pathm.join(dir, `${pid}.json`), JSON.stringify({ pid, sessionId: `s${pid}`, cwd: '/w' })); };
+  reg(pathm.join(home, '.claude', 'sessions'), 11);
+  reg(pathm.join(base, 'james%2Elevac', 'claude', 'sessions'), 22);
+  reg(pathm.join(base, 'kevin%2Echarlebois', 'claude', 'sessions'), 33);
+  reg(pathm.join(base, 'kevin%2Echarlebois', 'claude', 'sessions'), 22); // the same pid twice: one session
+  fsm.mkdirSync(pathm.join(base, 'kevin%2Echarlebois', 'not-claude', 'sessions'), { recursive: true });
+  const env = { HOME: home, PW_USER_CRED_BASE: base, CLAUDE_CONFIG_DIR: pathm.join(base, 'james%2Elevac', 'claude') };
+  const dirs = resolveRegistryDirs(env);
+  assert.deepEqual(dirs.sort(), [pathm.join(home, '.claude', 'sessions'), pathm.join(base, 'james%2Elevac', 'claude', 'sessions'), pathm.join(base, 'kevin%2Echarlebois', 'claude', 'sessions')].sort());
+  assert.deepEqual(readRegistry(dirs).map((r) => r.pid).sort((a, b) => a - b), [11, 22, 33]);
+  assert.deepEqual(resolveRegistryDirs({ ...env, PW_CLAUDE_SESSIONS_DIR: '/only' }), ['/only'], 'an explicit dir still wins');
+
+  assert.equal(resolveBoardDir({ PW_SESSION_BOARD_DIR: '/x', HOME: home }), '/x');
+  const denied = { accessSync: (d) => { const e = new Error('no'); e.code = d === '/opt/project-workbench' ? 'EACCES' : 'ENOENT'; throw e; } };
+  assert.equal(resolveBoardDir({ HOME: home }, { fsImpl: denied }), pathm.join(home, '.local', 'state', 'pw-session-board'));
+  const ok = { accessSync: () => {} };
+  assert.equal(resolveBoardDir({ HOME: home }, { fsImpl: ok }), '/opt/project-workbench/state/sessions');
 });

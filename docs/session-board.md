@@ -58,6 +58,16 @@ merely quiet.
 written by a hook on every edit by every session, so unbounded strings and an
 unbounded file list would eventually cost more to read than the board saves.
 
+### Per-user Claude and container mode (GOA)
+
+Where PW gives each person their own Claude (`PW_PER_USER_CLAUDE`), sessions register under
+`<PW_USER_CRED_BASE>/<user>/claude/sessions` (default base `/home/admin/pw-users`), not
+`~/.claude/sessions`. The board reads all of them, plus `$CLAUDE_CONFIG_DIR/sessions`
+(`resolveRegistryDirs`); `PW_CLAUDE_SESSIONS_DIR` still overrides with exactly one directory.
+In container mode the pane account cannot create `/opt/project-workbench/state`, so with
+`PW_SESSION_BOARD_DIR` unset the sidecars go to `~/.local/state/pw-session-board` instead — the
+same path for every pane, since they all run as the pane account.
+
 ## What keeps it current
 
 Two hooks in `~/.claude/settings.json`, both `async` so they can never add

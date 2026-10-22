@@ -28,7 +28,7 @@ const B = await import(path.join(APP, 'session-board.js'));
 const EXIT_USAGE = 64;
 const EXIT_COLLISION = 3;
 const BOARD = B.resolveBoardDir(process.env);
-const REG = B.resolveRegistryDir(process.env);
+const REG = B.resolveRegistryDirs(process.env);
 
 function usage(msg) {
   if (msg) process.stderr.write(`pw-session-status: ${msg}\n`);
