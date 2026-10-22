@@ -1,6 +1,6 @@
 [Unit]
 Description=Project Workbench persistent tmux server (terminal sessions)
-Documentation=https://github.com/GovAlta-EMU/ProjWB
+Documentation=https://github.com/JD2005L/ProjectWorkbench
 After=network-online.target
 Wants=network-online.target
 

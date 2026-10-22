@@ -188,10 +188,17 @@ test('no file in the shared trunk branches on an environment identity', async ()
     assert.ok(common.sharedTrees.includes(t), `${t} is enforced but not declared a shared tree`);
   }
 
+  // Not only JS. A systemd unit, a Containerfile or a shell hook is trunk content that
+  // ships to every deployment, and the old `.js|.mjs` filter is exactly why
+  // systemd/pw-tmux.service sat here for months pointing Documentation= at one
+  // environment's fork — in a unit whose own comment says it carries "the MECHANISM and
+  // none of the values". A gate that cannot see the artifact cannot hold the line.
+  const SCANNED = /\.(js|mjs|service|timer|slice|sh|conf)$/;
   const files = (await Promise.all(
     common.enforcedTrees.map((t) => walk(path.join(REPO, t))),
-  )).flat().filter((f) => /\.(js|mjs)$/.test(f));
+  )).flat().filter((f) => SCANNED.test(f) || path.basename(f) === 'Containerfile');
   assert.ok(files.length > 20, `only ${files.length} files scanned`);
+  assert.ok(files.some((f) => !/\.(js|mjs)$/.test(f)), 'the scan must reach non-JS trunk artifacts');
 
   const identities = /\b(goa|govalta|pvi2|pvie|pve)\b/i;
   const offenders = [];

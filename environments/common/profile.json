@@ -17,10 +17,12 @@
     "config/",
     "contract/",
     "docs/",
-    "tools/"
+    "tools/",
+    "systemd/"
   ],
   "enforcedTrees": [
-    "app/"
+    "app/",
+    "systemd/"
   ],
   "invariants": [
     "No file under an enforcedTree may branch on an environment identity (a site name, a host name, an organisation). Checked by test/env-profiles.test.mjs. enforcedTrees is product code only: test/ is a shared tree but its fixtures may legitimately contain a real account or domain name as DATA.",

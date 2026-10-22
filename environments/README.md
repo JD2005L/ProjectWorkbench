@@ -88,8 +88,53 @@ remaining physical overlaps, in the order worth doing them:
    live instance name in shared code, and the single exemption in the trunk test.
    Neutralising it changes a running value, so it wants its own change, not a
    drive-by.
-5. **Open decision: who owns the container artifacts.** `Containerfile`,
-   `deploy/container/` and `systemd/pw-tmux.service` serve the corporate
-   environment, but container mode is also how isolated test runs work. They may
-   be common mechanism rather than corporate overlay; that needs a call before
-   anything moves.
+5. **`deploy/` is a mixed tree, and this is the next real overlap.** Alongside
+   `deploy/host/` (item 2), `deploy/migrate-tmux-owner.sh` is a corporate-only
+   migration, and `deploy/promote-app.sh` hard-codes the preflight "turn outcomes
+   must stay off on GOA" — a standing rule about one environment, written in shell,
+   in a script that ships to all of them. That rule is **already** `forbiddenEnv`
+   in `environments/corporate/profile.json`, so it is now stated twice in two
+   languages and only one copy is gated. `deploy/` cannot join `enforcedTrees`
+   until the corporate parts move out; that is what makes it worth doing.
+
+## Decided: the container artifacts are common mechanism (2026-10-22)
+
+James-direct, after the question was put badly the first time. The root
+`Containerfile`, `systemd/` and `deploy/container/` **stay in the trunk.**
+
+`PW_DEPLOY_MODE` is a *mechanism* axis — how an instance is hosted — and
+corporate/personal is an *environment* axis. They correlate today, because the
+corporate instance runs container mode and the personal one runs host mode, but
+that is a fact about two deployments, not a property of the code. Rule 1 forbids
+the trunk branching on **who** is running it; branching on **how** it is deployed
+is what the trunk is for, and it already does so deliberately: CI runs the whole
+suite in both modes on every push, eleven container test files live in the shared
+`test/` tree, and `install.sh:34` refuses container mode out loud rather than
+inventing a partial topology. Moving these under `environments/corporate/` would
+make CI test an overlay from the trunk, orphan those tests, and freeze today's
+correlation into the structure the model exists to prevent.
+
+Two corrections to the question as originally posed:
+
+- **`deploy/container/` was never a candidate.** It is the client-app deploy
+  service — `builder-relay.py`, `runtime-relay.py`, podman, the .NET channels —
+  a product capability for deploying *projects* into containers. It has nothing
+  to do with how PW itself is hosted.
+- **Both remaining files already said so.** `Containerfile:8` calls itself "the
+  generic base. Environment-specific extras ... are optional and left commented
+  below"; `systemd/pw-tmux.service` says "HOST ALIASES ARE CONFIGURATION, NOT
+  CONTENT. This unit ships to every deployment, so it carries the MECHANISM and
+  none of the values." The structure was right; the enforcement was not.
+
+So the artifacts stayed and the **gate** moved instead: `systemd/` is now a
+shared *and* enforced tree, and the trunk identity scan no longer looks only at
+`.js`/`.mjs` — it reads units, Containerfiles and shell hooks too. That narrower
+filter is why `systemd/pw-tmux.service` sat here pointing `Documentation=` at one
+environment's fork, in the very unit that claims to carry no values; it now
+points at the canonical origin, and the gate fails if it drifts back.
+
+One thing deliberately left alone: `Containerfile:52` keeps a commented, clearly
+labelled `Example (GOA):` Kerberos realm. The scan strips comments by design — a
+comment does not make the trunk *branch* on anything — and that example is a
+useful recipe sitting exactly where someone configuring it would look. Removing
+it would cost a reader something and gain nothing.
