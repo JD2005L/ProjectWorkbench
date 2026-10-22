@@ -57,7 +57,7 @@ import { githubOauthConfig, startDeviceFlow, pollDeviceFlow, verifyToken, descri
 import { mountOrchestrator } from './orchestrator/index.js';
 import { DEFAULT_DEPLOYMENT_SETTINGS, createWorkbenchSettingsStore, publicWorkbenchSettings } from './deployment/settings.js';
 import { createDeploymentService, deploymentFailure, deploymentHistoryEntry, requireDeploymentOrigin } from './deployment/pw.js';
-import { exportWorkspaceSnapshot, checkWorkspaceUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES } from './deployment/source.js';
+import { exportWorkspaceSnapshot, checkWorkspaceUpstream, describeUpstream, upstreamCheckEnabled, UPSTREAM_REFUSES, snapshotArgv } from './deployment/source.js';
 import { planRepos, lastProdDeploys, summarize as summarizeProd, readRepoFacts, classifyProjects, fastForwardAsOwner, describeFastForward, describeWorkspacePull } from './deployment/prod-status.js';
 import { promotePromptHtml } from './promote-prompt.js';
 import { mountDeploymentRoutes, sendDeploymentHealth } from './deployment/routes.js';
@@ -5236,11 +5236,26 @@ app.get(BASE + '/api/promote/requests/:id', requireAdminOrLocal, async (req,res)
 // This is hygiene, not the security gate — the administrator's approval of the snapshot
 // digest is that. An emergency promote is a human's `sudo pw-promote-app --skip-git-check`.
 const PROMOTE_WORKSPACE = process.env.PW_PROMOTE_WORKSPACE || workspacePath('ProjectWorkbench');
+// Two reasons the comparison cannot run that are NOT a GitHub outage, and both are local
+// configuration: host mode naming a pane account this host does not have, and a rootful
+// container with no PW_TERMINAL_UID, where there is no unprivileged account to read Git as
+// at all. Both arrive here as the same bare 'unknown' the remote being down produces, and
+// the message for that one sends the operator to watch a remote that was never the problem
+// ("try again when GitHub is reachable" never comes true for either). Named separately, and
+// still refused: a promote whose source cannot be confirmed does not ship.
 async function promoteGitRefusal(){
- let check;
+ let check, owner = null;
+ const noPaneAccount = (why) => ({ check:{ state:'no_pane_account' },
+  error:`Promote refused: Git cannot be read as the pane account, so the checkout could not be confirmed to be exactly origin/main (${why}). That is this deployment's configuration, not a GitHub outage: host mode needs PW_HOST_TERMINAL_USER to name an account that exists on this host, and container mode needs PW_TERMINAL_UID/PW_TERMINAL_GID so there is an unprivileged account to read as. An emergency promote is a human's \`sudo pw-promote-app --skip-git-check\` on the host.` });
+ try { owner = await terminalOwner(); }
+ catch(e){ return noPaneAccount(String(e?.message || e).slice(0, 200)); }
+ // Pure argv construction, no spawn: it is the same refusal checkWorkspaceUpstream would
+ // swallow into 'unknown', asked where the reason is still legible.
+ try { snapshotArgv({ owner, currentUid: process.getuid?.() ?? null, mode:'--upstream' }); }
+ catch(e){ return noPaneAccount(String(e?.message || e).slice(0, 200)); }
  try {
   check = await checkWorkspaceUpstream({ workspace: PROMOTE_WORKSPACE, paths: ['app', 'scripts'],
-   owner: await terminalOwner(), home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
+   owner, home: TERMINAL_PRIV.enabled ? TERMINAL_PRIV.home : undefined });
  } catch { check = { state:'unknown' }; }
  if(check.dirtyCount){
   const list = (check.dirty || []).slice(0, 10).join(', ') + (check.dirtyCount > 10 ? `, and ${check.dirtyCount - 10} more` : '');

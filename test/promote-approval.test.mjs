@@ -22,6 +22,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
 import { fileURLToPath } from 'node:url';
+import { selfOwnedTerminalEnv } from './terminal-owner-fixture.mjs';
 
 const serverJs = fileURLToPath(new URL('../app/server.js', import.meta.url));
 const scryptAsync = promisify(crypto.scrypt);
@@ -80,6 +81,12 @@ async function withInstance(extraEnv, fn, { spool = true, ...options } = {}) {
     PW_SESSIONS_PATH: path.join(dir, 'sessions.json'), PW_WORKSPACES: path.join(dir, 'workspaces'),
     PW_SECRET_KEY_PATH: path.join(dir, '.secret-key'), PW_WORKBENCH_SETTINGS: path.join(dir, 'workbench.json'),
     PW_AUDIT_LOG: audit, PW_PROMOTE_SPOOL: spoolDir, PW_API_TOKENS_PATH: path.join(dir, 'api-tokens.json'),
+    // The git check reads the workspace AS the pane account, so an instance that never named
+    // one cannot run it: the owner defaults to the literal `admin`, which exists here and not
+    // on a GitHub runner, and an unresolvable owner is indistinguishable from an unconfirmable
+    // checkout -> every request below is refused 409 and the gate itself is never exercised.
+    // See test/terminal-owner-fixture.mjs: the repair belongs in the fixture, not production.
+    ...selfOwnedTerminalEnv(),
     ...extraEnv,
   };
   const logs = [];
@@ -273,6 +280,26 @@ test('a request is refused unless app/ and scripts/ are committed and exactly or
       assert.match(fs.readFileSync(audit, 'utf8'), /"promote_request_refused"/);
     }, { workspace: shape });
   }
+});
+
+// A deployment with no resolvable pane account cannot read Git at all, which is NOT the
+// remote being unreachable: the one message that condition used to produce told the operator
+// to "try again when GitHub is reachable", and for this cause that never comes true. Host
+// mode here (an account this host does not have); the same branch covers a rootful container
+// with no PW_TERMINAL_UID, where snapshotArgv refuses to read the workspace as root.
+test('a deployment that cannot resolve a pane account says so, instead of blaming GitHub', { timeout: 60000 }, async () => {
+  await withInstance({ PW_HOST_TERMINAL_USER: 'pw-test-nonexistent-account-793d' }, async ({ base, spool, audit }) => {
+    const r = await call(base, 'POST', '/api/promote/requests', { body: { note: 'no owner' } });
+    assert.equal(r.status, 409, JSON.stringify(r.body));
+    assert.equal(r.body.code, 'promote_git_not_origin_main');
+    assert.match(r.body.error, /cannot be read as the pane account/);
+    assert.match(r.body.error, /PW_HOST_TERMINAL_USER/);
+    assert.match(r.body.error, /PW_TERMINAL_UID/);
+    assert.doesNotMatch(r.body.error, /GitHub is reachable/, 'an unresolvable owner is not an unreachable remote');
+    // Still fails closed, and still audited with why.
+    assert.deepEqual(fs.readdirSync(path.join(spool, 'queue')), [], 'nothing is queued for the runner');
+    assert.match(fs.readFileSync(audit, 'utf8'), /"upstream":"no_pane_account"/);
+  });
 });
 
 // The prompt that brings the approval to the administrator (app/promote-prompt.js) rides the
