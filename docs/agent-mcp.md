@@ -293,6 +293,9 @@ app/agent-sessions.js) unless the caller passes `notify: true`, and is launched 
   pending marker, and never feeds the project's turn outcome;
 - on a host install the Stop hook (`scripts/pw-stop-hook.sh`) writes no pending marker for it.
 
+The marker is explicit either way (`'1'` excluded, `'0'` included by `notify: true`); a window that
+carries this API's token marker but no `@pw_quiet` — one created before the marker existed — counts
+as excluded, so existing automation sessions go quiet without being recreated.
 `bell` itself is untouched, so `finished_turn` and turn tracking keep working for the caller.
 `notify` on an existing session changes `@pw_quiet` only when the window carries this API's
 token marker: a person's own tab keeps the alerts they expect, whoever prompts it. Callers are

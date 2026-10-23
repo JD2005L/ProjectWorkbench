@@ -487,7 +487,7 @@ test('a created session is excluded from completion alerts unless notify: true',
   const asked = harness();
   const a = await asked.engine.prompt(BOT, { project: 'Demo', session: 'kevins-fix', prompt: 'fix it', cli: 'claude', notify: true });
   assert.equal(a.completion_alerts, true);
-  assert.equal(asked.state.markers[`pw_Demo:7|${MARKER_QUIET}`], undefined, 'no marker at all');
+  assert.equal(asked.state.markers[`pw_Demo:7|${MARKER_QUIET}`], '0', 'an explicit opt-in');
   assert.equal(asked.calls.agents[0].quiet, false);
 
   const truthy = harness();
@@ -500,7 +500,7 @@ test('notify on an existing session changes alerts only for a session this API c
     markers: { [`pw_Demo:5|${MARKER_TOKEN}`]: 'tok-1', [`pw_Demo:5|${MARKER_QUIET}`]: '1' } });
   const on = await api.engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'p', notify: true });
   assert.equal(on.completion_alerts, true);
-  assert.equal(api.state.markers[`pw_Demo:5|${MARKER_QUIET}`], '');
+  assert.equal(api.state.markers[`pw_Demo:5|${MARKER_QUIET}`], '0');
   const untouched = await api.engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'p' });
   assert.equal(api.calls.options.filter(([, o]) => o === MARKER_QUIET).length, 1, 'no notify, no change');
   assert.equal(untouched.completion_alerts, false, 'reported from the window as listed');

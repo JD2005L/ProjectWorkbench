@@ -2413,8 +2413,8 @@ function parseTmuxWindows(stdout){
   // Hibernation fields are read from the END of the line, because a window NAME may contain the
   // separator and would shift every positional index after it. The six leading fields keep their
   // historical positions; these cannot be knocked out of place by a name.
-  const tail = parts.slice(-8);
-  const [windowId, hibSid, hibWindow, waiting, paneCommand, panePid, credUser, quietMark] = parts.length >= 14 ? tail : ['', '', '', '', '', '', '', ''];
+  const tail = parts.slice(-9);
+  const [windowId, hibSid, hibWindow, waiting, paneCommand, panePid, credUser, quietMark, agentToken] = parts.length >= 15 ? tail : ['', '', '', '', '', '', '', '', ''];
   // The markers count only when they name THIS window: scripts/pw-claude-hibernate stamps
   // @pw_claude_hib_win with the window's own id precisely so a stray session- or global-scope
   // option cannot make every window look hibernated (the same rule scripts/pw-tmux-save applies).
@@ -2434,7 +2434,10 @@ function parseTmuxWindows(stdout){
    windowId, panePid, paneCommand, credUser, hibernationMarkers,
    // Excluded from people's completion alerts (agent-sessions MARKER_QUIET). `bell` stays the raw
    // flag: the agent API's finished_turn and turn tracking still need it.
-   quiet: quietMark === '1',
+   // '1' excluded, '0' explicitly included (notify: true). Unset on a window the API created
+   // means excluded too: sessions made before the marker existed (dependabot, eod-commit) are
+   // automation exactly like the ones made after.
+   quiet: quietMark === '1' || (quietMark === '' && !!agentToken),
    placeholderInPane: hibernationMarkers && paneCommand === 'claude-resume',
    // Whether the tmux wake hooks can still resume it on their own: pw-claude-wait stops
    // advertising @pw_claude_waiting once its automatic retries are spent, and pw-claude-wake then
@@ -2537,7 +2540,7 @@ function placeholderState(panePid){
 }
 // The windows as tmux has them now — no outcome annotation, no triage side effect.
 async function readTmuxWindows(project){
- const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}|#{window_id}|#{@pw_claude_sid}|#{@pw_claude_hib_win}|#{@pw_claude_waiting}|#{pane_current_command}|#{pane_pid}|#{@pw_cred_user}|#{@pw_quiet}']);
+ const { stdout } = await tmux(['list-windows','-t',tmuxSession(project),'-F','#{window_index}|#{window_name}|#{window_active}|#{window_bell_flag}|#{session_attached}|#{window_activity}|#{window_id}|#{@pw_claude_sid}|#{@pw_claude_hib_win}|#{@pw_claude_waiting}|#{pane_current_command}|#{pane_pid}|#{@pw_cred_user}|#{@pw_quiet}|#{@pw_agent_token}']);
  const now = Math.floor(Date.now()/1000);
  const session = tmuxSession(project);
  return parseTmuxWindows(stdout).map(({ placeholderInPane, ...w }) => ({

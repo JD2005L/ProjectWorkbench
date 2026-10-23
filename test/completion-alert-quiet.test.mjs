@@ -33,6 +33,18 @@ test('a quiet window rings, but neither its tab nor the project lights; a normal
     assert.equal(s.bell, false, 'the project key does not light for a quiet window');
     assert.equal(s.pending, false);
 
+    // Made by the API before the marker existed: token marker, no @pw_quiet. Excluded too.
+    await tmux(sock, ['new-window', '-d', '-t', session, '-n', 'eod-commit', 'bash --noprofile --norc']);
+    await tmux(sock, ['set-option', '-w', '-t', `${session}:eod-commit`, '@pw_agent_token', 'tok-old']);
+    await ring('eod-commit');
+    const eod = await until(async () => { const w = (await windows()).find((x) => x.name === 'eod-commit'); return { ok: !!w?.bell, value: w }; });
+    assert.equal(eod.quiet, true, 'an API window from before the marker is excluded');
+    assert.equal((await status()).bell, false);
+    // notify: true on an API window is an explicit '0': included.
+    await tmux(sock, ['new-window', '-d', '-t', session, '-n', 'asked', 'bash --noprofile --norc']);
+    await tmux(sock, ['set-option', '-w', '-t', `${session}:asked`, '@pw_agent_token', 'tok-new']);
+    await tmux(sock, ['set-option', '-w', '-t', `${session}:asked`, '@pw_quiet', '0']);
+    assert.equal((await windows()).find((x) => x.name === 'asked').quiet, false);
     await tmux(sock, ['new-window', '-d', '-t', session, '-n', 'kevin', 'bash --noprofile --norc']);
     await ring('kevin');
     s = await until(async () => { const v = await status(); return { ok: !!v?.bell, value: v }; });

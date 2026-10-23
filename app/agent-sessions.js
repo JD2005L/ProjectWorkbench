@@ -243,7 +243,8 @@ export function createAgentSessions({
         await setWindowOption(fresh, MARKER_TOKEN, token.id);
         await setWindowOption(fresh, MARKER_USER, verdict.user.username);
         await setWindowOption(fresh, MARKER_CREATED, now().toISOString());
-        if (quiet) await setWindowOption(fresh, MARKER_QUIET, '1');
+        // Explicit either way: unset on an API window reads as excluded (server.js parseTmuxWindows).
+        await setWindowOption(fresh, MARKER_QUIET, quiet ? '1' : '0');
         window = { index, name: session };
         created = true;
         // A new CLI takes seconds to start, and whatever is on screen in the
@@ -281,7 +282,7 @@ export function createAgentSessions({
         // notify on an existing session changes its alerts only if this API created it: a session
         // a person opened in the dashboard keeps the alerts they expect, whoever prompts it.
         if (typeof notify === 'boolean' && mark.tokenId) {
-          await setWindowOption(targetFor(projectName, window.index), MARKER_QUIET, notify ? '' : '1');
+          await setWindowOption(targetFor(projectName, window.index), MARKER_QUIET, notify ? '0' : '1');
         }
       }
 
