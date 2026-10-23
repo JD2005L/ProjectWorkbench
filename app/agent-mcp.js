@@ -126,6 +126,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
       'An existing session continues with whatever it is already running; `cli` is ignored for one.',
       'A Claude session created here runs unattended: auto permission mode (routine work approved, risky actions refused rather than asked), deploy and host commands denied, and a system prompt saying it acts for the person this credential acts as. Its first prompt waits for Claude to be ready (up to about 45 seconds) instead of pasting into a starting pane.',
       'Refused with pending_dialog (409) when the session is showing a dialog, and with session_not_ready (503) when a just-created Claude did not start; in both cases the session exists and nothing was sent.',
+      'Completion alerts: a session created here does NOT light the dashboard\'s amber "finished" alert for people, because most API sessions are automation nobody is waiting on. Pass notify: true ONLY when a person asked for this work and wants to be told when it is done; never for scheduled, triggered or bot work (dependabot, an end-of-day commit, CI follow-ups). On an existing session notify changes its alerts only if it was created through this API. The reply says completion_alerts.',
       'Returns a turn_id. Use pw_wait_for_turn to learn when that turn ends, then pw_read_session with since_turn to read what it produced.',
     ].join(' '),
     inputSchema: closed({
@@ -134,6 +135,7 @@ export const TOOL_DEFINITIONS = Object.freeze([
       prompt: { type: 'string', minLength: 1, maxLength: MAX_PROMPT_BYTES },
       cli: { type: 'string', enum: [...SUPPORTED_CLIS] },
       create_if_missing: { type: 'boolean' },
+      notify: { type: 'boolean', description: 'true only when a person initiated this work and wants the dashboard alert when it finishes; omit for automation.' },
     }, ['project', 'session', 'prompt']),
   },
   {
@@ -235,6 +237,7 @@ export function createAgentMcp({ sessions, tokenHasScope, serverVersion = '0' } 
       case 'pw_send_prompt': return sessions.prompt(token, {
         project: args.project, session: args.session, prompt: args.prompt,
         cli: String(args.cli || ''), create_if_missing: args.create_if_missing !== false,
+        ...(typeof args.notify === 'boolean' ? { notify: args.notify } : {}),
       });
       case 'pw_get_turn': return sessions.turn(token, args);
       case 'pw_wait_for_turn': return sessions.waitForTurn(token, args);

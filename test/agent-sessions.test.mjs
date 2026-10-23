@@ -8,7 +8,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
   createAgentSessions, validSessionName, AgentSessionError,
-  MARKER_TOKEN, MARKER_USER, MAX_PROMPT_BYTES, MAX_READ_LINES,
+  MARKER_TOKEN, MARKER_USER, MARKER_QUIET, MAX_PROMPT_BYTES, MAX_READ_LINES,
 } from '../app/agent-sessions.js';
 
 const BOT = { id: 'tok-1', label: 'PVIBot', actsAs: 'kev',
@@ -77,7 +77,7 @@ test('a prompt into a new session creates it as the ACTING user and marks it bef
   assert.equal(calls.options[0][2], 'tok-1');
   assert.equal(calls.options[1][2], 'kev');
   assert.deepEqual(calls.pasted[0], ['pw_Demo:7', 'do the thing']);
-  assert.deepEqual(out, { project: 'Demo', session: 'bot-lane', window: 7, created: true, injected_chars: 12 });
+  assert.deepEqual(out, { project: 'Demo', session: 'bot-lane', window: 7, created: true, completion_alerts: false, injected_chars: 12 });
 
   const [event, detail] = calls.audit.at(-1);
   assert.equal(event, 'agent_prompt');
@@ -221,7 +221,7 @@ test('reading is capped and says when it capped, and reports what the pane is do
   const listed = await engine.sessions(BOT, 'Demo');
   assert.deepEqual(listed.sessions[0], {
     session: 'bot-lane', index: 4, running: 'claude', working: false,
-    finished_turn: true, hibernated: false, runs_as: 'kev',
+    finished_turn: true, completion_alerts: true, hibernated: false, runs_as: 'kev',
     owned_by_this_token: true, agent_owned: true, promptable: true,
   });
 
@@ -397,7 +397,7 @@ test('a created session is told who it acts for, and its first prompt waits for 
     waitForReady: async (target, opts) => { calls.order.push('wait'); waited.push([target, opts]); return { state: 'ready' }; },
   } });
   await engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'bump deps', cli: 'claude' });
-  assert.deepEqual(calls.agents, [{ actsAs: 'kev', tokenId: 'tok-1', tokenLabel: 'PVIBot' }],
+  assert.deepEqual(calls.agents, [{ actsAs: 'kev', tokenId: 'tok-1', tokenLabel: 'PVIBot', quiet: true }],
     'the launch gets the acting user and the token label for its system prompt');
   assert.deepEqual(waited, [['pw_Demo:7', { cli: 'claude' }]]);
   assert.deepEqual(calls.order, ['create', 'wait', 'paste'], 'nothing is pasted into a starting pane');
@@ -472,4 +472,47 @@ test('a pane that cannot be captured does not block prompting', async () => {
   });
   await engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'x' });
   assert.equal(calls.pasted.length, 1);
+});
+
+// Completion alerts: an API session is automation unless the caller says a person asked for it.
+test('a created session is excluded from completion alerts unless notify: true', async () => {
+  const quiet = harness();
+  const q = await quiet.engine.prompt(BOT, { project: 'Demo', session: 'dependabot', prompt: 'bump', cli: 'claude' });
+  assert.equal(q.completion_alerts, false);
+  assert.equal(quiet.state.markers[`pw_Demo:7|${MARKER_QUIET}`], '1');
+  assert.equal(quiet.calls.agents[0].quiet, true, 'and it launches with the Stop hook told to stay quiet');
+  const qAudit = quiet.calls.audit.find(([e]) => e === 'agent_prompt')[1];
+  assert.equal(qAudit.completionAlerts, false);
+
+  const asked = harness();
+  const a = await asked.engine.prompt(BOT, { project: 'Demo', session: 'kevins-fix', prompt: 'fix it', cli: 'claude', notify: true });
+  assert.equal(a.completion_alerts, true);
+  assert.equal(asked.state.markers[`pw_Demo:7|${MARKER_QUIET}`], undefined, 'no marker at all');
+  assert.equal(asked.calls.agents[0].quiet, false);
+
+  const truthy = harness();
+  assert.equal((await truthy.engine.prompt(BOT, { project: 'Demo', session: 'x', prompt: 'p', cli: 'claude', notify: 'yes' })).completion_alerts, false,
+    'only a real true opts in');
+});
+
+test('notify on an existing session changes alerts only for a session this API created', async () => {
+  const api = harness({ windows: [{ index: 5, name: 'eod-commit', paneCommand: 'claude', quiet: true }],
+    markers: { [`pw_Demo:5|${MARKER_TOKEN}`]: 'tok-1', [`pw_Demo:5|${MARKER_QUIET}`]: '1' } });
+  const on = await api.engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'p', notify: true });
+  assert.equal(on.completion_alerts, true);
+  assert.equal(api.state.markers[`pw_Demo:5|${MARKER_QUIET}`], '');
+  const untouched = await api.engine.prompt(BOT, { project: 'Demo', session: 'eod-commit', prompt: 'p' });
+  assert.equal(api.calls.options.filter(([, o]) => o === MARKER_QUIET).length, 1, 'no notify, no change');
+  assert.equal(untouched.completion_alerts, false, 'reported from the window as listed');
+
+  const human = harness({ windows: [{ index: 4, name: 'Kevin', paneCommand: 'claude' }] });
+  const h = await human.engine.prompt(BOT, { project: 'Demo', session: 'Kevin', prompt: 'p', notify: false });
+  assert.equal(human.calls.options.length, 0, "a person's own tab keeps its alerts, whoever prompts it");
+  assert.equal(h.completion_alerts, true);
+});
+
+test('sessions report completion_alerts', async () => {
+  const { engine } = harness({ windows: [{ index: 1, name: 'a', paneCommand: 'claude', quiet: true }, { index: 2, name: 'b', paneCommand: 'claude' }] });
+  const out = await engine.sessions(BOT, 'Demo');
+  assert.deepEqual(out.sessions.map((s) => [s.session, s.completion_alerts]), [['a', false], ['b', true]]);
 });

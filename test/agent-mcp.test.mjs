@@ -53,7 +53,7 @@ test('the advertised tool set is exactly the allow-list, and every name is safe'
   assert.deepEqual(violatesToolNaming('pw_session_transcript'), [], 'and "transcript" is a word, not a script tool');
   const fields = new Set(TOOL_DEFINITIONS.flatMap((t) => Object.keys(t.inputSchema.properties)));
   assert.deepEqual([...fields].sort(), ['base64', 'cli', 'content', 'create_if_missing', 'filename',
-    'include_scrollback', 'lines', 'max_bytes', 'max_entries', 'messages', 'path', 'project', 'prompt',
+    'include_scrollback', 'lines', 'max_bytes', 'max_entries', 'messages', 'notify', 'path', 'project', 'prompt',
     'session', 'since_turn', 'timeout_ms', 'turn_id']);
 });
 

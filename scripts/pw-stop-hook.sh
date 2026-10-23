@@ -4,6 +4,9 @@
 # indicator. The marker is cleared when the user opens the project's
 # terminal in the browser (or via heartbeat while it's visible).
 set -e
+# A session the agent API made for automation is excluded from completion alerts
+# (agent-sessions.js MARKER_QUIET); its launch sets this.
+[ "${PW_COMPLETION_ALERT:-}" = off ] && exit 0
 DIR="${CLAUDE_PROJECT_DIR:-$PWD}"
 case "$DIR" in
   /opt/project-workbench/workspaces/*)

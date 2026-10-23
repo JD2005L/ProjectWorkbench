@@ -265,6 +265,14 @@ Three things to know before you use it:
   session showing a dialog lists `pending_dialog` and refuses prompts with 409
   until a person answers it. See docs/agent-mcp.md, "Sessions created here run
   unattended".
+- **Sessions you create do not alert people by default.** A finished turn in a session made
+  through this API does not light the dashboard's amber completion alert (its tab or the
+  project's key), because most such sessions are automation nobody is waiting on. Pass
+  `"notify": true` **only when a person asked for this work** and wants to be told when it is
+  done — never for scheduled, triggered or bot work (dependabot, an end-of-day commit, CI
+  follow-ups). On an existing session `notify` changes its alerts only if it was created through
+  this API; a person's own tab keeps its alerts. Replies and `pw_list_sessions` report
+  `completion_alerts`. Your own turn tracking (`finished_turn`, `pw_wait_for_turn`) is unaffected.
 - **A prompt is pasted whole**, up to 256 KB. For more than that, upload the
   content to the project's `_inbox/` and name the path in a short prompt instead.
 

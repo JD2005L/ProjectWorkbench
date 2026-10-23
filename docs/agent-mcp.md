@@ -42,7 +42,7 @@ whether this token created the session (see the marker rule). A human's windows
 appear, because hiding them would invite an agent to create a colliding name.
 
 ### `pw_send_prompt`
-`{ project, session, prompt, create_if_missing = true, cli = "claude" }`
+`{ project, session, prompt, create_if_missing = true, cli = "claude", notify }`
 → `{ session, window, created, injected_chars, turn_id, cursor }`
 
 Injects the text into that session's pane as keystrokes, exactly as the documented
@@ -280,6 +280,24 @@ is a speed bump, not a sandbox; auto mode's refusals and the workspace boundary 
 CLAUDE.md are the other layers. These flags apply at launch, so a lane created
 before them keeps running without them until it is closed and re-created, and a
 hibernated lane resumes as plain `claude --resume`.
+
+## Sessions created here are excluded from people's completion alerts (2026-10-23)
+
+James: dependabot and eod-commit are not started by a person, so their finished turns should not
+summon one. A session this API creates is marked `@pw_quiet=1` (`MARKER_QUIET` in
+app/agent-sessions.js) unless the caller passes `notify: true`, and is launched with
+`PW_COMPLETION_ALERT=off`:
+
+- the cockpit tab ignores its bell (and its tooltip says alerts are off and why);
+- `projectSignals` leaves it out, so it never lights the project's rail key, never latches the
+  pending marker, and never feeds the project's turn outcome;
+- on a host install the Stop hook (`scripts/pw-stop-hook.sh`) writes no pending marker for it.
+
+`bell` itself is untouched, so `finished_turn` and turn tracking keep working for the caller.
+`notify` on an existing session changes `@pw_quiet` only when the window carries this API's
+token marker: a person's own tab keeps the alerts they expect, whoever prompts it. Callers are
+told — in the tool description and AGENTS.md — to pass `notify: true` only for work a person
+asked for.
 
 ## Completion: how PW already knows a turn ended
 

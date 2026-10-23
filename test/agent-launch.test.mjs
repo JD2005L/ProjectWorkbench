@@ -296,7 +296,8 @@ test('server.js launches only API-created Claude windows unattended, and gives t
   // The cockpit's own new-window route never passes an agent identity, so only
   // the agent surface's createWindow can reach the unattended launch.
   assert.match(src, /createWindow: \(project, name, cli, launcher, agent = null\) => \{\n  const unattended = !!agent && cli === 'claude';/);
-  assert.match(src, /return newTmuxWindow\(project, name, cmd, launcher, \{ trustClaude: unattended \}\);/);
+  assert.match(src, /const launched = agent\?\.quiet \? `PW_COMPLETION_ALERT=off \$\{cmd\}` : cmd;\n  return newTmuxWindow\(project, name, launched, launcher, \{ trustClaude: unattended \}\);/,
+    'a window excluded from completion alerts launches with PW_COMPLETION_ALERT=off, which the Stop hook honours');
   assert.equal((src.match(/trustClaude: /g) || []).length, 1, 'no other caller pre-trusts');
   // nginx's default 60s read timeout 504'd pw_wait_for_turn while the app was still waiting.
   const maxWait = Number(/const AGENT_MAX_WAIT_MS = (\d+);/.exec(src)?.[1]);

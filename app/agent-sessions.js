@@ -33,6 +33,11 @@
 export const MARKER_TOKEN = '@pw_agent_token';
 export const MARKER_USER = '@pw_agent_user';
 export const MARKER_CREATED = '@pw_agent_created';
+// Excluded from the dashboard's completion alerts (the amber tab and project key). Set on every
+// session this API creates unless the caller passed notify: true, because most of them are not
+// started by a person (dependabot, an end-of-day commit) and a person should not be summoned to a
+// turn nobody asked for. The caller is told to pass notify only for a person's request.
+export const MARKER_QUIET = '@pw_quiet';
 
 /** Large and specific by design; beyond this, send a file (see the doc). */
 export const MAX_PROMPT_BYTES = 256 * 1024;
@@ -184,6 +189,8 @@ export function createAgentSessions({
           working: !!w.working,
           // The bell is how this instance already knows a turn ended; see the doc.
           finished_turn: !!w.bell,
+          // Whether a finished turn here lights the dashboard's amber alert for people.
+          completion_alerts: !w.quiet,
           hibernated: !!w.hibernated,
           runs_as: w.credUser || null,
           owned_by_this_token: !!mark.tokenId && mark.tokenId === token.id,
@@ -206,7 +213,7 @@ export function createAgentSessions({
      * credentials, and choosing for the caller would spend somebody's seat on a
      * guess.
      */
-    async prompt(token, { project: projectName, session, prompt, create_if_missing = true, cli = '' }) {
+    async prompt(token, { project: projectName, session, prompt, create_if_missing = true, cli = '', notify }) {
       const verdict = await reach(token, projectName);
       const text = typeof prompt === 'string' ? prompt : '';
       if (!text.trim()) refuse('A prompt is required', 400, 'empty_prompt');
@@ -227,14 +234,16 @@ export function createAgentSessions({
         }
         // The token's identity goes with the request so the launch can say whose
         // instructions this session carries (app/agent-launch.js).
+        const quiet = notify !== true;
         const index = await createWindow(verdict.project, session, cli, verdict.user.username,
-          { actsAs: verdict.user.username, tokenId: token.id, tokenLabel: token.label || '' });
+          { actsAs: verdict.user.username, tokenId: token.id, tokenLabel: token.label || '', quiet });
         const fresh = targetFor(projectName, index);
         // Marked BEFORE the prompt goes in: a pane must never become addressable as
         // this token's lane only after it has already been typed into.
         await setWindowOption(fresh, MARKER_TOKEN, token.id);
         await setWindowOption(fresh, MARKER_USER, verdict.user.username);
         await setWindowOption(fresh, MARKER_CREATED, now().toISOString());
+        if (quiet) await setWindowOption(fresh, MARKER_QUIET, '1');
         window = { index, name: session };
         created = true;
         // A new CLI takes seconds to start, and whatever is on screen in the
@@ -269,6 +278,11 @@ export function createAgentSessions({
         // permission to type here, not permission to answer a dialog blind.
         const dialog = await pendingDialog(targetFor(projectName, window.index));
         if (dialog) refuse(dialog.message, 409, 'pending_dialog');
+        // notify on an existing session changes its alerts only if this API created it: a session
+        // a person opened in the dashboard keeps the alerts they expect, whoever prompts it.
+        if (typeof notify === 'boolean' && mark.tokenId) {
+          await setWindowOption(targetFor(projectName, window.index), MARKER_QUIET, notify ? '' : '1');
+        }
       }
 
       const tmuxTarget = targetFor(projectName, window.index);
@@ -286,8 +300,10 @@ export function createAgentSessions({
       await audit('agent_prompt', {
         tokenId: token.id, label: token.label, actsAs: verdict.user.username,
         project: projectName, session, window: window.index, created, promptBytes: bytes,
+        ...(created ? { completionAlerts: notify === true } : typeof notify === 'boolean' ? { completionAlerts: notify } : {}),
       });
-      return { project: projectName, session, window: window.index, created,
+      const alerts = created ? notify === true : (typeof notify === 'boolean' && (await ownership(tmuxTarget)).tokenId ? notify : !window.quiet);
+      return { project: projectName, session, window: window.index, created, completion_alerts: alerts,
         injected_chars: text.length, ...(turn ? { turn_id: turn.turn_id } : {}) };
     },
 
